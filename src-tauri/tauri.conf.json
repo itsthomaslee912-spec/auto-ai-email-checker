@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Auto AI Email Checker",
+  "version": "0.1.0",
+  "identifier": "com.autoai.emailchecker",
+  "build": {
+    "beforeDevCommand": "cd frontend && npm.cmd run dev",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeBuildCommand": "cd frontend && npm.cmd run build",
+    "frontendDist": "../frontend/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Auto AI Email Checker",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 980,
+        "minHeight": 680
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "externalBin": ["binaries/email-checker-backend"],
+    "windows": {
+      "nsis": {
+        "installerMode": "currentUser"
+      }
+    }
+  }
+}
