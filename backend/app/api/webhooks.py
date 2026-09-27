@@ -13,6 +13,10 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.db import SessionLocal
 from app.services.mailbox_sync import process_gmail_notification, process_outlook_notification
+from app.services.webhook_health import (
+    record_webhook_delivery_failure,
+    record_webhook_delivery_success,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
@@ -53,7 +57,12 @@ async def _verify_gmail_push_auth(request: Request) -> None:
 
 @router.post("/gmail")
 async def gmail_pubsub_push(request: Request) -> dict:
-    await _verify_gmail_push_auth(request)
+    try:
+        await _verify_gmail_push_auth(request)
+    except HTTPException as exc:
+        record_webhook_delivery_failure("google", str(exc.detail))
+        raise
+    record_webhook_delivery_success("google")
     body = await request.json()
     message = body.get("message") or {}
     data_b64 = message.get("data")
@@ -118,8 +127,10 @@ async def outlook_graph_webhook(request: Request, background_tasks: BackgroundTa
     notifications = body.get("value") or []
     for note in notifications:
         if note.get("clientState") != settings.microsoft_webhook_client_state:
+            record_webhook_delivery_failure("microsoft", "Invalid Outlook clientState")
             logger.warning("Rejected Outlook notification with bad clientState")
             continue
+        record_webhook_delivery_success("microsoft")
         subscription_id = note.get("subscriptionId") or ""
         resource_data = note.get("resourceData") or {}
         message_id = resource_data.get("id")

@@ -1520,12 +1520,26 @@ export default function App() {
   const autoSyncState = autoSyncOffline ? "offline" : autoSyncStatus?.state ?? "checking";
   const autoSyncAlert = ["offline", "no_account", "stopped", "error"].includes(autoSyncState);
   const syncIntervalMinutes = Math.round((autoSyncStatus?.interval_seconds ?? 120) / 60);
+  const webhookDeliveryStates = Object.values(autoSyncStatus?.webhook_delivery ?? {});
+  const legacyWebhookVerified = webhookDeliveryStates.length === 0
+    && Boolean(autoSyncStatus?.connected_accounts)
+    && autoSyncStatus?.webhook_accounts === autoSyncStatus?.connected_accounts;
+  const webhookDeliveryVerified = legacyWebhookVerified
+    || (webhookDeliveryStates.length > 0
+      && webhookDeliveryStates.every((delivery) => delivery.healthy));
+  const registeredWebhookAccounts = autoSyncStatus?.registered_webhook_accounts
+    ?? autoSyncStatus?.webhook_accounts
+    ?? 0;
   const autoSyncLabel = autoSyncState === "active"
-    ? autoSyncStatus && autoSyncStatus.webhook_accounts === autoSyncStatus.connected_accounts
+    ? autoSyncStatus
+      && webhookDeliveryVerified
+      && autoSyncStatus.webhook_accounts === autoSyncStatus.connected_accounts
       ? "Webhook sync on"
-      : autoSyncStatus?.webhook_accounts
+      : webhookDeliveryVerified && autoSyncStatus?.webhook_accounts
         ? `Webhook + auto sync · every ${syncIntervalMinutes} min`
-        : `Auto sync on · every ${syncIntervalMinutes} min`
+        : registeredWebhookAccounts
+          ? `Polling fallback · ${syncIntervalMinutes} min`
+          : `Auto sync on · every ${syncIntervalMinutes} min`
     : autoSyncState === "syncing"
       ? "Auto sync running"
       : autoSyncState === "checking"

@@ -32,6 +32,13 @@ export interface AutoSyncStatus {
   interval_seconds: number;
   connected_accounts: number;
   webhook_accounts: number;
+  registered_webhook_accounts?: number;
+  webhook_delivery?: Record<string, {
+    healthy: boolean;
+    last_success_at: string | null;
+    last_failure_at: string | null;
+    last_error: string | null;
+  }>;
   last_check_at: string | null;
   last_error: string | null;
   problem_mailboxes: { mailbox_id: number; email_address: string; message: string }[];

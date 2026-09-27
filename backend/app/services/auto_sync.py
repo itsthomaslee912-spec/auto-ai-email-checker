@@ -10,6 +10,10 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.models import MailboxConnection
 from app.services.mailbox_sync import get_sync_status, start_mailbox_sync
+from app.services.webhook_health import (
+    webhook_delivery_is_healthy,
+    webhook_delivery_status,
+)
 from app.timeutil import as_utc
 
 logger = logging.getLogger(__name__)
@@ -18,7 +22,7 @@ _last_check_at: datetime | None = None
 _last_error: str | None = None
 
 
-def has_active_webhook(mailbox: MailboxConnection, now: datetime | None = None) -> bool:
+def has_registered_webhook(mailbox: MailboxConnection, now: datetime | None = None) -> bool:
     webhook = mailbox.webhook
     expires_at = as_utc(webhook.expires_at) if webhook else None
     return bool(
@@ -27,6 +31,12 @@ def has_active_webhook(mailbox: MailboxConnection, now: datetime | None = None) 
         and webhook.external_id
         and expires_at
         and expires_at > (now or datetime.now(timezone.utc))
+    )
+
+
+def has_active_webhook(mailbox: MailboxConnection, now: datetime | None = None) -> bool:
+    return has_registered_webhook(mailbox, now) and webhook_delivery_is_healthy(
+        mailbox.provider
     )
 
 
@@ -61,7 +71,10 @@ def get_auto_sync_status(db: Session) -> dict:
     problems = []
     syncing = False
     webhook_accounts = 0
+    registered_webhook_accounts = 0
     for mailbox in mailboxes:
+        if has_registered_webhook(mailbox):
+            registered_webhook_accounts += 1
         if has_active_webhook(mailbox):
             webhook_accounts += 1
             continue
@@ -86,11 +99,17 @@ def get_auto_sync_status(db: Session) -> dict:
         state = "syncing"
     else:
         state = "active"
+    provider_delivery = {
+        provider: webhook_delivery_status(provider)
+        for provider in {mailbox.provider for mailbox in mailboxes}
+    }
     return {
         "state": state,
         "interval_seconds": interval,
         "connected_accounts": len(mailboxes),
         "webhook_accounts": webhook_accounts,
+        "registered_webhook_accounts": registered_webhook_accounts,
+        "webhook_delivery": provider_delivery,
         "last_check_at": _last_check_at.isoformat() if _last_check_at else None,
         "last_error": _last_error,
         "problem_mailboxes": problems,

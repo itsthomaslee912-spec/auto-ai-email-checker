@@ -10,6 +10,11 @@ from sqlalchemy.pool import StaticPool
 from app.db import Base
 from app.models import MailboxConnection, User, WebhookSubscription
 from app.services import auto_sync
+from app.services.webhook_health import (
+    record_webhook_delivery_failure,
+    record_webhook_delivery_success,
+    reset_webhook_delivery_health,
+)
 
 
 def test_auto_sync_schedules_only_active_mailboxes_without_webhooks(monkeypatch):
@@ -47,6 +52,8 @@ def test_auto_sync_schedules_only_active_mailboxes_without_webhooks(monkeypatch)
 
 
 def test_auto_sync_skips_live_webhook_and_polls_expired_one(monkeypatch):
+    reset_webhook_delivery_health()
+    record_webhook_delivery_success("google")
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine)
@@ -76,6 +83,67 @@ def test_auto_sync_skips_live_webhook_and_polls_expired_one(monkeypatch):
         assert status["webhook_accounts"] == 1
         assert status["connected_accounts"] == 2
     assert live_id != expired_id
+    engine.dispose()
+    reset_webhook_delivery_health()
+
+
+def test_auto_sync_polls_registered_webhook_after_delivery_auth_failure(monkeypatch):
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as db:
+        user = User(external_id="webhook-fallback-test")
+        db.add(user)
+        db.flush()
+        mailbox = MailboxConnection(
+            user_id=user.id,
+            provider="google",
+            email_address="fallback@example.com",
+            access_token_enc="x",
+            is_active=True,
+        )
+        db.add(mailbox)
+        db.flush()
+        db.add(
+            WebhookSubscription(
+                mailbox_id=mailbox.id,
+                provider="google",
+                external_id="history-1",
+                expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+            )
+        )
+        mailbox_id = mailbox.id
+        db.commit()
+
+    reset_webhook_delivery_health()
+    record_webhook_delivery_success("google")
+    record_webhook_delivery_failure("google", "Missing Pub/Sub bearer token")
+    sync = AsyncMock()
+    monkeypatch.setattr(auto_sync, "SessionLocal", session_factory)
+    monkeypatch.setattr(auto_sync, "start_mailbox_sync", sync)
+    monkeypatch.setattr(
+        auto_sync,
+        "get_settings",
+        lambda: SimpleNamespace(
+            auto_sync_max_messages=200, auto_sync_interval_seconds=120
+        ),
+    )
+
+    asyncio.run(auto_sync.poll_active_mailboxes())
+
+    sync.assert_awaited_once_with(
+        mailbox_id, max_results=200, register_webhook=True
+    )
+    with session_factory() as db:
+        status = auto_sync.get_auto_sync_status(db)
+        assert status["webhook_accounts"] == 0
+        assert status["registered_webhook_accounts"] == 1
+        assert status["webhook_delivery"]["google"]["last_error"] == (
+            "Missing Pub/Sub bearer token"
+        )
+    reset_webhook_delivery_health()
     engine.dispose()
 
 
