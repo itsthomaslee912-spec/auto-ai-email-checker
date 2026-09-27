@@ -322,6 +322,7 @@ export default function App() {
   const [resizing, setResizing] = useState(false);
   const [replyOpen, setReplyOpen] = useState(false);
   const [replyText, setReplyText] = useState("");
+  const [replyInstruction, setReplyInstruction] = useState("");
   const [replyFiles, setReplyFiles] = useState<File[]>([]);
   const [scheduleAt, setScheduleAt] = useState("");
   const [sendingReply, setSendingReply] = useState(false);
@@ -1420,7 +1421,7 @@ export default function App() {
       try {
         await sendEmail({ mailbox_id: replyMailbox.id, to_address: selected.sender.match(/<([^>]+)>/)?.[1] ?? selected.sender, subject: /^re:/i.test(selected.subject) ? selected.subject : `Re: ${selected.subject}`, body_text: replyText, attachments: await filePayload(replyFiles) });
         setBanner(scheduleAt ? "Reply scheduled and sent." : "Reply sent. It is now in Sent.");
-        setReplyOpen(false); setReplyText(""); setReplyFiles([]); setScheduleAt("");
+        setReplyOpen(false); setReplyText(""); setReplyInstruction(""); setReplyFiles([]); setScheduleAt("");
         if (folder === "sent") void loadFirstPage();
       } catch (err) { setBanner(err instanceof Error ? err.message : "Could not send reply"); }
       finally { setSendingReply(false); }
@@ -1433,7 +1434,7 @@ export default function App() {
   async function draftAiReply() {
     if (!selected) return;
     setAiDrafting(true);
-    try { setReplyText((await createAiReply(selected.id)).body_text); }
+    try { setReplyText((await createAiReply(selected.id, replyInstruction.trim())).body_text); }
     catch (err) { setBanner(err instanceof Error ? err.message : "Could not create AI draft"); }
     finally { setAiDrafting(false); }
   }
@@ -2067,7 +2068,7 @@ export default function App() {
               />
               {!replyOpen && (
                 <div className="reply-action-row">
-                  <button type="button" className="action-btn primary" onClick={() => { setScheduleAt(""); setReplyOpen(true); }}>
+                  <button type="button" className="action-btn primary" onClick={() => { setScheduleAt(""); setReplyInstruction(""); setReplyOpen(true); }}>
                     ↩ Reply
                   </button>
                 </div>
@@ -2077,18 +2078,29 @@ export default function App() {
                   <header>
                     <strong>Reply</strong>
                     <span>From {replyMailbox?.email_address ?? "selected account"} to {selected.sender}</span>
-                    <button type="button" aria-label="Delete reply draft" title="Delete draft" onClick={() => { setReplyOpen(false); setReplyText(""); setReplyFiles([]); setScheduleAt(""); }}>🗑</button>
                   </header>
                   <textarea autoFocus value={replyText} onChange={(event) => setReplyText(event.target.value)} placeholder="Write your reply" />
+                  <form className="reply-ai-prompt" onSubmit={(event) => { event.preventDefault(); void draftAiReply(); }}>
+                    <span aria-hidden="true">✦</span>
+                    <input
+                      aria-label="Describe your reply"
+                      value={replyInstruction}
+                      onChange={(event) => setReplyInstruction(event.target.value)}
+                      placeholder="Describe your message"
+                      maxLength={2000}
+                      disabled={aiDrafting}
+                    />
+                    <button type="submit" disabled={aiDrafting} aria-label="Generate reply from description">
+                      {aiDrafting ? "Drafting…" : "Generate"}
+                    </button>
+                  </form>
                   <footer>
-                    <div className="reply-tools">
-                      <button type="button" className="action-btn" disabled={aiDrafting} onClick={() => void draftAiReply()}>{aiDrafting ? "Drafting…" : "✦ AI draft"}</button>
-                      <label className="reply-attach">📎 Attach<input type="file" multiple onChange={(event) => setReplyFiles(Array.from(event.target.files ?? []))} /></label>
+                    <div className="reply-compose-actions">
+                      <div className="send-split"><button type="button" className="primary-btn" disabled={sendingReply || !replyText.trim() || !replyMailbox} onClick={() => { setScheduleAt(""); void sendReply(); }}>{sendingReply ? "Sending…" : "Send"}</button><button type="button" className="primary-btn send-menu" title="Schedule send" aria-label="Schedule send" disabled={sendingReply || !replyMailbox} onClick={() => { setSchedulePickerOpen(false); setScheduleDialogOpen(true); }}>◷</button></div>
+                      <label className="reply-attach" title="Attach files">📎 <span>Attach</span><input type="file" multiple onChange={(event) => setReplyFiles(Array.from(event.target.files ?? []))} /></label>
                       {replyFiles.length > 0 && <span>{replyFiles.map((file) => file.name).join(", ")}</span>}
                     </div>
-                    <div className="reply-send-tools">
-                      <div className="send-split"><button type="button" className="primary-btn" disabled={sendingReply || !replyText.trim() || !replyMailbox} onClick={() => { setScheduleAt(""); void sendReply(); }}>{sendingReply ? "Sending…" : "Send"}</button><button type="button" className="primary-btn send-menu" title="Schedule send" aria-label="Schedule send" disabled={sendingReply || !replyMailbox} onClick={() => { setSchedulePickerOpen(false); setScheduleDialogOpen(true); }}>◷</button></div>
-                    </div>
+                    <button className="reply-delete" type="button" aria-label="Delete reply draft" title="Delete draft" onClick={() => { setReplyOpen(false); setReplyText(""); setReplyInstruction(""); setReplyFiles([]); setScheduleAt(""); }}>🗑</button>
                   </footer>
                 </section>
               )}

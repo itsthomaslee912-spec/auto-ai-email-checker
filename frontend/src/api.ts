@@ -305,8 +305,12 @@ export async function sendEmail(payload: {
   return res.json();
 }
 
-export async function createAiReply(id: number): Promise<{ body_text: string }> {
-  const res = await apiFetch(`${API_BASE}/api/emails/${id}/ai-reply`, { method: "POST" });
+export async function createAiReply(id: number, instruction = ""): Promise<{ body_text: string }> {
+  const res = await apiFetch(`${API_BASE}/api/emails/${id}/ai-reply`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ instruction }),
+  });
   if (!res.ok) throw new Error(await readApiError(res, "Failed to create AI draft"));
   return res.json();
 }

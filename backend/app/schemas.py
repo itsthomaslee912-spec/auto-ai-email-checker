@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, PlainSerializer
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PlainSerializer
 
 
 def _as_utc(value: Any) -> Any:
@@ -112,6 +112,10 @@ class SendEmailIn(BaseModel):
 class SendEmailOut(BaseModel):
     ok: bool
     provider_message_id: str | None = None
+
+
+class AiReplyIn(BaseModel):
+    instruction: str = Field(default="", max_length=2000)
 
 
 class AiReplyOut(BaseModel):

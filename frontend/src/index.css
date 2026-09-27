@@ -3453,18 +3453,33 @@ button:active:not(:disabled) {
 .reply-composer header, .reply-composer footer { display: flex; align-items: center; gap: 0.65rem; padding: 0.7rem 0.85rem; }
 .reply-composer header { border-bottom: 1px solid var(--line); }
 .reply-composer header span { color: var(--muted); font-size: 0.8rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.reply-composer header button { margin-left: auto; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
 .reply-composer textarea { display: block; box-sizing: border-box; width: 100%; min-height: 11rem; resize: vertical; border: 0; outline: 0; padding: 1rem; background: transparent; color: var(--ink); font: inherit; }
+.reply-ai-prompt { display: flex; align-items: center; gap: 0.65rem; min-height: 3.25rem; box-sizing: border-box; margin: 0.85rem 1rem 1rem; padding: 0.4rem 0.45rem 0.4rem 0.8rem; border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--line)); border-radius: 999px; background: color-mix(in srgb, var(--accent) 7%, var(--bg-pane)); color: var(--accent); transition: border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease; }
+.reply-ai-prompt:focus-within { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--bg-pane)); box-shadow: var(--focus-ring); }
+.reply-ai-prompt > span { display: grid; flex: 0 0 1.7rem; width: 1.7rem; height: 1.7rem; place-items: center; border-radius: 50%; background: color-mix(in srgb, var(--accent) 14%, transparent); font-size: 0.9rem; }
+.reply-ai-prompt input { flex: 1; min-width: 0; min-height: 2.25rem; border: 0; outline: 0; background: transparent; color: var(--ink); font: inherit; font-size: 0.95rem; }
+.reply-ai-prompt input::placeholder { color: var(--muted); }
+.reply-ai-prompt button { min-height: 2.4rem; padding: 0 1rem; border: 0; border-radius: 999px; background: var(--accent); color: #fff; font: inherit; font-size: 0.82rem; font-weight: 700; cursor: pointer; box-shadow: 0 4px 12px color-mix(in srgb, var(--accent) 24%, transparent); transition: filter 0.16s ease, transform 0.16s ease; }
+.reply-ai-prompt button:hover:not(:disabled) { filter: brightness(1.08); transform: translateY(-1px); }
+.reply-ai-prompt button:disabled { cursor: wait; opacity: 0.65; }
 .reply-composer footer { justify-content: space-between; border-top: 1px solid var(--line); flex-wrap: wrap; }
-.reply-tools, .reply-send-tools { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
-.reply-tools span { color: var(--muted); font-size: 0.76rem; max-width: 13rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.reply-attach { cursor: pointer; color: var(--muted); font-size: 0.85rem; }
+.reply-compose-actions { display: flex; align-items: center; gap: 0.75rem; min-width: 0; }
+.reply-compose-actions > span { color: var(--muted); font-size: 0.76rem; max-width: 13rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reply-attach { display: inline-flex; align-items: center; gap: 0.25rem; cursor: pointer; color: var(--muted); font-size: 0.85rem; }
+.reply-attach:hover { color: var(--ink); }
 .reply-attach input { display: none; }
-.reply-send-tools input { max-width: 12rem; min-height: 2.25rem; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--bg-pane); color: var(--ink); padding: 0 0.45rem; }
+.reply-delete { margin-left: auto; padding: 0.45rem; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--muted); cursor: pointer; }
+.reply-delete:hover { background: var(--hover); color: var(--ink); }
 .send-split { display: inline-flex; overflow: visible; border-radius: var(--radius-sm); }
 .send-split .primary-btn { border-radius: 0; }
 .send-split .primary-btn:first-child { border-radius: var(--radius-sm) 0 0 var(--radius-sm); }
 .send-split .send-menu { min-width: 2.25rem; padding-inline: 0.55rem; border-left-color: rgba(255,255,255,.35); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+@media (max-width: 520px) {
+  .reply-ai-prompt { gap: 0.4rem; margin: 0.7rem 0.7rem 0.85rem; padding-left: 0.55rem; }
+  .reply-ai-prompt > span { flex-basis: 1.5rem; width: 1.5rem; height: 1.5rem; }
+  .reply-ai-prompt button { min-height: 2.25rem; padding-inline: 0.75rem; }
+  .reply-attach span { display: none; }
+}
 .schedule-dialog { width: min(19.5rem, calc(100vw - 2rem)); padding: 0; overflow: hidden; }
 .schedule-dialog .dialog-header { align-items: flex-start; padding: 1.35rem 1.45rem 0.9rem; }
 .schedule-dialog .dialog-header h3 { margin: 0; font-size: 1.25rem; font-weight: 500; }
