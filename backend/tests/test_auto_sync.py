@@ -87,6 +87,59 @@ def test_auto_sync_skips_live_webhook_and_polls_expired_one(monkeypatch):
     reset_webhook_delivery_health()
 
 
+def test_auto_sync_keeps_verified_webhook_active_after_process_restart(monkeypatch):
+    reset_webhook_delivery_health()
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as db:
+        user = User(external_id="persisted-webhook-test")
+        db.add(user)
+        db.flush()
+        mailbox = MailboxConnection(
+            user_id=user.id,
+            provider="google",
+            email_address="persisted@example.com",
+            access_token_enc="x",
+            is_active=True,
+        )
+        db.add(mailbox)
+        db.flush()
+        db.add(WebhookSubscription(
+            mailbox_id=mailbox.id,
+            provider="google",
+            external_id="history-persisted",
+            expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+            last_delivery_success_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        ))
+        mailbox_id = mailbox.id
+        db.commit()
+
+    sync = AsyncMock()
+    monkeypatch.setattr(auto_sync, "SessionLocal", session_factory)
+    monkeypatch.setattr(auto_sync, "start_mailbox_sync", sync)
+    monkeypatch.setattr(
+        auto_sync,
+        "get_settings",
+        lambda: SimpleNamespace(
+            auto_sync_max_messages=200, auto_sync_interval_seconds=120
+        ),
+    )
+
+    asyncio.run(auto_sync.poll_active_mailboxes())
+
+    sync.assert_not_awaited()
+    with session_factory() as db:
+        mailbox = db.get(MailboxConnection, mailbox_id)
+        assert auto_sync.has_active_webhook(mailbox)
+        status = auto_sync.get_auto_sync_status(db)
+        assert status["webhook_accounts"] == 1
+        assert status["webhook_delivery"]["google"]["healthy"] is True
+    engine.dispose()
+
+
 def test_auto_sync_polls_registered_webhook_after_delivery_auth_failure(monkeypatch):
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool

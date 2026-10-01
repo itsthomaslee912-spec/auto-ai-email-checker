@@ -1,4 +1,4 @@
 @echo off
 setlocal
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run.ps1" -WithNgrok
 exit /b %errorlevel%

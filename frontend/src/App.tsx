@@ -1297,14 +1297,17 @@ export default function App() {
       const detail = await fetchEmailDetail(id);
       if (request !== detailGen.current) return;
       setSelected(detail);
+      // Keep state updaters pure. React Strict Mode may invoke an updater more
+      // than once in development; nesting the badge update inside setEmails
+      // made a single opened unread message subtract two from its badge.
+      const opened = emails.find((item) => item.id === id);
+      if (opened && !opened.is_read) {
+        setMailboxUnreadCounts((counts) => ({
+          ...counts,
+          [opened.mailbox_id]: Math.max(0, (counts[opened.mailbox_id] ?? 1) - 1),
+        }));
+      }
       setEmails((prev) => {
-        const opened = prev.find((item) => item.id === id);
-        if (opened && !opened.is_read) {
-          setMailboxUnreadCounts((counts) => ({
-            ...counts,
-            [opened.mailbox_id]: Math.max(0, (counts[opened.mailbox_id] ?? 1) - 1),
-          }));
-        }
         return sortEmailsForInbox(
           prev.map((item) =>
             item.id === id

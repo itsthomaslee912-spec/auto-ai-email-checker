@@ -1,4 +1,6 @@
-# Start backend + frontend in separate PowerShell windows.
+param([switch]$WithNgrok)
+
+# Start PostgreSQL plus a watchdog that keeps backend and frontend healthy.
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
@@ -17,24 +19,34 @@ Write-Host ""
 
 & (Join-Path $Root "scripts\run-postgres.ps1")
 
-Start-Process powershell -ArgumentList @(
-  "-NoProfile",
-  "-ExecutionPolicy", "Bypass",
-  "-File", (Join-Path $Root "scripts\run-backend.ps1")
-) -WindowStyle Hidden `
-  -RedirectStandardOutput (Join-Path $Logs "backend.log") `
-  -RedirectStandardError (Join-Path $Logs "backend-error.log")
-Start-Sleep -Seconds 2
-Start-Process powershell -ArgumentList @(
-  "-NoProfile",
-  "-ExecutionPolicy", "Bypass",
-  "-File", (Join-Path $Root "scripts\run-frontend.ps1")
-) -WindowStyle Hidden `
-  -RedirectStandardOutput (Join-Path $Logs "frontend.log") `
-  -RedirectStandardError (Join-Path $Logs "frontend-error.log")
+$Runtime = Join-Path $Root ".tmp"
+$SupervisorPidFile = Join-Path $Runtime "service-supervisor.pid"
+New-Item -ItemType Directory -Path $Runtime -Force | Out-Null
+$supervisorRunning = $false
+if (Test-Path $SupervisorPidFile) {
+  $supervisorPid = Get-Content $SupervisorPidFile -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($supervisorPid -and (Get-Process -Id $supervisorPid -ErrorAction SilentlyContinue)) {
+    $supervisorRunning = $true
+  }
+}
+if (-not $supervisorRunning) {
+  Start-Process powershell -ArgumentList @(
+    "-NoProfile",
+    "-ExecutionPolicy", "Bypass",
+    "-File", (Join-Path $Root "scripts\supervise-services.ps1")
+  ) -WindowStyle Hidden `
+    -RedirectStandardOutput (Join-Path $Logs "supervisor-output.log") `
+    -RedirectStandardError (Join-Path $Logs "supervisor-error.log")
+  Start-Sleep -Seconds 3
+} else {
+  Write-Host "  Service supervisor: already running"
+}
 
-$ngrok = Get-Command ngrok -ErrorAction SilentlyContinue
-if ($ngrok) {
+if ($WithNgrok) {
+  $ngrok = Get-Command ngrok -ErrorAction SilentlyContinue
+  if (-not $ngrok) {
+    Write-Warning "ngrok was not found. Webhook delivery will use polling fallback."
+  } else {
   $tunnelRunning = $false
   try {
     $null = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 2
@@ -65,8 +77,9 @@ if ($ngrok) {
   } else {
     Write-Host "  Webhook tunnel: already running"
   }
+  }
 } else {
-  Write-Warning "ngrok was not found. Webhook delivery requires ngrok or another public HTTPS tunnel."
+  Write-Host "  Webhook tunnel: not started (use .\run.ps1 -WithNgrok)"
 }
 
-Write-Host "Backend, frontend, and webhook tunnel started."
+Write-Host "PostgreSQL, backend, frontend, and service supervisor started."

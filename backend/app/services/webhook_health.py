@@ -3,6 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from threading import Lock
 
+from app.db import SessionLocal
+from app.models import WebhookSubscription
+
 _lock = Lock()
 _delivery: dict[str, dict[str, datetime | str | None]] = {}
 
@@ -14,11 +17,35 @@ def record_webhook_delivery_success(provider: str) -> None:
         state["last_error"] = None
 
 
+def persist_webhook_delivery_success(provider: str) -> None:
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as db:
+        rows = db.query(WebhookSubscription).filter(
+            WebhookSubscription.provider == provider
+        ).all()
+        for webhook in rows:
+            webhook.last_delivery_success_at = now
+            webhook.last_delivery_error = None
+        db.commit()
+
+
 def record_webhook_delivery_failure(provider: str, message: str) -> None:
     with _lock:
         state = _delivery.setdefault(provider, {})
         state["last_failure_at"] = datetime.now(timezone.utc)
         state["last_error"] = message
+
+
+def persist_webhook_delivery_failure(provider: str, message: str) -> None:
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as db:
+        rows = db.query(WebhookSubscription).filter(
+            WebhookSubscription.provider == provider
+        ).all()
+        for webhook in rows:
+            webhook.last_delivery_failure_at = now
+            webhook.last_delivery_error = message[:512]
+        db.commit()
 
 
 def webhook_delivery_is_healthy(provider: str) -> bool:

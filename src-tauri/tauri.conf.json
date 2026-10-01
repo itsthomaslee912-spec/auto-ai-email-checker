@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.autoai.emailchecker",
   "build": {
-    "beforeDevCommand": "cd frontend && npm.cmd run dev",
+    "beforeDevCommand": "cd ..\\frontend && npm.cmd run dev",
     "devUrl": "http://127.0.0.1:5173",
-    "beforeBuildCommand": "cd frontend && npm.cmd run build",
+    "beforeBuildCommand": "cd ..\\frontend && npm.cmd run build",
     "frontendDist": "../frontend/dist"
   },
   "app": {
@@ -27,9 +27,14 @@
     "active": true,
     "targets": ["nsis"],
     "externalBin": ["binaries/email-checker-backend"],
+    "resources": {
+      "../.local/postgresql/bin/": "postgresql/bin/",
+      "../.local/postgresql/lib/": "postgresql/lib/",
+      "../.local/postgresql/share/": "postgresql/share/"
+    },
     "windows": {
       "nsis": {
-        "installerMode": "currentUser"
+        "installMode": "currentUser"
       }
     }
   }

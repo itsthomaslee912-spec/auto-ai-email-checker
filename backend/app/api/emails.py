@@ -227,10 +227,11 @@ def list_emails(
     mailbox_unread_q = _from_active_mailbox(
         db.query(EmailMessage.mailbox_id, func.count(EmailMessage.id))
     ).filter(
-        EmailMessage.is_read.is_not(True),
-        # Sidebar badges represent new messages that are still in each inbox.
-        # Do not count unread copies in Sent, Spam, Trash, or Archive.
-        EmailMessage.folder == MailFolder.INBOX.value,
+        EmailMessage.is_read.is_not(True)
+        # Account badges use the same definition as the live event handler and
+        # “Mark all read”: every unread message in that mailbox.  Filtering
+        # this to Inbox made the badge jump after a refresh when the list also
+        # contained unread messages in another folder.
     )
     mailbox_unread_counts = {
         str(mid): int(count) for mid, count in mailbox_unread_q.group_by(EmailMessage.mailbox_id)

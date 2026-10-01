@@ -15,4 +15,4 @@ Write-Host "Backend running at http://127.0.0.1:8000"
 $env:DISABLE_SQLALCHEMY_CEXT_RUNTIME = "1"
 $env:PSYCOPG_IMPL = "python"
 $env:PATH = (Join-Path $Root ".local\postgresql\bin") + ";" + $env:PATH
-& $Python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+& $Python -m uvicorn app.main:app --host 127.0.0.1 --port 8000

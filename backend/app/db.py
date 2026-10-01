@@ -128,6 +128,35 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
 
+    # Webhook delivery health must survive application restarts. These columns
+    # are safe to add on both PostgreSQL and SQLite installations.
+    with engine.begin() as conn:
+        tables = inspect(conn).get_table_names()
+        if "webhook_subscriptions" in tables:
+            webhook_cols = {
+                c["name"] for c in inspect(conn).get_columns("webhook_subscriptions")
+            }
+            timestamp_type = (
+                "TIMESTAMP WITH TIME ZONE"
+                if database_url.get_backend_name() == "postgresql"
+                else "TIMESTAMP"
+            )
+            if "last_delivery_success_at" not in webhook_cols:
+                conn.execute(text(
+                    "ALTER TABLE webhook_subscriptions "
+                    f"ADD COLUMN last_delivery_success_at {timestamp_type}"
+                ))
+            if "last_delivery_failure_at" not in webhook_cols:
+                conn.execute(text(
+                    "ALTER TABLE webhook_subscriptions "
+                    f"ADD COLUMN last_delivery_failure_at {timestamp_type}"
+                ))
+            if "last_delivery_error" not in webhook_cols:
+                conn.execute(text(
+                    "ALTER TABLE webhook_subscriptions "
+                    "ADD COLUMN last_delivery_error VARCHAR(512)"
+                ))
+
     # Lightweight SQLite column / label migrations for existing DBs
     if settings.database_url.startswith("sqlite"):
         with engine.begin() as conn:

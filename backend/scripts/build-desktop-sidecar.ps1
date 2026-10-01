@@ -14,7 +14,14 @@ if (-not (Test-Path $VenvPython)) {
   --workpath (Join-Path $Backend "build-desktop") `
   --specpath (Join-Path $Backend "build-desktop") `
   (Join-Path $Backend "desktop_server.py")
+if ($LASTEXITCODE -ne 0) {
+  throw "PyInstaller failed with exit code $LASTEXITCODE."
+}
 
 # Tauri selects the target-specific sidecar name during Windows builds.
 $TargetBinary = Join-Path $Output "email-checker-backend-x86_64-pc-windows-msvc.exe"
-Move-Item -Force (Join-Path $Output "email-checker-backend.exe") $TargetBinary
+$BuiltBinary = Join-Path $Output "email-checker-backend.exe"
+if (-not (Test-Path $BuiltBinary)) {
+  throw "PyInstaller did not create $BuiltBinary."
+}
+Move-Item -Force $BuiltBinary $TargetBinary

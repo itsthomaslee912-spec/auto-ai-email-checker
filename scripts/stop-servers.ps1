@@ -12,6 +12,7 @@ $roots = @($processes | Where-Object {
     $line = $_.CommandLine
     if (-not $line) { return $false }
     ($line -match "$escapedRoot\\scripts\\run-(backend|frontend)\.bat") -or
+    ($line -match "$escapedRoot\\scripts\\supervise-services\.ps1") -or
     ($line -match "$escapedRoot\\backend\\\.venv\\Scripts\\python\.exe" -and $line -match "uvicorn app\.main:app") -or
     ($line -match "$escapedRoot\\frontend\\node_modules\\.*vite\.js") -or
     ($_.Name -in @("cmd.exe", "ngrok.exe") -and $line -match "\bngrok(?:\.exe)?`"?\s+http\s+8000\b")

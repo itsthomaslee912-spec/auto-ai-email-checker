@@ -35,9 +35,38 @@ def has_registered_webhook(mailbox: MailboxConnection, now: datetime | None = No
 
 
 def has_active_webhook(mailbox: MailboxConnection, now: datetime | None = None) -> bool:
-    return has_registered_webhook(mailbox, now) and webhook_delivery_is_healthy(
-        mailbox.provider
-    )
+    if not has_registered_webhook(mailbox, now):
+        return False
+    webhook = mailbox.webhook
+    success = as_utc(webhook.last_delivery_success_at) if webhook else None
+    failure = as_utc(webhook.last_delivery_failure_at) if webhook else None
+    persisted_healthy = bool(success and (not failure or success >= failure))
+    return persisted_healthy or webhook_delivery_is_healthy(mailbox.provider)
+
+
+def _provider_delivery_status(provider: str, mailboxes: list[MailboxConnection]) -> dict:
+    status = webhook_delivery_status(provider)
+    success = datetime.fromisoformat(status["last_success_at"]) if status["last_success_at"] else None
+    failure = datetime.fromisoformat(status["last_failure_at"]) if status["last_failure_at"] else None
+    error = status["last_error"]
+    for mailbox in mailboxes:
+        webhook = mailbox.webhook
+        if mailbox.provider != provider or webhook is None:
+            continue
+        stored_success = as_utc(webhook.last_delivery_success_at)
+        stored_failure = as_utc(webhook.last_delivery_failure_at)
+        if stored_success and (success is None or stored_success > success):
+            success = stored_success
+        if stored_failure and (failure is None or stored_failure > failure):
+            failure = stored_failure
+            error = webhook.last_delivery_error
+    healthy = bool(success and (not failure or success >= failure))
+    return {
+        "healthy": healthy,
+        "last_success_at": success.isoformat() if success else None,
+        "last_failure_at": failure.isoformat() if failure else None,
+        "last_error": error if failure and (not success or failure > success) else None,
+    }
 
 
 async def poll_active_mailboxes() -> int:
@@ -100,7 +129,7 @@ def get_auto_sync_status(db: Session) -> dict:
     else:
         state = "active"
     provider_delivery = {
-        provider: webhook_delivery_status(provider)
+        provider: _provider_delivery_status(provider, mailboxes)
         for provider in {mailbox.provider for mailbox in mailboxes}
     }
     return {

@@ -20,7 +20,9 @@ if ($LASTEXITCODE -eq 0) {
     return
 }
 
-& $PgCtl -D $DataDir -l $LogFile -o "-h 127.0.0.1 -p 5432" start
+# Listen on local and LAN IPv4 interfaces. pg_hba.conf restricts remote access
+# to the explicitly authorized client hosts.
+& $PgCtl -D $DataDir -l $LogFile -o "-h 0.0.0.0 -p 5432" start
 if ($LASTEXITCODE -ne 0) {
     throw "PostgreSQL failed to start. Check logs/postgresql.log."
 }

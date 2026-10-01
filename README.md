@@ -3,7 +3,7 @@
 Real-time Gmail / Outlook inbox classifier. New mail is ingested via provider webhooks, labeled with OpenAI, and pushed to a React dashboard over SSE.
 
 **Branch:** `feature/v1`  
-**Stack:** React (Vite) frontend · FastAPI backend · SQLite · OpenAI
+**Stack:** React (Vite) frontend · FastAPI backend · PostgreSQL · OpenAI · Tauri
 
 Labels: Application Confirmation ? Application Action Required ? Screening ? Assessment ? Interview Invitation ? Interview Scheduled ? Interview Follow-up ? Offer ? Rejected / Closed ? Recruitment Alert ? Other
 
@@ -17,7 +17,7 @@ One-time setup (creates `.env`, Python venv, npm install):
 scripts\setup.bat
 ```
 
-Start backend, frontend, and ngrok together (three console windows, if ngrok is installed):
+Start PostgreSQL, backend, and frontend under the automatic service supervisor:
 
 ```bat
 run.bat
@@ -35,15 +35,39 @@ Or from PowerShell:
 .\run.ps1
 ```
 
+To also start the public ngrok tunnel for webhook delivery:
+
+```powershell
+.\run.ps1 -WithNgrok
+```
+
 - Backend: http://127.0.0.1:8000  
 - Frontend: http://127.0.0.1:5173  
 
 Connected accounts without an active webhook are checked automatically every 2 minutes while the backend is running. Accounts with a registered, unexpired webhook use notifications instead of periodic polling; polling resumes if the subscription expires. This works without ngrok. Set `AUTO_SYNC_INTERVAL_SECONDS` and `AUTO_SYNC_MAX_MESSAGES` in `.env` to change the interval and recent-message limit. ngrok remains optional for immediate provider webhook updates.
 The first **Sync** for an account imports its history and saves provider cursors. Later **Sync** runs fetch changes from those cursors. Use **Full rescan** in the account controls to scan the mailbox again; an expired cursor also triggers a full rescan automatically. Cursor state is saved only after each batch of changes is processed.
 The inbox shows the current automatic sync state. If no account is connected, the sync worker stops, an account fails to sync, or the backend cannot be reached, a full-screen alert explains the issue and offers a connection or retry action. The alert clears after sync is available again.
-Relative SQLite database paths are resolved from `backend/`, regardless of where the launcher is run.
+Application data is stored in PostgreSQL; SQLite is used only by isolated automated tests.
 
 Individual servers: `scripts\run-backend.bat` · `scripts\run-frontend.bat`
+
+### Windows desktop application
+
+The Tauri installer bundles the React UI, FastAPI sidecar, and a portable
+PostgreSQL runtime. On first launch it creates an isolated database cluster in
+`%APPDATA%\com.autoai.emailchecker\postgres-data` and listens only on
+`127.0.0.1:55432`, avoiding conflicts with development PostgreSQL on port 5432.
+
+Build the NSIS installer:
+
+```powershell
+.\scripts\build-desktop.ps1
+```
+
+The installer is generated under `src-tauri\target\release\bundle\nsis`.
+Desktop OAuth/API settings can be placed in
+`%APPDATA%\com.autoai.emailchecker\.env`; database credentials are generated
+and managed locally by the application.
 
 ---
 
