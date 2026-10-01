@@ -325,6 +325,18 @@ export interface AiSettings {
   billing_url: string;
 }
 
+export interface AiStatus {
+  provider: "openai" | "ollama";
+  model: string;
+  ready: boolean;
+}
+
+export async function fetchAiStatus(): Promise<AiStatus> {
+  const res = await apiFetch(`${API_BASE}/api/ai-settings/status`);
+  if (!res.ok) throw new Error(await readApiError(res, "Failed to check AI status"));
+  return res.json();
+}
+
 export async function fetchAiSettings(): Promise<AiSettings> {
   const res = await apiFetch(`${API_BASE}/api/ai-settings`);
   if (!res.ok) throw new Error(await readApiError(res, "Failed to load AI settings"));

@@ -43,6 +43,28 @@ def read_ai_settings(db: Session = Depends(get_db)) -> dict:
     return _view(db.get(AiSettings, 1))
 
 
+@router.get("/status")
+async def read_ai_status(db: Session = Depends(get_db)) -> dict:
+    """Expose the selected provider's readiness without exposing credentials."""
+    settings = _view(db.get(AiSettings, 1))
+    if settings["provider"] == "openai":
+        return {
+            "provider": "openai",
+            "model": settings["openai_model"],
+            "ready": settings["openai_key_configured"],
+        }
+
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            response = await client.get(f"{settings['ollama_url'].rstrip('/')}/api/tags")
+            response.raise_for_status()
+            models = response.json().get("models", [])
+        ready = any(item.get("name") == settings["ollama_model"] for item in models)
+    except (httpx.HTTPError, ValueError, KeyError):
+        ready = False
+    return {"provider": "ollama", "model": settings["ollama_model"], "ready": ready}
+
+
 @router.put("")
 def save_ai_settings(payload: AiSettingsIn, db: Session = Depends(get_db)) -> dict:
     if payload.provider not in {"openai", "ollama"}:

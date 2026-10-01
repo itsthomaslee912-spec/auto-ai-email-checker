@@ -8,6 +8,7 @@ import {
   disconnectMailbox,
   eventsUrl,
   fetchAutoSyncStatus,
+  fetchAiStatus,
   fetchClassifyPromptStatus,
   fetchEmailDetail,
   fetchEmails,
@@ -29,6 +30,7 @@ import {
   type InterviewSubtype,
   type EmailPage,
   type AutoSyncStatus,
+  type AiStatus,
   type MailFolder,
   type Mailbox,
   type Provider,
@@ -279,6 +281,8 @@ export default function App() {
   const [autoSyncOffline, setAutoSyncOffline] = useState(false);
   const [autoSyncChecking, setAutoSyncChecking] = useState(false);
   const [autoSyncDetailsOpen, setAutoSyncDetailsOpen] = useState(false);
+  const [aiStatus, setAiStatus] = useState<AiStatus | null>(null);
+  const [aiStatusOffline, setAiStatusOffline] = useState(false);
   const [banner, setBanner] = useState<string | null>(null);
 
   const [connectEmail, setConnectEmail] = useState("");
@@ -586,6 +590,21 @@ export default function App() {
     const timer = window.setInterval(() => void refreshAutoSyncStatus(), 10_000);
     return () => window.clearInterval(timer);
   }, [refreshAutoSyncStatus]);
+
+  const refreshAiStatus = useCallback(async () => {
+    try {
+      setAiStatus(await fetchAiStatus());
+      setAiStatusOffline(false);
+    } catch {
+      setAiStatusOffline(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshAiStatus();
+    const timer = window.setInterval(() => void refreshAiStatus(), 30_000);
+    return () => window.clearInterval(timer);
+  }, [refreshAiStatus]);
 
   useEffect(() => {
     void refreshReclassifyStatuses();
@@ -1555,6 +1574,25 @@ export default function App() {
         : autoSyncStatus?.problem_mailboxes[0]
           ? `${autoSyncStatus.problem_mailboxes[0].email_address}: ${autoSyncStatus.problem_mailboxes[0].message}`
           : autoSyncStatus?.last_error ?? "An account could not sync. Check the connection and try again.";
+  const aiReady = Boolean(aiStatus?.ready) && !aiStatusOffline;
+  const aiLabel = aiStatus?.provider === "ollama"
+    ? aiReady ? "Local AI on" : "Local AI off"
+    : aiReady ? "OpenAI on" : "AI not configured";
+  const aiTitle = aiStatus?.provider === "ollama"
+    ? `${aiLabel} · ${aiStatus.model}`
+    : aiLabel;
+  const syncTooltip = autoSyncAlert
+    ? `Email sync needs attention. ${autoSyncReason}`
+    : autoSyncState === "syncing"
+      ? "Email sync is running now."
+      : "Email sync is working normally.";
+  const aiTooltip = aiStatus?.provider === "ollama"
+    ? aiReady
+      ? `Local AI is ready · ${aiStatus.model}`
+      : `Local AI is unavailable · ${aiStatus.model}. Check the Ollama server in AI settings.`
+    : aiReady
+      ? "OpenAI is ready."
+      : "AI is not configured. Add a provider in AI settings.";
 
   if (settingsOpen) {
     return (
@@ -1620,6 +1658,7 @@ export default function App() {
                   type="button"
                   className="auto-sync-status-button"
                   aria-label={`Email sync status: ${autoSyncLabel}. Show details`}
+                  data-tooltip={syncTooltip}
                   aria-expanded={autoSyncDetailsOpen}
                   aria-controls="auto-sync-details"
                   onClick={() => setAutoSyncDetailsOpen((open) => !open)}
@@ -1648,6 +1687,17 @@ export default function App() {
                 </div>
               )}
             </div>
+            <button
+              type="button"
+              className="ai-status-mini"
+              data-ready={aiReady}
+              data-tooltip={aiTooltip}
+              aria-label={`${aiTitle}. Open AI settings`}
+              onClick={() => openSettings("ai")}
+            >
+              <span className="ai-status-icon" aria-hidden="true">AI</span>
+              <span className="sr-only" role="status" aria-live="polite">{aiLabel}</span>
+            </button>
             <button
               type="button"
               className="settings-btn"
