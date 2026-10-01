@@ -85,6 +85,8 @@ Fill in at least:
 |---|---|
 | `OPENAI_API_KEY` | Classification (Chat Completions) |
 | `OPENAI_MODEL` | Model id, default `gpt-4o-mini` |
+| `GEMINI_API_KEY` | Gemini API key (may also be saved in Settings) |
+| `GEMINI_MODEL` | Gemini model id, default `gemini-3.8-flash` |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Gmail OAuth |
 | `MICROSOFT_CLIENT_ID` / `MICROSOFT_CLIENT_SECRET` | Outlook OAuth |
 | `GMAIL_PUBSUB_TOPIC` | e.g. `projects/PROJECT/topics/gmail-push` |
@@ -200,7 +202,7 @@ frontend/src/         React dashboard (connect + live inbox)
 
 ## How email classification works
 
-New mail and **Sync** use the active OpenAI classification prompt, with local rules for clear cases. The classifier chooses one of the eleven labels above. If no OpenAI key is configured, local rules classify clear cases and use **Other** for the rest.
+New mail and **Sync** use the AI provider selected in Settings (OpenAI, Gemini, or local Ollama), with local rules for clear cases. The classifier chooses one of the eleven labels above. If the selected cloud provider has no API key, local rules classify clear cases and use **Other** for the rest.
 
 **Interview Scheduled** also has a separate `interview_subtype` field: `confirmation`, `calendar_invite`, `reminder`, `reschedule`, `time_change`, or `cancellation`. These are metadata values, not extra categories. The message reader displays the subtype.
 

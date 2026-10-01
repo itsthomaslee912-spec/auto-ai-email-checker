@@ -156,6 +156,15 @@ def init_db() -> None:
                     "ALTER TABLE webhook_subscriptions "
                     "ADD COLUMN last_delivery_error VARCHAR(512)"
                 ))
+        if "ai_settings" in tables:
+            ai_cols = {c["name"] for c in inspect(conn).get_columns("ai_settings")}
+            if "gemini_key_enc" not in ai_cols:
+                conn.execute(text("ALTER TABLE ai_settings ADD COLUMN gemini_key_enc TEXT DEFAULT ''"))
+            if "gemini_model" not in ai_cols:
+                conn.execute(text(
+                    "ALTER TABLE ai_settings ADD COLUMN gemini_model "
+                    "VARCHAR(128) DEFAULT 'gemini-3.8-flash'"
+                ))
 
     # Lightweight SQLite column / label migrations for existing DBs
     if settings.database_url.startswith("sqlite"):

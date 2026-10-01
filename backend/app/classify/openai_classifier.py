@@ -491,7 +491,7 @@ async def classify_email(
             response_id=None,
         )
 
-    client = backend.client() if backend.provider == "ollama" else AsyncOpenAI(api_key=backend.api_key)
+    client = backend.client() if backend.provider in {"ollama", "gemini"} else AsyncOpenAI(api_key=backend.api_key)
     user_content = (
         f"From: {sender}\nSubject: {subject}\nSnippet: {snippet}\n\nBody:\n{body_text[:6000]}"
     )

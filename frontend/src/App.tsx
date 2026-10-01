@@ -1580,10 +1580,14 @@ export default function App() {
   const aiReady = Boolean(aiStatus?.ready) && !aiStatusOffline;
   const aiLabel = aiStatus?.provider === "ollama"
     ? aiReady ? "Local AI on" : "Local AI off"
-    : aiReady ? "OpenAI on" : "AI not configured";
+    : aiStatus?.provider === "gemini"
+      ? aiReady ? "Gemini on" : "Gemini not configured"
+      : aiReady ? "OpenAI on" : "AI not configured";
   const aiTitle = aiStatus?.provider === "ollama"
     ? `${aiLabel} · ${aiStatus.model}`
-    : aiLabel;
+    : aiStatus?.provider === "gemini"
+      ? `${aiLabel} · ${aiStatus.model}`
+      : aiLabel;
   const syncTooltip = autoSyncAlert
     ? `Email sync needs attention. ${autoSyncReason}`
     : autoSyncState === "syncing"
@@ -1593,6 +1597,10 @@ export default function App() {
     ? aiReady
       ? `Local AI is ready · ${aiStatus.model}`
       : `Local AI is unavailable · ${aiStatus.model}. Check the Ollama server in AI settings.`
+    : aiStatus?.provider === "gemini"
+      ? aiReady
+        ? `Gemini is ready · ${aiStatus.model}`
+        : `Gemini is not configured · ${aiStatus.model}. Add an API key in AI settings.`
     : aiReady
       ? "OpenAI is ready."
       : "AI is not configured. Add a provider in AI settings.";
@@ -1698,7 +1706,15 @@ export default function App() {
               aria-label={`${aiTitle}. Open AI settings`}
               onClick={() => openSettings("ai")}
             >
-              <span className="ai-status-icon" aria-hidden="true">AI</span>
+              <span className="ai-status-icon" aria-hidden="true">
+                {aiStatus?.provider === "gemini" ? (
+                  <svg viewBox="0 0 24 24"><path d="M12 2c.8 5.7 4.3 9.2 10 10-5.7.8-9.2 4.3-10 10-.8-5.7-4.3-9.2-10-10 5.7-.8 9.2-4.3 10-10Z" /></svg>
+                ) : aiStatus?.provider === "ollama" ? (
+                  <svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="7" rx="2" /><rect x="4" y="14" width="16" height="7" rx="2" /><path d="M8 6.5h.01M8 17.5h.01M12 6.5h5M12 17.5h5" /></svg>
+                ) : (
+                  <svg viewBox="0 0 24 24"><path d="M7 18h10a5 5 0 0 0 .5-9.97A7 7 0 0 0 4.2 10.7 4 4 0 0 0 7 18Z" /></svg>
+                )}
+              </span>
               <span className="sr-only" role="status" aria-live="polite">{aiLabel}</span>
             </button>
             <button

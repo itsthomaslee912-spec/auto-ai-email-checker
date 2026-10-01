@@ -2177,7 +2177,7 @@ body {
   gap: 0.55rem;
 }
 
-.model-choice { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .75rem; max-width: 42rem; margin-bottom: 1rem; }
+.model-choice { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .75rem; max-width: 42rem; margin-bottom: 1rem; }
 .model-card { display: grid; gap: .25rem; padding: 1rem; border: 1px solid var(--line); border-radius: 12px; color: var(--ink); background: var(--bg); text-align: left; cursor: pointer; }
 .model-card span { color: var(--muted); font-size: .82rem; }
 .model-card.active { border-color: var(--accent); background: var(--bg-select); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent); }
@@ -3216,6 +3216,26 @@ button:active:not(:disabled) {
   font-size: 0.68rem;
 }
 
+.secret-input { position: relative; display: block; }
+.secret-input input { padding-right: 4.2rem; }
+.secret-input button {
+  position: absolute;
+  top: 50%;
+  right: .35rem;
+  min-width: 3.35rem;
+  padding: .25rem .45rem;
+  transform: translateY(-50%);
+  border: 0;
+  border-radius: 6px;
+  background: var(--bg-hover);
+  color: var(--accent);
+  font: inherit;
+  font-size: .72rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+.secret-input button:disabled { color: var(--muted); cursor: default; opacity: .55; }
+
 .auto-sync-top-wrap .auto-sync-status-button > span[role="status"] { display: none; }
 
 .auto-sync-top-wrap .auto-sync-status-button,
@@ -3564,6 +3584,8 @@ button:active:not(:disabled) {
   font-weight: 800;
   letter-spacing: -0.05em;
 }
+.ai-status-icon svg { width: .78rem; height: .78rem; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+.ai-status-icon svg path:first-child:last-child { fill: currentColor; stroke: none; }
 .schedule-dialog { width: min(19.5rem, calc(100vw - 2rem)); padding: 0; overflow: hidden; }
 .schedule-dialog .dialog-header { align-items: flex-start; padding: 1.35rem 1.45rem 0.9rem; }
 .schedule-dialog .dialog-header h3 { margin: 0; font-size: 1.25rem; font-weight: 500; }

@@ -316,17 +316,19 @@ export async function createAiReply(id: number, instruction = ""): Promise<{ bod
 }
 
 export interface AiSettings {
-  provider: "openai" | "ollama";
+  provider: "openai" | "gemini" | "ollama";
   openai_model: string;
   openai_key_configured: boolean;
   openai_admin_key_configured: boolean;
+  gemini_model: string;
+  gemini_key_configured: boolean;
   ollama_url: string;
   ollama_model: string;
   billing_url: string;
 }
 
 export interface AiStatus {
-  provider: "openai" | "ollama";
+  provider: "openai" | "gemini" | "ollama";
   model: string;
   ready: boolean;
 }
@@ -343,11 +345,20 @@ export async function fetchAiSettings(): Promise<AiSettings> {
   return res.json();
 }
 
+export async function fetchGeminiModels(): Promise<string[]> {
+  const res = await apiFetch(`${API_BASE}/api/ai-settings/gemini-models`);
+  if (!res.ok) throw new Error(await readApiError(res, "Failed to load Gemini models"));
+  const data = await res.json();
+  return Array.isArray(data.models) ? data.models : [];
+}
+
 export async function saveAiSettings(payload: {
-  provider: "openai" | "ollama";
+  provider: "openai" | "gemini" | "ollama";
   openai_model: string;
   openai_api_key?: string;
   openai_admin_key?: string;
+  gemini_model: string;
+  gemini_api_key?: string;
   ollama_url: string;
   ollama_model: string;
 }): Promise<AiSettings> {

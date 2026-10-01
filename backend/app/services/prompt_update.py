@@ -175,7 +175,7 @@ async def update_prompt_from_corrections(db: Session) -> ClassifyPromptUpdateOut
         "Human corrections (wrong label → correct label):\n"
         f"{_format_examples(rows)}"
     )
-    client = backend.client() if backend.provider == "ollama" else AsyncOpenAI(api_key=backend.api_key)
+    client = backend.client() if backend.provider in {"ollama", "gemini"} else AsyncOpenAI(api_key=backend.api_key)
     response_id = None
     source = f"{backend.provider}_update"
     try:

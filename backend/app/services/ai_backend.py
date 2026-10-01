@@ -10,6 +10,8 @@ from app.crypto import decrypt_token
 from app.db import SessionLocal
 from app.models import AiSettings
 
+GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
 
 @dataclass(frozen=True)
 class AiBackend:
@@ -25,6 +27,12 @@ class AiBackend:
                 base_url=f"{self.base_url.rstrip('/')}/v1",
                 timeout=180.0,
             )
+        if self.provider == "gemini":
+            return AsyncOpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url or GEMINI_OPENAI_BASE_URL,
+                timeout=120.0,
+            )
         return AsyncOpenAI(api_key=self.api_key)
 
 
@@ -36,6 +44,14 @@ def get_ai_backend() -> AiBackend:
             return AiBackend(
                 provider="ollama", model=saved.ollama_model,
                 api_key="ollama", base_url=saved.ollama_url,
+            )
+        if saved and saved.provider == "gemini":
+            key = decrypt_token(saved.gemini_key_enc) if saved.gemini_key_enc else defaults.gemini_api_key
+            return AiBackend(
+                provider="gemini",
+                model=saved.gemini_model,
+                api_key=key,
+                base_url=GEMINI_OPENAI_BASE_URL,
             )
         key = decrypt_token(saved.openai_key_enc) if saved and saved.openai_key_enc else defaults.openai_api_key
         return AiBackend(

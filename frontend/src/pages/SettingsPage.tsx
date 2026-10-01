@@ -5,6 +5,7 @@ import {
   fetchClassifyPromptStatus,
   fetchClassifyTraining,
   fetchAiSettings,
+  fetchGeminiModels,
   fetchOllamaModels,
   fetchOpenAiCosts,
   fetchMailboxLabelStats,
@@ -37,6 +38,13 @@ import LabelPieChart from "../components/LabelPieChart";
 export type SettingsSection = "accounts" | "appearance" | "ai" | "training" | "statistics";
 
 const TRAINING_PAGE_SIZE = 20;
+const DEFAULT_GEMINI_MODELS = [
+  "gemini-3.8-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.5-pro",
+];
 
 function pad2(value: number): string {
   return String(value).padStart(2, "0");
@@ -161,7 +169,10 @@ export default function SettingsPage({
   const [aiSettings, setAiSettings] = useState<AiSettings | null>(null);
   const [openaiKey, setOpenaiKey] = useState("");
   const [openaiAdminKey, setOpenaiAdminKey] = useState("");
+  const [geminiKey, setGeminiKey] = useState("");
+  const [showGeminiKey, setShowGeminiKey] = useState(false);
   const [openaiCosts, setOpenaiCosts] = useState<OpenAiCosts | null>(null);
+  const [geminiModels, setGeminiModels] = useState<string[]>([]);
   const [ollamaModels, setOllamaModels] = useState<string[]>([]);
   const [aiBusy, setAiBusy] = useState(false);
   const [aiNotice, setAiNotice] = useState<string | null>(null);
@@ -181,6 +192,11 @@ export default function SettingsPage({
     void fetchOllamaModels(aiSettings.ollama_url).then(setOllamaModels).catch(() => setOllamaModels([]));
   }, [aiSettings?.provider, aiSettings?.ollama_url]);
 
+  useEffect(() => {
+    if (!aiSettings || aiSettings.provider !== "gemini" || !aiSettings.gemini_key_configured) return;
+    void fetchGeminiModels().then(setGeminiModels).catch(() => setGeminiModels([]));
+  }, [aiSettings?.provider, aiSettings?.gemini_key_configured]);
+
   async function saveModelSettings() {
     if (!aiSettings || aiBusy) return;
     setAiBusy(true);
@@ -191,12 +207,18 @@ export default function SettingsPage({
         openai_model: aiSettings.openai_model,
         openai_api_key: openaiKey || undefined,
         openai_admin_key: openaiAdminKey || undefined,
+        gemini_model: aiSettings.gemini_model,
+        gemini_api_key: geminiKey || undefined,
         ollama_url: aiSettings.ollama_url,
         ollama_model: aiSettings.ollama_model,
       });
       setAiSettings(saved);
       setOpenaiKey("");
       setOpenaiAdminKey("");
+      if (saved.provider !== "gemini") {
+        setGeminiKey("");
+        setShowGeminiKey(false);
+      }
       setAiNotice("AI model settings saved.");
       if (saved.openai_admin_key_configured) {
         try {
@@ -590,13 +612,13 @@ export default function SettingsPage({
                   {aiSettings ? (
                     <>
                       <div className="model-choice" role="radiogroup" aria-label="AI provider">
-                        {(["openai", "ollama"] as const).map((provider) => (
+                        {(["openai", "gemini", "ollama"] as const).map((provider) => (
                           <button key={provider} type="button" role="radio"
                             aria-checked={aiSettings.provider === provider}
                             className={aiSettings.provider === provider ? "model-card active" : "model-card"}
                             onClick={() => setAiSettings({ ...aiSettings, provider })}>
-                            <strong>{provider === "openai" ? "OpenAI" : "Local AI (Ollama)"}</strong>
-                            <span>{provider === "openai" ? "Cloud model using your API key" : "Private model on your local server"}</span>
+                            <strong>{provider === "openai" ? "OpenAI" : provider === "gemini" ? "Google Gemini" : "Local AI (Ollama)"}</strong>
+                            <span>{provider === "ollama" ? "Private model on your local server" : "Cloud model using your API key"}</span>
                           </button>
                         ))}
                       </div>
@@ -628,6 +650,36 @@ export default function SettingsPage({
                             )}
                             <a href={aiSettings.billing_url} target="_blank" rel="noreferrer">Open billing dashboard</a>
                           </div>
+                        </div>
+                      ) : aiSettings.provider === "gemini" ? (
+                        <div className="ai-fields">
+                          <label className="settings-field">Gemini model
+                            <select value={aiSettings.gemini_model} onChange={(e) => setAiSettings({ ...aiSettings, gemini_model: e.target.value })}>
+                              {![...DEFAULT_GEMINI_MODELS, ...geminiModels].includes(aiSettings.gemini_model) && (
+                                <option value={aiSettings.gemini_model}>{aiSettings.gemini_model}</option>
+                              )}
+                              {(geminiModels.length ? geminiModels : DEFAULT_GEMINI_MODELS).map((model) => (
+                                <option key={model} value={model}>
+                                  {model}{model === "gemini-3.8-flash" ? " - Recommended" : ""}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label className="settings-field">Gemini API key
+                            <span className="secret-input">
+                              <input type={showGeminiKey ? "text" : "password"} autoComplete="new-password" value={geminiKey}
+                                placeholder={aiSettings.gemini_key_configured ? "Key is saved - enter a new key to replace it" : "Google AI Studio API key"}
+                                onChange={(e) => setGeminiKey(e.target.value)} />
+                              <button type="button" disabled={!geminiKey} aria-pressed={showGeminiKey}
+                                aria-label={showGeminiKey ? "Hide Gemini API key" : "Show Gemini API key"}
+                                onClick={() => setShowGeminiKey((shown) => !shown)}>
+                                {showGeminiKey ? "Hide" : "Show"}
+                              </button>
+                            </span>
+                          </label>
+                          <p className="settings-help">
+                            Email content is sent to the Gemini API when this provider is selected.
+                          </p>
                         </div>
                       ) : (
                         <div className="ai-fields">

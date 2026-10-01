@@ -165,6 +165,8 @@ class AiSettings(Base):
     openai_key_enc: Mapped[str] = mapped_column(Text, default="")
     openai_admin_key_enc: Mapped[str] = mapped_column(Text, default="")
     openai_model: Mapped[str] = mapped_column(String(128), default="gpt-4o-mini")
+    gemini_key_enc: Mapped[str] = mapped_column(Text, default="")
+    gemini_model: Mapped[str] = mapped_column(String(128), default="gemini-3.8-flash")
     ollama_url: Mapped[str] = mapped_column(String(255), default="http://192.168.2.230:11440")
     ollama_model: Mapped[str] = mapped_column(String(128), default="qwen2.5:14b-instruct")
 
