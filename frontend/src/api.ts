@@ -331,6 +331,7 @@ export interface AiSettings {
 export type CalendarEventKind = "availability" | "confirmed";
 export type CalendarMeetingType = "video" | "phone" | "in_person" | "unspecified";
 export type CalendarApplicationStatus = "active" | "rejected" | "position_closed";
+export type CalendarWorkModel = "remote" | "hybrid" | "on_site" | "unspecified";
 
 export interface CalendarEvent {
   id: number;
@@ -343,6 +344,8 @@ export interface CalendarEvent {
   title: string;
   company: string;
   role: string;
+  interviewer: string;
+  work_model: CalendarWorkModel;
   job_url: string | null;
   description: string;
   start_at: string;
@@ -364,6 +367,8 @@ export interface CalendarEventPayload {
   title?: string;
   company?: string;
   role?: string;
+  interviewer?: string;
+  work_model?: CalendarWorkModel;
   job_url?: string | null;
   description?: string;
   start_at?: string;
@@ -382,6 +387,12 @@ export async function fetchCalendarEvents(start: string, end: string, signal?: A
   const params = new URLSearchParams({ start, end });
   const res = await fetch(`${API_BASE}/api/calendar-events?${params}`, { signal, cache: "no-store" });
   if (!res.ok) throw new Error(await readApiError(res, "Failed to load calendar"));
+  return res.json();
+}
+
+export async function fetchCalendarEventEmails(id: number): Promise<EmailDetail[]> {
+  const res = await apiFetch(`${API_BASE}/api/calendar-events/${id}/emails`, undefined, 4);
+  if (!res.ok) throw new Error(await readApiError(res, "Failed to load associated emails"));
   return res.json();
 }
 

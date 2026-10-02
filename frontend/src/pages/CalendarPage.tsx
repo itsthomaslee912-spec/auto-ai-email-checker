@@ -1,11 +1,13 @@
-import { FormEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import EmailBody from "../components/EmailBody";
 import CompactSelect from "../components/CompactSelect";
+import ModernDateTimePicker from "../components/ModernDateTimePicker";
 import {
   createCalendarEvent,
   eventsUrl,
   fetchCalendarEvents,
-  fetchEmailDetail,
+  fetchCalendarEventEmails,
   updateCalendarEvent,
   type CalendarEvent,
   type CalendarEventPayload,
@@ -26,8 +28,11 @@ const HOURS = Array.from({ length: 24 }, (_, hour) => hour);
 const HOUR_HEIGHT = 64;
 const DAY_MINUTES = 24 * 60;
 const SNAP_MINUTES = 15;
+const DEFAULT_EVENT_DURATION_MINUTES = 30;
+const VISIBLE_WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const CALENDAR_TIME_ZONE_KEY = "calendar-time-zone";
 const SYSTEM_TIME_ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+const calendarMotionDelay = (duration: number) => typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? 0 : duration;
 const TIME_ZONES = (() => {
   const intl = Intl as typeof Intl & { supportedValuesOf?: (key: "timeZone") => string[] };
   const supported = intl.supportedValuesOf?.("timeZone") ?? [
@@ -92,7 +97,7 @@ function wallDateFromInput(value: string) {
 
 function startOfDay(date: Date) { return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())); }
 function addDays(date: Date, amount: number) { const next = new Date(date); next.setUTCDate(next.getUTCDate() + amount); return next; }
-function startOfWeek(date: Date) { const out = startOfDay(date); out.setUTCDate(out.getUTCDate() - out.getUTCDay()); return out; }
+function startOfWeek(date: Date) { const out = startOfDay(date); out.setUTCDate(out.getUTCDate() - ((out.getUTCDay() + 6) % 7)); return out; }
 function endExclusive(start: Date, view: ViewMode) {
   if (view === "day") return addDays(startOfDay(start), 1);
   if (view === "week") return addDays(startOfWeek(start), 7);
@@ -103,15 +108,26 @@ function rangeStart(anchor: Date, view: ViewMode) {
   if (view === "day") return startOfDay(anchor);
   if (view === "week") return startOfWeek(anchor);
   const first = new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), 1));
-  return addDays(first, -first.getUTCDay());
+  return startOfWeek(first);
 }
 function localInput(date: Date) {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}T${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
 }
-function formatTime(value: string, timeZone: string, showZone = false) { return new Intl.DateTimeFormat(undefined, { timeZone, hour: "numeric", minute: "2-digit", ...(showZone ? { timeZoneName: "short" as const } : {}) }).format(new Date(value)); }
 function formatWallTime(value: Date) { return new Intl.DateTimeFormat(undefined, { timeZone: "UTC", hour: "numeric", minute: "2-digit" }).format(value); }
 function formatDateTime(value: string, timeZone: string) { return new Intl.DateTimeFormat(undefined, { timeZone, month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }).format(new Date(value)); }
+function formatInterviewTimeRange(event: CalendarEvent, timeZone: string) {
+  const compactTime = (value: string) => {
+    const instant = new Date(value);
+    const minute = partsInTimeZone(instant, timeZone).minute;
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hour: "numeric",
+      ...(minute ? { minute: "2-digit" as const } : {}),
+    }).format(instant).replace(/\s/g, "").toUpperCase();
+  };
+  return `${compactTime(event.start_at)} - ${compactTime(event.end_at)}`;
+}
 function accountColor(mailboxId: number) { return COLORS[Math.abs(mailboxId) % COLORS.length]; }
 function overlapsDay(event: CalendarEvent, day: Date, timeZone: string) {
   const dayStart = instantForWallDate(startOfDay(day), timeZone);
@@ -136,6 +152,53 @@ function startsIn(value: string) {
 }
 function eventInitials(event: CalendarEvent) {
   return (event.company || event.title).split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]?.toUpperCase()).join("") || "EV";
+}
+
+function interviewKindLabel(event: CalendarEvent): string {
+  return event.kind === "availability" ? "Available interview" : "Scheduled interview";
+}
+
+function interviewType(event: CalendarEvent): { type: CalendarEvent["meeting_type"]; label: string } {
+  const provider = event.meeting_provider?.trim().toLowerCase();
+  const hasVideoPlatform = Boolean(event.meeting_url || (provider && !provider.includes("phone") && !provider.includes("in person")));
+  if (event.meeting_type === "video" || hasVideoPlatform) return { type: "video", label: "Video call" };
+  if (event.meeting_type === "phone" || event.phone_number) return { type: "phone", label: "Phone call" };
+  if (event.meeting_type === "in_person") return { type: "in_person", label: "In-person interview" };
+  return { type: "unspecified", label: "Not specified" };
+}
+
+function meetingProviderLabel(event: CalendarEvent): string {
+  const provider = event.meeting_provider?.trim();
+  if (provider) {
+    const normalized = provider.toLowerCase();
+    if (normalized.includes("google") || normalized === "meet") return "Google Meet";
+    if (normalized.includes("zoom")) return "Zoom";
+    if (normalized.includes("teams")) return "Microsoft Teams";
+    if (normalized.includes("webex")) return "Cisco Webex";
+    if (normalized.includes("whereby")) return "Whereby";
+    if (normalized.includes("goto")) return "GoTo Meeting";
+    return provider;
+  }
+  if (!event.meeting_url) return "—";
+  try {
+    const host = new URL(event.meeting_url).hostname.toLowerCase().replace(/^www\./, "");
+    if (host === "meet.google.com") return "Google Meet";
+    if (host === "zoom.us" || host.endsWith(".zoom.us") || host === "zoom.com" || host.endsWith(".zoom.com")) return "Zoom";
+    if (host === "teams.microsoft.com" || host === "teams.live.com") return "Microsoft Teams";
+    if (host === "webex.com" || host.endsWith(".webex.com")) return "Cisco Webex";
+    if (host === "whereby.com" || host.endsWith(".whereby.com")) return "Whereby";
+    if (host === "meet.goto.com" || host.endsWith(".gotomeeting.com")) return "GoTo Meeting";
+    return host;
+  } catch {
+    return "—";
+  }
+}
+
+function MeetingTypeIcon({ type }: { type: CalendarEvent["meeting_type"] }) {
+  if (type === "phone") return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.1 2.3 3.4 3.5c-.7.5-.9 1.4-.5 2.2 1.6 3.3 4.1 5.8 7.4 7.4.8.4 1.7.2 2.2-.5l1.2-1.7-3-2-1.2 1.3c-1.6-.9-2.8-2.1-3.7-3.7l1.3-1.2-2-3Z" /></svg>;
+  if (type === "video") return <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="4" width="8.5" height="8" rx="2" /><path d="m10.5 6.6 3.5-2v6.8l-3.5-2" /></svg>;
+  if (type === "in_person") return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 14s4-3.8 4-7.5a4 4 0 1 0-8 0C4 10.2 8 14 8 14Z" /><circle cx="8" cy="6.5" r="1.35" /></svg>;
+  return <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.5" /><path d="M8 5.2v3.2l2.1 1.3" /></svg>;
 }
 
 function CalendarViewIcon({ view }: { view: ViewMode }) {
@@ -325,50 +388,198 @@ function layoutTimedEvents(events: CalendarEvent[], day: Date, hourHeight: numbe
   }));
 }
 
-function EventCard({ event, timeZone, compact, timed, position, onSelect }: { event: CalendarEvent; timeZone: string; compact?: boolean; timed?: boolean; position?: React.CSSProperties; onSelect: (event: CalendarEvent) => void }) {
+function EventCard({ event, timeZone, compact, timed, position, selected, activeHoverId, onHoverActivate, onHoverDeactivate, onSelect }: { event: CalendarEvent; timeZone: string; compact?: boolean; timed?: boolean; position?: React.CSSProperties; selected?: boolean; activeHoverId: string | null; onHoverActivate: (hoverId: string) => void; onHoverDeactivate: (hoverId: string) => void; onSelect: (event: CalendarEvent) => void }) {
+  const eventRef = useRef<HTMLDivElement>(null);
+  const hoverId = useId();
+  const [hoverPosition, setHoverPosition] = useState<{ left: number; top: number; above: boolean } | null>(null);
+  const [hoverVisible, setHoverVisible] = useState(false);
+  const hoverHideTimer = useRef<number | null>(null);
+  const hoverFrame = useRef<number | null>(null);
   const color = accountColor(event.mailbox_id);
   const canceled = event.interview_status === "cancellation";
-  const action = event.meeting_type === "video" ? "🎥" : event.meeting_type === "phone" ? "☎" : "";
-  const launch = (e: MouseEvent) => {
-    e.stopPropagation();
-    if (event.meeting_url) window.open(event.meeting_url, "_blank", "noopener,noreferrer");
-    else if (event.phone_number) window.location.href = `tel:${event.phone_number.replace(/[^+\d]/g, "")}`;
-  };
-  return <button type="button" className={`calendar-event ${event.kind} ${canceled ? "canceled" : ""} ${timed ? "timed" : ""}`} style={{ "--account-color": color, ...position } as React.CSSProperties} onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onSelect(event); }} title={`${event.email_account}\n${event.title}`}>
-    <span className="calendar-event-main"><span className="calendar-event-time">{formatTime(event.start_at, timeZone)}{timed && ` – ${formatTime(event.end_at, timeZone)}`}</span> {event.kind === "availability" ? "Available" : event.title}</span>
-    {!compact && (event.company || event.role) && <span className="calendar-event-meta">{[event.company, event.role].filter(Boolean).join(" · ")}</span>}
-    <span className="calendar-event-badges">
-      {event.application_status === "rejected" && <span className="event-badge danger">Rejected</span>}
-      {event.application_status === "position_closed" && <span className="event-badge warning">Position Closed</span>}
-      {action && <span className="event-access" onClick={launch} role="link" tabIndex={0} title={event.meeting_type === "video" ? "Join meeting" : "Call"}>{action}{!compact && <span>{event.meeting_type === "video" ? " Join" : " Call"}</span>}</span>}
-    </span>
-  </button>;
+  const type = interviewType(event);
+  const durationMinutes = Math.max(0, (new Date(event.end_at).getTime() - new Date(event.start_at).getTime()) / 60000);
+  const getHoverPosition = useCallback(() => {
+    const rect = eventRef.current?.getBoundingClientRect();
+    if (!rect) return null;
+    const cardWidth = Math.min(288, window.innerWidth - 24);
+    const above = window.innerHeight - rect.bottom < 240 && rect.top > window.innerHeight - rect.bottom;
+    return {
+      left: Math.max(12, Math.min(window.innerWidth - cardWidth - 12, rect.left + (rect.width - cardWidth) / 2)),
+      top: above ? rect.top - 8 : rect.bottom + 8,
+      above,
+    };
+  }, []);
+  const showHover = useCallback(() => {
+    if (hoverHideTimer.current != null) window.clearTimeout(hoverHideTimer.current);
+    if (hoverFrame.current != null) window.cancelAnimationFrame(hoverFrame.current);
+    const nextPosition = getHoverPosition();
+    if (!nextPosition) return;
+    onHoverActivate(hoverId);
+    setHoverPosition(nextPosition);
+    setHoverVisible(false);
+    hoverFrame.current = window.requestAnimationFrame(() => {
+      setHoverVisible(true);
+      hoverFrame.current = null;
+    });
+  }, [getHoverPosition, hoverId, onHoverActivate]);
+  const hideHover = useCallback(() => {
+    if (hoverFrame.current != null) window.cancelAnimationFrame(hoverFrame.current);
+    if (hoverHideTimer.current != null) window.clearTimeout(hoverHideTimer.current);
+    onHoverDeactivate(hoverId);
+    setHoverVisible(false);
+    hoverHideTimer.current = window.setTimeout(() => {
+      setHoverPosition(null);
+      hoverHideTimer.current = null;
+    }, calendarMotionDelay(150));
+  }, [hoverId, onHoverDeactivate]);
+  useEffect(() => {
+    if (activeHoverId == null || activeHoverId === hoverId) return;
+    if (hoverFrame.current != null) window.cancelAnimationFrame(hoverFrame.current);
+    if (hoverHideTimer.current != null) window.clearTimeout(hoverHideTimer.current);
+    hoverFrame.current = null;
+    hoverHideTimer.current = null;
+    setHoverVisible(false);
+    setHoverPosition(null);
+  }, [activeHoverId, hoverId]);
+  useEffect(() => {
+    if (!hoverPosition) return;
+    const reposition = () => {
+      const nextPosition = getHoverPosition();
+      if (nextPosition) setHoverPosition(nextPosition);
+    };
+    window.addEventListener("resize", reposition);
+    window.addEventListener("scroll", reposition, true);
+    return () => {
+      window.removeEventListener("resize", reposition);
+      window.removeEventListener("scroll", reposition, true);
+    };
+  }, [hoverPosition, getHoverPosition]);
+  useEffect(() => () => {
+    if (hoverHideTimer.current != null) window.clearTimeout(hoverHideTimer.current);
+    if (hoverFrame.current != null) window.cancelAnimationFrame(hoverFrame.current);
+  }, []);
+  const selectEvent = () => { onHoverDeactivate(hoverId); setHoverVisible(false); setHoverPosition(null); onSelect(event); };
+  return <>
+    <div
+    ref={eventRef}
+    className={`calendar-event ${event.kind} ${canceled ? "canceled" : ""} ${compact ? "compact" : ""} ${timed ? "timed" : ""} ${selected ? "selected" : ""} has-meeting-type ${timed && durationMinutes <= 30 ? "very-short" : timed && durationMinutes < 60 ? "short" : ""}`}
+    style={{ "--account-color": color, ...position } as React.CSSProperties}
+    onPointerDown={(e) => e.stopPropagation()}
+    onClick={(e) => { e.stopPropagation(); selectEvent(); }}
+    onKeyDown={(e) => { if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); e.stopPropagation(); selectEvent(); } }}
+    onMouseEnter={showHover}
+    onMouseLeave={() => { if (document.activeElement !== eventRef.current) hideHover(); }}
+    onFocus={showHover}
+    onBlur={hideHover}
+    role="button"
+    tabIndex={0}
+    aria-pressed={selected}
+    aria-label={`${interviewKindLabel(event)}, ${event.company || "Company not specified"}, ${type.label}`}
+    aria-describedby={hoverPosition ? hoverId : undefined}
+  >
+    <span className="calendar-event-company">{event.company || "Company not specified"}</span>
+    <span className={`event-type-badge meeting-${type.type}`} role="img" aria-label={type.label}><MeetingTypeIcon type={type.type} /></span>
+  </div>
+    {hoverPosition && createPortal(
+      <div
+        id={hoverId}
+        className={`calendar-event-hover-card ${hoverPosition.above ? "above" : "below"} ${hoverVisible ? "is-visible" : ""}`}
+        role="tooltip"
+        style={{ left: hoverPosition.left, top: hoverPosition.top }}
+      >
+        <dl>
+          <div className="calendar-hover-time"><dt>Interview time</dt><dd>{formatInterviewTimeRange(event, timeZone)}</dd></div>
+          <div><dt>Account</dt><dd>{event.email_account || "—"}</dd></div>
+          <div><dt>Company</dt><dd>{event.company || "—"}</dd></div>
+          <div><dt>Role</dt><dd>{event.role || "—"}</dd></div>
+          <div className={`calendar-hover-type meeting-${type.type}`}>
+            <dt>Interview type</dt>
+            <dd><MeetingTypeIcon type={type.type} /><span>{type.label}</span></dd>
+          </div>
+        </dl>
+      </div>,
+      document.body,
+    )}
+  </>;
 }
 
-type Editor = { id?: number; mailbox_id: number; title: string; company: string; role: string; start: string; end: string; description: string; job_url: string; meeting_type: "video" | "phone" | "in_person" | "unspecified"; meeting_provider: string; meeting_url: string; phone_number: string; phone_access_code: string };
+type AccountInterviewCount = {
+  mailboxId: number;
+  email: string;
+  count: number;
+  color: string;
+};
+
+function ScheduledInterviewChart({ accounts }: { accounts: AccountInterviewCount[] }) {
+  const total = accounts.reduce((sum, account) => sum + account.count, 0);
+  const activeAccounts = accounts.filter((account) => account.count > 0);
+  let cursor = 0;
+  const chartFill = total === 0
+    ? "var(--calendar-border-soft)"
+    : `conic-gradient(${activeAccounts.map((account) => {
+      const start = (cursor / total) * 100;
+      cursor += account.count;
+      const end = (cursor / total) * 100;
+      return `${account.color} ${start}% ${end}%`;
+    }).join(", ")})`;
+  const ariaSummary = total === 0
+    ? "No scheduled interviews in this view"
+    : `${total} scheduled interview${total === 1 ? "" : "s"} in this view. ${activeAccounts.map((account) => `${account.email}: ${account.count}`).join(". ")}`;
+
+  return <section className="calendar-interview-summary" aria-label="Scheduled interviews by email account">
+    <div className="interview-chart-card">
+      <div className="interview-donut-wrap">
+        <div className="interview-donut" style={{ background: chartFill }} role="img" aria-label={ariaSummary}>
+          <div className="interview-donut-hole"><strong>{total}</strong><span>scheduled</span></div>
+        </div>
+      </div>
+      <ul className="interview-account-list" aria-label="Scheduled interview counts by email account">
+        {accounts.map((account) => {
+          const percentage = total > 0 ? Math.round((account.count / total) * 100) : 0;
+          return <li className={account.count === 0 ? "is-empty" : undefined} key={account.mailboxId} title={account.email}>
+            <span className="interview-account-swatch" style={{ background: account.color }} aria-hidden="true" />
+            <span className="interview-account-copy"><strong>{account.email}</strong><small>{percentage}% of scheduled</small></span>
+            <span className="interview-account-count" aria-label={`${account.count} scheduled`}>{account.count}</span>
+          </li>;
+        })}
+      </ul>
+      {!accounts.length && <p className="interview-chart-empty">Connect an email account to see interview activity.</p>}
+    </div>
+  </section>;
+}
+
+type Editor = { id?: number; mailbox_id: number; title: string; company: string; role: string; interviewer: string; work_model: CalendarEvent["work_model"]; start: string; end: string; description: string; job_url: string; meeting_type: "video" | "phone"; meeting_provider: string; meeting_url: string; phone_number: string; phone_access_code: string };
 function editorFor(date: Date, mailboxId: number, timeZone: string, event?: CalendarEvent, selectedEnd?: Date): Editor {
   const start = event ? wallDateForInstant(new Date(event.start_at), timeZone) : selectedEnd ? new Date(date) : new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 9));
-  const end = event ? wallDateForInstant(new Date(event.end_at), timeZone) : selectedEnd ?? new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate(), start.getUTCHours() + 1, start.getUTCMinutes()));
-  return { id: event?.id, mailbox_id: event?.mailbox_id ?? mailboxId, title: event?.title ?? "Interview", company: event?.company ?? "", role: event?.role ?? "", start: localInput(start), end: localInput(end), description: event?.description ?? "", job_url: event?.job_url ?? "", meeting_type: event?.meeting_type ?? "unspecified", meeting_provider: event?.meeting_provider ?? "", meeting_url: event?.meeting_url ?? "", phone_number: event?.phone_number ?? "", phone_access_code: event?.phone_access_code ?? "" };
+  const end = event ? wallDateForInstant(new Date(event.end_at), timeZone) : selectedEnd ?? new Date(start.getTime() + DEFAULT_EVENT_DURATION_MINUTES * 60_000);
+  return { id: event?.id, mailbox_id: event?.mailbox_id ?? mailboxId, title: event?.title ?? "Interview", company: event?.company ?? "", role: event?.role ?? "", interviewer: event?.interviewer ?? "", work_model: event?.work_model ?? "unspecified", start: localInput(start), end: localInput(end), description: event?.description ?? "", job_url: event?.job_url ?? "", meeting_type: event?.meeting_type === "phone" ? "phone" : "video", meeting_provider: event?.meeting_provider ?? "", meeting_url: event?.meeting_url ?? "", phone_number: event?.phone_number ?? "", phone_access_code: event?.phone_access_code ?? "" };
 }
 
 type DragSelection = { dayIndex: number; startMinutes: number; endMinutes: number };
 
-export default function CalendarPage({ mailboxes, onClose, onOpenEmail }: { mailboxes: Mailbox[]; onClose: () => void; onOpenEmail: (id: number, mailboxId: number) => void }) {
+export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailboxes: Mailbox[]; refreshKey: number; onClose: () => void }) {
   const [view, setView] = useState<ViewMode>(() => (localStorage.getItem("calendar-view") as ViewMode) || "week");
   const [timeZone, setTimeZone] = useState(loadCalendarTimeZone);
   const [anchor, setAnchor] = useState(() => wallDateForInstant(new Date(), timeZone));
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [loading, setLoading] = useState(true); const [error, setError] = useState("");
   const [selected, setSelected] = useState<CalendarEvent | null>(null);
-  const [meetWith, setMeetWith] = useState("");
+  const [activeHoverId, setActiveHoverId] = useState<string | null>(null);
+  const [detailsClosing, setDetailsClosing] = useState(false);
+  const [copiedMeetingEventId, setCopiedMeetingEventId] = useState<number | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [email, setEmail] = useState<EmailDetail | null>(null); const [emailLoading, setEmailLoading] = useState(false); const [emailError, setEmailError] = useState(""); const [emailExpanded, setEmailExpanded] = useState(false);
+  const [sidebarClosing, setSidebarClosing] = useState(false);
+  const [emailMessages, setEmailMessages] = useState<EmailDetail[]>([]); const [emailLoading, setEmailLoading] = useState(false); const [emailError, setEmailError] = useState(""); const [expandedEmailId, setExpandedEmailId] = useState<number | null>(null);
   const [editor, setEditor] = useState<Editor | null>(null); const [saving, setSaving] = useState(false); const [saveError, setSaveError] = useState("");
+  const activateEventHover = useCallback((hoverId: string) => setActiveHoverId(hoverId), []);
+  const deactivateEventHover = useCallback((hoverId: string) => setActiveHoverId((current) => current === hoverId ? null : current), []);
   const [dragSelection, setDragSelection] = useState<DragSelection | null>(null);
   const [hourHeight, setHourHeight] = useState(HOUR_HEIGHT);
   const refreshRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
+  const detailsCloseTimer = useRef<number | null>(null);
+  const sidebarCloseTimer = useRef<number | null>(null);
   const timelineRef = useRef<HTMLElement | null>(null);
   const timelineHeaderRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<{ dayIndex: number; anchorMinutes: number } | null>(null);
@@ -384,10 +595,14 @@ export default function CalendarPage({ mailboxes, onClose, onOpenEmail }: { mail
     catch (err) { if (request === refreshRef.current && (err as Error).name !== "AbortError") setError(err instanceof Error ? err.message : "Failed to load calendar"); }
     finally { if (request === refreshRef.current) setLoading(false); }
   }, [start.getTime(), end.getTime(), timeZone]);
-  useEffect(() => { void load(); return () => abortRef.current?.abort(); }, [load]);
+  useEffect(() => { void load(); return () => abortRef.current?.abort(); }, [load, refreshKey]);
   useEffect(() => { const source = new EventSource(eventsUrl()); source.addEventListener("calendar.changed", () => void load()); return () => source.close(); }, [load]);
   useEffect(() => { localStorage.setItem("calendar-view", view); }, [view]);
   useEffect(() => { try { localStorage.setItem(CALENDAR_TIME_ZONE_KEY, timeZone); } catch { /* ignore unavailable storage */ } }, [timeZone]);
+  useEffect(() => () => {
+    if (detailsCloseTimer.current != null) window.clearTimeout(detailsCloseTimer.current);
+    if (sidebarCloseTimer.current != null) window.clearTimeout(sidebarCloseTimer.current);
+  }, []);
   useLayoutEffect(() => {
     if (view === "month") return;
     const timeline = timelineRef.current;
@@ -411,18 +626,33 @@ export default function CalendarPage({ mailboxes, onClose, onOpenEmail }: { mail
     setDragSelection(null); dragRef.current = null;
   }, [view, start.getTime(), hourHeight]);
   useEffect(() => {
-    setEmail(null); setEmailError(""); setEmailExpanded(false);
-    if (!selected?.source_email_id) return;
+    setEmailMessages([]); setEmailError(""); setExpandedEmailId(null);
+    if (!selected) return;
     let active = true; setEmailLoading(true);
-    fetchEmailDetail(selected.source_email_id, false).then((value) => active && setEmail(value)).catch((err) => active && setEmailError(err instanceof Error ? err.message : "Failed to load email")).finally(() => active && setEmailLoading(false));
+    fetchCalendarEventEmails(selected.id).then((messages) => {
+      if (!active) return;
+      setEmailMessages([...messages].sort((a, b) => {
+        const bTime = new Date(b.received_at || b.created_at || 0).getTime();
+        const aTime = new Date(a.received_at || a.created_at || 0).getTime();
+        return bTime - aTime || b.id - a.id;
+      }));
+    }).catch((err) => active && setEmailError(err instanceof Error ? err.message : "Failed to load associated emails")).finally(() => active && setEmailLoading(false));
     return () => { active = false; };
-  }, [selected?.id]);
+  }, [selected]);
 
-  const visible = useMemo(() => { const query = meetWith.trim().toLowerCase(); return query ? events.filter((event) => [event.title, event.company, event.role, event.email_account].some((value) => value?.toLowerCase().includes(query))) : events; }, [events, meetWith]);
-  const days = useMemo(() => Array.from({ length: view === "month" ? 42 : view === "week" ? 7 : 1 }, (_, i) => addDays(start, i)), [start, view]);
-  const miniMonthStart = useMemo(() => { const first = new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), 1)); return addDays(first, -first.getUTCDay()); }, [anchor.getUTCFullYear(), anchor.getUTCMonth()]);
+  const days = useMemo(() => {
+    if (view === "day") return [start];
+    return Array.from({ length: view === "month" ? 42 : 7 }, (_, i) => addDays(start, i));
+  }, [start, view]);
+  const miniMonthStart = useMemo(() => startOfWeek(new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), 1))), [anchor.getUTCFullYear(), anchor.getUTCMonth()]);
   const miniMonthDays = useMemo(() => Array.from({ length: 42 }, (_, i) => addDays(miniMonthStart, i)), [miniMonthStart.getTime()]);
-  const nextMeeting = useMemo(() => visible.filter((event) => event.kind === "confirmed" && event.interview_status !== "cancellation" && new Date(event.end_at).getTime() > Date.now()).sort((a, b) => new Date(a.start_at).getTime() - new Date(b.start_at).getTime())[0] ?? null, [visible]);
+  const scheduledInterviewsByAccount = useMemo(() => mailboxes.filter((mailbox) => mailbox.is_active).map((mailbox) => ({
+    mailboxId: mailbox.id,
+    email: mailbox.email_address,
+    color: accountColor(mailbox.id),
+    count: events.filter((event) => event.mailbox_id === mailbox.id && event.kind === "confirmed" && event.interview_status !== "cancellation").length,
+  })), [events, mailboxes]);
+  const nextMeeting = useMemo(() => events.filter((event) => event.kind === "confirmed" && event.interview_status !== "cancellation" && new Date(event.end_at).getTime() > Date.now()).sort((a, b) => new Date(a.start_at).getTime() - new Date(b.start_at).getTime())[0] ?? null, [events]);
   const nowInTimeZone = wallDateForInstant(new Date(), timeZone);
   const move = (amount: number) => setAnchor((date) => { const out = new Date(date); if (view === "month") out.setUTCMonth(out.getUTCMonth() + amount); else out.setUTCDate(out.getUTCDate() + amount * (view === "week" ? 7 : 1)); return out; });
   const defaultMailboxId = mailboxes.find((m) => m.is_active)?.id;
@@ -438,50 +668,103 @@ export default function CalendarPage({ mailboxes, onClose, onOpenEmail }: { mail
     event.currentTarget.setPointerCapture(event.pointerId);
     const anchorMinutes = minutesAtPointer(event.currentTarget, event.clientY);
     dragRef.current = { dayIndex, anchorMinutes };
-    setDragSelection({ dayIndex, startMinutes: anchorMinutes, endMinutes: anchorMinutes + SNAP_MINUTES });
+    setDragSelection({ dayIndex, startMinutes: anchorMinutes, endMinutes: Math.min(DAY_MINUTES, anchorMinutes + DEFAULT_EVENT_DURATION_MINUTES) });
   };
   const updateTimeDrag = (dayIndex: number, event: ReactPointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
     if (!drag || drag.dayIndex !== dayIndex) return;
     const currentMinutes = minutesAtPointer(event.currentTarget, event.clientY);
-    setDragSelection({ dayIndex, startMinutes: Math.min(drag.anchorMinutes, currentMinutes), endMinutes: drag.anchorMinutes === currentMinutes ? currentMinutes + SNAP_MINUTES : Math.max(drag.anchorMinutes, currentMinutes) });
+    setDragSelection({ dayIndex, startMinutes: Math.min(drag.anchorMinutes, currentMinutes), endMinutes: drag.anchorMinutes === currentMinutes ? Math.min(DAY_MINUTES, currentMinutes + DEFAULT_EVENT_DURATION_MINUTES) : Math.max(drag.anchorMinutes, currentMinutes) });
   };
   const finishTimeDrag = (dayIndex: number, event: ReactPointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
     if (!drag || drag.dayIndex !== dayIndex || defaultMailboxId == null) return;
     const currentMinutes = minutesAtPointer(event.currentTarget, event.clientY);
     const startMinutes = Math.min(drag.anchorMinutes, currentMinutes);
-    const endMinutes = drag.anchorMinutes === currentMinutes ? Math.min(DAY_MINUTES, startMinutes + 60) : Math.max(drag.anchorMinutes, currentMinutes);
+    const endMinutes = drag.anchorMinutes === currentMinutes ? Math.min(DAY_MINUTES, startMinutes + DEFAULT_EVENT_DURATION_MINUTES) : Math.max(drag.anchorMinutes, currentMinutes);
     const rangeStart = new Date(days[dayIndex]); rangeStart.setUTCMinutes(startMinutes);
     const rangeEnd = new Date(days[dayIndex]); rangeEnd.setUTCMinutes(endMinutes);
     dragRef.current = null; setDragSelection(null);
     setEditor(editorFor(rangeStart, defaultMailboxId, timeZone, undefined, rangeEnd));
   };
   const cancelTimeDrag = () => { dragRef.current = null; setDragSelection(null); };
+  const closeEventDetails = () => {
+    if (!selected || detailsClosing) return;
+    setDetailsClosing(true);
+    detailsCloseTimer.current = window.setTimeout(() => {
+      setSelected(null);
+      setDetailsClosing(false);
+      detailsCloseTimer.current = null;
+    }, calendarMotionDelay(220));
+  };
+  const showEventDetails = (event: CalendarEvent) => {
+    if (selected?.id === event.id && !detailsClosing) {
+      closeEventDetails();
+      return;
+    }
+    if (detailsCloseTimer.current != null) window.clearTimeout(detailsCloseTimer.current);
+    if (sidebarCloseTimer.current != null) window.clearTimeout(sidebarCloseTimer.current);
+    setDetailsClosing(false);
+    setSidebarOpen(false);
+    setSidebarClosing(false);
+    setSelected(event);
+  };
+  const toggleSidebar = () => {
+    if (sidebarOpen) {
+      setSidebarOpen(false);
+      setSidebarClosing(true);
+      sidebarCloseTimer.current = window.setTimeout(() => {
+        setSidebarClosing(false);
+        sidebarCloseTimer.current = null;
+      }, calendarMotionDelay(220));
+      return;
+    }
+    if (sidebarCloseTimer.current != null) window.clearTimeout(sidebarCloseTimer.current);
+    setSidebarClosing(false);
+    setSidebarOpen(true);
+  };
   const save = async (e: FormEvent) => {
     e.preventDefault(); if (!editor) return; setSaving(true); setSaveError("");
     const startAt = instantForWallDate(wallDateFromInput(editor.start), timeZone);
     const endAt = instantForWallDate(wallDateFromInput(editor.end), timeZone);
-    const payload: CalendarEventPayload = { mailbox_id: editor.mailbox_id, title: editor.title, company: editor.company, role: editor.role, start_at: startAt.toISOString(), end_at: endAt.toISOString(), source_timezone: timeZone, description: editor.description, job_url: editor.job_url || null, meeting_type: editor.meeting_type, meeting_provider: editor.meeting_provider || null, meeting_url: editor.meeting_url || null, phone_number: editor.phone_number || null, phone_access_code: editor.phone_access_code || null, interview_status: "confirmation", application_status: "active" };
-    try { const saved = editor.id ? await updateCalendarEvent(editor.id, payload) : await createCalendarEvent(payload); setEvents((prev) => [...prev.filter((x) => x.id !== saved.id), saved]); setSelected(saved); setEditor(null); }
+    const payload: CalendarEventPayload = { mailbox_id: editor.mailbox_id, title: editor.title, company: editor.company, role: editor.role, interviewer: editor.interviewer, work_model: editor.work_model, start_at: startAt.toISOString(), end_at: endAt.toISOString(), source_timezone: timeZone, description: editor.description, job_url: editor.job_url || null, meeting_type: editor.meeting_type, meeting_provider: editor.meeting_provider || null, meeting_url: editor.meeting_url || null, phone_number: editor.phone_number || null, phone_access_code: editor.phone_access_code || null, interview_status: "confirmation", application_status: "active" };
+    try { const saved = editor.id ? await updateCalendarEvent(editor.id, payload) : await createCalendarEvent(payload); setEvents((prev) => [...prev.filter((x) => x.id !== saved.id), saved]); showEventDetails(saved); setEditor(null); }
     catch (err) { setSaveError(err instanceof Error ? err.message : "Failed to save event"); }
     finally { setSaving(false); }
   };
 
-  return <main className={`calendar-workspace ${sidebarOpen ? "sidebar-open" : ""}`}>
+  const copyMeetingLink = async (event: CalendarEvent) => {
+    if (!event.meeting_url) return;
+    try {
+      await navigator.clipboard.writeText(event.meeting_url);
+    } catch {
+      const field = document.createElement("textarea");
+      field.value = event.meeting_url;
+      field.style.position = "fixed";
+      field.style.opacity = "0";
+      document.body.appendChild(field);
+      field.select();
+      document.execCommand("copy");
+      field.remove();
+    }
+    setCopiedMeetingEventId(event.id);
+    window.setTimeout(() => setCopiedMeetingEventId((current) => current === event.id ? null : current), 1800);
+  };
+
+  return <main className={`calendar-workspace ${sidebarOpen ? "sidebar-open" : ""} ${sidebarClosing ? "sidebar-closing" : ""} ${detailsClosing ? "details-closing" : ""}`}>
     <header className="calendar-toolbar">
       <div className="calendar-title-group"><button className="calendar-back" type="button" onClick={onClose} aria-label="Back to inbox">←</button><h1><strong>{new Intl.DateTimeFormat(undefined, { timeZone: "UTC", month: "long" }).format(anchor)}</strong><span>{anchor.getUTCFullYear()}</span></h1></div>
       <div className="calendar-nav"><button type="button" onClick={() => move(-1)} aria-label="Previous period">‹</button><button className="calendar-today" type="button" onClick={() => setAnchor(startOfDay(wallDateForInstant(new Date(), timeZone)))}>Today</button><button type="button" onClick={() => move(1)} aria-label="Next period">›</button></div>
-      <div className="calendar-toolbar-actions"><CalendarTimeZonePicker value={timeZone} onChange={setTimeZone} /><CalendarViewPicker value={view} onChange={setView} /><button className="calendar-sidebar-toggle" type="button" aria-label="Toggle calendar sidebar" aria-pressed={sidebarOpen} onClick={() => setSidebarOpen((open) => !open)}>▥</button></div>
+      <div className="calendar-toolbar-actions"><CalendarTimeZonePicker value={timeZone} onChange={setTimeZone} /><CalendarViewPicker value={view} onChange={setView} /><button className="calendar-sidebar-toggle" type="button" aria-label={sidebarOpen ? "Hide calendar sidebar" : "Show calendar sidebar"} title={sidebarOpen ? "Hide sidebar" : "Show sidebar"} aria-pressed={sidebarOpen} onClick={toggleSidebar}>▥</button></div>
     </header>
     {error && <div className="calendar-state error"><span>{error}</span><button type="button" onClick={() => void load()}>Retry</button></div>}
     <div className={`calendar-main ${selected ? "has-details" : ""}`}>
       {view === "month" ? (
         <section className="calendar-grid month" aria-busy={loading}>
-          {["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map((day) => <div className="calendar-weekday" key={day}>{day}</div>)}
-          {days.map((day) => { const dayEvents = visible.filter((event) => overlapsDay(event, day, timeZone)); const today = sameDay(day, nowInTimeZone); return <div className={`calendar-day ${today ? "today" : ""} ${day.getUTCMonth() !== anchor.getUTCMonth() ? "outside" : ""}`} key={day.toISOString()} onClick={() => openCreate(day)}>
+          {VISIBLE_WEEKDAYS.map((day) => <div className="calendar-weekday" key={day}>{day}</div>)}
+        {days.map((day) => { const dayEvents = events.filter((event) => overlapsDay(event, day, timeZone)); const today = sameDay(day, nowInTimeZone); return <div className={`calendar-day ${today ? "today" : ""} ${day.getUTCMonth() !== anchor.getUTCMonth() ? "outside" : ""}`} key={day.toISOString()} onClick={() => openCreate(day)}>
             <div className="calendar-day-heading"><strong>{day.getUTCDate()}</strong>{today && <em>Today</em>}</div>
-            <div className="calendar-day-events">{dayEvents.map((event) => <EventCard event={event} timeZone={timeZone} compact onSelect={setSelected} key={event.id} />)}</div>
+            <div className="calendar-day-events">{dayEvents.map((event) => <EventCard event={event} timeZone={timeZone} compact selected={selected?.id === event.id && !detailsClosing} activeHoverId={activeHoverId} onHoverActivate={activateEventHover} onHoverDeactivate={deactivateEventHover} onSelect={showEventDetails} key={event.id} />)}</div>
           </div>; })}
           {loading && <div className="calendar-loading">Loading calendar…</div>}
         </section>
@@ -491,12 +774,12 @@ export default function CalendarPage({ mailboxes, onClose, onOpenEmail }: { mail
             <div className="calendar-time-corner" />
             {days.map((day) => { const today = sameDay(day, nowInTimeZone); return <div className={`calendar-time-day-heading ${today ? "today" : ""}`} key={day.toISOString()}><span>{new Intl.DateTimeFormat(undefined, { timeZone: "UTC", weekday: "short" }).format(day)}</span><strong>{day.getUTCDate()}</strong></div>; })}
             <div className="calendar-all-day-label">all-day</div>
-            {days.map((day) => <div className="calendar-all-day-cell" key={`all-day-${day.toISOString()}`}>{visible.filter((event) => isAllDay(event, timeZone) && overlapsDay(event, day, timeZone)).map((event) => <EventCard event={event} timeZone={timeZone} compact onSelect={setSelected} key={event.id} />)}</div>)}
+          {days.map((day) => <div className="calendar-all-day-cell" key={`all-day-${day.toISOString()}`}>{events.filter((event) => isAllDay(event, timeZone) && overlapsDay(event, day, timeZone)).map((event) => <EventCard event={event} timeZone={timeZone} compact selected={selected?.id === event.id && !detailsClosing} activeHoverId={activeHoverId} onHoverActivate={activateEventHover} onHoverDeactivate={deactivateEventHover} onSelect={showEventDetails} key={event.id} />)}</div>)}
           </div>
           <div className="calendar-time-body">
             <div className="calendar-time-axis">{HOURS.map((hour) => <span key={hour} style={{ top: `${hour * hourHeight}px` }}>{hourLabel(hour)}</span>)}</div>
             <div className="calendar-time-days">
-              {days.map((day, dayIndex) => { const dayEvents = visible.filter((event) => overlapsDay(event, day, timeZone)); const today = sameDay(day, nowInTimeZone); const nowMinutes = nowInTimeZone.getUTCHours() * 60 + nowInTimeZone.getUTCMinutes(); return <div
+            {days.map((day, dayIndex) => { const dayEvents = events.filter((event) => overlapsDay(event, day, timeZone)); const today = sameDay(day, nowInTimeZone); const nowMinutes = nowInTimeZone.getUTCHours() * 60 + nowInTimeZone.getUTCMinutes(); return <div
                 className={`calendar-time-day ${today ? "today" : ""} ${defaultMailboxId == null ? "disabled" : ""}`}
                 key={day.toISOString()}
                 title={defaultMailboxId == null ? "Connect an email account to create events" : "Drag to create an event"}
@@ -508,37 +791,82 @@ export default function CalendarPage({ mailboxes, onClose, onOpenEmail }: { mail
                 {HOURS.map((hour) => <div className="calendar-hour-slot" key={hour} />)}
                 {today && <div className="calendar-now-line" style={{ top: `${(nowMinutes / 60) * hourHeight}px` }} />}
                 {dragSelection?.dayIndex === dayIndex && <div className="calendar-drag-selection" style={{ top: `${(dragSelection.startMinutes / 60) * hourHeight}px`, height: `${((dragSelection.endMinutes - dragSelection.startMinutes) / 60) * hourHeight}px` }}><span>{formatWallTime(new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), 0, dragSelection.startMinutes)))} – {formatWallTime(new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), 0, dragSelection.endMinutes)))}</span></div>}
-                {layoutTimedEvents(dayEvents, day, hourHeight, timeZone).map(({ event, position }) => <EventCard event={event} timeZone={timeZone} timed position={position} onSelect={setSelected} key={event.id} />)}
+                {layoutTimedEvents(dayEvents, day, hourHeight, timeZone).map(({ event, position }) => <EventCard event={event} timeZone={timeZone} timed position={position} selected={selected?.id === event.id && !detailsClosing} activeHoverId={activeHoverId} onHoverActivate={activateEventHover} onHoverDeactivate={deactivateEventHover} onSelect={showEventDetails} key={event.id} />)}
               </div>; })}
             </div>
           </div>
           {loading && <div className="calendar-loading">Loading calendar…</div>}
         </section>
       )}
-      {selected ? <aside className="calendar-details">
-        <div className="details-sticky"><button type="button" onClick={() => setSelected(null)} aria-label="Close details">×</button><div>{selected.meeting_url && <a className="primary" href={selected.meeting_url} target="_blank" rel="noreferrer">Join meeting</a>}{!selected.meeting_url && selected.phone_number && <a className="primary" href={`tel:${selected.phone_number.replace(/[^+\d]/g, "")}`}>Call</a>}</div></div>
-        <div className="details-content"><span className={`details-kind ${selected.kind}`}>{selected.kind === "confirmed" ? "Scheduled interview" : "Available time"}</span><h2>{selected.title}</h2>
-          <dl><dt>Account</dt><dd>{selected.email_account}</dd><dt>Date and time</dt><dd>{formatDateTime(selected.start_at, timeZone)} – {formatTime(selected.end_at, timeZone, true)}</dd><dt>Company</dt><dd>{selected.company || "—"}</dd><dt>Role</dt><dd>{selected.role || "—"}</dd><dt>Interview status</dt><dd>{selected.interview_status?.replaceAll("_", " ") || "—"}</dd><dt>Application outcome</dt><dd className={selected.application_status !== "active" ? "status-danger" : ""}>{selected.application_status.replaceAll("_", " ")}</dd>{selected.meeting_provider && <><dt>Meeting</dt><dd>{selected.meeting_provider}{selected.phone_access_code ? ` · Code ${selected.phone_access_code}` : ""}</dd></>}</dl>
-          {selected.job_url && <a href={selected.job_url} target="_blank" rel="noreferrer">View job posting ↗</a>}{selected.description && <p className="details-description">{selected.description}</p>}
-          {selected.kind === "confirmed" && <button type="button" onClick={() => setEditor(editorFor(new Date(selected.start_at), selected.mailbox_id, timeZone, selected))}>Edit event</button>}
-          {selected.source_email_id && <section className="source-email"><h3>Source email</h3>{emailLoading && <p>Loading email…</p>}{emailError && <p className="error-text">{emailError}</p>}{email && <><strong>{email.subject}</strong><p>{email.sender} · {formatDateTime(email.received_at || email.created_at || selected.start_at, timeZone)} · {selected.email_account}</p><p>{email.snippet}</p><div className="source-email-actions"><button type="button" onClick={() => setEmailExpanded((v) => !v)}>{emailExpanded ? "Hide body" : "Show body"}</button><button type="button" onClick={() => onOpenEmail(email.id, email.mailbox_id)}>Open in Inbox</button></div>{emailExpanded && <div className="source-email-body"><EmailBody html={email.body_html} text={email.body_text} snippet={email.snippet} /></div>}</>}</section>}
+      {(selected || sidebarOpen || sidebarClosing) && <button className="calendar-panel-scrim" type="button" aria-label="Close calendar panel" onClick={selected ? closeEventDetails : toggleSidebar} />}
+      {selected ? <aside className={`calendar-details ${detailsClosing ? "is-closing" : ""}`} aria-label="Event details" key={`details-${selected.id}`}>
+        <header className="details-sticky">
+          <button className="details-close" type="button" onClick={closeEventDetails} aria-label="Close event details"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg></button>
+          <div className="details-sticky-actions">
+            {selected.meeting_url && <a className="details-primary-action" href={selected.meeting_url} target="_blank" rel="noreferrer"><MeetingTypeIcon type="video" /><span>Join meeting</span><svg className="details-action-arrow" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3h7v7M13 3 5 11" /></svg></a>}
+            {!selected.meeting_url && selected.phone_number && <a className="details-primary-action" href={`tel:${selected.phone_number.replace(/[^+\d]/g, "")}`}><MeetingTypeIcon type="phone" /><span>Call now</span></a>}
+          </div>
+        </header>
+        <div className="details-content">
+          <dl className="details-list">
+            <div className="details-row details-time-row"><dt>Interview time</dt><dd>{formatInterviewTimeRange(selected, timeZone)}</dd></div>
+            <div className="details-row"><dt>Account</dt><dd>{selected.email_account}</dd></div>
+            <div className="details-row"><dt>Company</dt><dd>{selected.company || "—"}</dd></div>
+            <div className="details-row"><dt>Role</dt><dd>{selected.role || "—"}</dd></div>
+            {interviewType(selected).type === "video" && <div className="details-row details-action-row"><dt>Meeting</dt><dd>{meetingProviderLabel(selected) !== "—" ? <span className="details-meeting-value">{selected.meeting_url ? <a className="details-meeting-link" href={selected.meeting_url} target="_blank" rel="noreferrer" aria-label={`Open ${meetingProviderLabel(selected)}`} title={`Open ${meetingProviderLabel(selected)}`}><span className="details-meeting-icon"><MeetingTypeIcon type="video" /></span><span>{meetingProviderLabel(selected)}</span><svg className="details-meeting-arrow" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3h7v7M13 3 5 11" /></svg></a> : <span className="details-meeting-label"><span className="details-meeting-icon"><MeetingTypeIcon type="video" /></span><span>{meetingProviderLabel(selected)}</span></span>}{selected.meeting_url && <button className="details-copy-link details-copy-icon" type="button" onClick={() => void copyMeetingLink(selected)} aria-label={copiedMeetingEventId === selected.id ? "Meeting link copied" : `Copy ${meetingProviderLabel(selected)} meeting link`} title={copiedMeetingEventId === selected.id ? "Copied" : "Copy meeting link"}>{copiedMeetingEventId === selected.id ? <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.2 3 3 6-6.4" /></svg> : <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="2.25" width="8.5" height="8.5" rx="1.5" /><path d="M10.75 10.75v1.5a1.5 1.5 0 0 1-1.5 1.5h-5.5a1.5 1.5 0 0 1-1.5-1.5v-5.5a1.5 1.5 0 0 1 1.5-1.5h1.5" /></svg>}</button>}</span> : "—"}</dd></div>}
+          </dl>
+
+          {selected.kind === "confirmed" && <div className="details-actions">
+            {selected.kind === "confirmed" && <button className="details-secondary-action" type="button" onClick={() => setEditor(editorFor(new Date(selected.start_at), selected.mailbox_id, timeZone, selected))}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m10.8 2.7 2.5 2.5-7.7 7.7-3 .5.5-3 7.7-7.7ZM9.4 4.1l2.5 2.5" /></svg>Edit event</button>}
+          </div>}
+
+          <section className="source-email">
+            <div className="source-email-heading">
+              <span className="source-email-icon"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="2" /><path d="m3 5 5 4 5-4" /></svg></span>
+              <div><h3>Associated emails</h3><p>{emailLoading ? "Loading linked messages…" : `${emailMessages.length} linked message${emailMessages.length === 1 ? "" : "s"}`}</p></div>
+            </div>
+            {emailLoading && <div className="source-email-loading"><span />Loading emails…</div>}
+            {emailError && <p className="error-text">{emailError}</p>}
+            {!emailLoading && !emailError && emailMessages.length === 0 && <p className="source-email-empty">No emails are linked to this calendar item.</p>}
+            {emailMessages.length > 0 && <ol className="source-email-list" aria-label="Emails associated with this calendar item, newest first">
+              {emailMessages.map((message) => {
+                const timestamp = message.received_at || message.created_at || selected.start_at;
+                const expanded = expandedEmailId === message.id;
+                return <li key={message.id}>
+                  <button className="source-email-list-item" type="button" aria-expanded={expanded} onClick={() => setExpandedEmailId(expanded ? null : message.id)}>
+                    <span className="source-email-list-top"><strong>{message.subject || "(no subject)"}</strong><time dateTime={timestamp}>{formatDateTime(timestamp, timeZone)}</time></span>
+                    <span className="source-email-meta">{message.sender}{message.interview_subtype && <><span>·</span>{message.interview_subtype.replaceAll("_", " ")}</>}</span>
+                    <span className="source-email-snippet">{message.snippet || message.body_text}</span>
+                  </button>
+                  {expanded && <div className="source-email-body"><EmailBody html={message.body_html} text={message.body_text} snippet={message.snippet} /></div>}
+                </li>;
+              })}
+            </ol>}
+          </section>
         </div>
       </aside> : <aside className="calendar-sidebar">
         <section className="calendar-mini-month">
           <header><strong>{new Intl.DateTimeFormat(undefined, { timeZone: "UTC", month: "long", year: "numeric" }).format(anchor)}</strong><div><button type="button" aria-label="Previous month" onClick={() => setAnchor(new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth() - 1, 1)))}>‹</button><button type="button" aria-label="Next month" onClick={() => setAnchor(new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth() + 1, 1)))}>›</button></div></header>
-          <div className="mini-weekdays">{["Su","Mo","Tu","We","Th","Fr","Sa"].map((day) => <span key={day}>{day}</span>)}</div>
+          <div className="mini-weekdays">{VISIBLE_WEEKDAYS.map((day) => <span key={day}>{day.slice(0, 2)}</span>)}</div>
           <div className="mini-days">{miniMonthDays.map((day) => <button type="button" className={`${day.getUTCMonth() !== anchor.getUTCMonth() ? "outside" : ""} ${view === "week" && day >= start && day < end ? "in-range" : ""} ${sameDay(day, anchor) ? "selected" : ""} ${sameDay(day, nowInTimeZone) ? "today" : ""}`} key={day.toISOString()} onClick={() => setAnchor(day)}>{day.getUTCDate()}</button>)}</div>
         </section>
-        <section className="calendar-next-meeting"><h2>Next meeting</h2>{nextMeeting ? <button type="button" className="next-meeting-card" onClick={() => setSelected(nextMeeting)}><span className="next-meeting-logo" style={{ "--account-color": accountColor(nextMeeting.mailbox_id) } as React.CSSProperties}>{eventInitials(nextMeeting)}</span><span><strong>{nextMeeting.title}</strong><small>{startsIn(nextMeeting.start_at)}</small></span></button> : <p>No upcoming meetings in this view.</p>}</section>
-        <section className="calendar-meet-with"><h2>Meet with</h2><input value={meetWith} onChange={(event) => setMeetWith(event.target.value)} placeholder="Add participants" list="calendar-meet-options" aria-label="Filter calendar by person, company, or account" /><datalist id="calendar-meet-options">{mailboxes.filter((mailbox) => mailbox.is_active).map((mailbox) => <option value={mailbox.email_address} key={mailbox.id} />)}{events.filter((event) => event.company).map((event) => <option value={event.company} key={`company-${event.id}`} />)}</datalist></section>
+        <section className="calendar-next-meeting"><h2>Next meeting</h2>{nextMeeting ? <button type="button" className="next-meeting-card" onClick={() => showEventDetails(nextMeeting)}><span className="next-meeting-logo" style={{ "--account-color": accountColor(nextMeeting.mailbox_id) } as React.CSSProperties}>{eventInitials(nextMeeting)}</span><span><strong>{nextMeeting.title}</strong><small>{startsIn(nextMeeting.start_at)}</small></span></button> : <p>No upcoming meetings in this view.</p>}</section>
+        <ScheduledInterviewChart accounts={scheduledInterviewsByAccount} />
         <section className="calendar-legend"><h2>Calendars</h2>{mailboxes.filter((mailbox) => mailbox.is_active).map((mailbox) => <div key={mailbox.id}><span style={{ background: accountColor(mailbox.id) }} /><p title={mailbox.email_address}>{mailbox.email_address}</p></div>)}</section>
       </aside>}
     </div>
     {editor && <div className="modal-backdrop" role="presentation" onMouseDown={() => !saving && setEditor(null)}><form className="calendar-editor" onSubmit={save} onMouseDown={(e) => e.stopPropagation()}><header><h2>{editor.id ? "Edit event" : "New event"}</h2><button type="button" onClick={() => setEditor(null)}>×</button></header>
       <label>Email account<CompactSelect value={editor.mailbox_id} onChange={(e) => setEditor({ ...editor, mailbox_id: Number(e.target.value) })} required>{mailboxes.filter((m) => m.is_active).map((m) => <option value={m.id} key={m.id}>{m.email_address}</option>)}</CompactSelect></label>
       <label>Title<input required value={editor.title} onChange={(e) => setEditor({ ...editor, title: e.target.value })} /></label><div className="editor-row"><label>Company<input value={editor.company} onChange={(e) => setEditor({ ...editor, company: e.target.value })} /></label><label>Role<input value={editor.role} onChange={(e) => setEditor({ ...editor, role: e.target.value })} /></label></div>
-      <div className="editor-timezone">Times shown in {timeZone.replaceAll("_", " ")}</div><div className="editor-row"><label>Start<input type="datetime-local" required value={editor.start} onChange={(e) => setEditor({ ...editor, start: e.target.value })} /></label><label>End<input type="datetime-local" required value={editor.end} onChange={(e) => setEditor({ ...editor, end: e.target.value })} /></label></div>
-      <label>Meeting type<CompactSelect value={editor.meeting_type} onChange={(e) => setEditor({ ...editor, meeting_type: e.target.value as Editor["meeting_type"] })}><option value="unspecified">Unspecified</option><option value="video">Video</option><option value="phone">Phone</option><option value="in_person">In person</option></CompactSelect></label>
+      <div className="editor-row"><label>Interviewer<input value={editor.interviewer} onChange={(e) => setEditor({ ...editor, interviewer: e.target.value })} placeholder="Name or email" /></label><label>Work model<CompactSelect value={editor.work_model} onChange={(e) => setEditor({ ...editor, work_model: e.target.value as Editor["work_model"] })}><option value="unspecified">Not specified</option><option value="remote">Remote</option><option value="hybrid">Hybrid</option><option value="on_site">On-site</option></CompactSelect></label></div>
+      <div className="editor-timezone">Times shown in {timeZone.replaceAll("_", " ")}</div><div className="editor-row"><ModernDateTimePicker label="Start" value={editor.start} minuteStep={5} onChange={(start) => setEditor((current) => {
+        if (!current) return current;
+        if (current.end > start) return { ...current, start };
+        const nextEnd = wallDateFromInput(start);
+        nextEnd.setUTCMinutes(nextEnd.getUTCMinutes() + DEFAULT_EVENT_DURATION_MINUTES);
+        return { ...current, start, end: localInput(nextEnd) };
+      })} /><ModernDateTimePicker label="End" value={editor.end} min={editor.start} minuteStep={5} onChange={(end) => setEditor((current) => current ? { ...current, end } : current)} /></div>
+      <label>Interview type<CompactSelect value={editor.meeting_type} onChange={(e) => setEditor({ ...editor, meeting_type: e.target.value as Editor["meeting_type"] })}><option value="video">Video call</option><option value="phone">Phone call</option></CompactSelect></label>
       {editor.meeting_type === "video" && <div className="editor-row"><label>Provider<input placeholder="Zoom, Google Meet…" value={editor.meeting_provider} onChange={(e) => setEditor({ ...editor, meeting_provider: e.target.value })} /></label><label>HTTPS meeting link<input type="url" value={editor.meeting_url} onChange={(e) => setEditor({ ...editor, meeting_url: e.target.value })} /></label></div>}
       {editor.meeting_type === "phone" && <div className="editor-row"><label>Phone<input type="tel" value={editor.phone_number} onChange={(e) => setEditor({ ...editor, phone_number: e.target.value })} /></label><label>Access code<input value={editor.phone_access_code} onChange={(e) => setEditor({ ...editor, phone_access_code: e.target.value })} /></label></div>}
       <label>Job link<input type="url" value={editor.job_url} onChange={(e) => setEditor({ ...editor, job_url: e.target.value })} /></label><label>Description<textarea rows={4} value={editor.description} onChange={(e) => setEditor({ ...editor, description: e.target.value })} /></label>{saveError && <p className="error-text">{saveError}</p>}<footer><button type="button" onClick={() => setEditor(null)}>Cancel</button><button className="primary" disabled={saving}>{saving ? "Saving…" : "Save event"}</button></footer>

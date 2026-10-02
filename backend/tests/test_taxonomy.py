@@ -12,6 +12,7 @@ from app.models import EmailLabel
         ("Screening questions", "Please answer the recruiter questionnaire before we schedule an interview.", EmailLabel.SCREENING),
         ("Coding challenge", "Complete your online coding test.", EmailLabel.ASSESSMENT),
         ("Interview invitation", "Select your interview slot using the scheduling link.", EmailLabel.INTERVIEW_INVITATION),
+        ("Thomson Reuters Interview Invitation", "Thank you for providing your availability! We are pleased to inform you about your upcoming discussion. Date: Tuesday, September 29, 2026 at 3:00 PM (America/New York).", EmailLabel.INTERVIEW_SCHEDULED),
         ("Your interview has been scheduled", "Your interview is scheduled for Friday at 2 PM.", EmailLabel.INTERVIEW_SCHEDULED),
         ("Interview follow-up", "Thank you for interviewing with us. Next steps soon.", EmailLabel.INTERVIEW_FOLLOW_UP),
         ("Offer letter", "We are pleased to offer you the role.", EmailLabel.OFFER),
@@ -37,3 +38,19 @@ def test_classification_examples(subject, body, expected):
 def test_scheduled_interview_subtypes(subject, body, subtype):
     assert _heuristic_label(subject, "", body, "") == EmailLabel.INTERVIEW_SCHEDULED.value
     assert infer_interview_subtype(subject, "", body, "") == subtype
+
+
+def test_microsoft_bookings_phone_conversation_is_a_confirmation_not_a_reschedule():
+    subject = "Jordan Meeker - Opportunity with Castelion - Phone Conversation"
+    body = """This meeting was scheduled from the bookings page of Julee Yoo.
+
+Use the following link to reschedule or cancel this meeting:
+Manage meeting
+BEGIN:VCALENDAR
+BEGIN:VEVENT
+DTSTART;TZID=Eastern Standard Time:20261002T133000
+DTEND;TZID=Eastern Standard Time:20261002T140000
+END:VEVENT
+END:VCALENDAR"""
+    assert _heuristic_label(subject, "Julee Yoo <julee@castelion.com>", body, "") == EmailLabel.INTERVIEW_SCHEDULED.value
+    assert infer_interview_subtype(subject, "Julee Yoo <julee@castelion.com>", body, "") == "confirmation"

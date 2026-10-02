@@ -2,6 +2,7 @@ import { CSSProperties, Dispatch, DragEvent, FormEvent, KeyboardEvent, PointerEv
 import { useVirtualizer } from "@tanstack/react-virtual";
 import EmailBody from "./components/EmailBody";
 import CompactSelect from "./components/CompactSelect";
+import ModernDateTimePicker from "./components/ModernDateTimePicker";
 import MessageRow from "./components/MessageRow";
 import SettingsPage, { type SettingsSection } from "./pages/SettingsPage";
 import CalendarPage from "./pages/CalendarPage";
@@ -43,14 +44,17 @@ import {
   loadFontFamily,
   loadFontSize,
   loadInboxType,
+  loadReadingPane,
   loadViewMode,
   saveFontFamily,
   saveFontSize,
   saveInboxType,
+  saveReadingPane,
   saveViewMode,
   type FontFamily,
   type FontSize,
   type InboxType,
+  type ReadingPane,
   type ViewMode,
 } from "./prefs";
 import { applyTheme, loadThemePref, saveThemePref, type ThemePref } from "./theme";
@@ -59,7 +63,6 @@ const PAGE_SIZE = 50;
 const LIST_OVERSCAN = 12;
 const LIST_ROW_GROUP_H = 40;
 const LIST_ROW_EMAIL_H = 102;
-const LIST_ROW_CARD_H = 148;
 const LIST_ROW_TABLE_H = 72;
 
 type ListRow =
@@ -69,8 +72,11 @@ type ListRow =
 const ACCOUNTS_MIN = 220;
 const LIST_MIN = 240;
 const READER_MIN = 280;
+const LIST_HEIGHT_MIN = 180;
+const READER_HEIGHT_MIN = 240;
 const ACCOUNTS_W_KEY = "email-checker-accounts-w";
 const LIST_W_KEY = "email-checker-list-w";
+const LIST_H_KEY = "email-checker-list-h";
 const ACCOUNTS_ORDER_KEY = "email-checker-accounts-order";
 
 function loadStoredWidth(key: string, fallback: number, min: number): number {
@@ -146,6 +152,12 @@ function localDateKey(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
+function localDateTimeValue(d: Date): string {
+  const hour = String(d.getHours()).padStart(2, "0");
+  const minute = String(d.getMinutes()).padStart(2, "0");
+  return `${localDateKey(d)}T${hour}:${minute}`;
+}
+
 function startOfDay(d: Date): Date {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate());
 }
@@ -202,7 +214,6 @@ function initialsFrom(text: string): string {
 }
 
 function emailRowHeight(mode: ViewMode): number {
-  if (mode === "card") return LIST_ROW_CARD_H;
   if (mode === "table") return LIST_ROW_TABLE_H;
   return LIST_ROW_EMAIL_H;
 }
@@ -326,18 +337,24 @@ export default function App() {
   const [selected, setSelected] = useState<EmailDetail | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [tableDialogOpen, setTableDialogOpen] = useState(false);
+  const [syncMenuOpen, setSyncMenuOpen] = useState(false);
+  const [calendarRefreshKey, setCalendarRefreshKey] = useState(0);
   const [collapsedDates, setCollapsedDates] = useState<Set<string>>(new Set());
   const [accountsW, setAccountsW] = useState(() => loadStoredWidth(ACCOUNTS_W_KEY, 300, ACCOUNTS_MIN));
   const [listW, setListW] = useState(() => loadStoredWidth(LIST_W_KEY, 360, LIST_MIN));
+  const [listH, setListH] = useState(() =>
+    loadStoredWidth(LIST_H_KEY, Math.max(LIST_HEIGHT_MIN, Math.round((window.innerHeight - 6) / 2)), LIST_HEIGHT_MIN)
+  );
   const [themePref, setThemePref] = useState<ThemePref>(() => loadThemePref());
   const [viewMode, setViewMode] = useState<ViewMode>(() => loadViewMode());
   const [inboxType, setInboxType] = useState<InboxType>(() => loadInboxType());
+  const [readingPane, setReadingPane] = useState<ReadingPane>(() => loadReadingPane());
   const [fontFamily, setFontFamily] = useState<FontFamily>(() => loadFontFamily());
   const [fontSize, setFontSize] = useState<FontSize>(() => loadFontSize());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("appearance");
   const [sidebarSections, setSidebarSections] = useState({ inbox: true, categories: true, sent: false, spam: false, trash: false, archive: false });
-  const [resizing, setResizing] = useState(false);
+  const [resizing, setResizing] = useState<"accounts" | "list" | null>(null);
   const [replyOpen, setReplyOpen] = useState(false);
   const [replyText, setReplyText] = useState("");
   const [replyInstruction, setReplyInstruction] = useState("");
@@ -346,7 +363,6 @@ export default function App() {
   const [sendingReply, setSendingReply] = useState(false);
   const [aiDrafting, setAiDrafting] = useState(false);
   const [scheduleDialogOpen, setScheduleDialogOpen] = useState(false);
-  const [schedulePickerOpen, setSchedulePickerOpen] = useState(false);
 
   const filterRef = useRef({
     mailboxId: selectedMailboxId,
@@ -370,6 +386,7 @@ export default function App() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const readerDialogRef = useRef<HTMLElement>(null);
   const readerCloseRef = useRef<HTMLButtonElement>(null);
+  const syncMenuRef = useRef<HTMLDivElement>(null);
   const didMountFilters = useRef(false);
   // Mailbox navigation starts its own load so the list (including date-group
   // counts) is refreshed from the clicked scope immediately.
@@ -378,12 +395,15 @@ export default function App() {
   const accountsPaneRef = useRef<HTMLElement>(null);
   const dragRef = useRef<{
     which: "accounts" | "list";
+    axis: "x" | "y";
     startX: number;
+    startY: number;
     startAccounts: number;
     startList: number;
+    startListHeight: number;
   } | null>(null);
-  const widthsRef = useRef({ accounts: accountsW, list: listW });
-  widthsRef.current = { accounts: accountsW, list: listW };
+  const paneSizesRef = useRef({ accounts: accountsW, list: listW, listHeight: listH });
+  paneSizesRef.current = { accounts: accountsW, list: listW, listHeight: listH };
   const mailboxesRef = useRef(mailboxes);
   mailboxesRef.current = mailboxes;
   const syncingIdsRef = useRef(syncingIds);
@@ -868,8 +888,9 @@ export default function App() {
 
   function persistPaneWidths() {
     try {
-      localStorage.setItem(ACCOUNTS_W_KEY, String(Math.round(widthsRef.current.accounts)));
-      localStorage.setItem(LIST_W_KEY, String(Math.round(widthsRef.current.list)));
+      localStorage.setItem(ACCOUNTS_W_KEY, String(Math.round(paneSizesRef.current.accounts)));
+      localStorage.setItem(LIST_W_KEY, String(Math.round(paneSizesRef.current.list)));
+      localStorage.setItem(LIST_H_KEY, String(Math.round(paneSizesRef.current.listHeight)));
     } catch {
       /* ignore */
     }
@@ -879,12 +900,15 @@ export default function App() {
     return (event: PointerEvent<HTMLButtonElement>) => {
       event.preventDefault();
       event.currentTarget.setPointerCapture(event.pointerId);
-      setResizing(true);
+      setResizing(which);
       dragRef.current = {
         which,
+        axis: which === "list" && readingPane === "below" ? "y" : "x",
         startX: event.clientX,
-        startAccounts: widthsRef.current.accounts,
-        startList: widthsRef.current.list,
+        startY: event.clientY,
+        startAccounts: paneSizesRef.current.accounts,
+        startList: paneSizesRef.current.list,
+        startListHeight: paneSizesRef.current.listHeight,
       };
     };
   }
@@ -893,13 +917,20 @@ export default function App() {
     const drag = dragRef.current;
     const shell = shellRef.current;
     if (!drag || !shell) return;
-    const width = shell.getBoundingClientRect().width;
+    const bounds = shell.getBoundingClientRect();
+    if (drag.axis === "y") {
+      const max = Math.max(LIST_HEIGHT_MIN, bounds.height - READER_HEIGHT_MIN - 6);
+      const next = drag.startListHeight + event.clientY - drag.startY;
+      setListH(Math.round(Math.min(max, Math.max(LIST_HEIGHT_MIN, next))));
+      return;
+    }
     const dx = event.clientX - drag.startX;
     if (drag.which === "accounts") {
-      const max = Math.max(ACCOUNTS_MIN, width - drag.startList - READER_MIN - 12);
+      const reserved = readingPane === "right" ? drag.startList + READER_MIN + 12 : LIST_MIN + 6;
+      const max = Math.max(ACCOUNTS_MIN, bounds.width - reserved);
       setAccountsW(Math.round(Math.min(max, Math.max(ACCOUNTS_MIN, drag.startAccounts + dx))));
     } else {
-      const max = Math.max(LIST_MIN, width - drag.startAccounts - READER_MIN - 12);
+      const max = Math.max(LIST_MIN, bounds.width - drag.startAccounts - READER_MIN - 12);
       setListW(Math.round(Math.min(max, Math.max(LIST_MIN, drag.startList + dx))));
     }
   }
@@ -907,8 +938,40 @@ export default function App() {
   function onSplitterPointerUp() {
     if (!dragRef.current) return;
     dragRef.current = null;
-    setResizing(false);
+    setResizing(null);
     persistPaneWidths();
+  }
+
+  function onSplitterKeyDown(which: "accounts" | "list") {
+    return (event: KeyboardEvent<HTMLButtonElement>) => {
+      const shell = shellRef.current;
+      if (!shell) return;
+      const verticalStack = which === "list" && readingPane === "below";
+      const decrementKey = verticalStack ? "ArrowUp" : "ArrowLeft";
+      const incrementKey = verticalStack ? "ArrowDown" : "ArrowRight";
+      if (event.key !== decrementKey && event.key !== incrementKey) return;
+      event.preventDefault();
+      const delta = (event.shiftKey ? 40 : 10) * (event.key === incrementKey ? 1 : -1);
+      const bounds = shell.getBoundingClientRect();
+
+      if (which === "accounts") {
+        const reserved = readingPane === "right" ? paneSizesRef.current.list + READER_MIN + 12 : LIST_MIN + 6;
+        const max = Math.max(ACCOUNTS_MIN, bounds.width - reserved);
+        const next = Math.round(Math.min(max, Math.max(ACCOUNTS_MIN, paneSizesRef.current.accounts + delta)));
+        setAccountsW(next);
+        try { localStorage.setItem(ACCOUNTS_W_KEY, String(next)); } catch { /* ignore */ }
+      } else if (verticalStack) {
+        const max = Math.max(LIST_HEIGHT_MIN, bounds.height - READER_HEIGHT_MIN - 6);
+        const next = Math.round(Math.min(max, Math.max(LIST_HEIGHT_MIN, paneSizesRef.current.listHeight + delta)));
+        setListH(next);
+        try { localStorage.setItem(LIST_H_KEY, String(next)); } catch { /* ignore */ }
+      } else {
+        const max = Math.max(LIST_MIN, bounds.width - paneSizesRef.current.accounts - READER_MIN - 12);
+        const next = Math.round(Math.min(max, Math.max(LIST_MIN, paneSizesRef.current.list + delta)));
+        setListW(next);
+        try { localStorage.setItem(LIST_W_KEY, String(next)); } catch { /* ignore */ }
+      }
+    };
   }
 
   function chooseTheme(next: ThemePref) {
@@ -1076,7 +1139,7 @@ export default function App() {
 
   useEffect(() => {
     listVirtualizer.measure();
-  }, [viewMode, listVirtualizer]);
+  }, [fontFamily, fontSize, viewMode, listVirtualizer]);
 
   useEffect(() => {
     if (loading || lastVirtualIndex < 0) return;
@@ -1160,6 +1223,18 @@ export default function App() {
       next.delete(id);
       syncingIdsRef.current = next;
     }
+  }
+
+  async function onSyncAllEmails() {
+    setSyncMenuOpen(false);
+    const activeMailboxes = mailboxesRef.current.filter((mailbox) => mailbox.is_active);
+    await Promise.all(activeMailboxes.map((mailbox) => onSync(mailbox.id, false)));
+  }
+
+  function onSyncCalendar() {
+    setSyncMenuOpen(false);
+    setActivePage("calendar");
+    setCalendarRefreshKey((current) => current + 1);
   }
 
   async function onStopSync(id: number, selectAccount = true) {
@@ -1300,7 +1375,7 @@ export default function App() {
     } catch (err) {
       if (request === detailGen.current) {
         setBanner(err instanceof Error ? err.message : "Could not open email");
-        if (viewMode === "table") setTableDialogOpen(false);
+        if (readingPane === "no_split") setTableDialogOpen(false);
       }
     } finally {
       if (request === detailGen.current) setLoadingDetail(false);
@@ -1361,8 +1436,24 @@ export default function App() {
     };
   }, [tableDialogOpen]);
 
+  useEffect(() => {
+    if (!syncMenuOpen) return;
+    const closeOnPointerDown = (event: globalThis.PointerEvent) => {
+      if (!syncMenuRef.current?.contains(event.target as Node)) setSyncMenuOpen(false);
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setSyncMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnPointerDown);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnPointerDown);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [syncMenuOpen]);
+
   function onMessageListKeyDown(event: KeyboardEvent<HTMLDivElement>) {
-    if (viewMode === "table" && event.key === "Enter" && event.target === event.currentTarget && selectedId != null) {
+    if (viewMode === "table" && readingPane === "no_split" && event.key === "Enter" && event.target === event.currentTarget && selectedId != null) {
       event.preventDefault();
       openTableEmail(selectedId);
       return;
@@ -1384,7 +1475,7 @@ export default function App() {
     event.currentTarget.focus();
     if (row.id === selectedId) return;
     listVirtualizer.scrollToIndex(row.index, { align: "auto" });
-    if (viewMode === "table") selectTableEmail(row.id);
+    if (viewMode === "table" && readingPane === "no_split") selectTableEmail(row.id);
     else void onOpenEmail(row.id);
   }
 
@@ -1483,6 +1574,12 @@ export default function App() {
     setFolder(nextFolder);
     setEmails([]);
     void loadFirstPage();
+  }
+
+  function chooseReadingPane(next: ReadingPane) {
+    setTableDialogOpen(false);
+    setReadingPane(next);
+    saveReadingPane(next);
   }
 
   function toggleSidebarSection(section: keyof typeof sidebarSections) {
@@ -1632,6 +1729,8 @@ export default function App() {
         onViewModeChange={chooseViewMode}
         inboxType={inboxType}
         onInboxTypeChange={chooseInboxType}
+        readingPane={readingPane}
+        onReadingPaneChange={chooseReadingPane}
         fontFamily={fontFamily}
         onFontFamilyChange={chooseFontFamily}
         fontSize={fontSize}
@@ -1666,19 +1765,46 @@ export default function App() {
   return (
     <div
       ref={shellRef}
-      className={`app-shell view-${viewMode}${activePage === "calendar" ? " calendar-open" : ""}${viewMode === "table" && tableDialogOpen ? " table-dialog-open" : ""}${resizing ? " is-resizing" : ""}`}
+      className={`app-shell view-${viewMode} reading-${readingPane.replace("_", "-")}${activePage === "calendar" ? " calendar-open" : ""}${tableDialogOpen ? " table-dialog-open" : ""}${resizing ? ` is-resizing resizing-${resizing}` : ""}`}
       style={
         {
           "--accounts-w": `${accountsW}px`,
           "--list-w": `${listW}px`,
+          "--list-h": `${listH}px`,
         } as CSSProperties
       }
     >
       <aside className="pane-accounts" ref={accountsPaneRef}>
         <div className="accounts-top">
-          <button type="button" className={`sidebar-home-row ${activePage === "inbox" && folder === "all" && selectedMailboxId == null ? "active" : ""}`} onClick={() => selectMailboxFolder(null, "all")}>
-            <SidebarIcon name="home" /><span>Home Screen</span>
-          </button>
+          <div className="sidebar-brand-row">
+            <button type="button" className="sidebar-brand" onClick={() => selectMailboxFolder(null, "all")} aria-label="Auto Email Check home">
+              <img src="/favicon.svg" alt="" />
+              <span>Auto Email Check</span>
+            </button>
+            <div className="sidebar-sync-menu" ref={syncMenuRef}>
+              <button
+                type="button"
+                className={`sidebar-sync-trigger ${syncMenuOpen ? "active" : ""} ${syncingIds.size ? "syncing" : ""}`}
+                aria-label="Open sync menu"
+                aria-haspopup="menu"
+                aria-expanded={syncMenuOpen}
+                title="Sync"
+                onClick={() => setSyncMenuOpen((open) => !open)}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5" /><path d="M6.1 8.2A7 7 0 0 1 18.8 7L20 12M4 12l1.2 5A7 7 0 0 0 17.9 15.8" /></svg>
+              </button>
+              {syncMenuOpen && <div className="sidebar-sync-popover" role="menu" aria-label="Sync options">
+                <button type="button" role="menuitem" disabled={!orderedMailboxes.some((mailbox) => mailbox.is_active) || syncingIds.size > 0} onClick={() => void onSyncAllEmails()}>
+                  <span className="sidebar-sync-option-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="3" /><path d="m4 7 8 6 8-6" /></svg></span>
+                  <span><strong>Email sync</strong><small>{syncingIds.size > 0 ? emailSyncStatusLabel : "Sync all connected accounts"}</small></span>
+                </button>
+                <button type="button" role="menuitem" onClick={onSyncCalendar}>
+                  <span className="sidebar-sync-option-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4.5" width="18" height="16" rx="3" /><path d="M7 2.5v4M17 2.5v4M3 9h18" /></svg></span>
+                  <span><strong>Calendar sync</strong><small>Refresh calendar events</small></span>
+                </button>
+              </div>}
+            </div>
+          </div>
         </div>
         <nav className="sidebar-tree" aria-label="Mailbox navigation">
           <section className="sidebar-tree-section">
@@ -1760,11 +1886,15 @@ export default function App() {
       <button
         type="button"
         className="pane-splitter accounts-splitter"
+        role="separator"
         aria-label="Resize accounts pane"
+        aria-orientation="vertical"
+        aria-valuenow={accountsW}
         onPointerDown={onSplitterPointerDown("accounts")}
         onPointerMove={onSplitterPointerMove}
         onPointerUp={onSplitterPointerUp}
         onPointerCancel={onSplitterPointerUp}
+        onKeyDown={onSplitterKeyDown("accounts")}
       />
 
       {activePage === "inbox" && <>
@@ -1847,7 +1977,7 @@ export default function App() {
         {loading && <p className="hint pad">Loading…</p>}
         {error && <p className="error pad">{error}</p>}
 
-        {viewMode === "table" && <p className="table-view-hint">Double-click an email to open it.</p>}
+        {viewMode === "table" && <p className="table-view-hint">{readingPane === "no_split" ? "Double-click an email to open it." : "Select an email to read it."}</p>}
         {viewMode === "table" && (
           <div className="table-header table-columns" aria-hidden="true">
             <span>From</span>
@@ -1923,8 +2053,15 @@ export default function App() {
                       when={when}
                       folder={mailFolderOf(email)}
                       folderTitle={MAIL_FOLDER_TITLES[mailFolderOf(email)]}
-                      onOpen={(id) => viewMode === "table" ? selectTableEmail(id) : void onOpenEmail(id)}
-                      onDoubleOpen={openTableEmail}
+                      onOpen={(id) => {
+                        if (readingPane === "no_split") {
+                          if (viewMode === "table") selectTableEmail(id);
+                          else openTableEmail(id);
+                        } else {
+                          void onOpenEmail(id);
+                        }
+                      }}
+                      onDoubleOpen={(id) => readingPane === "no_split" ? openTableEmail(id) : void onOpenEmail(id)}
                     />
                   </div>
                 );
@@ -1952,32 +2089,36 @@ export default function App() {
       <button
         type="button"
         className="pane-splitter reader-splitter"
-        aria-label="Resize message list"
+        role="separator"
+        aria-label={readingPane === "below" ? "Resize message list height" : "Resize message list width"}
+        aria-orientation={readingPane === "below" ? "horizontal" : "vertical"}
+        aria-valuenow={readingPane === "below" ? listH : listW}
         onPointerDown={onSplitterPointerDown("list")}
         onPointerMove={onSplitterPointerMove}
         onPointerUp={onSplitterPointerUp}
         onPointerCancel={onSplitterPointerUp}
+        onKeyDown={onSplitterKeyDown("list")}
       />
       </>}
 
-      {activePage === "inbox" && viewMode === "table" && tableDialogOpen && (
+      {activePage === "inbox" && readingPane === "no_split" && tableDialogOpen && (
         <div className="table-dialog-backdrop" role="presentation" onClick={closeTableDialog} />
       )}
       <section
         className="pane-reader"
         ref={readerDialogRef}
-        role={activePage === "inbox" && viewMode === "table" && tableDialogOpen ? "dialog" : undefined}
-        aria-modal={activePage === "inbox" && viewMode === "table" && tableDialogOpen ? true : undefined}
-        aria-label={activePage === "calendar" ? "Calendar" : viewMode === "table" && tableDialogOpen ? selected?.subject || "Email" : undefined}
+        role={activePage === "inbox" && readingPane === "no_split" && tableDialogOpen ? "dialog" : undefined}
+        aria-modal={activePage === "inbox" && readingPane === "no_split" && tableDialogOpen ? true : undefined}
+        aria-label={activePage === "calendar" ? "Calendar" : readingPane === "no_split" && tableDialogOpen ? selected?.subject || "Email" : undefined}
       >
         {activePage === "calendar" ? (
           <CalendarPage
             mailboxes={orderedMailboxes}
+            refreshKey={calendarRefreshKey}
             onClose={() => setActivePage("inbox")}
-            onOpenEmail={(id) => void onOpenEmail(id)}
           />
         ) : <>
-        {viewMode === "table" && tableDialogOpen && (
+        {readingPane === "no_split" && tableDialogOpen && (
           <div className="table-dialog-toolbar">
             <span>Email</span>
             <button type="button" className="dialog-close" ref={readerCloseRef} onClick={closeTableDialog} aria-label="Close email">×</button>
@@ -2014,67 +2155,71 @@ export default function App() {
                   </div>
                 </div>
                 <div className="reader-side">
-                  <CompactSelect
-                    className={`label-select label-${selected.label}`}
-                    containerClassName={`category-compact-select label-${selected.label}`}
-                    value={selected.label}
-                    disabled={savingLabel || pendingLabel != null}
-                    aria-label="Email category"
-                    onChange={(event) => onChangeCategory(event.target.value as EmailLabel)}
-                  >
-                    {CLASSIFY_LABELS.map((item) => (
-                      <option key={item} value={item}>
-                        {CLASSIFY_LABEL_TITLES[item]}
-                      </option>
-                    ))}
-                  </CompactSelect>
-                  {selected.label === "interview_scheduled" && selected.interview_subtype && (
-                    <label className="interview-subtype-field">
-                      <span>Interview event</span>
-                      <span className="interview-subtype-control">
-                        <CompactSelect
-                        value={selected.interview_subtype}
-                        disabled={savingLabel || pendingLabel != null}
-                        aria-label="Interview subtype"
-                        onChange={async (event) => {
-                          const subtype = event.target.value as InterviewSubtype;
-                          const emailId = selected.id;
-                          setSavingLabel(true);
-                          try {
-                            const updated = await updateEmailLabel(emailId, "interview_scheduled", true, subtype);
-                            setSelected((prev) => prev?.id === emailId ? { ...prev, ...updated } : prev);
-                            setEmails((prev) => {
-                              const currentSubtype = filterRef.current.interviewSubtype;
-                              if (currentSubtype !== "all" && currentSubtype !== updated.interview_subtype) {
-                                return prev.filter((item) => item.id !== emailId);
-                              }
-                              return prev.map((item) => item.id === emailId ? { ...item, ...updated } : item);
-                            });
-                            setUnusedTraining((count) => count + 1);
-                            void refreshPromptStatus();
-                          } catch (err) {
-                            setBanner(err instanceof Error ? err.message : "Could not update interview subtype");
-                          } finally {
-                            setSavingLabel(false);
-                          }
-                        }}
-                        >
-                          {(Object.entries(INTERVIEW_SUBTYPE_TITLES) as [InterviewSubtype, string][]).map(([value, title]) => (
-                            <option key={value} value={value}>{title}</option>
-                          ))}
-                        </CompactSelect>
-                      </span>
+                  <div className="reader-controls">
+                    <CompactSelect
+                      className={`label-select label-${selected.label}`}
+                      containerClassName={`category-compact-select label-${selected.label}`}
+                      value={selected.label}
+                      disabled={savingLabel || pendingLabel != null}
+                      aria-label="Email category"
+                      onChange={(event) => onChangeCategory(event.target.value as EmailLabel)}
+                    >
+                      {CLASSIFY_LABELS.map((item) => (
+                        <option key={item} value={item}>
+                          {CLASSIFY_LABEL_TITLES[item]}
+                        </option>
+                      ))}
+                    </CompactSelect>
+                    {selected.label === "interview_scheduled" && selected.interview_subtype && (
+                      <label className="interview-subtype-field">
+                        <span>Interview event</span>
+                        <span className="interview-subtype-control">
+                          <CompactSelect
+                          value={selected.interview_subtype}
+                          disabled={savingLabel || pendingLabel != null}
+                          aria-label="Interview subtype"
+                          onChange={async (event) => {
+                            const subtype = event.target.value as InterviewSubtype;
+                            const emailId = selected.id;
+                            setSavingLabel(true);
+                            try {
+                              const updated = await updateEmailLabel(emailId, "interview_scheduled", true, subtype);
+                              setSelected((prev) => prev?.id === emailId ? { ...prev, ...updated } : prev);
+                              setEmails((prev) => {
+                                const currentSubtype = filterRef.current.interviewSubtype;
+                                if (currentSubtype !== "all" && currentSubtype !== updated.interview_subtype) {
+                                  return prev.filter((item) => item.id !== emailId);
+                                }
+                                return prev.map((item) => item.id === emailId ? { ...item, ...updated } : item);
+                              });
+                              setUnusedTraining((count) => count + 1);
+                              void refreshPromptStatus();
+                            } catch (err) {
+                              setBanner(err instanceof Error ? err.message : "Could not update interview subtype");
+                            } finally {
+                              setSavingLabel(false);
+                            }
+                          }}
+                          >
+                            {(Object.entries(INTERVIEW_SUBTYPE_TITLES) as [InterviewSubtype, string][]).map(([value, title]) => (
+                              <option key={value} value={value}>{title}</option>
+                            ))}
+                          </CompactSelect>
+                        </span>
+                      </label>
+                    )}
+                  </div>
+                  <div className="reader-secondary">
+                    <label className="train-check">
+                      <input
+                        type="checkbox"
+                        checked={saveTraining}
+                        onChange={(event) => setSaveTraining(event.target.checked)}
+                      />
+                      <span>Save as training data</span>
                     </label>
-                  )}
-                  <label className="train-check">
-                    <input
-                      type="checkbox"
-                      checked={saveTraining}
-                      onChange={(event) => setSaveTraining(event.target.checked)}
-                    />
-                    Save as training data
-                  </label>
-                  <time>{formatReaderTime(selected.received_at)}</time>
+                    <time>{formatReaderTime(selected.received_at)}</time>
+                  </div>
                 </div>
               </div>
               <EmailBody
@@ -2112,7 +2257,7 @@ export default function App() {
                   </form>
                   <footer>
                     <div className="reply-compose-actions">
-                      <div className="send-split"><button type="button" className="primary-btn" disabled={sendingReply || !replyText.trim() || !replyMailbox} onClick={() => { setScheduleAt(""); void sendReply(); }}>{sendingReply ? "Sending…" : "Send"}</button><button type="button" className="primary-btn send-menu" title="Schedule send" aria-label="Schedule send" disabled={sendingReply || !replyMailbox} onClick={() => { setSchedulePickerOpen(false); setScheduleDialogOpen(true); }}>◷</button></div>
+                      <div className="send-split"><button type="button" className="primary-btn" disabled={sendingReply || !replyText.trim() || !replyMailbox} onClick={() => { setScheduleAt(""); void sendReply(); }}>{sendingReply ? "Sending…" : "Send"}</button><button type="button" className="primary-btn send-menu" title="Schedule send" aria-label="Schedule send" disabled={sendingReply || !replyMailbox} onClick={() => setScheduleDialogOpen(true)}>◷</button></div>
                       <label className="reply-attach" title="Attach files">📎 <span>Attach</span><input type="file" multiple onChange={(event) => setReplyFiles(Array.from(event.target.files ?? []))} /></label>
                       {replyFiles.length > 0 && <span>{replyFiles.map((file) => file.name).join(", ")}</span>}
                     </div>
@@ -2129,9 +2274,9 @@ export default function App() {
       {scheduleDialogOpen && (
         <div className="dialog-backdrop" role="presentation">
           <div className="dialog schedule-dialog" role="dialog" aria-modal="true" aria-labelledby="schedule-send-title">
-            <header className="dialog-header"><div><h3 id="schedule-send-title">Schedule send</h3><p>Eastern Daylight Time</p></div><button type="button" className="dialog-close" aria-label="Close" onClick={() => setScheduleDialogOpen(false)}>×</button></header>
-            <div className="schedule-presets"><button type="button" onClick={() => chooseSchedulePreset(1, 8)}><span>Tomorrow morning</span><small>8:00 AM</small></button><button type="button" onClick={() => chooseSchedulePreset(0, 13)}><span>This afternoon</span><small>1:00 PM</small></button><button type="button" onClick={() => chooseSchedulePreset((8 - new Date().getDay()) % 7 || 7, 8)}><span>Monday morning</span><small>8:00 AM</small></button></div>
-            <div className="schedule-custom"><button type="button" onClick={() => setSchedulePickerOpen((open) => !open)}>▣ <span>Pick date & time</span></button>{schedulePickerOpen && <input type="datetime-local" value={scheduleAt} min={new Date().toISOString().slice(0, 16)} onChange={(event) => setScheduleAt(event.target.value)} />}</div>
+            <header className="dialog-header"><div><h3 id="schedule-send-title">Schedule send</h3><p>Times shown in {(Intl.DateTimeFormat().resolvedOptions().timeZone || "Local time").replaceAll("_", " ")}</p></div><button type="button" className="dialog-close" aria-label="Close" onClick={() => setScheduleDialogOpen(false)}>×</button></header>
+            <div className="schedule-presets"><button type="button" onClick={() => chooseSchedulePreset(1, 8)}><span>Tomorrow morning</span><small>8:00 AM</small></button><button type="button" onClick={() => chooseSchedulePreset(new Date().getHours() >= 13 ? 1 : 0, 13)}><span>{new Date().getHours() >= 13 ? "Tomorrow afternoon" : "This afternoon"}</span><small>1:00 PM</small></button><button type="button" onClick={() => chooseSchedulePreset((8 - new Date().getDay()) % 7 || 7, 8)}><span>Monday morning</span><small>8:00 AM</small></button></div>
+            <div className="schedule-custom"><ModernDateTimePicker label="Custom date and time" value={scheduleAt} min={localDateTimeValue(new Date())} minuteStep={5} onChange={setScheduleAt} /></div>
             {scheduleAt && <div className="dialog-actions schedule-confirm"><button type="button" className="primary-btn" onClick={() => { setScheduleDialogOpen(false); void sendReply(); }}>Schedule send</button></div>}
           </div>
         </div>

@@ -13,7 +13,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import Base
 from app.email import gmail
-from app.models import MailboxConnection, Provider, User
+from app.models import EmailLabel, EmailMessage, MailboxConnection, Provider, User
 from app.realtime import gmail_watch
 from app.services import mailbox_sync
 
@@ -250,6 +250,22 @@ def test_sync_uses_saved_cursor_and_full_rescan_bypasses_it(monkeypatch):
 
     asyncio.run(mailbox_sync.bootstrap_mailbox(db, mailbox, register_webhook=False, force_full=True))
     full.assert_awaited_once_with(db, mailbox, 500)
+    db.close()
+    engine.dispose()
+
+
+def test_full_gmail_refresh_set_includes_all_existing_interview_messages_only():
+    engine, db, mailbox = _mailbox(Provider.GOOGLE)
+    rows = [
+        EmailMessage(mailbox_id=mailbox.id, provider_message_id="scheduled", subject="Scheduled", sender="a@example.com", label=EmailLabel.INTERVIEW_SCHEDULED.value),
+        EmailMessage(mailbox_id=mailbox.id, provider_message_id="invitation", subject="Invitation", sender="a@example.com", label=EmailLabel.INTERVIEW_INVITATION.value),
+        EmailMessage(mailbox_id=mailbox.id, provider_message_id="outside-list-window", subject="Older scheduled", sender="a@example.com", label=EmailLabel.INTERVIEW_SCHEDULED.value),
+        EmailMessage(mailbox_id=mailbox.id, provider_message_id="other", subject="Other", sender="a@example.com", label=EmailLabel.OTHER.value),
+    ]
+    db.add_all(rows)
+    db.commit()
+
+    assert mailbox_sync._existing_calendar_ids(db, mailbox.id) == ["scheduled", "invitation", "outside-list-window"]
     db.close()
     engine.dispose()
 

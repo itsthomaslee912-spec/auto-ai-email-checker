@@ -32,7 +32,7 @@ from app.email.outlook import (
     outlook_list_delta,
     outlook_list_recent,
 )
-from app.models import EmailMessage, MailboxConnection, Provider
+from app.models import EmailLabel, EmailMessage, MailboxConnection, Provider
 from app.realtime.outlook_subscriptions import parse_outlook_subscription_ids
 from app.realtime.sse import publish
 from app.services.ingest import ingest_normalized_message
@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 FETCH_CHUNK = 80
 GMAIL_CONCURRENCY = 16
+GMAIL_CALENDAR_REFRESH_CONCURRENCY = 2
 OUTLOOK_FOLDERS = ("inbox", "junkemail", "deleteditems", "archive")
 
 _jobs: dict[int, dict[str, Any]] = {}
@@ -253,6 +254,31 @@ async def _existing_ids(db: Session, mailbox_id: int) -> set[str]:
     return {row[0] for row in rows if row[0]}
 
 
+def _existing_calendar_ids(db: Session, mailbox_id: int) -> list[str]:
+    """Return stored interview mail that a full rescan must re-download.
+
+    Older imports may have skipped detached ICS attachments. Refreshing only
+    calendar-relevant records repairs those messages without downloading every
+    previously stored email again. Do not limit this repair to the provider's
+    current listing window: an older stored invite may fall outside that window
+    while still needing its detached calendar attachment hydrated.
+    """
+    rows = (
+        db.query(EmailMessage.provider_message_id)
+        .filter(
+            EmailMessage.mailbox_id == mailbox_id,
+            EmailMessage.provider_message_id != "",
+            EmailMessage.label.in_((
+                EmailLabel.INTERVIEW_INVITATION.value,
+                EmailLabel.INTERVIEW_SCHEDULED.value,
+            )),
+        )
+        .order_by(EmailMessage.received_at.asc(), EmailMessage.id.asc())
+        .all()
+    )
+    return [row[0] for row in rows if row[0]]
+
+
 def _stamp_listed_outlook_folders(db: Session, mailbox_id: int, messages: list[dict]) -> None:
     id_to_folder = {
         str(raw["id"]): folder_from_outlook_well_known(str(raw.get("_mail_folder") or "inbox"))
@@ -397,41 +423,53 @@ async def _sync_gmail(db: Session, mailbox: MailboxConnection, limit: int) -> No
         )
         _stamp_listed_gmail_folders(db, mailbox.id, folder_map)
     new_ids = [mid for mid in ids if mid not in existing]
+    refresh_ids = _existing_calendar_ids(db, mailbox.id)
+    fetch_ids = list(dict.fromkeys([*new_ids, *refresh_ids]))
+    refresh_id_set = set(refresh_ids)
+    listed_refreshes = len(set(ids) & set(refresh_ids))
+    skipped = max(0, len(ids) - len(new_ids) - listed_refreshes)
     imported = 0
+    refreshed = 0
     failed = 0
     await _publish_progress(
         mailbox.id,
         listed=len(ids),
-        skipped=len(ids) - len(new_ids),
+        skipped=skipped,
         imported=0,
         failed=0,
         total=max(estimate, len(ids)),
-        message=f"Downloading {len(new_ids)} new messages...",
+        message=f"Downloading {len(new_ids)} new and {len(refresh_ids)} calendar messages...",
     )
     logger.info(
-        "Gmail sync mailbox=%s listed=%s new=%s skipped=%s estimate=%s",
+        "Gmail sync mailbox=%s listed=%s new=%s calendar_refresh=%s skipped=%s estimate=%s",
         mailbox.id,
         len(ids),
         len(new_ids),
-        len(ids) - len(new_ids),
+        len(refresh_ids),
+        skipped,
         estimate,
     )
 
-    for start in range(0, len(new_ids), FETCH_CHUNK):
+    for start in range(0, len(fetch_ids), FETCH_CHUNK):
         if _should_stop(mailbox.id):
             await _publish_progress(
                 mailbox.id,
                 imported=imported,
                 failed=failed,
-                skipped=len(ids) - len(new_ids),
+                skipped=skipped,
                 listed=len(ids),
                 total=max(estimate, len(ids)),
                 message="Stopping sync…",
             )
             return
         token = await ensure_google_access_token(db, mailbox)
-        chunk = new_ids[start : start + FETCH_CHUNK]
-        raws = await gmail_get_messages(token, chunk, concurrency=GMAIL_CONCURRENCY)
+        chunk = fetch_ids[start : start + FETCH_CHUNK]
+        concurrency = (
+            GMAIL_CALENDAR_REFRESH_CONCURRENCY
+            if any(mid in refresh_id_set for mid in chunk)
+            else GMAIL_CONCURRENCY
+        )
+        raws = await gmail_get_messages(token, chunk, concurrency=concurrency)
         got = {raw.get("id"): raw for raw in raws if raw.get("id")}
         for mid in chunk:
             raw = got.get(mid)
@@ -446,24 +484,27 @@ async def _sync_gmail(db: Session, mailbox: MailboxConnection, limit: int) -> No
             email = await ingest_normalized_message(db, mailbox, normalized, download_only=True)
             if email:
                 imported += 1
-            if (imported + failed) % 10 == 0 or imported + failed == len(new_ids):
+            elif mid in existing:
+                refreshed += 1
+            processed = imported + refreshed + failed
+            if processed % 10 == 0 or processed == len(fetch_ids):
                 await _publish_progress(
                     mailbox.id,
                     imported=imported,
                     failed=failed,
-                    skipped=len(ids) - len(new_ids),
+                    skipped=skipped,
                     listed=len(ids),
                     total=max(estimate, len(ids)),
-                    message=f"Imported {imported} of {len(new_ids)} new messages",
+                    message=f"Imported {imported} new and refreshed {refreshed} calendar messages",
                 )
     await _publish_progress(
         mailbox.id,
         imported=imported,
         failed=failed,
-        skipped=len(ids) - len(new_ids),
+        skipped=skipped,
         listed=len(ids),
         total=max(estimate, len(ids)),
-        message=f"Imported {imported} of {len(new_ids)} new messages",
+        message=f"Imported {imported} new and refreshed {refreshed} calendar messages",
     )
 
 

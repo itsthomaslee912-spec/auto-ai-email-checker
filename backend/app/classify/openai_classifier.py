@@ -336,6 +336,14 @@ def _looks_like_cold_jd_blast(text: str) -> bool:
 def infer_interview_subtype(subject: str, sender: str, body_text: str, snippet: str) -> str:
     """Metadata for scheduled interviews; never a primary category."""
     text = _combined_text(subject, sender, body_text, snippet)
+    # Microsoft Bookings confirmations include a permanent management link
+    # labeled "reschedule or cancel". That boilerplate is not a change to the
+    # appointment and must not override the message's confirmation purpose.
+    text = re.sub(
+        r"use the following link to reschedule or cancel (?:this|the)\s+mee\s*ting\b",
+        " ",
+        text,
+    )
     if re.search(r"\b(interview|meeting)\b.{0,100}\b(cancelled|canceled)\b|\b(cancelled|canceled)\b.{0,100}\b(interview|meeting)\b", text):
         return "cancellation"
     if re.search(r"\b(reschedul\w*|moved to|new date)\b", text):
@@ -352,7 +360,21 @@ def infer_interview_subtype(subject: str, sender: str, body_text: str, snippet: 
 def _is_scheduled_interview(text: str) -> bool:
     if _looks_like_cold_jd_blast(text) or _is_application_received(text):
         return False
+    has_fixed_appointment = bool(
+        re.search(
+            r"\bdate\s*:\s*(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+            text,
+        )
+        and re.search(r"\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", text)
+        and re.search(
+            r"\b(?:thank you for providing your availability|upcoming (?:discussion|interview|conversation))\b",
+            text,
+        )
+    )
+    if has_fixed_appointment:
+        return True
     return any(re.search(pattern, text) for pattern in (
+        r"\bmeeting was scheduled from the bookings page of\b",
         r"\b(your|the) interview (is|has been|was|will be) (scheduled|confirmed|moved|rescheduled|cancelled|canceled)\b",
         r"\bconfirmed for your interview\b",
         r"\binterview\b.{0,90}\b(on|at)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|\d{1,2}(:\d{2})?\s*(am|pm))\b",

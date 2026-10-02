@@ -36,6 +36,7 @@ async def ingest_normalized_message(
     )
     if existing is not None:
         changed = False
+        content_changed = False
         folder = normalize_folder(normalized.get("folder"))
         if existing.folder != folder:
             existing.folder = folder
@@ -50,7 +51,35 @@ async def ingest_normalized_message(
         if existing.is_read != new_is_read:
             existing.is_read = new_is_read
             changed = True
+        # A provider can return a richer version of an existing message later
+        # (most importantly after fetching a detached text/calendar part).
+        # Keep user classification fields intact, but refresh provider-owned
+        # message content so calendar extraction can see the complete invite.
+        provider_fields = {
+            "thread_id": normalized.get("thread_id"),
+            "subject": normalized.get("subject") or "",
+            "sender": normalized.get("sender") or "",
+            "snippet": (normalized.get("snippet") or "")[:1000],
+            "body_text": normalized.get("body_text") or "",
+            "body_html": normalized.get("body_html") or "",
+        }
+        for field, value in provider_fields.items():
+            if getattr(existing, field) != value:
+                setattr(existing, field, value)
+                changed = True
+                content_changed = True
         if changed:
+            if content_changed:
+                # Make the changed content visible to the calendar processor;
+                # process_calendar_email will preserve label corrections.
+                db.flush()
+                try:
+                    # Keep a single malformed legacy item from invalidating the
+                    # provider-content refresh or the rest of a bulk repair.
+                    with db.begin_nested():
+                        await process_calendar_email(db, existing, force=True, use_ai=not download_only)
+                except Exception:
+                    logger.exception("Calendar refresh failed during existing-message ingest email_id=%s", existing.id)
             db.commit()
         return None
 

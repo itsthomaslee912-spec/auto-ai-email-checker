@@ -5,12 +5,13 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models import CalendarEvent, MailboxConnection
+from app.models import CalendarEvent, CalendarEventEmail, EmailMessage, MailboxConnection
 from app.realtime.sse import publish
-from app.schemas import CalendarEventCreateIn, CalendarEventOut, CalendarEventUpdateIn
+from app.schemas import CalendarEventCreateIn, CalendarEventOut, CalendarEventUpdateIn, EmailDetailOut
 from app.timeutil import as_utc
 
 router = APIRouter(prefix="/api/calendar-events", tags=["calendar"])
@@ -45,6 +46,8 @@ def _event_out(event: CalendarEvent, mailbox: MailboxConnection | None = None) -
         title=event.title,
         company=event.company or "",
         role=event.job_role or "",
+        interviewer=event.interviewer or "",
+        work_model=event.work_model or "unspecified",
         job_url=event.job_url,
         description=event.description or "",
         start_at=event.start_at,
@@ -119,6 +122,74 @@ def get_calendar_event(event_id: int, db: Session = Depends(get_db)) -> Calendar
     return _event_out(event)
 
 
+@router.get("/{event_id}/emails", response_model=list[EmailDetailOut])
+def list_calendar_event_emails(event_id: int, db: Session = Depends(get_db)) -> list[EmailMessage]:
+    """Return every stored email linked to an event, newest first."""
+    event = _event_query(db).filter(CalendarEvent.id == event_id).one_or_none()
+    if event is None:
+        raise HTTPException(status_code=404, detail="Calendar event not found")
+
+    # Include legacy availability rows that were folded into this confirmed
+    # event. This recovers invitations created before durable links existed.
+    superseded_events = (
+        db.query(CalendarEvent)
+        .filter(
+            CalendarEvent.mailbox_id == event.mailbox_id,
+            CalendarEvent.superseded_by_event_id == event.id,
+        )
+        .all()
+    )
+    related_events = [event, *superseded_events]
+    related_event_ids = {item.id for item in related_events}
+    linked_ids = {
+        email_id
+        for item in related_events
+        for email_id in (item.source_email_id, item.outcome_source_email_id)
+        if email_id is not None
+    }
+    linked_ids.update(
+        row[0]
+        for row in db.query(CalendarEventEmail.email_id)
+        .filter(CalendarEventEmail.event_id.in_(related_event_ids))
+        .all()
+    )
+
+    thread_ids = {item.source_thread_id for item in related_events if item.source_thread_id}
+    if linked_ids:
+        thread_ids.update(
+            row[0]
+            for row in db.query(EmailMessage.thread_id)
+            .filter(
+                EmailMessage.mailbox_id == event.mailbox_id,
+                EmailMessage.id.in_(linked_ids),
+                EmailMessage.thread_id.is_not(None),
+            )
+            .all()
+            if row[0]
+        )
+
+    associations = []
+    if thread_ids:
+        associations.append(EmailMessage.thread_id.in_(thread_ids))
+    if linked_ids:
+        associations.append(EmailMessage.id.in_(linked_ids))
+    if not associations:
+        return []
+
+    return (
+        db.query(EmailMessage)
+        .filter(
+            EmailMessage.mailbox_id == event.mailbox_id,
+            or_(*associations),
+        )
+        .order_by(
+            func.coalesce(EmailMessage.received_at, EmailMessage.created_at).desc(),
+            EmailMessage.id.desc(),
+        )
+        .all()
+    )
+
+
 @router.post("", response_model=CalendarEventOut, status_code=201)
 async def create_calendar_event(
     payload: CalendarEventCreateIn,
@@ -133,6 +204,8 @@ async def create_calendar_event(
         title=payload.title.strip(),
         company=payload.company.strip(),
         job_role=payload.role.strip(),
+        interviewer=payload.interviewer.strip(),
+        work_model=payload.work_model,
         job_url=_validate_url(payload.job_url),
         description=payload.description.strip(),
         start_at=start_at,
@@ -170,6 +243,10 @@ async def update_calendar_event(
         event.company = (payload.company or "").strip()
     if "role" in fields:
         event.job_role = (payload.role or "").strip()
+    if "interviewer" in fields:
+        event.interviewer = (payload.interviewer or "").strip()
+    if "work_model" in fields and payload.work_model is not None:
+        event.work_model = payload.work_model
     if "job_url" in fields:
         event.job_url = _validate_url(payload.job_url)
     if "description" in fields:

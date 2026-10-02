@@ -185,6 +185,16 @@ def init_db() -> None:
                 conn.execute(text(
                     "ALTER TABLE email_messages ADD COLUMN calendar_processing_error VARCHAR(512)"
                 ))
+        if "calendar_events" in tables:
+            calendar_cols = {c["name"] for c in inspect(conn).get_columns("calendar_events")}
+            if "interviewer" not in calendar_cols:
+                conn.execute(text(
+                    "ALTER TABLE calendar_events ADD COLUMN interviewer VARCHAR(255) DEFAULT ''"
+                ))
+            if "work_model" not in calendar_cols:
+                conn.execute(text(
+                    "ALTER TABLE calendar_events ADD COLUMN work_model VARCHAR(32) DEFAULT 'unspecified'"
+                ))
 
     # Lightweight SQLite column / label migrations for existing DBs
     if settings.database_url.startswith("sqlite"):

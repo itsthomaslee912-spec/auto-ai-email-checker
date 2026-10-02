@@ -92,3 +92,73 @@ def test_download_only_queues_other_without_ai_processing(tmp_path, monkeypatch)
         assert email.interview_subtype is None
         assert email.outcome_extracted is False
     engine.dispose()
+
+
+def test_existing_message_refreshes_calendar_attachment_content(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'refresh.db'}", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    with Session() as db:
+        user = User(external_id="refresh-existing")
+        db.add(user)
+        db.flush()
+        mailbox = MailboxConnection(user_id=user.id, provider=Provider.GOOGLE.value, email_address="refresh@example.com", access_token_enc="x", is_active=True)
+        db.add(mailbox)
+        db.flush()
+        email = EmailMessage(mailbox_id=mailbox.id, provider_message_id="calendar-message", thread_id="thread-old", subject="Interview", sender="recruiter@example.com", body_text="Confirmation only", label=EmailLabel.INTERVIEW_SCHEDULED.value)
+        db.add(email)
+        db.commit()
+
+        calls = []
+
+        async def process(_db, refreshed, *, force=False, use_ai=True):
+            calls.append((refreshed.id, refreshed.body_text, force, use_ai))
+            return True
+
+        monkeypatch.setattr("app.services.ingest.process_calendar_email", process)
+        result = asyncio.run(ingest_normalized_message(db, mailbox, {
+            "provider_message_id": "calendar-message",
+            "thread_id": "thread-new",
+            "subject": "Interview",
+            "sender": "recruiter@example.com",
+            "body_text": "Confirmation only\nBEGIN:VCALENDAR\nDTSTART:20261005T140000Z",
+        }, download_only=True))
+
+        assert result is None
+        db.refresh(email)
+        assert email.thread_id == "thread-new"
+        assert "BEGIN:VCALENDAR" in email.body_text
+        assert calls == [(email.id, email.body_text, True, False)]
+    engine.dispose()
+
+
+def test_existing_message_keeps_provider_refresh_when_calendar_repair_fails(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'failed-repair.db'}", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    with Session() as db:
+        user = User(external_id="failed-calendar-repair")
+        db.add(user)
+        db.flush()
+        mailbox = MailboxConnection(user_id=user.id, provider=Provider.GOOGLE.value, email_address="repair@example.com", access_token_enc="x", is_active=True)
+        db.add(mailbox)
+        db.flush()
+        email = EmailMessage(mailbox_id=mailbox.id, provider_message_id="calendar-message", subject="Interview", sender="recruiter@example.com", body_text="Incomplete", label=EmailLabel.INTERVIEW_SCHEDULED.value)
+        db.add(email)
+        db.commit()
+
+        async def fail_repair(*_args, **_kwargs):
+            raise RuntimeError("legacy repair failed")
+
+        monkeypatch.setattr("app.services.ingest.process_calendar_email", fail_repair)
+        result = asyncio.run(ingest_normalized_message(db, mailbox, {
+            "provider_message_id": "calendar-message",
+            "subject": "Interview",
+            "sender": "recruiter@example.com",
+            "body_text": "Complete provider content",
+        }, download_only=True))
+
+        assert result is None
+        db.refresh(email)
+        assert email.body_text == "Complete provider content"
+    engine.dispose()

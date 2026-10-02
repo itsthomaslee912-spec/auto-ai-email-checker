@@ -453,6 +453,29 @@ async def update_email_label(
     return email
 
 
+@router.get("/{email_id}/conversation", response_model=list[EmailDetailOut])
+def get_email_conversation(
+    email_id: int,
+    db: Session = Depends(get_db),
+) -> list[EmailMessage]:
+    """Return the stored messages associated with an email without marking them read."""
+    email = _email_from_active_mailbox(db, email_id)
+    if email is None:
+        raise HTTPException(status_code=404, detail="Email not found")
+    if not email.thread_id:
+        return [email]
+    return (
+        _from_active_mailbox(db.query(EmailMessage))
+        .filter(
+            EmailMessage.mailbox_id == email.mailbox_id,
+            EmailMessage.thread_id == email.thread_id,
+        )
+        .order_by(EmailMessage.received_at.asc(), EmailMessage.id.asc())
+        .limit(50)
+        .all()
+    )
+
+
 @router.post("/send", response_model=SendEmailOut)
 async def send_email(payload: SendEmailIn, db: Session = Depends(get_db)) -> SendEmailOut:
     mailbox = (

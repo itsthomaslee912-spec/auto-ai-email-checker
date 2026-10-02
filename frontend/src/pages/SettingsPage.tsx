@@ -24,16 +24,18 @@ import {
   FONT_FAMILIES,
   FONT_SIZES,
   INBOX_TYPES,
+  READING_PANES,
   VIEW_MODES,
   type FontFamily,
   type FontSize,
   type InboxType,
+  type ReadingPane,
   type ViewMode,
 } from "../prefs";
 import type { ThemePref } from "../theme";
 import AccountSelect from "../components/AccountSelect";
 import CompactSelect from "../components/CompactSelect";
-import DateTimeField from "../components/DateTimeField";
+import ModernDateTimePicker from "../components/ModernDateTimePicker";
 import LabelPieChart from "../components/LabelPieChart";
 
 export type SettingsSection = "accounts" | "appearance" | "ai" | "training" | "statistics";
@@ -106,6 +108,8 @@ export default function SettingsPage({
   onViewModeChange,
   inboxType,
   onInboxTypeChange,
+  readingPane,
+  onReadingPaneChange,
   fontFamily,
   onFontFamilyChange,
   fontSize,
@@ -137,6 +141,8 @@ export default function SettingsPage({
   onViewModeChange: (mode: ViewMode) => void;
   inboxType: InboxType;
   onInboxTypeChange: (type: InboxType) => void;
+  readingPane: ReadingPane;
+  onReadingPaneChange: (pane: ReadingPane) => void;
   fontFamily: FontFamily;
   onFontFamilyChange: (font: FontFamily) => void;
   fontSize: FontSize;
@@ -533,7 +539,25 @@ export default function SettingsPage({
                         className={viewMode === mode ? "seg-btn active" : "seg-btn"}
                         onClick={() => onViewModeChange(mode)}
                       >
-                        {mode === "list" ? "List" : mode === "card" ? "Card" : "Table"}
+                        {mode === "list" ? "List" : "Table"}
+                      </button>
+                    ))}
+                  </div>
+                </section>
+                <section className="settings-block">
+                  <h3>Reading pane</h3>
+                  <p className="settings-help">Where the selected message appears beside the inbox.</p>
+                  <div className="seg-control" role="radiogroup" aria-label="Reading pane">
+                    {READING_PANES.map((pane) => (
+                      <button
+                        key={pane.id}
+                        type="button"
+                        role="radio"
+                        aria-checked={readingPane === pane.id}
+                        className={readingPane === pane.id ? "seg-btn active" : "seg-btn"}
+                        onClick={() => onReadingPaneChange(pane.id)}
+                      >
+                        {pane.label}
                       </button>
                     ))}
                   </div>
@@ -877,8 +901,8 @@ export default function SettingsPage({
                         void loadOutcomes(value, 0);
                       }}
                     />
-                    <DateTimeField label="From" value={dateFrom} onChange={setDateFrom} />
-                    <DateTimeField label="To" value={dateTo} onChange={setDateTo} />
+                    <ModernDateTimePicker label="From" value={dateFrom} onChange={setDateFrom} />
+                    <ModernDateTimePicker label="To" value={dateTo} onChange={setDateTo} />
                     <button type="submit" className="action-btn" disabled={statsLoading}>
                       {statsLoading ? "Loading…" : "Search"}
                     </button>

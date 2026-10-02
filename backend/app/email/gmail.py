@@ -80,6 +80,47 @@ def _extract_parts(payload: dict) -> tuple[str, str]:
     return plain.strip(), html.strip()
 
 
+def _calendar_attachment_parts(payload: dict) -> list[dict]:
+    """Return calendar MIME parts whose content must be fetched separately."""
+    matches: list[dict] = []
+    stack = [payload]
+    while stack:
+        part = stack.pop()
+        body = part.get("body") or {}
+        filename = (part.get("filename") or "").lower()
+        if (_mime_type(part) == "text/calendar" or filename.endswith(".ics")) and body.get("attachmentId") and not body.get("data"):
+            matches.append(part)
+        stack.extend(part.get("parts") or [])
+    return matches
+
+
+async def _hydrate_calendar_attachments(
+    client: httpx.AsyncClient,
+    access_token: str,
+    message_id: str,
+    payload: dict,
+) -> None:
+    """Inline small ICS attachments so normalization and calendar extraction see them."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    for part in _calendar_attachment_parts(payload):
+        body = part.get("body") or {}
+        attachment_id = body.get("attachmentId")
+        try:
+            resp = await client.get(
+                f"{GMAIL_API}/users/me/messages/{message_id}/attachments/{attachment_id}",
+                headers=headers,
+            )
+            if resp.status_code >= 400:
+                logger.warning("Gmail calendar attachment fetch failed for %s: %s", message_id, resp.status_code)
+                continue
+            data = resp.json().get("data")
+            if data:
+                body["data"] = data
+                part["body"] = body
+        except (httpx.HTTPError, ValueError):
+            logger.exception("Gmail calendar attachment fetch failed for %s", message_id)
+
+
 def _header(headers: list[dict], name: str) -> str:
     for h in headers:
         if h.get("name", "").lower() == name.lower():
@@ -200,7 +241,9 @@ async def gmail_get_message(access_token: str, message_id: str) -> dict:
             raise HTTPException(status_code=404, detail="Gmail message no longer exists")
         if resp.status_code >= 400:
             raise HTTPException(status_code=400, detail=f"Gmail get message failed: {resp.text}")
-        return resp.json()
+        raw = resp.json()
+        await _hydrate_calendar_attachments(client, access_token, message_id, raw.get("payload") or {})
+        return raw
 
 
 async def gmail_get_messages(
@@ -255,7 +298,9 @@ async def gmail_get_messages(
                 if resp.status_code >= 400:
                     logger.warning("Gmail get %s failed: %s", mid, resp.text[:180])
                     return None
-                return resp.json()
+                raw = resp.json()
+                await _hydrate_calendar_attachments(client, access_token, mid, raw.get("payload") or {})
+                return raw
             return None
 
     async with httpx.AsyncClient(timeout=45) as client:

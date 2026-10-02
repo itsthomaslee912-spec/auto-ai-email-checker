@@ -235,6 +235,8 @@ class CalendarEvent(Base):
     title: Mapped[str] = mapped_column(String(512), default="Interview")
     company: Mapped[str] = mapped_column(String(255), default="")
     job_role: Mapped[str] = mapped_column(String(255), default="")
+    interviewer: Mapped[str] = mapped_column(String(255), default="")
+    work_model: Mapped[str] = mapped_column(String(32), default="unspecified")
     job_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     description: Mapped[str] = mapped_column(Text, default="")
     start_at: Mapped[datetime] = mapped_column(UtcDateTime(), index=True)
@@ -255,3 +257,25 @@ class CalendarEvent(Base):
     )
 
     mailbox: Mapped[MailboxConnection] = relationship(back_populates="calendar_events")
+
+
+class CalendarEventEmail(Base):
+    """Durable many-to-many links between calendar items and source messages.
+
+    Calendar providers do not reliably keep invitations, confirmations, and
+    updates in one thread, so CalendarEvent.source_email_id alone cannot retain
+    the complete history after a later message becomes the event's new source.
+    """
+
+    __tablename__ = "calendar_event_emails"
+    __table_args__ = (Index("ix_calendar_event_emails_email", "email_id"),)
+
+    event_id: Mapped[int] = mapped_column(
+        ForeignKey("calendar_events.id", ondelete="CASCADE"), primary_key=True
+    )
+    email_id: Mapped[int] = mapped_column(
+        ForeignKey("email_messages.id", ondelete="CASCADE"), primary_key=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

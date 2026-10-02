@@ -225,6 +225,7 @@ InterviewStatusLiteral = Literal[
 ]
 ApplicationStatusLiteral = Literal["active", "rejected", "position_closed"]
 MeetingTypeLiteral = Literal["video", "phone", "in_person", "unspecified"]
+WorkModelLiteral = Literal["remote", "hybrid", "on_site", "unspecified"]
 
 
 class CalendarEventCreateIn(BaseModel):
@@ -232,6 +233,8 @@ class CalendarEventCreateIn(BaseModel):
     title: str = Field(min_length=1, max_length=512)
     company: str = Field(default="", max_length=255)
     role: str = Field(default="", max_length=255)
+    interviewer: str = Field(default="", max_length=255)
+    work_model: WorkModelLiteral = "unspecified"
     job_url: str | None = Field(default=None, max_length=2048)
     description: str = Field(default="", max_length=10000)
     start_at: UtcDateTime
@@ -250,6 +253,8 @@ class CalendarEventUpdateIn(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=512)
     company: str | None = Field(default=None, max_length=255)
     role: str | None = Field(default=None, max_length=255)
+    interviewer: str | None = Field(default=None, max_length=255)
+    work_model: WorkModelLiteral | None = None
     job_url: str | None = Field(default=None, max_length=2048)
     description: str | None = Field(default=None, max_length=10000)
     start_at: UtcDateTime | None = None
@@ -275,6 +280,8 @@ class CalendarEventOut(BaseModel):
     title: str
     company: str = ""
     role: str = ""
+    interviewer: str = ""
+    work_model: WorkModelLiteral = "unspecified"
     job_url: str | None = None
     description: str = ""
     start_at: UtcDateTime

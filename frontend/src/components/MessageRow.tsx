@@ -24,7 +24,7 @@ export default function MessageRow({
   onDoubleOpen: (id: number) => void;
 }) {
   const itemClass = [
-    viewMode === "card" ? "msg-card" : "msg-item",
+    "msg-item",
     active ? "active" : "",
     email.is_read ? "" : "unread",
   ]
