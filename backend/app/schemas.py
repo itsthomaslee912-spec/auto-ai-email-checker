@@ -223,7 +223,7 @@ CalendarEventKindLiteral = Literal["availability", "confirmed"]
 InterviewStatusLiteral = Literal[
     "confirmation", "calendar_invite", "reminder", "reschedule", "time_change", "cancellation"
 ]
-ApplicationStatusLiteral = Literal["active", "rejected", "position_closed"]
+ApplicationStatusLiteral = Literal["active", "passed", "rejected", "position_closed"]
 MeetingTypeLiteral = Literal["video", "phone", "in_person", "unspecified"]
 WorkModelLiteral = Literal["remote", "hybrid", "on_site", "unspecified"]
 

@@ -4064,12 +4064,27 @@ button:active:not(:disabled) {
 .calendar-event.selected { z-index: 5; background: color-mix(in srgb, var(--account-color) 32%, var(--calendar-control)); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--account-color) 72%, transparent), 0 5px 16px color-mix(in srgb, var(--account-color) 18%, transparent); }
 .calendar-event:focus-visible { box-shadow: inset 0 0 0 2px var(--calendar-control), 0 0 0 2px var(--account-color); }
 .calendar-event.availability { border: 1px dashed var(--account-color); border-left-width: 3px; background: color-mix(in srgb, var(--account-color) 12%, var(--calendar-control)); }
-.calendar-event.canceled { opacity: .5; text-decoration: line-through; }
 .calendar-event.has-meeting-type { padding-right: 1.85rem; }
+.calendar-event.has-outcome { padding-right: 3.3rem; }
+.calendar-event.status-passed { --outcome-color: #22c55e; border-left-color: var(--outcome-color); background: linear-gradient(115deg, color-mix(in srgb, var(--outcome-color) 30%, var(--calendar-control)), color-mix(in srgb, var(--outcome-color) 13%, var(--calendar-control))); animation: calendar-passed-alarm 1.8s ease-in-out infinite; }
+.calendar-event.status-rejected { --outcome-color: #ef4444; border-left-color: var(--outcome-color); background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--outcome-color) 20%, var(--calendar-control)) 0 9px, color-mix(in srgb, var(--outcome-color) 11%, var(--calendar-control)) 9px 18px); animation: calendar-outcome-settle 420ms cubic-bezier(.2,.8,.2,1); }
+.calendar-event.status-position-closed { --outcome-color: #64748b; border-left-color: var(--outcome-color); background: linear-gradient(115deg, color-mix(in srgb, var(--outcome-color) 26%, var(--calendar-control)), color-mix(in srgb, var(--outcome-color) 10%, var(--calendar-control))); animation: calendar-closed-settle 520ms cubic-bezier(.2,.8,.2,1); }
+.calendar-event.canceled { border-left-color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, var(--calendar-control)); animation: none; }
+.calendar-event.canceled .calendar-event-company { opacity: .62; text-decoration: line-through; }
+@keyframes calendar-passed-alarm { 0%, 70%, 100% { box-shadow: var(--shadow-sm); } 78% { box-shadow: 0 0 0 2px color-mix(in srgb, #22c55e 30%, transparent), 0 0 16px color-mix(in srgb, #22c55e 34%, transparent); } 86% { box-shadow: 0 0 0 5px color-mix(in srgb, #22c55e 0%, transparent), var(--shadow-sm); } }
+@keyframes calendar-outcome-settle { from { opacity: .55; filter: saturate(.35); transform: scale(.96); } to { opacity: 1; filter: saturate(1); transform: scale(1); } }
+@keyframes calendar-closed-settle { from { clip-path: inset(0 0 100% 0); } to { clip-path: inset(0); } }
 .calendar-event-company { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .calendar-event-company { font-size: .72rem; font-weight: 780; line-height: 1.15; }
+.event-canceled-badge { max-width: 100%; display: inline-flex; align-items: center; align-self: flex-start; gap: .2rem; overflow: hidden; padding: .1rem .3rem; border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--calendar-border)); border-radius: 999px; background: color-mix(in srgb, var(--danger) 14%, var(--calendar-control)); color: var(--danger); font-size: .58rem; font-weight: 780; line-height: 1; text-decoration: none; text-overflow: ellipsis; white-space: nowrap; }
+.event-canceled-badge svg { width: .62rem; height: .62rem; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.55; stroke-linecap: round; }
 .event-type-badge { position: absolute; z-index: 2; top: .22rem; right: .28rem; width: 1.2rem; min-width: 1.2rem; height: 1.2rem; display: inline-flex; align-items: center; justify-content: center; padding: 0; border: 1px solid color-mix(in srgb, var(--account-color) 42%, var(--calendar-border)); border-radius: 999px; background: color-mix(in srgb, var(--account-color) 16%, var(--calendar-control)); color: color-mix(in srgb, var(--account-color) 58%, var(--ink)); line-height: 1; }
 .event-type-badge svg { width: .72rem; height: .72rem; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; }
+.calendar-event.has-outcome .event-type-badge { right: 1.72rem; }
+.event-outcome-badge { position: absolute; z-index: 3; top: .22rem; right: .28rem; width: 1.2rem; height: 1.2rem; display: inline-flex; align-items: center; justify-content: center; border: 1px solid color-mix(in srgb, var(--outcome-color) 55%, var(--calendar-border)); border-radius: 999px; background: color-mix(in srgb, var(--outcome-color) 20%, var(--calendar-control)); color: color-mix(in srgb, var(--outcome-color) 75%, var(--ink)); }
+.event-outcome-badge svg { width: .72rem; height: .72rem; fill: none; stroke: currentColor; stroke-width: 1.55; stroke-linecap: round; stroke-linejoin: round; }
+.calendar-event.status-passed .event-outcome-badge { transform-origin: 50% 12%; animation: calendar-alarm-ring 1.8s ease-in-out infinite; }
+@keyframes calendar-alarm-ring { 0%, 70%, 100% { transform: rotate(0); } 74% { transform: rotate(18deg); } 78% { transform: rotate(-16deg); } 82% { transform: rotate(12deg); } 86% { transform: rotate(-8deg); } 90% { transform: rotate(0); } }
 .calendar-event-hover-card { position: fixed; z-index: 100; width: min(18rem, calc(100vw - 1.5rem)); padding: .58rem .72rem; border: 1px solid var(--calendar-border, var(--line)); border-radius: 10px; background: var(--surface-glass); color: var(--ink); box-shadow: var(--shadow-md); pointer-events: none; opacity: 0; backdrop-filter: blur(18px) saturate(130%); transition: opacity 140ms ease, transform 180ms cubic-bezier(.2,.8,.2,1); will-change: opacity, transform; }
 .calendar-event-hover-card.above { transform: translateY(calc(-100% - 5px)) scale(.97); transform-origin: bottom center; }
 .calendar-event-hover-card.above.is-visible { transform: translateY(-100%) scale(1); }
@@ -4085,6 +4100,13 @@ button:active:not(:disabled) {
 .calendar-event-hover-card .calendar-hover-type dd { align-items: center; }
 .calendar-event-hover-card .calendar-hover-type dd span { min-width: 0; }
 .calendar-event-hover-card dd svg { width: .82rem; height: .82rem; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; color: var(--accent); }
+.calendar-event-hover-card .calendar-hover-status.status-passed dd, .details-status-row.status-passed dd { color: #16a34a; }
+.calendar-event-hover-card .calendar-hover-status.status-rejected dd, .details-status-row.status-rejected dd { color: var(--danger); }
+.calendar-event-hover-card .calendar-hover-status.status-position-closed dd, .details-status-row.status-position-closed dd { color: var(--muted); }
+.calendar-event-hover-card .calendar-hover-status dd svg { color: currentColor; }
+.calendar-event-hover-card .calendar-hover-canceled dd, .details-canceled-row dd { color: var(--danger); }
+.calendar-event-hover-card .calendar-hover-canceled dd svg, .details-canceled-row dd svg { width: .9rem; height: .9rem; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.55; stroke-linecap: round; }
+.details-status-row dd svg { width: .9rem; height: .9rem; fill: none; stroke: currentColor; stroke-width: 1.55; stroke-linecap: round; stroke-linejoin: round; }
 .event-badge { padding: .1rem .32rem; border: 1px solid transparent; border-radius: 999px; font-size: .62rem; font-weight: 750; }
 .event-badge.danger { border-color: color-mix(in srgb, var(--danger) 34%, var(--calendar-border)); background: color-mix(in srgb, var(--danger) 14%, var(--calendar-control)); color: color-mix(in srgb, var(--danger) 72%, var(--ink)); }
 .event-badge.warning { border-color: color-mix(in srgb, var(--warn) 38%, var(--calendar-border)); background: color-mix(in srgb, var(--warn) 16%, var(--calendar-control)); color: color-mix(in srgb, var(--warn) 70%, var(--ink)); }
@@ -4112,6 +4134,7 @@ button:active:not(:disabled) {
 .calendar-event.timed { position: absolute; z-index: 3; right: auto; min-height: 28px; overflow: hidden; align-content: start; box-shadow: var(--shadow-sm); }
 .calendar-event.timed.very-short { flex-direction: row; align-items: center; gap: .25rem; padding-block: .2rem; }
 .calendar-event.timed.very-short .calendar-event-company { flex: 1; }
+.calendar-event.timed.very-short .event-canceled-badge { flex: 0 0 auto; }
 .calendar-drag-selection { position: absolute; z-index: 5; left: 3px; right: 3px; min-height: 12px; border: 1px solid var(--accent); border-radius: 6px; background: color-mix(in srgb, var(--accent) 24%, transparent); color: var(--ink); pointer-events: none; }
 .calendar-drag-selection span { position: absolute; left: .3rem; top: .15rem; padding: .08rem .25rem; border-radius: 4px; background: var(--bg-elev); font-size: .65rem; white-space: nowrap; }
 .calendar-now-line { position: absolute; z-index: 4; left: 0; right: 0; height: 2px; background: #ef4444; pointer-events: none; }
@@ -4234,6 +4257,9 @@ button:active:not(:disabled) {
 
 .details-primary-action:hover { filter: brightness(1.08); box-shadow: 0 7px 18px color-mix(in srgb, var(--accent) 32%, transparent); }
 .details-primary-action:active { transform: translateY(1px); }
+.details-primary-action.is-static { cursor: default; }
+.details-primary-action.is-static:hover { filter: none; box-shadow: 0 5px 14px color-mix(in srgb, var(--accent) 25%, transparent); }
+.details-primary-action.is-static:active { transform: none; }
 .details-primary-action > svg { width: .95rem; height: .95rem; fill: none; stroke: currentColor; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; }
 .details-primary-action .details-action-arrow { width: .8rem; height: .8rem; margin-left: .1rem; opacity: .8; }
 
@@ -4826,10 +4852,10 @@ button:active:not(:disabled) {
 .sidebar-health-row[data-state="error"] .sidebar-health-dot,
 .sidebar-health-row[data-state="stopped"] .sidebar-health-dot,
 .sidebar-health-row[data-state="offline"] .sidebar-health-dot { background: var(--danger); box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 14%, transparent); }
-.sidebar-health-copy { min-width: 0; flex: 1; display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: center; gap: .65rem; }
-.sidebar-health-name { flex: 0 0 auto; color: color-mix(in srgb, var(--ink) 92%, var(--muted)); font-size: .76rem; font-weight: 650; }
-.sidebar-health-value { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: .32rem; overflow: hidden; color: var(--muted); font-size: .69rem; white-space: nowrap; }
-.sidebar-health-status { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.sidebar-health-copy { min-width: 0; flex: 1; display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: baseline; gap: .65rem; }
+.sidebar-health-name { flex: 0 0 auto; color: color-mix(in srgb, var(--ink) 92%, var(--muted)); font-size: .76rem; font-weight: 650; line-height: 1.25; }
+.sidebar-health-value { min-width: 0; display: flex; align-items: baseline; justify-content: flex-end; gap: .32rem; overflow: hidden; color: var(--muted); font-size: .69rem; line-height: 1.25; white-space: nowrap; }
+.sidebar-health-status { min-width: 0; overflow: hidden; line-height: 1.25; text-overflow: ellipsis; }
 .sidebar-sync-method { flex: 0 0 auto; max-width: 8.5rem; overflow: hidden; padding: .12rem .38rem; border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--line)); border-radius: 999px; background: color-mix(in srgb, var(--accent) 10%, var(--bg-pane)); color: color-mix(in srgb, var(--accent) 68%, var(--ink)); font-size: .61rem; font-weight: 700; line-height: 1.25; text-overflow: ellipsis; }
 @keyframes sidebar-health-pulse { 50% { opacity: .45; transform: scale(.82); } }
 .sidebar-footer-row { min-height: 2.35rem; display: flex; align-items: center; gap: .68rem; padding: .4rem .72rem; border-radius: 8px; color: color-mix(in srgb, var(--ink) 90%, var(--accent)); font-size: .82rem; text-align: left; }

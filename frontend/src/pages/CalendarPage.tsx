@@ -158,6 +158,24 @@ function interviewKindLabel(event: CalendarEvent): string {
   return event.kind === "availability" ? "Available interview" : "Scheduled interview";
 }
 
+function applicationStatusLabel(event: CalendarEvent): string {
+  if (event.application_status === "passed") return "Passed";
+  if (event.application_status === "position_closed") return "Position closed";
+  if (event.application_status === "rejected") return "Rejected";
+  return "Active";
+}
+
+function ApplicationStatusIcon({ status }: { status: CalendarEvent["application_status"] }) {
+  if (status === "passed") return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 12h6M6 12.2a2 2 0 0 0 4 0M4.5 10.5h7l-1-1.5V6a2.5 2.5 0 0 0-5 0v3l-1 1.5Z" /></svg>;
+  if (status === "position_closed") return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 5.5h9v7h-9zM5.5 5.5V4a2.5 2.5 0 0 1 5 0v1.5M6 9h4" /></svg>;
+  if (status === "rejected") return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg>;
+  return <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="4.5" /><path d="m6 8 1.3 1.3L10.5 6" /></svg>;
+}
+
+function CanceledStatusIcon() {
+  return <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.5" /><path d="m4.1 4.1 7.8 7.8" /></svg>;
+}
+
 function interviewType(event: CalendarEvent): { type: CalendarEvent["meeting_type"]; label: string } {
   const provider = event.meeting_provider?.trim().toLowerCase();
   const hasVideoPlatform = Boolean(event.meeting_url || (provider && !provider.includes("phone") && !provider.includes("in person")));
@@ -397,6 +415,9 @@ function EventCard({ event, timeZone, compact, timed, position, selected, active
   const hoverFrame = useRef<number | null>(null);
   const color = accountColor(event.mailbox_id);
   const canceled = event.interview_status === "cancellation";
+  const outcome = event.application_status !== "active" ? event.application_status : null;
+  const outcomeClass = outcome ? `status-${outcome.replaceAll("_", "-")}` : "";
+  const outcomeLabel = applicationStatusLabel(event);
   const type = interviewType(event);
   const durationMinutes = Math.max(0, (new Date(event.end_at).getTime() - new Date(event.start_at).getTime()) / 60000);
   const getHoverPosition = useCallback(() => {
@@ -463,7 +484,7 @@ function EventCard({ event, timeZone, compact, timed, position, selected, active
   return <>
     <div
     ref={eventRef}
-    className={`calendar-event ${event.kind} ${canceled ? "canceled" : ""} ${compact ? "compact" : ""} ${timed ? "timed" : ""} ${selected ? "selected" : ""} has-meeting-type ${timed && durationMinutes <= 30 ? "very-short" : timed && durationMinutes < 60 ? "short" : ""}`}
+    className={`calendar-event ${event.kind} ${canceled ? "canceled" : ""} ${outcomeClass} ${compact ? "compact" : ""} ${timed ? "timed" : ""} ${selected ? "selected" : ""} has-meeting-type ${outcome ? "has-outcome" : ""} ${timed && durationMinutes <= 30 ? "very-short" : timed && durationMinutes < 60 ? "short" : ""}`}
     style={{ "--account-color": color, ...position } as React.CSSProperties}
     onPointerDown={(e) => e.stopPropagation()}
     onClick={(e) => { e.stopPropagation(); selectEvent(); }}
@@ -475,11 +496,13 @@ function EventCard({ event, timeZone, compact, timed, position, selected, active
     role="button"
     tabIndex={0}
     aria-pressed={selected}
-    aria-label={`${interviewKindLabel(event)}, ${event.company || "Company not specified"}, ${type.label}`}
+    aria-label={`${interviewKindLabel(event)}, ${event.company || "Company not specified"}, ${type.label}, ${canceled ? "Canceled, " : ""}${outcomeLabel}`}
     aria-describedby={hoverPosition ? hoverId : undefined}
   >
     <span className="calendar-event-company">{event.company || "Company not specified"}</span>
+    {canceled && <span className="event-canceled-badge"><CanceledStatusIcon />Canceled</span>}
     <span className={`event-type-badge meeting-${type.type}`} role="img" aria-label={type.label}><MeetingTypeIcon type={type.type} /></span>
+    {outcome && <span className="event-outcome-badge" role="img" aria-label={outcomeLabel} title={outcomeLabel}><ApplicationStatusIcon status={outcome} /></span>}
   </div>
     {hoverPosition && createPortal(
       <div
@@ -497,6 +520,8 @@ function EventCard({ event, timeZone, compact, timed, position, selected, active
             <dt>Interview type</dt>
             <dd><MeetingTypeIcon type={type.type} /><span>{type.label}</span></dd>
           </div>
+          {canceled && <div className="calendar-hover-canceled"><dt>Interview status</dt><dd><CanceledStatusIcon /><span>Canceled</span></dd></div>}
+          {outcome && <div className={`calendar-hover-status ${outcomeClass}`}><dt>Application status</dt><dd><ApplicationStatusIcon status={outcome} /><span>{outcomeLabel}</span></dd></div>}
         </dl>
       </div>,
       document.body,
@@ -549,11 +574,11 @@ function ScheduledInterviewChart({ accounts }: { accounts: AccountInterviewCount
   </section>;
 }
 
-type Editor = { id?: number; mailbox_id: number; title: string; company: string; role: string; interviewer: string; work_model: CalendarEvent["work_model"]; start: string; end: string; description: string; job_url: string; meeting_type: "video" | "phone"; meeting_provider: string; meeting_url: string; phone_number: string; phone_access_code: string };
+type Editor = { id?: number; mailbox_id: number; title: string; company: string; role: string; interviewer: string; work_model: CalendarEvent["work_model"]; application_status: CalendarEvent["application_status"]; start: string; end: string; description: string; job_url: string; meeting_type: "video" | "phone"; meeting_provider: string; meeting_url: string; phone_number: string; phone_access_code: string };
 function editorFor(date: Date, mailboxId: number, timeZone: string, event?: CalendarEvent, selectedEnd?: Date): Editor {
   const start = event ? wallDateForInstant(new Date(event.start_at), timeZone) : selectedEnd ? new Date(date) : new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 9));
   const end = event ? wallDateForInstant(new Date(event.end_at), timeZone) : selectedEnd ?? new Date(start.getTime() + DEFAULT_EVENT_DURATION_MINUTES * 60_000);
-  return { id: event?.id, mailbox_id: event?.mailbox_id ?? mailboxId, title: event?.title ?? "Interview", company: event?.company ?? "", role: event?.role ?? "", interviewer: event?.interviewer ?? "", work_model: event?.work_model ?? "unspecified", start: localInput(start), end: localInput(end), description: event?.description ?? "", job_url: event?.job_url ?? "", meeting_type: event?.meeting_type === "phone" ? "phone" : "video", meeting_provider: event?.meeting_provider ?? "", meeting_url: event?.meeting_url ?? "", phone_number: event?.phone_number ?? "", phone_access_code: event?.phone_access_code ?? "" };
+  return { id: event?.id, mailbox_id: event?.mailbox_id ?? mailboxId, title: event?.title ?? "Interview", company: event?.company ?? "", role: event?.role ?? "", interviewer: event?.interviewer ?? "", work_model: event?.work_model ?? "unspecified", application_status: event?.application_status ?? "active", start: localInput(start), end: localInput(end), description: event?.description ?? "", job_url: event?.job_url ?? "", meeting_type: event?.meeting_type === "phone" ? "phone" : "video", meeting_provider: event?.meeting_provider ?? "", meeting_url: event?.meeting_url ?? "", phone_number: event?.phone_number ?? "", phone_access_code: event?.phone_access_code ?? "" };
 }
 
 type DragSelection = { dayIndex: number; startMinutes: number; endMinutes: number };
@@ -591,7 +616,13 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
     const request = ++refreshRef.current; const controller = new AbortController();
     abortRef.current = controller;
     setLoading(true); setError("");
-    try { const rows = await fetchCalendarEvents(instantForWallDate(start, timeZone).toISOString(), instantForWallDate(end, timeZone).toISOString(), controller.signal); if (request === refreshRef.current) setEvents(rows); }
+    try {
+      const rows = await fetchCalendarEvents(instantForWallDate(start, timeZone).toISOString(), instantForWallDate(end, timeZone).toISOString(), controller.signal);
+      if (request === refreshRef.current) {
+        setEvents(rows);
+        setSelected((current) => current ? rows.find((event) => event.id === current.id) ?? current : null);
+      }
+    }
     catch (err) { if (request === refreshRef.current && (err as Error).name !== "AbortError") setError(err instanceof Error ? err.message : "Failed to load calendar"); }
     finally { if (request === refreshRef.current) setLoading(false); }
   }, [start.getTime(), end.getTime(), timeZone]);
@@ -727,7 +758,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
     e.preventDefault(); if (!editor) return; setSaving(true); setSaveError("");
     const startAt = instantForWallDate(wallDateFromInput(editor.start), timeZone);
     const endAt = instantForWallDate(wallDateFromInput(editor.end), timeZone);
-    const payload: CalendarEventPayload = { mailbox_id: editor.mailbox_id, title: editor.title, company: editor.company, role: editor.role, interviewer: editor.interviewer, work_model: editor.work_model, start_at: startAt.toISOString(), end_at: endAt.toISOString(), source_timezone: timeZone, description: editor.description, job_url: editor.job_url || null, meeting_type: editor.meeting_type, meeting_provider: editor.meeting_provider || null, meeting_url: editor.meeting_url || null, phone_number: editor.phone_number || null, phone_access_code: editor.phone_access_code || null, interview_status: "confirmation", application_status: "active" };
+    const payload: CalendarEventPayload = { mailbox_id: editor.mailbox_id, title: editor.title, company: editor.company, role: editor.role, interviewer: editor.interviewer, work_model: editor.work_model, start_at: startAt.toISOString(), end_at: endAt.toISOString(), source_timezone: timeZone, description: editor.description, job_url: editor.job_url || null, meeting_type: editor.meeting_type, meeting_provider: editor.meeting_provider || null, meeting_url: editor.meeting_url || null, phone_number: editor.phone_number || null, phone_access_code: editor.phone_access_code || null, interview_status: "confirmation", application_status: editor.application_status };
     try { const saved = editor.id ? await updateCalendarEvent(editor.id, payload) : await createCalendarEvent(payload); setEvents((prev) => [...prev.filter((x) => x.id !== saved.id), saved]); showEventDetails(saved); setEditor(null); }
     catch (err) { setSaveError(err instanceof Error ? err.message : "Failed to save event"); }
     finally { setSaving(false); }
@@ -803,8 +834,8 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
         <header className="details-sticky">
           <button className="details-close" type="button" onClick={closeEventDetails} aria-label="Close event details"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg></button>
           <div className="details-sticky-actions">
-            {selected.meeting_url && <a className="details-primary-action" href={selected.meeting_url} target="_blank" rel="noreferrer"><MeetingTypeIcon type="video" /><span>Join meeting</span><svg className="details-action-arrow" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3h7v7M13 3 5 11" /></svg></a>}
-            {!selected.meeting_url && selected.phone_number && <a className="details-primary-action" href={`tel:${selected.phone_number.replace(/[^+\d]/g, "")}`}><MeetingTypeIcon type="phone" /><span>Call now</span></a>}
+            {interviewType(selected).type === "video" && selected.meeting_url && <a className="details-primary-action" href={selected.meeting_url} target="_blank" rel="noreferrer"><MeetingTypeIcon type="video" /><span>Join meeting</span><svg className="details-action-arrow" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3h7v7M13 3 5 11" /></svg></a>}
+            {interviewType(selected).type === "phone" && <span className="details-primary-action is-static"><MeetingTypeIcon type="phone" /><span>Phone call</span></span>}
           </div>
         </header>
         <div className="details-content">
@@ -813,6 +844,8 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
             <div className="details-row"><dt>Account</dt><dd>{selected.email_account}</dd></div>
             <div className="details-row"><dt>Company</dt><dd>{selected.company || "—"}</dd></div>
             <div className="details-row"><dt>Role</dt><dd>{selected.role || "—"}</dd></div>
+            {selected.interview_status === "cancellation" && <div className="details-row details-canceled-row"><dt>Interview status</dt><dd><CanceledStatusIcon /><span>Canceled</span></dd></div>}
+            <div className={`details-row details-status-row status-${selected.application_status.replaceAll("_", "-")}`}><dt>Application status</dt><dd><ApplicationStatusIcon status={selected.application_status} /><span>{applicationStatusLabel(selected)}</span></dd></div>
             {interviewType(selected).type === "video" && <div className="details-row details-action-row"><dt>Meeting</dt><dd>{meetingProviderLabel(selected) !== "—" ? <span className="details-meeting-value">{selected.meeting_url ? <a className="details-meeting-link" href={selected.meeting_url} target="_blank" rel="noreferrer" aria-label={`Open ${meetingProviderLabel(selected)}`} title={`Open ${meetingProviderLabel(selected)}`}><span className="details-meeting-icon"><MeetingTypeIcon type="video" /></span><span>{meetingProviderLabel(selected)}</span><svg className="details-meeting-arrow" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3h7v7M13 3 5 11" /></svg></a> : <span className="details-meeting-label"><span className="details-meeting-icon"><MeetingTypeIcon type="video" /></span><span>{meetingProviderLabel(selected)}</span></span>}{selected.meeting_url && <button className="details-copy-link details-copy-icon" type="button" onClick={() => void copyMeetingLink(selected)} aria-label={copiedMeetingEventId === selected.id ? "Meeting link copied" : `Copy ${meetingProviderLabel(selected)} meeting link`} title={copiedMeetingEventId === selected.id ? "Copied" : "Copy meeting link"}>{copiedMeetingEventId === selected.id ? <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.2 3 3 6-6.4" /></svg> : <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="2.25" width="8.5" height="8.5" rx="1.5" /><path d="M10.75 10.75v1.5a1.5 1.5 0 0 1-1.5 1.5h-5.5a1.5 1.5 0 0 1-1.5-1.5v-5.5a1.5 1.5 0 0 1 1.5-1.5h1.5" /></svg>}</button>}</span> : "—"}</dd></div>}
           </dl>
 

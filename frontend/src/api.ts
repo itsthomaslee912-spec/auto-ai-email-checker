@@ -330,7 +330,7 @@ export interface AiSettings {
 
 export type CalendarEventKind = "availability" | "confirmed";
 export type CalendarMeetingType = "video" | "phone" | "in_person" | "unspecified";
-export type CalendarApplicationStatus = "active" | "rejected" | "position_closed";
+export type CalendarApplicationStatus = "active" | "passed" | "rejected" | "position_closed";
 export type CalendarWorkModel = "remote" | "hybrid" | "on_site" | "unspecified";
 
 export interface CalendarEvent {

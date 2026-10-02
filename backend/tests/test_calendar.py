@@ -219,6 +219,49 @@ Join https://zoom.us/j/123456789"""
         assert db.get(CalendarEvent, scheduled.id).application_status == "rejected"
 
 
+def test_positive_outcome_marks_existing_calendar_event_passed():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        event = CalendarEvent(mailbox_id=mailbox_id, source_thread_id="pass-thread", kind="confirmed", origin="email", title="Acme interview", company="Acme", job_role="Engineer", start_at=datetime(2026, 10, 5, 14, tzinfo=timezone.utc), end_at=datetime(2026, 10, 5, 14, 30, tzinfo=timezone.utc), is_visible=True)
+        db.add(event)
+        db.flush()
+        outcome = EmailMessage(mailbox_id=mailbox_id, provider_message_id="pass-outcome", thread_id="pass-thread", subject="You passed the interview", sender="recruiter@acme.test", body_text="We are pleased to move you forward to the next round.", label=EmailLabel.INTERVIEW_FOLLOW_UP.value, company="Acme", job_role="Engineer")
+        db.add(outcome)
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, outcome)) is True
+        assert event.application_status == "passed"
+        assert event.outcome_source_email_id == outcome.id
+
+
+def test_offer_marks_existing_calendar_event_passed():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        event = CalendarEvent(mailbox_id=mailbox_id, source_thread_id="interview-thread", kind="confirmed", origin="email", title="Acme interview", company="Acme", job_role="Engineer", start_at=datetime(2026, 10, 5, 14, tzinfo=timezone.utc), end_at=datetime(2026, 10, 5, 14, 30, tzinfo=timezone.utc), is_visible=True)
+        db.add(event)
+        db.flush()
+        offer = EmailMessage(mailbox_id=mailbox_id, provider_message_id="offer-outcome", thread_id="offer-thread", subject="Your offer from Acme", sender="recruiter@acme.test", body_text="We are pleased to offer you the role.", label=EmailLabel.OFFER.value, company="Acme", job_role="Engineer")
+        db.add(offer)
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, offer)) is True
+        assert event.application_status == "passed"
+
+
+def test_neutral_follow_up_does_not_mark_calendar_event_passed():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        event = CalendarEvent(mailbox_id=mailbox_id, source_thread_id="neutral-thread", kind="confirmed", origin="email", title="Acme interview", start_at=datetime(2026, 10, 5, 14, tzinfo=timezone.utc), end_at=datetime(2026, 10, 5, 14, 30, tzinfo=timezone.utc), is_visible=True)
+        db.add(event)
+        db.flush()
+        follow_up = EmailMessage(mailbox_id=mailbox_id, provider_message_id="neutral-follow-up", thread_id="neutral-thread", subject="Interview feedback survey", sender="recruiter@acme.test", body_text="Please tell us about your interview experience.", label=EmailLabel.INTERVIEW_FOLLOW_UP.value)
+        db.add(follow_up)
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, follow_up)) is False
+        assert event.application_status == "active"
+
+
 def test_cancellation_hides_the_existing_confirmed_event():
     factory, (mailbox_id, _) = _database()
     with factory() as db:

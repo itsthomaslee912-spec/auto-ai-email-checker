@@ -18,6 +18,7 @@ OUTCOME_LABELS = frozenset(
         EmailLabel.SCREENING.value,
         EmailLabel.INTERVIEW_SCHEDULED.value,
         EmailLabel.INTERVIEW_INVITATION.value,
+        EmailLabel.OFFER.value,
     }
 )
 # Application confirmations are extracted for new mail and label changes only.

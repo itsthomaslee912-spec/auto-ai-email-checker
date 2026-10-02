@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 CALENDAR_LABELS = {
     EmailLabel.INTERVIEW_INVITATION.value,
     EmailLabel.INTERVIEW_SCHEDULED.value,
+    EmailLabel.INTERVIEW_FOLLOW_UP.value,
+    EmailLabel.OFFER.value,
     EmailLabel.REJECTED_CLOSED.value,
 }
 
@@ -891,6 +893,24 @@ def infer_application_outcome(email: EmailMessage) -> str:
     return "position_closed" if any(pattern in text for pattern in closed_patterns) else "rejected"
 
 
+def is_passed_outcome(email: EmailMessage) -> bool:
+    """Return whether a positive outcome message advances this application."""
+    if email.label == EmailLabel.OFFER.value:
+        return True
+    if email.label != EmailLabel.INTERVIEW_FOLLOW_UP.value:
+        return False
+    text = " ".join([email.subject or "", email.snippet or "", email.body_text or ""]).lower()
+    positive_patterns = (
+        r"\byou (?:have )?passed\b",
+        r"\bsuccessfully (?:passed|cleared)\b",
+        r"\b(?:move|moving|advance|advancing) (?:you )?(?:forward|to the next)\b",
+        r"\b(?:invite|inviting) you to (?:the )?next (?:round|stage)\b",
+        r"\b(?:pleased|happy|excited) to (?:move|invite|advance) you\b",
+        r"\bcongratulations\b.{0,120}\bnext (?:round|stage)\b",
+    )
+    return any(re.search(pattern, text, re.I) for pattern in positive_patterns)
+
+
 async def process_calendar_email(
     db: Session,
     email: EmailMessage,
@@ -908,13 +928,18 @@ async def process_calendar_email(
     if not force and email.calendar_processed_hash == digest:
         return False
     changed = False
+    outcome_status = None
     if email.label == EmailLabel.REJECTED_CLOSED.value:
+        outcome_status = infer_application_outcome(email)
+    elif is_passed_outcome(email):
+        outcome_status = "passed"
+    if email.label in {EmailLabel.REJECTED_CLOSED.value, EmailLabel.INTERVIEW_FOLLOW_UP.value, EmailLabel.OFFER.value}:
         confirmed = _thread_events(db, email, kind="confirmed")
         if not confirmed:
             confirmed = _identity_events(db, email, kind="confirmed")
-        if confirmed:
+        if confirmed and outcome_status:
             target = confirmed[0]
-            target.application_status = infer_application_outcome(email)
+            target.application_status = outcome_status
             target.outcome_source_email_id = email.id
             target.outcome_at = as_utc(email.received_at) or datetime.now(timezone.utc)
             _link_event_email(db, target, email.id)
