@@ -186,8 +186,9 @@ export async function markAllRead(mailboxId?: number | null): Promise<{ marked: 
   return res.json();
 }
 
-export async function fetchEmailDetail(id: number): Promise<EmailDetail> {
-  const res = await apiFetch(`${API_BASE}/api/emails/${id}`, undefined, 4);
+export async function fetchEmailDetail(id: number, markRead = true): Promise<EmailDetail> {
+  const suffix = markRead ? "" : "?mark_read=false";
+  const res = await apiFetch(`${API_BASE}/api/emails/${id}${suffix}`, undefined, 4);
   if (!res.ok) throw new Error(await readApiError(res, "Failed to load email"));
   return res.json();
 }
@@ -325,6 +326,83 @@ export interface AiSettings {
   ollama_url: string;
   ollama_model: string;
   billing_url: string;
+}
+
+export type CalendarEventKind = "availability" | "confirmed";
+export type CalendarMeetingType = "video" | "phone" | "in_person" | "unspecified";
+export type CalendarApplicationStatus = "active" | "rejected" | "position_closed";
+
+export interface CalendarEvent {
+  id: number;
+  mailbox_id: number;
+  email_account: string;
+  provider: Provider;
+  source_email_id: number | null;
+  kind: CalendarEventKind;
+  origin: "email" | "manual";
+  title: string;
+  company: string;
+  role: string;
+  job_url: string | null;
+  description: string;
+  start_at: string;
+  end_at: string;
+  source_timezone: string | null;
+  interview_status: InterviewSubtype | null;
+  application_status: CalendarApplicationStatus;
+  meeting_type: CalendarMeetingType;
+  meeting_provider: string | null;
+  meeting_url: string | null;
+  phone_number: string | null;
+  phone_access_code: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface CalendarEventPayload {
+  mailbox_id?: number;
+  title?: string;
+  company?: string;
+  role?: string;
+  job_url?: string | null;
+  description?: string;
+  start_at?: string;
+  end_at?: string;
+  source_timezone?: string | null;
+  interview_status?: InterviewSubtype;
+  application_status?: CalendarApplicationStatus;
+  meeting_type?: CalendarMeetingType;
+  meeting_provider?: string | null;
+  meeting_url?: string | null;
+  phone_number?: string | null;
+  phone_access_code?: string | null;
+}
+
+export async function fetchCalendarEvents(start: string, end: string, signal?: AbortSignal): Promise<CalendarEvent[]> {
+  const params = new URLSearchParams({ start, end });
+  const res = await fetch(`${API_BASE}/api/calendar-events?${params}`, { signal, cache: "no-store" });
+  if (!res.ok) throw new Error(await readApiError(res, "Failed to load calendar"));
+  return res.json();
+}
+
+export async function createCalendarEvent(payload: CalendarEventPayload): Promise<CalendarEvent> {
+  const res = await apiFetch(`${API_BASE}/api/calendar-events`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(await readApiError(res, "Failed to create event"));
+  return res.json();
+}
+
+export async function updateCalendarEvent(id: number, payload: CalendarEventPayload): Promise<CalendarEvent> {
+  const res = await apiFetch(`${API_BASE}/api/calendar-events/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(await readApiError(res, "Failed to update event"));
+  return res.json();
 }
 
 export interface AiStatus {

@@ -6,10 +6,11 @@ from typing import Any
 
 from app.classify.openai_classifier import classify_email, infer_interview_subtype
 from app.classify.outcome_extract import BACKFILL_LABELS, OUTCOME_LABELS, extract_company_role
-from app.models import EmailLabel, EmailMessage, MailboxConnection
+from app.models import CalendarEvent, EmailLabel, EmailMessage, MailboxConnection
 from app.realtime.sse import publish
 from app.schemas import EmailOut
 from app.services.ai_backend import get_ai_backend
+from app.services.calendar_extract import CALENDAR_LABELS, process_calendar_email
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +257,16 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                     outcome_changed = True
                 if was_pending:
                     email.classification_pending = False
-                if label_changed or outcome_changed or was_pending:
+                calendar_changed = False
+                if previous_label in CALENDAR_LABELS or email.label in CALENDAR_LABELS:
+                    if email.label in CALENDAR_LABELS:
+                        calendar_changed = await process_calendar_email(db, email, force=True)
+                    else:
+                        sourced = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == email.id).all()
+                        for event in sourced:
+                            event.is_visible = False
+                        calendar_changed = bool(sourced)
+                if label_changed or outcome_changed or was_pending or calendar_changed:
                     db.commit()
                     if label_changed:
                         db.refresh(email)
@@ -265,6 +275,8 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                         payload["previous_label"] = previous_label
                         payload["updated"] = True
                         await publish("email.classified", payload)
+                    if calendar_changed:
+                        await publish("calendar.changed", {"action": "reclassified", "mailbox_id": mailbox_id})
                 else:
                     db.rollback()
             await _publish_progress(

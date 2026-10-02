@@ -165,6 +165,26 @@ def init_db() -> None:
                     "ALTER TABLE ai_settings ADD COLUMN gemini_model "
                     "VARCHAR(128) DEFAULT 'gemini-3.8-flash'"
                 ))
+        if "email_messages" in tables:
+            email_cols = {c["name"] for c in inspect(conn).get_columns("email_messages")}
+            timestamp_type = (
+                "TIMESTAMP WITH TIME ZONE"
+                if database_url.get_backend_name() == "postgresql"
+                else "TIMESTAMP"
+            )
+            if "calendar_processed_hash" not in email_cols:
+                conn.execute(text(
+                    "ALTER TABLE email_messages ADD COLUMN calendar_processed_hash VARCHAR(64)"
+                ))
+            if "calendar_processed_at" not in email_cols:
+                conn.execute(text(
+                    "ALTER TABLE email_messages "
+                    f"ADD COLUMN calendar_processed_at {timestamp_type}"
+                ))
+            if "calendar_processing_error" not in email_cols:
+                conn.execute(text(
+                    "ALTER TABLE email_messages ADD COLUMN calendar_processing_error VARCHAR(512)"
+                ))
 
     # Lightweight SQLite column / label migrations for existing DBs
     if settings.database_url.startswith("sqlite"):

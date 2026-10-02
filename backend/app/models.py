@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -77,6 +77,11 @@ class MailboxConnection(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    calendar_events: Mapped[list[CalendarEvent]] = relationship(
+        back_populates="mailbox",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
     webhook: Mapped[WebhookSubscription | None] = relationship(
         back_populates="mailbox",
         uselist=False,
@@ -106,6 +111,9 @@ class EmailMessage(Base):
     company: Mapped[str | None] = mapped_column(String(255), nullable=True)
     job_role: Mapped[str | None] = mapped_column(String(255), nullable=True)
     outcome_extracted: Mapped[bool] = mapped_column(default=False)
+    calendar_processed_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    calendar_processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    calendar_processing_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
     folder: Mapped[str] = mapped_column(String(16), index=True, default=MailFolder.INBOX.value)
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     openai_response_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -195,3 +203,55 @@ class WebhookSubscription(Base):
     )
 
     mailbox: Mapped[MailboxConnection] = relationship(back_populates="webhook")
+
+
+class CalendarEvent(Base):
+    __tablename__ = "calendar_events"
+    __table_args__ = (
+        UniqueConstraint("source_email_id", "slot_index", name="uq_calendar_source_slot"),
+        Index("ix_calendar_mailbox_time", "mailbox_id", "start_at", "end_at"),
+        Index("ix_calendar_visible_time", "is_visible", "start_at", "end_at"),
+        Index("ix_calendar_thread", "mailbox_id", "source_thread_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mailbox_id: Mapped[int] = mapped_column(
+        ForeignKey("mailbox_connections.id", ondelete="CASCADE"), index=True
+    )
+    source_email_id: Mapped[int | None] = mapped_column(
+        ForeignKey("email_messages.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    source_thread_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    superseded_by_event_id: Mapped[int | None] = mapped_column(
+        ForeignKey("calendar_events.id", ondelete="SET NULL"), nullable=True
+    )
+    outcome_source_email_id: Mapped[int | None] = mapped_column(
+        ForeignKey("email_messages.id", ondelete="SET NULL"), nullable=True
+    )
+    slot_index: Mapped[int] = mapped_column(Integer, default=0)
+    kind: Mapped[str] = mapped_column(String(24), index=True)
+    is_visible: Mapped[bool] = mapped_column(default=True, index=True)
+    origin: Mapped[str] = mapped_column(String(16), default="email")
+    title: Mapped[str] = mapped_column(String(512), default="Interview")
+    company: Mapped[str] = mapped_column(String(255), default="")
+    job_role: Mapped[str] = mapped_column(String(255), default="")
+    job_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    start_at: Mapped[datetime] = mapped_column(UtcDateTime(), index=True)
+    end_at: Mapped[datetime] = mapped_column(UtcDateTime(), index=True)
+    source_timezone: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    interview_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    application_status: Mapped[str] = mapped_column(String(32), default="active")
+    meeting_type: Mapped[str] = mapped_column(String(24), default="unspecified")
+    meeting_provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    meeting_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    phone_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    phone_access_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_received_at: Mapped[datetime | None] = mapped_column(UtcDateTime(), nullable=True)
+    outcome_at: Mapped[datetime | None] = mapped_column(UtcDateTime(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    mailbox: Mapped[MailboxConnection] = relationship(back_populates="calendar_events")

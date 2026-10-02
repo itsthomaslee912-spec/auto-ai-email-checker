@@ -11,3 +11,4 @@ email-validator>=2.2.0
 google-auth>=2.35.0
 requests>=2.32.0
 pytest>=8.0.0
+tzdata>=2025.2

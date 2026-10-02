@@ -32,6 +32,7 @@ import {
 } from "../prefs";
 import type { ThemePref } from "../theme";
 import AccountSelect from "../components/AccountSelect";
+import CompactSelect from "../components/CompactSelect";
 import DateTimeField from "../components/DateTimeField";
 import LabelPieChart from "../components/LabelPieChart";
 
@@ -114,6 +115,7 @@ export default function SettingsPage({
   updatingPrompt,
   onUpdatePrompt,
   onTrainingDeleted,
+  onAiSettingsSaved,
   onAddAccount,
   onRemoveAccount,
   syncingIds,
@@ -144,6 +146,7 @@ export default function SettingsPage({
   updatingPrompt: boolean;
   onUpdatePrompt: () => Promise<void> | void;
   onTrainingDeleted: () => Promise<void>;
+  onAiSettingsSaved: () => Promise<void> | void;
   onAddAccount: () => void;
   onRemoveAccount: (mailboxId: number) => Promise<void>;
   syncingIds: Set<number>;
@@ -220,6 +223,7 @@ export default function SettingsPage({
         setShowGeminiKey(false);
       }
       setAiNotice("AI model settings saved.");
+      await onAiSettingsSaved();
       if (saved.openai_admin_key_configured) {
         try {
           setOpenaiCosts(await fetchOpenAiCosts());
@@ -575,7 +579,7 @@ export default function SettingsPage({
                   <p className="settings-help">Typeface and size used across the app.</p>
                   <label className="settings-field">
                     Family
-                    <select
+                    <CompactSelect
                       value={fontFamily}
                       onChange={(event) => onFontFamilyChange(event.target.value as FontFamily)}
                     >
@@ -584,7 +588,7 @@ export default function SettingsPage({
                           {item.label}
                         </option>
                       ))}
-                    </select>
+                    </CompactSelect>
                   </label>
                   <div className="seg-control" role="radiogroup" aria-label="Font size">
                     {FONT_SIZES.map((item) => (
@@ -654,7 +658,7 @@ export default function SettingsPage({
                       ) : aiSettings.provider === "gemini" ? (
                         <div className="ai-fields">
                           <label className="settings-field">Gemini model
-                            <select value={aiSettings.gemini_model} onChange={(e) => setAiSettings({ ...aiSettings, gemini_model: e.target.value })}>
+                            <CompactSelect value={aiSettings.gemini_model} onChange={(e) => setAiSettings({ ...aiSettings, gemini_model: e.target.value })}>
                               {![...DEFAULT_GEMINI_MODELS, ...geminiModels].includes(aiSettings.gemini_model) && (
                                 <option value={aiSettings.gemini_model}>{aiSettings.gemini_model}</option>
                               )}
@@ -663,7 +667,7 @@ export default function SettingsPage({
                                   {model}{model === "gemini-3.8-flash" ? " - Recommended" : ""}
                                 </option>
                               ))}
-                            </select>
+                            </CompactSelect>
                           </label>
                           <label className="settings-field">Gemini API key
                             <span className="secret-input">
@@ -687,14 +691,14 @@ export default function SettingsPage({
                             <input value={aiSettings.ollama_url} onChange={(e) => setAiSettings({ ...aiSettings, ollama_url: e.target.value })} />
                           </label>
                           <label className="settings-field">Ollama model
-                            <select value={aiSettings.ollama_model} onChange={(e) => setAiSettings({ ...aiSettings, ollama_model: e.target.value })}>
+                            <CompactSelect value={aiSettings.ollama_model} onChange={(e) => setAiSettings({ ...aiSettings, ollama_model: e.target.value })}>
                               {!ollamaModels.includes(aiSettings.ollama_model) && <option value={aiSettings.ollama_model}>{aiSettings.ollama_model}</option>}
                               {ollamaModels.map((model) => (
                                 <option key={model} value={model}>
                                   {model}{model === "qwen2.5:14b-instruct" ? " — Recommended" : ""}
                                 </option>
                               ))}
-                            </select>
+                            </CompactSelect>
                           </label>
                           <p className="settings-help">
                             Recommended: qwen2.5:14b-instruct for accurate JSON classification with moderate resource use.

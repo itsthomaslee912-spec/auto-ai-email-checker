@@ -29,8 +29,9 @@ from app.email.outlook import (
     outlook_send_message,
 )
 from app.email.folders import VALID_FOLDERS
-from app.models import ClassifyCorrection, EmailLabel, EmailMessage, MailboxConnection, MailFolder, Provider
+from app.models import CalendarEvent, ClassifyCorrection, EmailLabel, EmailMessage, MailboxConnection, MailFolder, Provider
 from app.realtime.sse import publish
+from app.services.calendar_extract import CALENDAR_LABELS, process_calendar_email
 from app.schemas import (
     AiReplyIn,
     AiReplyOut,
@@ -227,11 +228,8 @@ def list_emails(
     mailbox_unread_q = _from_active_mailbox(
         db.query(EmailMessage.mailbox_id, func.count(EmailMessage.id))
     ).filter(
-        EmailMessage.is_read.is_not(True)
-        # Account badges use the same definition as the live event handler and
-        # “Mark all read”: every unread message in that mailbox.  Filtering
-        # this to Inbox made the badge jump after a refresh when the list also
-        # contained unread messages in another folder.
+        EmailMessage.is_read.is_not(True),
+        EmailMessage.folder == MailFolder.INBOX.value,
     )
     mailbox_unread_counts = {
         str(mid): int(count) for mid, count in mailbox_unread_q.group_by(EmailMessage.mailbox_id)
@@ -317,7 +315,12 @@ async def _mark_provider_message_read(mailbox_id: int, provider_message_id: str)
 
 
 @router.get("/{email_id}", response_model=EmailDetailOut)
-async def get_email(email_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)) -> EmailMessage:
+async def get_email(
+    email_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    mark_read: bool = Query(default=True),
+) -> EmailMessage:
     email = _email_from_active_mailbox(db, email_id)
     if email is None:
         raise HTTPException(status_code=404, detail="Email not found")
@@ -369,7 +372,7 @@ async def get_email(email_id: int, background_tasks: BackgroundTasks, db: Sessio
             except Exception as exc:
                 raise HTTPException(status_code=502, detail=f"Could not load email body: {exc}") from exc
 
-    if not email.is_read:
+    if mark_read and not email.is_read:
         email.is_read = True
         background_tasks.add_task(_mark_provider_message_read, email.mailbox_id, email.provider_message_id)
     if email.label not in {item.value for item in EmailLabel}:
@@ -429,10 +432,24 @@ async def update_email_label(
             db.commit()
             db.refresh(email)
 
+    calendar_changed = False
+    if previous_label in CALENDAR_LABELS or new_label in CALENDAR_LABELS:
+        if new_label in CALENDAR_LABELS:
+            calendar_changed = await process_calendar_email(db, email, force=True)
+        else:
+            sourced = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == email.id).all()
+            for event in sourced:
+                event.is_visible = False
+            calendar_changed = bool(sourced)
+        db.commit()
+        db.refresh(email)
+
     payload_out = EmailOut.model_validate(email).model_dump()
     payload_out["previous_label"] = previous_label
     payload_out["updated"] = previous_label != new_label
     await publish("email.classified", payload_out)
+    if calendar_changed:
+        await publish("calendar.changed", {"action": "reclassified", "mailbox_id": email.mailbox_id})
     return email
 
 

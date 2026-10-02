@@ -11,6 +11,7 @@ from app.email.folders import normalize_folder
 from app.models import EmailLabel, EmailMessage, MailboxConnection
 from app.realtime.sse import publish
 from app.schemas import EmailOut
+from app.services.calendar_extract import process_calendar_email
 from app.timeutil import as_utc
 
 logger = logging.getLogger(__name__)
@@ -101,9 +102,15 @@ async def ingest_normalized_message(
         is_read=bool(normalized.get("is_read", False)),
     )
     db.add(email)
-    if not download_only:
-        await apply_outcome(db, email)
+    calendar_changed = False
     try:
+        if not download_only:
+            await apply_outcome(db, email)
+            db.flush()
+            try:
+                calendar_changed = await process_calendar_email(db, email)
+            except Exception:
+                logger.exception("Calendar extraction failed during ingest email_id=%s", email.id)
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -123,4 +130,6 @@ async def ingest_normalized_message(
     db.refresh(email)
 
     await publish("email.classified", EmailOut.model_validate(email).model_dump(mode="json"))
+    if calendar_changed:
+        await publish("calendar.changed", {"action": "extracted", "mailbox_id": email.mailbox_id})
     return email

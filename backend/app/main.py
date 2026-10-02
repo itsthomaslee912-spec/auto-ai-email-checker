@@ -7,11 +7,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import ai_settings, auth, classify, emails, events, health, mailboxes, webhooks
+from app.api import ai_settings, auth, calendar_events, classify, emails, events, health, mailboxes, webhooks
 from app.config import get_settings
 from app.db import init_db
 from app.realtime.renewal import renewal_loop
 from app.services.outcome_backfill import backfill_outcomes
+from app.services.calendar_backfill import backfill_calendar_events
 from app.services.auto_sync import auto_sync_loop
 from app.services.reclassify import start_all_pending_reclassify
 
@@ -25,6 +26,11 @@ async def lifespan(app: FastAPI):
     stop_event = asyncio.Event()
     task = asyncio.create_task(renewal_loop(stop_event))
     backfill_task = asyncio.create_task(backfill_outcomes(stop_event))
+    async def calendar_after_outcomes() -> None:
+        await backfill_task
+        await backfill_calendar_events(stop_event)
+
+    calendar_backfill_task = asyncio.create_task(calendar_after_outcomes())
     auto_sync_task = asyncio.create_task(auto_sync_loop(stop_event))
     pending_reclassify_task = asyncio.create_task(start_all_pending_reclassify())
     logger.info("Auto AI Email Checker API started")
@@ -34,6 +40,7 @@ async def lifespan(app: FastAPI):
         stop_event.set()
         await task
         await backfill_task
+        await calendar_backfill_task
         await auto_sync_task
         await pending_reclassify_task
 
@@ -53,6 +60,7 @@ def create_app() -> FastAPI:
     app.include_router(auth.router)
     app.include_router(mailboxes.router)
     app.include_router(emails.router)
+    app.include_router(calendar_events.router)
     app.include_router(classify.router)
     app.include_router(events.router)
     app.include_router(webhooks.router)

@@ -1,14 +1,15 @@
 import { CSSProperties, Dispatch, DragEvent, FormEvent, KeyboardEvent, PointerEvent, SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import EmailBody from "./components/EmailBody";
+import CompactSelect from "./components/CompactSelect";
 import MessageRow from "./components/MessageRow";
 import SettingsPage, { type SettingsSection } from "./pages/SettingsPage";
+import CalendarPage from "./pages/CalendarPage";
 import {
-  checkAutoSyncNow,
   disconnectMailbox,
   eventsUrl,
-  fetchAutoSyncStatus,
   fetchAiStatus,
+  fetchAutoSyncStatus,
   fetchClassifyPromptStatus,
   fetchEmailDetail,
   fetchEmails,
@@ -29,8 +30,8 @@ import {
   type EmailLabel,
   type InterviewSubtype,
   type EmailPage,
-  type AutoSyncStatus,
   type AiStatus,
+  type AutoSyncStatus,
   type MailFolder,
   type Mailbox,
   type Provider,
@@ -65,12 +66,11 @@ type ListRow =
   | { kind: "group"; key: string; heading: string; count: number }
   | { kind: "email"; email: EmailItem };
 
-const ACCOUNTS_MIN = 180;
+const ACCOUNTS_MIN = 220;
 const LIST_MIN = 240;
 const READER_MIN = 280;
 const ACCOUNTS_W_KEY = "email-checker-accounts-w";
 const LIST_W_KEY = "email-checker-list-w";
-const ACCOUNTS_LIST_H_KEY = "email-checker-accounts-list-h";
 const ACCOUNTS_ORDER_KEY = "email-checker-accounts-order";
 
 function loadStoredWidth(key: string, fallback: number, min: number): number {
@@ -253,7 +253,23 @@ function providerMark(provider: Provider): string {
   return provider === "google" ? "G" : "O";
 }
 
+type SidebarIconName = "home" | "inbox" | "calendar" | "categories" | "sent" | "spam" | "trash" | "archive" | "settings";
+
+function SidebarIcon({ name }: { name: SidebarIconName }) {
+  const path = name === "home" ? <><path d="m3 10 9-7 9 7" /><path d="M5 9v11h14V9M9 20v-7h6v7" /></>
+    : name === "inbox" ? <><rect x="3" y="4" width="18" height="16" rx="3" /><path d="M3 14h5l2 3h4l2-3h5M8 8h8" /></>
+    : name === "calendar" ? <><rect x="3" y="4.5" width="18" height="16" rx="3" /><path d="M7 2.5v4M17 2.5v4M3 9h18" /><path d="M8 13h3v3H8z" /></>
+    : name === "categories" ? <><path d="M12 3v6M8 9h8M9 9l-4 11M15 9l4 11M4 20h16" /></>
+    : name === "sent" ? <><path d="m3 11 18-8-7 18-3.5-7.5L3 11Z" /><path d="m10.5 13.5 4-4" /></>
+    : name === "spam" ? <><path d="M8 3h8l5 5v8l-5 5H8l-5-5V8l5-5Z" /><path d="M12 7v6M12 17h.01" /></>
+    : name === "trash" ? <><path d="M4 7h16M9 3h6l1 4H8l1-4ZM7 7l1 14h8l1-14M10 11v6M14 11v6" /></>
+    : name === "archive" ? <><path d="M4 4h16l-2 4H6L4 4Z" /><path d="M6 8v12h12V8M9 12h6" /></>
+    : <><circle cx="12" cy="12" r="3" /><path d="M12 2v3M12 19v3M4.93 4.93l2.12 2.12M16.95 16.95l2.12 2.12M2 12h3M19 12h3M4.93 19.07l2.12-2.12M16.95 7.05l2.12-2.12" /></>;
+  return <svg className="sidebar-nav-icon" viewBox="0 0 24 24" aria-hidden="true">{path}</svg>;
+}
+
 export default function App() {
+  const [activePage, setActivePage] = useState<"inbox" | "calendar">("inbox");
   const [mailboxes, setMailboxes] = useState<Mailbox[]>([]);
   const [accountOrder, setAccountOrder] = useState<number[]>(() => {
     try { return JSON.parse(localStorage.getItem(ACCOUNTS_ORDER_KEY) ?? "[]"); } catch { return []; }
@@ -277,12 +293,10 @@ export default function App() {
   const [mailboxUnreadCounts, setMailboxUnreadCounts] = useState<Record<number, number>>({});
   const [folderCounts, setFolderCounts] = useState<Record<MailFolder, number>>(EMPTY_FOLDER_COUNTS);
   const [error, setError] = useState<string | null>(null);
-  const [autoSyncStatus, setAutoSyncStatus] = useState<AutoSyncStatus | null>(null);
-  const [autoSyncOffline, setAutoSyncOffline] = useState(false);
-  const [autoSyncChecking, setAutoSyncChecking] = useState(false);
-  const [autoSyncDetailsOpen, setAutoSyncDetailsOpen] = useState(false);
   const [aiStatus, setAiStatus] = useState<AiStatus | null>(null);
   const [aiStatusOffline, setAiStatusOffline] = useState(false);
+  const [autoSyncStatus, setAutoSyncStatus] = useState<AutoSyncStatus | null>(null);
+  const [autoSyncOffline, setAutoSyncOffline] = useState(false);
   const [banner, setBanner] = useState<string | null>(null);
 
   const [connectEmail, setConnectEmail] = useState("");
@@ -313,9 +327,8 @@ export default function App() {
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [tableDialogOpen, setTableDialogOpen] = useState(false);
   const [collapsedDates, setCollapsedDates] = useState<Set<string>>(new Set());
-  const [accountsW, setAccountsW] = useState(() => loadStoredWidth(ACCOUNTS_W_KEY, 260, ACCOUNTS_MIN));
+  const [accountsW, setAccountsW] = useState(() => loadStoredWidth(ACCOUNTS_W_KEY, 300, ACCOUNTS_MIN));
   const [listW, setListW] = useState(() => loadStoredWidth(LIST_W_KEY, 360, LIST_MIN));
-  const [accountsListH, setAccountsListH] = useState(() => loadStoredWidth(ACCOUNTS_LIST_H_KEY, 118, 72));
   const [themePref, setThemePref] = useState<ThemePref>(() => loadThemePref());
   const [viewMode, setViewMode] = useState<ViewMode>(() => loadViewMode());
   const [inboxType, setInboxType] = useState<InboxType>(() => loadInboxType());
@@ -323,6 +336,7 @@ export default function App() {
   const [fontSize, setFontSize] = useState<FontSize>(() => loadFontSize());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("appearance");
+  const [sidebarSections, setSidebarSections] = useState({ inbox: true, categories: true, sent: false, spam: false, trash: false, archive: false });
   const [resizing, setResizing] = useState(false);
   const [replyOpen, setReplyOpen] = useState(false);
   const [replyText, setReplyText] = useState("");
@@ -368,7 +382,6 @@ export default function App() {
     startAccounts: number;
     startList: number;
   } | null>(null);
-  const accountHeightDragRef = useRef<{ startY: number; startH: number } | null>(null);
   const widthsRef = useRef({ accounts: accountsW, list: listW });
   widthsRef.current = { accounts: accountsW, list: listW };
   const mailboxesRef = useRef(mailboxes);
@@ -575,22 +588,6 @@ export default function App() {
     void load();
   }, [load]);
 
-  const refreshAutoSyncStatus = useCallback(async () => {
-    try {
-      const status = await fetchAutoSyncStatus();
-      setAutoSyncStatus(status);
-      setAutoSyncOffline(false);
-    } catch {
-      setAutoSyncOffline(true);
-    }
-  }, []);
-
-  useEffect(() => {
-    void refreshAutoSyncStatus();
-    const timer = window.setInterval(() => void refreshAutoSyncStatus(), 10_000);
-    return () => window.clearInterval(timer);
-  }, [refreshAutoSyncStatus]);
-
   const refreshAiStatus = useCallback(async () => {
     try {
       setAiStatus(await fetchAiStatus());
@@ -606,25 +603,26 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [refreshAiStatus]);
 
+  const refreshAutoSyncStatus = useCallback(async () => {
+    try {
+      setAutoSyncStatus(await fetchAutoSyncStatus());
+      setAutoSyncOffline(false);
+    } catch {
+      setAutoSyncOffline(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshAutoSyncStatus();
+    const timer = window.setInterval(() => void refreshAutoSyncStatus(), 15_000);
+    return () => window.clearInterval(timer);
+  }, [refreshAutoSyncStatus]);
+
   useEffect(() => {
     void refreshReclassifyStatuses();
     const timer = window.setInterval(() => void refreshReclassifyStatuses(), 3_000);
     return () => window.clearInterval(timer);
   }, [refreshReclassifyStatuses]);
-
-  async function retryAutoSync() {
-    if (autoSyncChecking) return;
-    setAutoSyncChecking(true);
-    try {
-      const status = autoSyncOffline ? await fetchAutoSyncStatus() : await checkAutoSyncNow();
-      setAutoSyncStatus(status);
-      setAutoSyncOffline(false);
-    } catch {
-      setAutoSyncOffline(true);
-    } finally {
-      setAutoSyncChecking(false);
-    }
-  }
 
   useEffect(() => {
     if (!didMountFilters.current) {
@@ -889,25 +887,6 @@ export default function App() {
         startList: widthsRef.current.list,
       };
     };
-  }
-
-  function onAccountHeightSplitterDown(event: PointerEvent<HTMLButtonElement>) {
-    event.preventDefault();
-    accountHeightDragRef.current = { startY: event.clientY, startH: accountsListH };
-    event.currentTarget.setPointerCapture(event.pointerId);
-  }
-
-  function onAccountHeightSplitterMove(event: PointerEvent<HTMLButtonElement>) {
-    const drag = accountHeightDragRef.current;
-    const pane = accountsPaneRef.current;
-    if (!drag || !pane) return;
-    const max = Math.max(72, pane.clientHeight - 270);
-    setAccountsListH(Math.round(Math.max(72, Math.min(max, drag.startH + event.clientY - drag.startY))));
-  }
-
-  function onAccountHeightSplitterUp() {
-    accountHeightDragRef.current = null;
-    try { localStorage.setItem(ACCOUNTS_LIST_H_KEY, String(Math.round(accountsListH))); } catch { /* ignore */ }
   }
 
   function onSplitterPointerMove(event: PointerEvent<HTMLButtonElement>) {
@@ -1287,6 +1266,7 @@ export default function App() {
   }
 
   async function onOpenEmail(id: number) {
+    setActivePage("inbox");
     const request = ++detailGen.current;
     setSelectedId(id);
     setSelected(null);
@@ -1409,6 +1389,7 @@ export default function App() {
   }
 
   function selectMailbox(id: number | null) {
+    setActivePage("inbox");
     scrollRef.current?.scrollTo(0, 0);
     if (selectedMailboxId === id) {
       setEmails([]);
@@ -1488,14 +1469,24 @@ export default function App() {
     setInterviewSubtype(next);
   }
 
-  function selectFolder(next: "all" | MailFolder) {
+  function selectMailboxFolder(id: number | null, nextFolder: "all" | MailFolder) {
+    setActivePage("inbox");
     scrollRef.current?.scrollTo(0, 0);
-    if (folder === next) {
+    if (selectedMailboxId === id && folder === nextFolder) {
       setEmails([]);
       void loadFirstPage();
       return;
     }
-    setFolder(next);
+    filterRef.current = { ...filterRef.current, mailboxId: id, folder: nextFolder };
+    skipNextMailboxFilterLoad.current = true;
+    setSelectedMailboxId(id);
+    setFolder(nextFolder);
+    setEmails([]);
+    void loadFirstPage();
+  }
+
+  function toggleSidebarSection(section: keyof typeof sidebarSections) {
+    setSidebarSections((current) => ({ ...current, [section]: !current[section] }));
   }
 
   const selectedMailbox = selectedMailboxId != null ? mailboxById.get(selectedMailboxId) : null;
@@ -1540,59 +1531,13 @@ export default function App() {
   }
   const readerAccount =
     selected != null ? mailboxById.get(selected.mailbox_id)?.email_address ?? "" : "";
-  const autoSyncState = autoSyncOffline ? "offline" : autoSyncStatus?.state ?? "checking";
-  const autoSyncAlert = ["offline", "no_account", "stopped", "error"].includes(autoSyncState);
-  const syncIntervalMinutes = Math.round((autoSyncStatus?.interval_seconds ?? 120) / 60);
-  const webhookDeliveryStates = Object.values(autoSyncStatus?.webhook_delivery ?? {});
-  const legacyWebhookVerified = webhookDeliveryStates.length === 0
-    && Boolean(autoSyncStatus?.connected_accounts)
-    && autoSyncStatus?.webhook_accounts === autoSyncStatus?.connected_accounts;
-  const webhookDeliveryVerified = legacyWebhookVerified
-    || (webhookDeliveryStates.length > 0
-      && webhookDeliveryStates.every((delivery) => delivery.healthy));
-  const registeredWebhookAccounts = autoSyncStatus?.registered_webhook_accounts
-    ?? autoSyncStatus?.webhook_accounts
-    ?? 0;
-  const autoSyncLabel = autoSyncState === "active"
-    ? autoSyncStatus
-      && webhookDeliveryVerified
-      && autoSyncStatus.webhook_accounts === autoSyncStatus.connected_accounts
-      ? "Webhook sync on"
-      : webhookDeliveryVerified && autoSyncStatus?.webhook_accounts
-        ? `Webhook + auto sync · every ${syncIntervalMinutes} min`
-        : registeredWebhookAccounts
-          ? `Polling fallback · ${syncIntervalMinutes} min`
-          : `Auto sync on · every ${syncIntervalMinutes} min`
-    : autoSyncState === "syncing"
-      ? "Auto sync running"
-      : autoSyncState === "checking"
-        ? "Checking auto sync…"
-        : "Auto sync off";
-  const autoSyncReason = autoSyncState === "no_account"
-    ? "Connect an email account to start automatic syncing."
-    : autoSyncState === "offline"
-      ? "The app cannot reach the email checker server. Start the server, then check again."
-      : autoSyncState === "stopped"
-        ? "The automatic sync worker is not running. Restart the email checker server, then check again."
-        : autoSyncStatus?.problem_mailboxes[0]
-          ? `${autoSyncStatus.problem_mailboxes[0].email_address}: ${autoSyncStatus.problem_mailboxes[0].message}`
-          : autoSyncStatus?.last_error ?? "An account could not sync. Check the connection and try again.";
   const aiReady = Boolean(aiStatus?.ready) && !aiStatusOffline;
   const aiLabel = aiStatus?.provider === "ollama"
     ? aiReady ? "Local AI on" : "Local AI off"
     : aiStatus?.provider === "gemini"
       ? aiReady ? "Gemini on" : "Gemini not configured"
       : aiReady ? "OpenAI on" : "AI not configured";
-  const aiTitle = aiStatus?.provider === "ollama"
-    ? `${aiLabel} · ${aiStatus.model}`
-    : aiStatus?.provider === "gemini"
-      ? `${aiLabel} · ${aiStatus.model}`
-      : aiLabel;
-  const syncTooltip = autoSyncAlert
-    ? `Email sync needs attention. ${autoSyncReason}`
-    : autoSyncState === "syncing"
-      ? "Email sync is running now."
-      : "Email sync is working normally.";
+  const aiTitle = aiStatus?.model ? `${aiLabel} · ${aiStatus.model}` : aiLabel;
   const aiTooltip = aiStatus?.provider === "ollama"
     ? aiReady
       ? `Local AI is ready · ${aiStatus.model}`
@@ -1604,6 +1549,76 @@ export default function App() {
     : aiReady
       ? "OpenAI is ready."
       : "AI is not configured. Add a provider in AI settings.";
+  const emailSyncState = syncingIds.size > 0 ? "syncing" : autoSyncOffline ? "offline" : autoSyncStatus?.state ?? "loading";
+  const emailSyncMethod = !autoSyncStatus || autoSyncStatus.connected_accounts === 0
+    ? null
+    : autoSyncStatus.webhook_accounts >= autoSyncStatus.connected_accounts
+      ? "Webhook"
+      : autoSyncStatus.webhook_accounts > 0
+        ? "Webhook + polling"
+        : "Polling";
+  const emailSyncStatusLabel = emailSyncState === "syncing"
+    ? syncingIds.size > 0
+      ? `Syncing ${syncingIds.size} ${syncingIds.size === 1 ? "account" : "accounts"}`
+      : "Syncing"
+    : emailSyncState === "active"
+      ? "Up to date"
+      : emailSyncState === "no_account"
+        ? "No account"
+        : emailSyncState === "stopped"
+          ? "Sync paused"
+          : emailSyncState === "error"
+            ? "Needs attention"
+            : emailSyncState === "offline"
+              ? "Unavailable"
+            : "Checking";
+  const emailSyncLabel = emailSyncMethod && emailSyncState !== "offline" && emailSyncState !== "loading"
+    ? `${emailSyncStatusLabel} · ${emailSyncMethod}`
+    : emailSyncStatusLabel;
+  const emailSyncTooltip = autoSyncOffline
+    ? "The app cannot reach the email sync service."
+    : autoSyncStatus?.last_error
+    ?? autoSyncStatus?.problem_mailboxes[0]?.message
+    ?? (emailSyncState === "active"
+      ? `Automatic sync uses ${emailSyncMethod ?? "background checks"} for ${autoSyncStatus?.connected_accounts ?? mailboxes.length} ${((autoSyncStatus?.connected_accounts ?? mailboxes.length) === 1) ? "account" : "accounts"}.`
+      : emailSyncLabel);
+  const aiProviderLabel = aiStatus?.provider === "openai"
+    ? "OpenAI"
+    : aiStatus?.provider === "gemini"
+      ? "Gemini"
+      : aiStatus?.provider === "ollama"
+        ? "Ollama"
+        : "";
+  const aiModelLabel = aiStatus
+    ? `${aiProviderLabel} · ${aiStatus.model}`
+    : aiStatusOffline
+      ? "Unavailable"
+      : "Checking";
+
+  const renderSidebarAccounts = (scope: MailFolder, showUnread = false) => (
+    <div className="sidebar-account-list">
+      {orderedMailboxes.map((box) => {
+        const unread = mailboxUnreadCounts[box.id] ?? 0;
+        const active = activePage === "inbox" && folder === scope && selectedMailboxId === box.id;
+        return <div
+          className={`sidebar-account-wrap ${draggedAccountId === box.id ? "is-dragging" : ""}`}
+          draggable
+          onDragStart={(event) => onAccountDragStart(event, box.id)}
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={(event) => onAccountDrop(event, box.id)}
+          onDragEnd={() => setDraggedAccountId(null)}
+          key={`${scope}-${box.id}`}
+        >
+          <button type="button" className={`sidebar-account-row ${active ? "active" : ""}`} onClick={() => selectMailboxFolder(box.id, scope)} title={box.email_address}>
+            <span className={`sidebar-account-avatar provider-${box.provider}`} style={{ "--avatar-hue": `${(box.id * 47) % 360}` } as CSSProperties}>{providerMark(box.provider)}</span>
+            <span className="sidebar-account-email">{box.email_address}</span>
+            {showUnread && unread > 0 && <span className="sidebar-account-count" title={`${unread} unread messages`}>{unread}</span>}
+          </button>
+        </div>;
+      })}
+      {!orderedMailboxes.length && <p className="sidebar-empty">Add an account to start.</p>}
+    </div>
+  );
 
   if (settingsOpen) {
     return (
@@ -1626,6 +1641,7 @@ export default function App() {
         updatingPrompt={updatingPrompt}
         onUpdatePrompt={onUpdatePrompt}
         onTrainingDeleted={refreshPromptStatus}
+        onAiSettingsSaved={refreshAiStatus}
         onAddAccount={() => {
           setSettingsOpen(false);
           setConnectEmail("");
@@ -1650,173 +1666,94 @@ export default function App() {
   return (
     <div
       ref={shellRef}
-      className={`app-shell view-${viewMode}${viewMode === "table" && tableDialogOpen ? " table-dialog-open" : ""}${resizing ? " is-resizing" : ""}`}
+      className={`app-shell view-${viewMode}${activePage === "calendar" ? " calendar-open" : ""}${viewMode === "table" && tableDialogOpen ? " table-dialog-open" : ""}${resizing ? " is-resizing" : ""}`}
       style={
         {
           "--accounts-w": `${accountsW}px`,
           "--list-w": `${listW}px`,
-          "--accounts-list-h": `${accountsListH}px`,
         } as CSSProperties
       }
     >
       <aside className="pane-accounts" ref={accountsPaneRef}>
         <div className="accounts-top">
-          <div className="brand-mini">Auto AI Email Checker</div>
-          <div className="accounts-top-actions">
-            <div className="auto-sync-header-wrap auto-sync-top-wrap">
-              <div className="auto-sync-mini" data-state={autoSyncState}>
-                <button
-                  type="button"
-                  className="auto-sync-status-button"
-                  aria-label={`Email sync status: ${autoSyncLabel}. Show details`}
-                  data-tooltip={syncTooltip}
-                  aria-expanded={autoSyncDetailsOpen}
-                  aria-controls="auto-sync-details"
-                  onClick={() => setAutoSyncDetailsOpen((open) => !open)}
-                >
-                  <span className="auto-sync-status-icon" aria-hidden="true">
-                    {autoSyncAlert ? "!" : autoSyncState === "active" ? "✓" : "↻"}
-                  </span>
-                  <span role="status" aria-live="polite">{autoSyncLabel}</span>
-                </button>
-              </div>
-              {autoSyncDetailsOpen && autoSyncAlert && (
-                <div id="auto-sync-details" className="auto-sync-details auto-sync-header-details">
-                  <p>{autoSyncReason}</p>
-                  {autoSyncState === "error" && autoSyncStatus && autoSyncStatus.problem_mailboxes.length > 1 && (
-                    <p>{autoSyncStatus.problem_mailboxes.length} accounts need attention.</p>
-                  )}
-                  <div className="auto-sync-actions">
-                    {autoSyncState === "no_account" ? (
-                      <button type="button" className="action-btn" onClick={() => openSettings("accounts")}>Accounts</button>
-                    ) : (
-                      <button type="button" className="action-btn" disabled={autoSyncChecking} onClick={() => void retryAutoSync()}>
-                        {autoSyncChecking ? "Checking…" : autoSyncState === "error" ? "Retry sync" : "Check again"}
-                      </button>
-                    )}
-                  </div>
-                </div>
-              )}
+          <button type="button" className={`sidebar-home-row ${activePage === "inbox" && folder === "all" && selectedMailboxId == null ? "active" : ""}`} onClick={() => selectMailboxFolder(null, "all")}>
+            <SidebarIcon name="home" /><span>Home Screen</span>
+          </button>
+        </div>
+        <nav className="sidebar-tree" aria-label="Mailbox navigation">
+          <section className="sidebar-tree-section">
+            <div className="sidebar-section-heading">
+              <button type="button" className={`sidebar-disclosure ${sidebarSections.inbox ? "open" : ""}`} aria-label={`${sidebarSections.inbox ? "Collapse" : "Expand"} Inbox accounts`} aria-expanded={sidebarSections.inbox} onClick={() => toggleSidebarSection("inbox")}><span>›</span></button>
+              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "inbox" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, inbox: true })); selectMailboxFolder(null, "inbox"); }}><SidebarIcon name="inbox" /><span>Inbox</span>{inboxCount > 0 && <span className="sidebar-row-count">{inboxCount}</span>}</button>
             </div>
-            <button
-              type="button"
-              className="ai-status-mini"
-              data-ready={aiReady}
-              data-tooltip={aiTooltip}
-              aria-label={`${aiTitle}. Open AI settings`}
-              onClick={() => openSettings("ai")}
-            >
-              <span className="ai-status-icon" aria-hidden="true">
-                {aiStatus?.provider === "gemini" ? (
-                  <svg viewBox="0 0 24 24"><path d="M12 2c.8 5.7 4.3 9.2 10 10-5.7.8-9.2 4.3-10 10-.8-5.7-4.3-9.2-10-10 5.7-.8 9.2-4.3 10-10Z" /></svg>
-                ) : aiStatus?.provider === "ollama" ? (
-                  <svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="7" rx="2" /><rect x="4" y="14" width="16" height="7" rx="2" /><path d="M8 6.5h.01M8 17.5h.01M12 6.5h5M12 17.5h5" /></svg>
-                ) : (
-                  <svg viewBox="0 0 24 24"><path d="M7 18h10a5 5 0 0 0 .5-9.97A7 7 0 0 0 4.2 10.7 4 4 0 0 0 7 18Z" /></svg>
-                )}
+            {sidebarSections.inbox && renderSidebarAccounts("inbox", true)}
+          </section>
+
+          <button type="button" className={`sidebar-nav-row sidebar-primary-row ${activePage === "calendar" ? "active" : ""}`} onClick={() => setActivePage("calendar")}><SidebarIcon name="calendar" /><span>Calendar</span></button>
+
+          <section className="sidebar-tree-section">
+            <div className="sidebar-section-heading">
+              <button type="button" className={`sidebar-disclosure ${sidebarSections.categories ? "open" : ""}`} aria-label={`${sidebarSections.categories ? "Collapse" : "Expand"} categories`} aria-expanded={sidebarSections.categories} onClick={() => toggleSidebarSection("categories")}><span>›</span></button>
+              <button type="button" className={`sidebar-nav-row ${label !== "all" ? "active" : ""}`} onClick={() => toggleSidebarSection("categories")}><SidebarIcon name="categories" /><span>Categories</span></button>
+            </div>
+            {sidebarSections.categories && <div className="sidebar-category-list">
+              <button type="button" className={`sidebar-filter-row ${label === "all" ? "active" : ""}`} onClick={() => { setActivePage("inbox"); selectLabel("all"); }}><span>All categories</span><span>{allCount}</span></button>
+              {CLASSIFY_LABELS.map((item) => <button type="button" className={`sidebar-filter-row ${label === item ? "active" : ""}`} onClick={() => { setActivePage("inbox"); selectLabel(item); }} key={item}><span>{CLASSIFY_LABEL_TITLES[item]}</span><span>{labelCounts[item]}</span></button>)}
+            </div>}
+          </section>
+
+          <div className="sidebar-group-label">Folders</div>
+          <section className="sidebar-tree-section">
+            <div className="sidebar-section-heading">
+              <button type="button" className={`sidebar-disclosure ${sidebarSections.sent ? "open" : ""}`} aria-label={`${sidebarSections.sent ? "Collapse" : "Expand"} Sent accounts`} aria-expanded={sidebarSections.sent} onClick={() => toggleSidebarSection("sent")}><span>›</span></button>
+              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "sent" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, sent: true })); selectMailboxFolder(null, "sent"); }}><SidebarIcon name="sent" /><span>Sent</span>{folderCounts.sent > 0 && <span className="sidebar-row-count">{folderCounts.sent}</span>}</button>
+            </div>
+            {sidebarSections.sent && renderSidebarAccounts("sent")}
+          </section>
+          <section className="sidebar-tree-section">
+            <div className="sidebar-section-heading">
+              <button type="button" className={`sidebar-disclosure ${sidebarSections.spam ? "open" : ""}`} aria-label={`${sidebarSections.spam ? "Collapse" : "Expand"} Spam accounts`} aria-expanded={sidebarSections.spam} onClick={() => toggleSidebarSection("spam")}><span>›</span></button>
+              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "spam" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, spam: true })); selectMailboxFolder(null, "spam"); }}><SidebarIcon name="spam" /><span>Spam</span>{folderCounts.spam > 0 && <span className="sidebar-row-count">{folderCounts.spam}</span>}</button>
+            </div>
+            {sidebarSections.spam && renderSidebarAccounts("spam")}
+          </section>
+          <section className="sidebar-tree-section">
+            <div className="sidebar-section-heading">
+              <button type="button" className={`sidebar-disclosure ${sidebarSections.trash ? "open" : ""}`} aria-label={`${sidebarSections.trash ? "Collapse" : "Expand"} Trash accounts`} aria-expanded={sidebarSections.trash} onClick={() => toggleSidebarSection("trash")}><span>›</span></button>
+              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "trash" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, trash: true })); selectMailboxFolder(null, "trash"); }}><SidebarIcon name="trash" /><span>Trash</span>{folderCounts.trash > 0 && <span className="sidebar-row-count">{folderCounts.trash}</span>}</button>
+            </div>
+            {sidebarSections.trash && renderSidebarAccounts("trash")}
+          </section>
+          <section className="sidebar-tree-section">
+            <div className="sidebar-section-heading">
+              <button type="button" className={`sidebar-disclosure ${sidebarSections.archive ? "open" : ""}`} aria-label={`${sidebarSections.archive ? "Collapse" : "Expand"} Archive accounts`} aria-expanded={sidebarSections.archive} onClick={() => toggleSidebarSection("archive")}><span>›</span></button>
+              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "archive" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, archive: true })); selectMailboxFolder(null, "archive"); }}><SidebarIcon name="archive" /><span>Archive</span>{folderCounts.archive > 0 && <span className="sidebar-row-count">{folderCounts.archive}</span>}</button>
+            </div>
+            {sidebarSections.archive && renderSidebarAccounts("archive")}
+          </section>
+        </nav>
+
+        <div className="sidebar-footer">
+          <div className="sidebar-status-panel" aria-label="Service status">
+            <button type="button" className="sidebar-health-row" data-state={emailSyncState} title={emailSyncTooltip} aria-label={`Email sync: ${emailSyncLabel}. Open account settings`} onClick={() => openSettings("accounts")}>
+              <span className="sidebar-health-dot" aria-hidden="true" />
+              <span className="sidebar-health-copy">
+                <span className="sidebar-health-name">Email sync</span>
+                <span className="sidebar-health-value" role="status" aria-live="polite">
+                  <span className="sidebar-health-status">{emailSyncStatusLabel}</span>
+                  {emailSyncMethod && emailSyncState !== "offline" && emailSyncState !== "loading" && (
+                    <span className="sidebar-sync-method">{emailSyncMethod}</span>
+                  )}
+                </span>
               </span>
+            </button>
+            <button type="button" className="sidebar-health-row" data-state={aiReady ? "active" : "error"} title={aiTooltip} aria-label={`${aiTitle}. Open AI settings`} onClick={() => openSettings("ai")}>
+              <span className="sidebar-health-dot" aria-hidden="true" />
+              <span className="sidebar-health-copy"><span className="sidebar-health-name">AI model</span><span className="sidebar-health-value" title={aiModelLabel}>{aiModelLabel}</span></span>
               <span className="sr-only" role="status" aria-live="polite">{aiLabel}</span>
             </button>
-            <button
-              type="button"
-              className="settings-btn"
-              aria-label="Settings"
-              aria-expanded={settingsOpen}
-              onClick={() => openSettings("appearance")}
-            >
-              ⚙
-            </button>
           </div>
-        </div>
-        <button
-          type="button"
-          className={selectedMailboxId == null ? "nav-inbox active" : "nav-inbox"}
-          onClick={() => selectMailbox(null)}
-        >
-          <span className="nav-inbox-icon" aria-hidden="true">
-            ▣
-          </span>
-          <span>Inbox</span>
-          {inboxCount > 0 && <span className="nav-count">{inboxCount}</span>}
-        </button>
-
-        <div className="accounts-label">Accounts</div>
-        <div className="accounts-scroll">
-          {orderedMailboxes.map((box) => {
-            const unread = mailboxUnreadCounts[box.id] ?? 0;
-            return (
-              <div
-                key={box.id}
-                className={draggedAccountId === box.id ? "account-row-wrap is-dragging" : "account-row-wrap"}
-                draggable
-                onDragStart={(event) => onAccountDragStart(event, box.id)}
-                onDragOver={(event) => event.preventDefault()}
-                onDrop={(event) => onAccountDrop(event, box.id)}
-                onDragEnd={() => setDraggedAccountId(null)}
-              >
-                <button
-                  type="button"
-                  className={
-                    selectedMailboxId === box.id ? "account-row active" : "account-row"
-                  }
-                  onClick={() => selectMailbox(box.id)}
-                  title={box.email_address}
-                >
-                  <span className={`avatar provider-${box.provider}`}>
-                    {providerMark(box.provider)}
-                  </span>
-                  <span className="account-main">
-                    <span className="account-email">{box.email_address}</span>
-                  </span>
-                  {unread > 0 && (
-                    <span className="account-new-badge" title={`${unread} new messages`}>
-                      {unread}
-                    </span>
-                  )}
-                </button>
-              </div>
-            );
-          })}
-          {!mailboxes.length && <p className="hint">Add an account to start automatic sync.</p>}
-        </div>
-        <button
-          type="button"
-          className="account-height-splitter"
-          aria-label="Resize accounts and filters panels"
-          title="Drag to resize account list"
-          onPointerDown={onAccountHeightSplitterDown}
-          onPointerMove={onAccountHeightSplitterMove}
-          onPointerUp={onAccountHeightSplitterUp}
-          onPointerCancel={onAccountHeightSplitterUp}
-        />
-
-        <div className="account-filter-panel" aria-label="Email filters">
-          <div className="account-filter-section">
-            <span className="account-filter-title">Folders</span>
-            <div className="folder-badges account-filter-list" role="tablist" aria-label="Mail folders">
-              <button type="button" className={folder === "all" ? "folder-badge active" : "folder-badge"} onClick={() => selectFolder("all")}>
-                <span>All mail</span><span className="count-pill">{allCount}</span>
-              </button>
-              {MAIL_FOLDERS.map((item) => (
-                <button key={item} type="button" className={folder === item ? `folder-badge active folder-${item}` : `folder-badge folder-${item}`} onClick={() => selectFolder(item)}>
-                  <span>{MAIL_FOLDER_TITLES[item]}</span><span className="count-pill">{folderCounts[item]}</span>
-                </button>
-              ))}
-            </div>
-          </div>
-          <div className="account-filter-section">
-            <span className="account-filter-title">Categories</span>
-            <div className="classify-badges account-filter-list" role="tablist" aria-label="Classifications">
-              <button type="button" className={label === "all" ? "classify-badge active" : "classify-badge"} onClick={() => selectLabel("all")}>
-                <span>All categories</span><span className="count-pill">{allCount}</span>
-              </button>
-              {CLASSIFY_LABELS.map((item) => (
-                <button key={item} type="button" className={label === item ? `classify-badge active label-${item}` : `classify-badge label-${item}`} onClick={() => selectLabel(item)}>
-                  <span>{CLASSIFY_LABEL_TITLES[item]}</span><span className="count-pill">{labelCounts[item]}</span>
-                </button>
-              ))}
-            </div>
-          </div>
+          <button type="button" className="sidebar-footer-row" onClick={() => openSettings("appearance")}><SidebarIcon name="settings" /><span>Settings</span></button>
         </div>
       </aside>
 
@@ -1830,6 +1767,7 @@ export default function App() {
         onPointerCancel={onSplitterPointerUp}
       />
 
+      {activePage === "inbox" && <>
       <section className={`pane-list view-${viewMode}`}>
         <header className="list-header">
           <div className="list-title">
@@ -1883,7 +1821,7 @@ export default function App() {
         {label === "interview_scheduled" && (
           <div className="subtype-filter" role="group" aria-label="Interview Scheduled subtype">
             <label className="subtype-filter-label" htmlFor="interview-subtype-filter">Interview subtype</label>
-            <select
+            <CompactSelect
               id="interview-subtype-filter"
               className="subtype-filter-select"
               value={interviewSubtype}
@@ -1893,7 +1831,7 @@ export default function App() {
               {(Object.entries(INTERVIEW_SUBTYPE_TITLES) as [InterviewSubtype, string][]).map(([value, title]) => (
                 <option key={value} value={value}>{title}</option>
               ))}
-            </select>
+            </CompactSelect>
             {!loading && <span className="subtype-filter-count" role="status">{filteredTotal} email{filteredTotal === 1 ? "" : "s"}</span>}
           </div>
         )}
@@ -2020,17 +1958,25 @@ export default function App() {
         onPointerUp={onSplitterPointerUp}
         onPointerCancel={onSplitterPointerUp}
       />
+      </>}
 
-      {viewMode === "table" && tableDialogOpen && (
+      {activePage === "inbox" && viewMode === "table" && tableDialogOpen && (
         <div className="table-dialog-backdrop" role="presentation" onClick={closeTableDialog} />
       )}
       <section
         className="pane-reader"
         ref={readerDialogRef}
-        role={viewMode === "table" && tableDialogOpen ? "dialog" : undefined}
-        aria-modal={viewMode === "table" && tableDialogOpen ? true : undefined}
-        aria-label={viewMode === "table" && tableDialogOpen ? selected?.subject || "Email" : undefined}
+        role={activePage === "inbox" && viewMode === "table" && tableDialogOpen ? "dialog" : undefined}
+        aria-modal={activePage === "inbox" && viewMode === "table" && tableDialogOpen ? true : undefined}
+        aria-label={activePage === "calendar" ? "Calendar" : viewMode === "table" && tableDialogOpen ? selected?.subject || "Email" : undefined}
       >
+        {activePage === "calendar" ? (
+          <CalendarPage
+            mailboxes={orderedMailboxes}
+            onClose={() => setActivePage("inbox")}
+            onOpenEmail={(id) => void onOpenEmail(id)}
+          />
+        ) : <>
         {viewMode === "table" && tableDialogOpen && (
           <div className="table-dialog-toolbar">
             <span>Email</span>
@@ -2068,8 +2014,9 @@ export default function App() {
                   </div>
                 </div>
                 <div className="reader-side">
-                  <select
+                  <CompactSelect
                     className={`label-select label-${selected.label}`}
+                    containerClassName={`category-compact-select label-${selected.label}`}
                     value={selected.label}
                     disabled={savingLabel || pendingLabel != null}
                     aria-label="Email category"
@@ -2080,12 +2027,12 @@ export default function App() {
                         {CLASSIFY_LABEL_TITLES[item]}
                       </option>
                     ))}
-                  </select>
+                  </CompactSelect>
                   {selected.label === "interview_scheduled" && selected.interview_subtype && (
                     <label className="interview-subtype-field">
                       <span>Interview event</span>
                       <span className="interview-subtype-control">
-                        <select
+                        <CompactSelect
                         value={selected.interview_subtype}
                         disabled={savingLabel || pendingLabel != null}
                         aria-label="Interview subtype"
@@ -2115,7 +2062,7 @@ export default function App() {
                           {(Object.entries(INTERVIEW_SUBTYPE_TITLES) as [InterviewSubtype, string][]).map(([value, title]) => (
                             <option key={value} value={value}>{title}</option>
                           ))}
-                        </select>
+                        </CompactSelect>
                       </span>
                     </label>
                   )}
@@ -2176,6 +2123,7 @@ export default function App() {
             </div>
           </article>
         )}
+        </>}
       </section>
 
       {scheduleDialogOpen && (
@@ -2239,7 +2187,7 @@ export default function App() {
               {pendingLabel.nextLabel === "interview_scheduled" && (
                 <label className="dialog-email-label">
                   Interview event
-                  <select
+                  <CompactSelect
                     value={pendingSubtype}
                     onChange={(event) => setPendingSubtype(event.target.value as InterviewSubtype | "")}
                     aria-label="Interview subtype"
@@ -2249,7 +2197,7 @@ export default function App() {
                     {(Object.entries(INTERVIEW_SUBTYPE_TITLES) as [InterviewSubtype, string][]).map(([value, title]) => (
                       <option key={value} value={value}>{title}</option>
                     ))}
-                  </select>
+                  </CompactSelect>
                 </label>
               )}
               <p className="dialog-hint">Use this email as prompt update training data?</p>

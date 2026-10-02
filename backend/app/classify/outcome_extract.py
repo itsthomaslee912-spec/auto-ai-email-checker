@@ -15,6 +15,7 @@ OUTCOME_LABELS = frozenset(
     {
         EmailLabel.APPLICATION_CONFIRMATION.value,
         EmailLabel.REJECTED_CLOSED.value,
+        EmailLabel.SCREENING.value,
         EmailLabel.INTERVIEW_SCHEDULED.value,
         EmailLabel.INTERVIEW_INVITATION.value,
     }

@@ -217,3 +217,75 @@ class MailboxOutcomesOut(BaseModel):
     items: list[OutcomeEntryOut] = []
     total: int = 0
     label: str | None = None
+
+
+CalendarEventKindLiteral = Literal["availability", "confirmed"]
+InterviewStatusLiteral = Literal[
+    "confirmation", "calendar_invite", "reminder", "reschedule", "time_change", "cancellation"
+]
+ApplicationStatusLiteral = Literal["active", "rejected", "position_closed"]
+MeetingTypeLiteral = Literal["video", "phone", "in_person", "unspecified"]
+
+
+class CalendarEventCreateIn(BaseModel):
+    mailbox_id: int
+    title: str = Field(min_length=1, max_length=512)
+    company: str = Field(default="", max_length=255)
+    role: str = Field(default="", max_length=255)
+    job_url: str | None = Field(default=None, max_length=2048)
+    description: str = Field(default="", max_length=10000)
+    start_at: UtcDateTime
+    end_at: UtcDateTime
+    source_timezone: str | None = Field(default=None, max_length=128)
+    interview_status: InterviewStatusLiteral = "confirmation"
+    application_status: ApplicationStatusLiteral = "active"
+    meeting_type: MeetingTypeLiteral = "unspecified"
+    meeting_provider: str | None = Field(default=None, max_length=64)
+    meeting_url: str | None = Field(default=None, max_length=2048)
+    phone_number: str | None = Field(default=None, max_length=64)
+    phone_access_code: str | None = Field(default=None, max_length=64)
+
+
+class CalendarEventUpdateIn(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=512)
+    company: str | None = Field(default=None, max_length=255)
+    role: str | None = Field(default=None, max_length=255)
+    job_url: str | None = Field(default=None, max_length=2048)
+    description: str | None = Field(default=None, max_length=10000)
+    start_at: UtcDateTime | None = None
+    end_at: UtcDateTime | None = None
+    source_timezone: str | None = Field(default=None, max_length=128)
+    interview_status: InterviewStatusLiteral | None = None
+    application_status: ApplicationStatusLiteral | None = None
+    meeting_type: MeetingTypeLiteral | None = None
+    meeting_provider: str | None = Field(default=None, max_length=64)
+    meeting_url: str | None = Field(default=None, max_length=2048)
+    phone_number: str | None = Field(default=None, max_length=64)
+    phone_access_code: str | None = Field(default=None, max_length=64)
+
+
+class CalendarEventOut(BaseModel):
+    id: int
+    mailbox_id: int
+    email_account: str
+    provider: ProviderLiteral
+    source_email_id: int | None = None
+    kind: CalendarEventKindLiteral
+    origin: Literal["email", "manual"]
+    title: str
+    company: str = ""
+    role: str = ""
+    job_url: str | None = None
+    description: str = ""
+    start_at: UtcDateTime
+    end_at: UtcDateTime
+    source_timezone: str | None = None
+    interview_status: InterviewStatusLiteral | None = None
+    application_status: ApplicationStatusLiteral = "active"
+    meeting_type: MeetingTypeLiteral = "unspecified"
+    meeting_provider: str | None = None
+    meeting_url: str | None = None
+    phone_number: str | None = None
+    phone_access_code: str | None = None
+    created_at: UtcDateTime | None = None
+    updated_at: UtcDateTime | None = None
