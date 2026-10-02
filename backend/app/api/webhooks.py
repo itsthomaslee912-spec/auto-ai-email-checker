@@ -15,9 +15,7 @@ from app.db import SessionLocal
 from app.services.mailbox_sync import process_gmail_notification, process_outlook_notification
 from app.services.webhook_health import (
     persist_webhook_delivery_failure,
-    persist_webhook_delivery_success,
     record_webhook_delivery_failure,
-    record_webhook_delivery_success,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,8 +63,6 @@ async def gmail_pubsub_push(request: Request) -> dict:
         record_webhook_delivery_failure("google", str(exc.detail))
         persist_webhook_delivery_failure("google", str(exc.detail))
         raise
-    record_webhook_delivery_success("google")
-    persist_webhook_delivery_success("google")
     body = await request.json()
     message = body.get("message") or {}
     data_b64 = message.get("data")
@@ -135,8 +131,6 @@ async def outlook_graph_webhook(request: Request, background_tasks: BackgroundTa
             persist_webhook_delivery_failure("microsoft", "Invalid Outlook clientState")
             logger.warning("Rejected Outlook notification with bad clientState")
             continue
-        record_webhook_delivery_success("microsoft")
-        persist_webhook_delivery_success("microsoft")
         subscription_id = note.get("subscriptionId") or ""
         resource_data = note.get("resourceData") or {}
         message_id = resource_data.get("id")

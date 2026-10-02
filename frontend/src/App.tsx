@@ -1647,19 +1647,37 @@ export default function App() {
       ? "OpenAI is ready."
       : "AI is not configured. Add a provider in AI settings.";
   const emailSyncState = syncingIds.size > 0 ? "syncing" : autoSyncOffline ? "offline" : autoSyncStatus?.state ?? "loading";
+  const completedSyncTimes = (autoSyncStatus?.mailboxes ?? [])
+    .map((mailbox) => mailbox.last_sync_completed_at ? Date.parse(mailbox.last_sync_completed_at) : Number.NaN)
+    .filter(Number.isFinite);
+  const oldestCompletedSync = completedSyncTimes.length === (autoSyncStatus?.connected_accounts ?? 0)
+    && completedSyncTimes.length > 0
+    ? Math.min(...completedSyncTimes)
+    : null;
+  const syncAgeLabel = oldestCompletedSync == null
+    ? null
+    : (() => {
+        const seconds = Math.max(0, Math.floor((Date.now() - oldestCompletedSync) / 1000));
+        if (seconds < 10) return "Checked just now";
+        if (seconds < 60) return `Checked ${seconds}s ago`;
+        const minutes = Math.floor(seconds / 60);
+        if (minutes < 60) return `Checked ${minutes}m ago`;
+        return `Checked ${Math.floor(minutes / 60)}h ago`;
+      })();
+  const registeredWebhookAccounts = autoSyncStatus?.registered_webhook_accounts ?? 0;
   const emailSyncMethod = !autoSyncStatus || autoSyncStatus.connected_accounts === 0
     ? null
-    : autoSyncStatus.webhook_accounts >= autoSyncStatus.connected_accounts
-      ? "Webhook"
-      : autoSyncStatus.webhook_accounts > 0
-        ? "Webhook + polling"
+    : registeredWebhookAccounts >= autoSyncStatus.connected_accounts
+      ? "Webhook + backup"
+      : registeredWebhookAccounts > 0
+        ? "Mixed + backup"
         : "Polling";
   const emailSyncStatusLabel = emailSyncState === "syncing"
     ? syncingIds.size > 0
       ? `Syncing ${syncingIds.size} ${syncingIds.size === 1 ? "account" : "accounts"}`
       : "Syncing"
     : emailSyncState === "active"
-      ? "Up to date"
+      ? syncAgeLabel ?? "Waiting for sync"
       : emailSyncState === "no_account"
         ? "No account"
         : emailSyncState === "stopped"
@@ -1677,7 +1695,7 @@ export default function App() {
     : autoSyncStatus?.last_error
     ?? autoSyncStatus?.problem_mailboxes[0]?.message
     ?? (emailSyncState === "active"
-      ? `Automatic sync uses ${emailSyncMethod ?? "background checks"} for ${autoSyncStatus?.connected_accounts ?? mailboxes.length} ${((autoSyncStatus?.connected_accounts ?? mailboxes.length) === 1) ? "account" : "accounts"}.`
+      ? `${syncAgeLabel ?? "The first sync has not completed yet"}. Webhooks deliver new mail immediately when available; polling reconciles every account every ${Math.round((autoSyncStatus?.interval_seconds ?? 120) / 60)} minute(s).`
       : emailSyncLabel);
   const aiProviderLabel = aiStatus?.provider === "openai"
     ? "OpenAI"

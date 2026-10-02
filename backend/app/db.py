@@ -195,6 +195,16 @@ def init_db() -> None:
                 conn.execute(text(
                     "ALTER TABLE calendar_events ADD COLUMN work_model VARCHAR(32) DEFAULT 'unspecified'"
                 ))
+            if {"interview_status", "is_visible"}.issubset(calendar_cols):
+                # Cancellations used to be hidden. Preserve those historical
+                # appointments and let the calendar render their status.
+                conn.execute(
+                    text(
+                        "UPDATE calendar_events SET is_visible = :visible "
+                        "WHERE interview_status = 'cancellation' AND is_visible = :hidden"
+                    ),
+                    {"visible": True, "hidden": False},
+                )
 
     # Lightweight SQLite column / label migrations for existing DBs
     if settings.database_url.startswith("sqlite"):
@@ -298,6 +308,21 @@ def init_db() -> None:
                             "ADD COLUMN received_at_utc_fixed BOOLEAN DEFAULT 0"
                         )
                     )
+                if "last_sync_started_at" not in mb_cols:
+                    conn.execute(text(
+                        "ALTER TABLE mailbox_connections "
+                        "ADD COLUMN last_sync_started_at TIMESTAMP"
+                    ))
+                if "last_sync_completed_at" not in mb_cols:
+                    conn.execute(text(
+                        "ALTER TABLE mailbox_connections "
+                        "ADD COLUMN last_sync_completed_at TIMESTAMP"
+                    ))
+                if "last_sync_error" not in mb_cols:
+                    conn.execute(text(
+                        "ALTER TABLE mailbox_connections "
+                        "ADD COLUMN last_sync_error VARCHAR(512)"
+                    ))
             if "classify_corrections" in tables:
                 correction_cols = {c["name"] for c in inspect(conn).get_columns("classify_corrections")}
                 if "previous_subtype" not in correction_cols:

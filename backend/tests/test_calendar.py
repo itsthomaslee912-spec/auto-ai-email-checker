@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -14,8 +15,8 @@ from sqlalchemy.pool import StaticPool
 
 from app.api import calendar_events, emails
 from app.db import Base, get_db
-from app.models import CalendarEvent, EmailLabel, EmailMessage, MailboxConnection, Provider, User
-from app.services.calendar_extract import InterviewDetails, MeetingAccess, _parse_ai_slot, extract_interviewer, extract_meeting_access, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details
+from app.models import CalendarEvent, CalendarEventEmail, EmailLabel, EmailMessage, MailboxConnection, Provider, User
+from app.services.calendar_extract import InterviewDetails, MeetingAccess, _parse_ai_slot, _resolve_video_landing_page, extract_interviewer, extract_meeting_access, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details
 
 
 def _database():
@@ -68,6 +69,44 @@ Join https://meet.google.com/abc-defg-hij or call +1 (212) 555-0199, PIN: 456 78
     assert access.url == "https://meet.google.com/abc-defg-hij"
     assert access.phone_number == "+1 (212) 555-0199"
     assert access.access_code == "456 789"
+
+
+def test_named_video_provider_is_preserved_without_a_direct_join_url():
+    access = extract_meeting_access(
+        "Your meeting will be a video call on Google Meet. Click below to join."
+    )
+
+    assert access == MeetingAccess("video", "Google Meet")
+
+
+def test_teamtailor_landing_page_resolves_provider_join_url(monkeypatch):
+    schedule_url = "https://careers.example.com/schedule/5d6de20f-e95c-443c-881a-ffaec8340694"
+    gateway_url = "https://careers.example.com/video_meetings/73a303c3-72d6-4209-bd2a-374ea819f5fd"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == schedule_url:
+            return httpx.Response(
+                200,
+                text=f'<html>Powered by Teamtailor <a href="{gateway_url}">Google Meet</a></html>',
+            )
+        if str(request.url) == gateway_url:
+            return httpx.Response(302, headers={"location": "https://meet.google.com/abc-defg-hij"})
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "app.services.calendar_extract.httpx.AsyncClient",
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+
+    access = asyncio.run(
+        _resolve_video_landing_page(f"Recruiting powered by Teamtailor\n{schedule_url}")
+    )
+
+    assert access == MeetingAccess(
+        "video", "Google Meet", "https://meet.google.com/abc-defg-hij"
+    )
 
 
 def test_start_only_ics_defaults_to_thirty_minutes():
@@ -232,6 +271,7 @@ def test_positive_outcome_marks_existing_calendar_event_passed():
         assert asyncio.run(process_calendar_email(db, outcome)) is True
         assert event.application_status == "passed"
         assert event.outcome_source_email_id == outcome.id
+        assert db.get(CalendarEventEmail, (event.id, outcome.id)) is not None
 
 
 def test_offer_marks_existing_calendar_event_passed():
@@ -262,19 +302,42 @@ def test_neutral_follow_up_does_not_mark_calendar_event_passed():
         assert event.application_status == "active"
 
 
-def test_cancellation_hides_the_existing_confirmed_event():
+def test_cancellation_keeps_the_existing_confirmed_event_visible_with_status():
     factory, (mailbox_id, _) = _database()
     with factory() as db:
-        email = EmailMessage(mailbox_id=mailbox_id, provider_message_id="cancel-source", thread_id="cancel-thread", subject="Canceled interview", sender="recruiter@example.com", body_text="Canceled", label=EmailLabel.INTERVIEW_SCHEDULED.value, interview_subtype="cancellation", company="Acme")
+        email = EmailMessage(mailbox_id=mailbox_id, provider_message_id="cancel-source", thread_id="cancel-thread", subject="Canceled interview", sender="recruiter@example.com", body_text="Your interview on October 5, 2026 at 2:00 PM UTC was canceled.", label=EmailLabel.INTERVIEW_SCHEDULED.value, interview_subtype="cancellation", company="Acme")
         db.add(email)
         db.flush()
         event = CalendarEvent(mailbox_id=mailbox_id, source_email_id=email.id, source_thread_id=email.thread_id, kind="confirmed", origin="email", title="Acme", start_at=datetime(2026, 10, 5, 14, tzinfo=timezone.utc), end_at=datetime(2026, 10, 5, 14, 30, tzinfo=timezone.utc), is_visible=True)
         db.add(event)
         db.flush()
 
-        assert asyncio.run(process_calendar_email(db, email, force=True)) is True
+        assert asyncio.run(process_calendar_email(db, email, force=True, use_ai=False)) is True
         assert event.interview_status == "cancellation"
-        assert event.is_visible is False
+        assert event.is_visible is True
+
+
+def test_cancellation_with_a_time_creates_a_visible_calendar_event():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        email = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="standalone-cancel",
+            thread_id="standalone-cancel-thread",
+            subject="Interview canceled",
+            sender="recruiter@example.com",
+            body_text="Your interview on October 5, 2026 at 10:00 AM UTC was canceled.",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="cancellation",
+            company="Acme",
+        )
+        db.add(email)
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, email, use_ai=False)) is True
+        event = db.query(CalendarEvent).filter(CalendarEvent.kind == "confirmed").one()
+        assert event.interview_status == "cancellation"
+        assert event.is_visible is True
 
 
 def test_separate_thread_confirmation_matches_time_not_another_company_interview():
@@ -449,6 +512,188 @@ END:VCALENDAR"""
     response = _client(factory).get(f"/api/calendar-events/{event_id}/emails")
     assert response.status_code == 200
     assert [item["id"] for item in response.json()] == expected_ids
+
+
+def test_booking_uses_organizer_identity_to_enrich_and_link_separate_threads():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        availability = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="limrun-availability",
+            thread_id="availability-thread",
+            subject="Limrun Interview Availability",
+            sender="no-reply@us.greenhouse-mail.io",
+            received_at=datetime(2026, 9, 24, 19, 48, tzinfo=timezone.utc),
+            body_text="Thanks for your interest in the Founding Engineer position at Limrun. Regards, Hasan",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="Limrun",
+            job_role="Founding Engineer",
+        )
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="hasan-invitation",
+            thread_id="invitation-thread",
+            subject="Founding Engineer Interview | Mark & Hasan",
+            sender='"Hasan Türken" <hasan@limrun.com>',
+            received_at=datetime(2026, 9, 24, 20, 55, tzinfo=timezone.utc),
+            body_text="We would love to move forward. Please pick a time using my calendar.",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="limrun.com",
+            job_role="Founding Engineer",
+        )
+        other_interview = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="tunya-reminder",
+            thread_id="other-interview-thread",
+            subject="Reminder: Call with Tunya",
+            sender='"Tunya Irkad" <tunya@limrun.com>',
+            received_at=datetime(2026, 9, 24, 20, 40, tzinfo=timezone.utc),
+            body_text="Your earlier Limrun interview starts soon.",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="reminder",
+            company="Limrun",
+            job_role="Founding Engineer",
+        )
+        booking = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="hasan-booking",
+            thread_id="booking-thread",
+            subject="Appointment booked: 30 min with Hasan (Mark Wei)",
+            sender='"Hasan Türken" <hasan@limrun.com>',
+            received_at=datetime(2026, 9, 24, 20, 57, tzinfo=timezone.utc),
+            body_text="""BEGIN:VCALENDAR
+BEGIN:VEVENT
+DTSTART:20260928T190000Z
+DTEND:20260928T193000Z
+ORGANIZER:mailto:hasan@limrun.com
+END:VEVENT
+END:VCALENDAR""",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+            company="",
+            job_role="",
+        )
+        db.add_all([availability, invitation, other_interview, booking])
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=booking.id,
+            source_thread_id=booking.thread_id,
+            kind="confirmed",
+            origin="email",
+            title=booking.subject,
+            company="",
+            job_role="",
+            start_at=datetime(2026, 9, 28, 19, tzinfo=timezone.utc),
+            end_at=datetime(2026, 9, 28, 19, 30, tzinfo=timezone.utc),
+            is_visible=True,
+        )
+        db.add(event)
+        db.flush()
+
+        assert refresh_calendar_event_details(db, booking) is True
+        db.commit()
+        db.refresh(event)
+        event_id = event.id
+        assert event.company == "Limrun"
+        assert event.job_role == "Founding Engineer"
+        assert event.title == "Limrun — Founding Engineer"
+        expected_ids = [booking.id, invitation.id, availability.id]
+
+    response = _client(factory).get(f"/api/calendar-events/{event_id}/emails")
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()] == expected_ids
+
+
+def test_teamtailor_reminder_keeps_role_and_meet_link_across_separate_threads(monkeypatch):
+    factory, (mailbox_id, _) = _database()
+    schedule_url = "https://careers.blueorange.digital/schedule/5d6de20f-e95c-443c-881a-ffaec8340694"
+
+    async def resolve(_text: str):
+        return MeetingAccess("video", "Google Meet", "https://meet.google.com/gwi-eeng-wvw")
+
+    monkeypatch.setattr("app.services.calendar_extract._resolve_video_landing_page", resolve)
+
+    with factory() as db:
+        unrelated_role = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="blue-orange-unrelated-role",
+            thread_id="other-role-thread",
+            received_at=datetime(2026, 9, 18, 19, 8, tzinfo=timezone.utc),
+            subject="Application Received for Sales Engineer role at Blue Orange",
+            sender="Paula Barcelos <paula.barcelos@blueorangedigital.na.teamtailor-mail.com>",
+            body_text="Thank you for applying to the Sales Engineer role.",
+            label=EmailLabel.APPLICATION_CONFIRMATION.value,
+            company="Blue Orange Digital",
+            job_role="Sales Engineer",
+        )
+        role_context = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="blue-orange-role-context",
+            thread_id="recruiter-thread",
+            received_at=datetime(2026, 9, 25, 19, 8, tzinfo=timezone.utc),
+            subject="Re: Time confirmed: Senior Data & LLM Engineer role at Blue Orange",
+            sender="Paula Barcelos <paula.barcelos@blueorangedigital.na.teamtailor-mail.com>",
+            body_text="I just sent you an updated invite.",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="Blue Orange Digital",
+            job_role="Senior Data & LLM Engineer (AI-Ready Data & Agentic Systems)",
+        )
+        invite = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="blue-orange-invite",
+            thread_id="calendar-thread",
+            received_at=datetime(2026, 9, 25, 19, 9, tzinfo=timezone.utc),
+            subject="Meeting invite: Ryan Queen / Paula Barcelos (Blue Orange Digital)",
+            sender="Paula Barcelos <paula.barcelos@blueorangedigital.na.teamtailor-mail.com>",
+            body_text=f"""Ryan Queen / Paula Barcelos (Blue Orange Digital)
+DATE/TIME 2026-09-28 01:00 pm - 01:30 pm EDT
+Your meeting will be a video call on Google Meet.
+View meeting details {schedule_url}
+Recruiting powered by Teamtailor""",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="Blue Orange Digital",
+            job_role="",
+        )
+        reminder = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="blue-orange-reminder",
+            thread_id="reminder-thread",
+            received_at=datetime(2026, 9, 27, 16, 1, tzinfo=timezone.utc),
+            subject="Meeting reminder",
+            sender="Blue Orange Digital <no-reply@blueorangedigital.na.teamtailor-mail.com>",
+            body_text=f"""Meeting with Blue Orange Digital
+DATE/TIME 2026-09-28 01:00 pm - 01:30 pm EDT
+Your meeting will be a video call on Google Meet.
+View meeting details {schedule_url}
+Recruiting powered by Teamtailor""",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="reminder",
+            company="Blue Orange Digital",
+            job_role="",
+        )
+        db.add_all([unrelated_role, role_context, invite, reminder])
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, invite, use_ai=False)) is True
+        assert asyncio.run(process_calendar_email(db, reminder, use_ai=False)) is True
+        db.commit()
+
+        event = db.query(CalendarEvent).filter(CalendarEvent.kind == "confirmed").one()
+        assert event.company == "Blue Orange Digital"
+        assert event.job_role == "Senior Data & LLM Engineer (AI-Ready Data & Agentic Systems)"
+        assert event.meeting_provider == "Google Meet"
+        assert event.meeting_url == "https://meet.google.com/gwi-eeng-wvw"
+        linked_ids = {
+            item[0]
+            for item in db.query(CalendarEventEmail.email_id)
+            .filter(CalendarEventEmail.event_id == event.id)
+            .all()
+        }
+        assert linked_ids == {role_context.id, invite.id, reminder.id}
+        assert unrelated_role.id not in linked_ids
 
 
 def test_manual_event_create_and_update_validates_times():

@@ -42,6 +42,17 @@ export interface AutoSyncStatus {
   last_check_at: string | null;
   last_error: string | null;
   problem_mailboxes: { mailbox_id: number; email_address: string; message: string }[];
+  mailboxes?: {
+    mailbox_id: number;
+    email_address: string;
+    provider: Provider;
+    state: string;
+    last_sync_started_at: string | null;
+    last_sync_completed_at: string | null;
+    last_error: string | null;
+    webhook_registered: boolean;
+    webhook_verified: boolean;
+  }[];
 }
 
 export interface EmailItem {

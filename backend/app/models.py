@@ -63,6 +63,13 @@ class MailboxConnection(Base):
     # Gmail history / Outlook delta cursors
     sync_cursor: Mapped[str | None] = mapped_column(Text, nullable=True)
     full_sync_completed: Mapped[bool] = mapped_column(default=False)
+    last_sync_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_sync_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_sync_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
     is_active: Mapped[bool] = mapped_column(default=True)
     # One-shot: received_at rewritten from provider UTC (fixes SQLite tz stripping)
     received_at_utc_fixed: Mapped[bool] = mapped_column(default=False)

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import logging
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parseaddr
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import httpx
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.models import CalendarEvent, CalendarEventEmail, EmailLabel, EmailMessage
@@ -25,6 +29,58 @@ CALENDAR_LABELS = {
     EmailLabel.OFFER.value,
     EmailLabel.REJECTED_CLOSED.value,
 }
+
+CONTEXT_LABELS = {
+    EmailLabel.APPLICATION_CONFIRMATION.value,
+    EmailLabel.SCREENING.value,
+    EmailLabel.INTERVIEW_INVITATION.value,
+    EmailLabel.INTERVIEW_SCHEDULED.value,
+}
+
+_EMAIL_ADDRESS_RE = re.compile(r"[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
+_ORGANIZER_RE = re.compile(r"\bORGANIZER(?:;[^:\r\n]*)?:mailto:([^\s;\r\n]+)", re.I)
+_AUTOMATED_LOCAL_PARTS = {
+    "calendar-notification",
+    "mailer-daemon",
+    "no-reply",
+    "noreply",
+    "notifications",
+}
+_AUTOMATED_DOMAINS = {
+    "cal.com",
+    "calendly.com",
+    "google.com",
+    "greenhouse-mail.io",
+    "us.greenhouse-mail.io",
+}
+_PUBLIC_EMAIL_DOMAINS = {
+    "gmail.com",
+    "googlemail.com",
+    "hotmail.com",
+    "icloud.com",
+    "live.com",
+    "outlook.com",
+    "yahoo.com",
+}
+_IDENTITY_STOPWORDS = {
+    "appointment",
+    "booked",
+    "calendar",
+    "interview",
+    "meeting",
+    "notification",
+}
+_DOMAIN_STOPWORDS = {"co", "com", "email", "io", "mail", "net", "org", "us"}
+_CROSS_THREAD_WINDOW = timedelta(days=14)
+_CALENDAR_EXTRACT_VERSION = "4"
+_SCHEDULE_TOKEN_RE = re.compile(
+    r"https://[^\s<>\"']+/schedule/(?P<token>[a-z0-9-]{12,})(?=[/?.#\s<>\"']|$)",
+    re.I,
+)
+_VIDEO_MEETING_LINK_RE = re.compile(
+    r"https://[^\s<>\"']+/video_meetings/[a-z0-9-]+(?:[/?#][^\s<>\"']*)?",
+    re.I,
+)
 
 VIDEO_HOSTS = {
     "zoom.us": "Zoom",
@@ -141,6 +197,7 @@ class InterviewDetails:
 def email_calendar_hash(email: EmailMessage) -> str:
     raw = "\n".join(
         [
+            _CALENDAR_EXTRACT_VERSION,
             email.label or "",
             email.interview_subtype or "",
             email.subject or "",
@@ -394,19 +451,31 @@ def _extract_phone(text: str) -> tuple[str | None, str | None]:
 
 
 def extract_meeting_access(text: str) -> MeetingAccess:
-    urls = re.findall(r"https://[^\s<>\"']+", text or "", flags=re.I)
+    source = html.unescape(text or "")
+    urls = re.findall(r"https://[^\s<>\"']+", source, flags=re.I)
     for raw in urls:
         url = raw.rstrip(".,);]")
         provider = _provider_for_url(url)
         if provider:
-            phone, code = _extract_phone(text)
+            phone, code = _extract_phone(source)
             return MeetingAccess("video", provider, url, phone, code)
-    phone, code = _extract_phone(text)
+    phone, code = _extract_phone(source)
     if phone:
         return MeetingAccess("phone", None, None, phone, code)
-    if re.search(r"\b(phone (?:conversation|interview|screen|call)|telephone (?:interview|call))\b", text or "", re.I):
+    provider_phrases = (
+        (r"\bGoogle Meet\b", "Google Meet"),
+        (r"\b(?:Microsoft )?Teams\b", "Microsoft Teams"),
+        (r"\bZoom\b", "Zoom"),
+        (r"\bWebex\b", "Webex"),
+        (r"\bGoTo Meeting\b", "GoTo Meeting"),
+        (r"\bWhereby\b", "Whereby"),
+    )
+    for pattern, provider in provider_phrases:
+        if re.search(pattern, source, re.I):
+            return MeetingAccess("video", provider, None, None, code)
+    if re.search(r"\b(phone (?:conversation|interview|screen|call)|telephone (?:interview|call))\b", source, re.I):
         return MeetingAccess("phone")
-    if re.search(r"\b(in person|on-site|onsite|at our office)\b", text or "", re.I):
+    if re.search(r"\b(in person|on-site|onsite|at our office)\b", source, re.I):
         return MeetingAccess("in_person")
     return MeetingAccess()
 
@@ -442,22 +511,265 @@ def _safe_http_url(value: object, *, meeting: bool = False) -> str | None:
     return raw
 
 
-def _related_interview_emails(db: Session, email: EmailMessage) -> list[EmailMessage]:
-    """Return a small, oldest-to-newest conversation context for extraction."""
-    if not email.thread_id:
-        return []
-    rows = (
-        db.query(EmailMessage)
-        .filter(
-            EmailMessage.mailbox_id == email.mailbox_id,
-            EmailMessage.thread_id == email.thread_id,
-            EmailMessage.id != email.id,
-        )
-        .order_by(EmailMessage.received_at.desc(), EmailMessage.id.desc())
-        .limit(7)
-        .all()
+def _message_text(email: EmailMessage) -> str:
+    return "\n".join(
+        [
+            email.subject or "",
+            email.snippet or "",
+            (email.body_text or "")[:12000],
+            (email.body_html or "")[:20000],
+        ]
     )
-    return list(reversed(rows))
+
+
+def _schedule_tokens(text: str) -> set[str]:
+    return {match.group("token").casefold() for match in _SCHEDULE_TOKEN_RE.finditer(html.unescape(text or ""))}
+
+
+def _normalized_address(value: str) -> str:
+    return value.strip().strip("<>.,;\"'").casefold()
+
+
+def _is_automated_address(address: str) -> bool:
+    local, _, domain = _normalized_address(address).partition("@")
+    return (
+        not domain
+        or local in _AUTOMATED_LOCAL_PARTS
+        or any(domain == item or domain.endswith(f".{item}") for item in _AUTOMATED_DOMAINS)
+    )
+
+
+def _organizer_addresses(email: EmailMessage) -> set[str]:
+    text = _message_text(email)
+    addresses = {
+        _normalized_address(match.group(1))
+        for match in _ORGANIZER_RE.finditer(text)
+    }
+    _, sender_address = parseaddr(email.sender or "")
+    sender_address = _normalized_address(sender_address)
+    if sender_address and not _is_automated_address(sender_address):
+        addresses.add(sender_address)
+    return {address for address in addresses if address and not _is_automated_address(address)}
+
+
+def _organizer_name_tokens(email: EmailMessage, addresses: set[str]) -> set[str]:
+    display_name, sender_address = parseaddr(email.sender or "")
+    tokens: set[str] = set()
+    if sender_address and not _is_automated_address(sender_address):
+        tokens.update(re.findall(r"[^\W\d_]+", display_name.casefold()))
+    for address in addresses:
+        local = address.partition("@")[0]
+        tokens.update(re.findall(r"[^\W\d_]+", local.casefold()))
+    return {
+        token
+        for token in tokens
+        if len(token) >= 4 and token not in _IDENTITY_STOPWORDS
+    }
+
+
+def _domain_identity_tokens(addresses: set[str]) -> set[str]:
+    tokens: set[str] = set()
+    for address in addresses:
+        domain = address.partition("@")[2]
+        if not domain or domain in _PUBLIC_EMAIL_DOMAINS:
+            continue
+        tokens.update(
+            part
+            for part in re.findall(r"[a-z0-9]+", domain.casefold())
+            if len(part) >= 3 and part not in _DOMAIN_STOPWORDS
+        )
+    return tokens
+
+
+def _company_identity_tokens(company: str | None) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", (company or "").casefold())
+        if len(token) >= 3 and token not in _DOMAIN_STOPWORDS
+    }
+
+
+def _cross_thread_score(
+    source: EmailMessage,
+    candidate: EmailMessage,
+    organizer_addresses: set[str],
+    organizer_names: set[str],
+    domain_tokens: set[str],
+    schedule_tokens: set[str],
+) -> int:
+    candidate_text = _message_text(candidate).casefold()
+    _, candidate_sender = parseaddr(candidate.sender or "")
+    candidate_sender = _normalized_address(candidate_sender)
+    candidate_addresses = {
+        _normalized_address(value)
+        for value in _EMAIL_ADDRESS_RE.findall(candidate_text)
+    }
+    score = 0
+    if schedule_tokens.intersection(_schedule_tokens(candidate_text)):
+        score += 20
+    if candidate_sender and candidate_sender in organizer_addresses:
+        score += 10
+    elif organizer_addresses.intersection(candidate_addresses):
+        score += 7
+    if any(re.search(rf"\b{re.escape(name)}\b", candidate_text, re.I) for name in organizer_names):
+        score += 4
+    if domain_tokens.intersection(_company_identity_tokens(candidate.company)):
+        score += 4
+    if source.company and candidate.company and source.company.casefold() == candidate.company.casefold():
+        score += 4
+    if source.job_role and candidate.job_role and source.job_role.casefold() == candidate.job_role.casefold():
+        score += 4
+    source_received = as_utc(source.received_at)
+    candidate_received = as_utc(candidate.received_at)
+    if source_received and candidate_received:
+        distance = abs(source_received - candidate_received)
+        if distance <= timedelta(days=2):
+            score += 2
+        elif distance <= timedelta(days=7):
+            score += 1
+    return score
+
+
+def _related_interview_emails(
+    db: Session,
+    email: EmailMessage,
+    *,
+    include_cross_thread: bool = True,
+) -> list[EmailMessage]:
+    """Return safe same- and cross-thread context, oldest to newest.
+
+    Google Calendar and scheduling systems commonly place the booking in a
+    fresh thread. Cross-thread candidates therefore require strong organizer
+    identity evidence; company alone is deliberately insufficient.
+    """
+    related: dict[int, EmailMessage] = {}
+    if email.thread_id:
+        rows = (
+            db.query(EmailMessage)
+            .filter(
+                EmailMessage.mailbox_id == email.mailbox_id,
+                EmailMessage.thread_id == email.thread_id,
+                EmailMessage.id != email.id,
+            )
+            .order_by(EmailMessage.received_at.desc(), EmailMessage.id.desc())
+            .limit(7)
+            .all()
+        )
+        related.update({item.id: item for item in rows})
+
+    organizer_addresses = _organizer_addresses(email)
+    organizer_names = _organizer_name_tokens(email, organizer_addresses)
+    domain_tokens = _domain_identity_tokens(organizer_addresses)
+    schedule_tokens = _schedule_tokens(_message_text(email))
+    received_at = as_utc(email.received_at)
+    if include_cross_thread and received_at and (organizer_addresses or organizer_names or schedule_tokens):
+        identity_conditions = []
+        for address in organizer_addresses:
+            pattern = f"%{address}%"
+            identity_conditions.extend(
+                [
+                    EmailMessage.sender.ilike(pattern),
+                    EmailMessage.subject.ilike(pattern),
+                    EmailMessage.snippet.ilike(pattern),
+                ]
+            )
+        for name in organizer_names:
+            pattern = f"%{name}%"
+            identity_conditions.extend(
+                [
+                    EmailMessage.subject.ilike(pattern),
+                    EmailMessage.snippet.ilike(pattern),
+                    EmailMessage.sender.ilike(pattern),
+                ]
+            )
+        for token in domain_tokens:
+            identity_conditions.append(EmailMessage.company.ilike(f"%{token}%"))
+        for token in schedule_tokens:
+            pattern = f"%{token}%"
+            identity_conditions.extend(
+                [
+                    EmailMessage.snippet.ilike(pattern),
+                    EmailMessage.body_text.ilike(pattern),
+                    EmailMessage.body_html.ilike(pattern),
+                ]
+            )
+        candidates = (
+            db.query(EmailMessage)
+            .filter(
+                EmailMessage.mailbox_id == email.mailbox_id,
+                EmailMessage.id != email.id,
+                EmailMessage.label.in_(CONTEXT_LABELS),
+                EmailMessage.received_at >= received_at - _CROSS_THREAD_WINDOW,
+                EmailMessage.received_at <= received_at + timedelta(days=2),
+                or_(*identity_conditions),
+            )
+            .order_by(EmailMessage.received_at.desc(), EmailMessage.id.desc())
+            .limit(160)
+            .all()
+        )
+        for candidate in candidates:
+            if candidate.thread_id and candidate.thread_id == email.thread_id:
+                continue
+            if _cross_thread_score(
+                email,
+                candidate,
+                organizer_addresses,
+                organizer_names,
+                domain_tokens,
+                schedule_tokens,
+            ) >= 8:
+                related[candidate.id] = candidate
+
+    ordered = sorted(
+        related.values(),
+        key=lambda item: (as_utc(item.received_at) or datetime.min.replace(tzinfo=timezone.utc), item.id),
+    )
+    source_role = (email.job_role or "").strip()
+    anchor_role = source_role
+    if not anchor_role and received_at:
+        role_candidates = [item for item in ordered if (item.job_role or "").strip()]
+        if role_candidates:
+            closest = min(
+                role_candidates,
+                key=lambda item: (
+                    abs((as_utc(item.received_at) or received_at) - received_at),
+                    -(as_utc(item.received_at) or received_at).timestamp(),
+                ),
+            )
+            anchor_role = (closest.job_role or "").strip()
+    if anchor_role:
+        normalized_role = anchor_role.casefold()
+        ordered = [
+            item
+            for item in ordered
+            if not (item.job_role or "").strip()
+            or (item.job_role or "").strip().casefold() == normalized_role
+        ]
+    return ordered[-12:]
+
+
+def _company_quality(value: str) -> int:
+    text = (value or "").strip()
+    if not text:
+        return 0
+    if "@" in text or re.fullmatch(r"(?:[a-z0-9-]+\.)+[a-z]{2,}", text, re.I):
+        return 1
+    return 2
+
+
+def _known_company(messages: list[EmailMessage]) -> str:
+    values = [(index, (item.company or "").strip()) for index, item in enumerate(messages)]
+    values = [(index, value) for index, value in values if value]
+    if not values:
+        return ""
+    return max(values, key=lambda item: (_company_quality(item[1]), item[0]))[1]
+
+
+def _known_role(messages: list[EmailMessage]) -> str:
+    return next(
+        ((item.job_role or "").strip() for item in reversed(messages) if (item.job_role or "").strip()),
+        "",
+    )
 
 
 def _email_context(emails: list[EmailMessage]) -> str:
@@ -484,8 +796,49 @@ def _calendar_text(email: EmailMessage) -> str:
     return "\n".join([
         email.subject or "",
         email.snippet or "",
-        email.body_text or email.body_html or "",
+        email.body_text or "",
+        email.body_html or "",
     ])
+
+
+async def _resolve_video_landing_page(text: str) -> MeetingAccess | None:
+    """Resolve Teamtailor's public meeting-details gateway to a join URL.
+
+    The first page must identify itself as Teamtailor and may only point to a
+    same-host ``/video_meetings/`` endpoint. Redirects are disabled; only a
+    redirect directly to a recognized video provider is accepted.
+    """
+    source = html.unescape(text or "")
+    if "teamtailor" not in source.casefold():
+        return None
+    schedule_urls = [match.group(0).rstrip(".,);]") for match in _SCHEDULE_TOKEN_RE.finditer(source)]
+    if not schedule_urls:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
+            for schedule_url in schedule_urls[:3]:
+                parsed_schedule = urlparse(schedule_url)
+                response = await client.get(schedule_url)
+                if response.status_code != 200 or "teamtailor" not in response.text.casefold():
+                    continue
+                meeting_links = _VIDEO_MEETING_LINK_RE.findall(html.unescape(response.text))
+                for meeting_link in meeting_links[:3]:
+                    parsed_meeting = urlparse(meeting_link)
+                    if (
+                        parsed_meeting.scheme != "https"
+                        or parsed_meeting.hostname != parsed_schedule.hostname
+                        or not parsed_meeting.path.startswith("/video_meetings/")
+                    ):
+                        continue
+                    gateway = await client.get(meeting_link)
+                    location = gateway.headers.get("location", "")
+                    provider = _provider_for_url(location)
+                    safe_url = _safe_http_url(location, meeting=True)
+                    if gateway.is_redirect and provider and safe_url:
+                        return MeetingAccess("video", provider, safe_url)
+    except httpx.HTTPError:
+        logger.info("Could not resolve calendar meeting landing page", exc_info=True)
+    return None
 
 
 def _parse_ai_slot(item: object) -> ExtractedSlot | None:
@@ -528,8 +881,20 @@ async def extract_calendar_details(
     access = extract_meeting_access(current_text)
     if access.meeting_type == "unspecified":
         access = extract_meeting_access(text)
-    known_company = next(((item.company or "").strip() for item in reversed(messages) if (item.company or "").strip()), "")
-    known_role = next(((item.job_role or "").strip() for item in reversed(messages) if (item.job_role or "").strip()), "")
+    if access.url is None:
+        resolved_access = await _resolve_video_landing_page(current_text)
+        if resolved_access is None:
+            resolved_access = await _resolve_video_landing_page(text)
+        if resolved_access is not None:
+            access = MeetingAccess(
+                "video",
+                resolved_access.provider or access.provider,
+                resolved_access.url,
+                access.phone_number,
+                access.access_code,
+            )
+    known_company = _known_company(messages)
+    known_role = _known_role(messages)
     deterministic_job_url = extract_job_url(text)
     deterministic_interviewer = extract_interviewer(current_text, email.sender or "")
     if not deterministic_interviewer:
@@ -615,8 +980,9 @@ def _title(email: EmailMessage, details: InterviewDetails) -> str:
 
 
 def _apply_details(event: CalendarEvent, email: EmailMessage, access: MeetingAccess, details: InterviewDetails) -> None:
-    event.title = _title(email, details)
-    event.company = details.company or (email.company or "").strip() or event.company
+    candidate_company = details.company or (email.company or "").strip()
+    if _company_quality(candidate_company) >= _company_quality(event.company):
+        event.company = candidate_company or event.company
     event.job_role = details.role or (email.job_role or "").strip() or event.job_role
     event.interviewer = details.interviewer or event.interviewer
     event.work_model = details.work_model if details.work_model != "unspecified" else (event.work_model or "unspecified")
@@ -631,6 +997,10 @@ def _apply_details(event: CalendarEvent, email: EmailMessage, access: MeetingAcc
     event.meeting_url = access.url or event.meeting_url
     event.phone_number = access.phone_number or event.phone_number
     event.phone_access_code = access.access_code or event.phone_access_code
+    event.title = _title(
+        email,
+        InterviewDetails(company=event.company or "", role=event.job_role or ""),
+    )
 
 
 def _apply_common(
@@ -651,7 +1021,11 @@ def refresh_calendar_event_details(db: Session, email: EmailMessage) -> bool:
     events = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == email.id).all()
     if not events:
         return False
-    messages = [*_related_interview_emails(db, email), email]
+    needs_cross_thread = any(not (event.company or "").strip() or not (event.job_role or "").strip() for event in events)
+    messages = [
+        *_related_interview_emails(db, email, include_cross_thread=needs_cross_thread),
+        email,
+    ]
     current_text = "\n".join([email.subject or "", email.snippet or "", email.body_text or "", email.body_html or ""])
     combined_text = "\n".join(
         value
@@ -676,12 +1050,13 @@ def refresh_calendar_event_details(db: Session, email: EmailMessage) -> bool:
             ),
             "",
         )
-    company = next(((item.company or "").strip() for item in reversed(messages) if (item.company or "").strip()), "")
-    role = next(((item.job_role or "").strip() for item in reversed(messages) if (item.job_role or "").strip()), "")
+    company = _known_company(messages)
+    role = _known_role(messages)
     job_url = extract_job_url(combined_text)
     changed = False
     for event in events:
         before = (
+            event.title,
             event.company,
             event.job_role,
             event.interviewer,
@@ -692,7 +1067,8 @@ def refresh_calendar_event_details(db: Session, email: EmailMessage) -> bool:
             event.phone_number,
             event.phone_access_code,
         )
-        event.company = event.company or company
+        if _company_quality(company) > _company_quality(event.company):
+            event.company = company
         event.job_role = event.job_role or role
         event.interviewer = event.interviewer or interviewer
         event.job_url = event.job_url or job_url
@@ -702,7 +1078,13 @@ def refresh_calendar_event_details(db: Session, email: EmailMessage) -> bool:
         event.meeting_url = event.meeting_url or access.url
         event.phone_number = event.phone_number or access.phone_number
         event.phone_access_code = event.phone_access_code or access.access_code
+        if event.origin == "email" and (event.company or event.job_role):
+            event.title = _title(
+                email,
+                InterviewDetails(company=event.company or "", role=event.job_role or ""),
+            )
         after = (
+            event.title,
             event.company,
             event.job_role,
             event.interviewer,
@@ -714,6 +1096,8 @@ def refresh_calendar_event_details(db: Session, email: EmailMessage) -> bool:
             event.phone_access_code,
         )
         changed = changed or after != before
+        if needs_cross_thread:
+            changed = _link_event_emails(db, event, (item.id for item in messages)) or changed
     return changed
 
 
@@ -740,14 +1124,43 @@ def _thread_events(db: Session, email: EmailMessage, *, kind: str | None = None)
     return query.order_by(CalendarEvent.start_at.desc(), CalendarEvent.id.desc()).all()
 
 
-def _link_event_email(db: Session, event: CalendarEvent, email_id: int | None) -> None:
+def _link_event_email(db: Session, event: CalendarEvent, email_id: int | None) -> bool:
     """Remember a source message even if a later update replaces source_email_id."""
     if email_id is None:
-        return
+        return False
     db.flush()
     if db.get(CalendarEventEmail, (event.id, email_id)) is None:
         db.add(CalendarEventEmail(event_id=event.id, email_id=email_id))
         db.flush()
+        return True
+    return False
+
+
+def _link_event_emails(
+    db: Session,
+    event: CalendarEvent,
+    email_ids: Iterable[int | None],
+) -> bool:
+    """Add several durable message links with one lookup and one flush."""
+    wanted = {email_id for email_id in email_ids if email_id is not None}
+    if not wanted:
+        return False
+    db.flush()
+    existing = {
+        row[0]
+        for row in db.query(CalendarEventEmail.email_id)
+        .filter(
+            CalendarEventEmail.event_id == event.id,
+            CalendarEventEmail.email_id.in_(wanted),
+        )
+        .all()
+    }
+    missing = wanted - existing
+    if not missing:
+        return False
+    db.add_all(CalendarEventEmail(event_id=event.id, email_id=email_id) for email_id in missing)
+    db.flush()
+    return True
 
 
 def _transfer_event_email_links(db: Session, source: CalendarEvent, target: CalendarEvent) -> None:
@@ -983,7 +1396,7 @@ async def process_calendar_email(
             event.interview_status = None
             event.is_visible = True
             db.add(event)
-            _link_event_email(db, event, email.id)
+            _link_event_emails(db, event, [email.id, *(related.id for related in related_emails)])
             changed = True
         for stale in existing.values():
             stale.is_visible = False
@@ -1007,14 +1420,15 @@ async def process_calendar_email(
             event.source_email_id = email.id
             event.source_received_at = as_utc(email.received_at)
             event.interview_status = status
-            if status == "cancellation":
-                event.is_visible = False
+            # Keep cancellations on the calendar so the user can see that the
+            # appointment was canceled instead of having it silently vanish.
+            event.is_visible = True
             if slots:
                 _apply_common(event, email, _slot_for_event(event, slots), access, details)
             else:
                 _apply_details(event, email, access, details)
             changed = True
-        elif status != "cancellation" and (slots or sourced_availability):
+        elif slots or (status != "cancellation" and sourced_availability):
             event = sourced_availability[0] if sourced_availability else CalendarEvent(
                 mailbox_id=email.mailbox_id,
                 origin="email",
@@ -1036,7 +1450,7 @@ async def process_calendar_email(
             changed = True
         if event is not None:
             db.flush()
-            _link_event_email(db, event, email.id)
+            _link_event_emails(db, event, [email.id, *(related.id for related in related_emails)])
             _hide_availability(db, email, event)
 
     email.calendar_processed_hash = digest

@@ -181,6 +181,9 @@ async def _run_sync_job(
             _set_job(mailbox_id, state="error", message="Mailbox not found")
             await publish("sync.done", get_sync_status(mailbox_id))
             return
+        mailbox.last_sync_started_at = datetime.now(timezone.utc)
+        mailbox.last_sync_error = None
+        db.commit()
         async with _cursor_lock(mailbox_id):
             await bootstrap_mailbox(
                 db, mailbox, initial_sync=max_results,
@@ -194,6 +197,9 @@ async def _run_sync_job(
                 message=f"Sync stopped — imported {imported} new messages",
             )
         else:
+            mailbox.last_sync_completed_at = datetime.now(timezone.utc)
+            mailbox.last_sync_error = None
+            db.commit()
             job = _set_job(
                 mailbox_id,
                 state="done",
@@ -202,6 +208,11 @@ async def _run_sync_job(
         await publish("sync.done", dict(job))
     except Exception as exc:
         logger.exception("Mailbox sync failed for %s", mailbox_id)
+        db.rollback()
+        failed_mailbox = db.get(MailboxConnection, mailbox_id)
+        if failed_mailbox is not None:
+            failed_mailbox.last_sync_error = str(exc)[:512]
+            db.commit()
         job = _set_job(mailbox_id, state="error", message=str(exc)[:300])
         await publish("sync.done", dict(job))
     finally:
@@ -691,7 +702,12 @@ async def process_gmail_notification(db: Session, email_address: str, history_id
                 db.commit()
         elif history_id:
             mailbox.sync_cursor = str(history_id)
-            db.commit()
+        mailbox.last_sync_completed_at = datetime.now(timezone.utc)
+        mailbox.last_sync_error = None
+        if mailbox.webhook is not None:
+            mailbox.webhook.last_delivery_success_at = datetime.now(timezone.utc)
+            mailbox.webhook.last_delivery_error = None
+        db.commit()
         return created
 
 
@@ -702,15 +718,6 @@ async def process_outlook_notification(db: Session, subscription_id: str, messag
             mailbox = conn
             break
     if mailbox is None:
-        mailbox = (
-            db.query(MailboxConnection)
-            .filter(
-                MailboxConnection.provider == Provider.MICROSOFT.value,
-                MailboxConnection.is_active.is_(True),
-            )
-            .first()
-        )
-    if mailbox is None:
         logger.warning("No Outlook mailbox for subscription %s", subscription_id)
         return 0
 
@@ -718,4 +725,10 @@ async def process_outlook_notification(db: Session, subscription_id: str, messag
     raw = await outlook_get_message(token, message_id)
     raw = await outlook_attach_folder(token, raw)
     email = await ingest_normalized_message(db, mailbox, normalize_outlook_message(raw))
+    mailbox.last_sync_completed_at = datetime.now(timezone.utc)
+    mailbox.last_sync_error = None
+    if mailbox.webhook is not None:
+        mailbox.webhook.last_delivery_success_at = datetime.now(timezone.utc)
+        mailbox.webhook.last_delivery_error = None
+    db.commit()
     return 1 if email else 0

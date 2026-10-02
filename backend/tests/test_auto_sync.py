@@ -17,7 +17,7 @@ from app.services.webhook_health import (
 )
 
 
-def test_auto_sync_schedules_only_active_mailboxes_without_webhooks(monkeypatch):
+def test_auto_sync_schedules_every_active_mailbox(monkeypatch):
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
@@ -51,7 +51,7 @@ def test_auto_sync_schedules_only_active_mailboxes_without_webhooks(monkeypatch)
     engine.dispose()
 
 
-def test_auto_sync_skips_live_webhook_and_polls_expired_one(monkeypatch):
+def test_auto_sync_reconciles_live_and_expired_webhooks(monkeypatch):
     reset_webhook_delivery_health()
     record_webhook_delivery_success("google")
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
@@ -66,7 +66,13 @@ def test_auto_sync_skips_live_webhook_and_polls_expired_one(monkeypatch):
         db.add_all([live, expired])
         db.flush()
         db.add_all([
-            WebhookSubscription(mailbox_id=live.id, provider="google", external_id="history-1", expires_at=datetime.now(timezone.utc) + timedelta(days=1)),
+            WebhookSubscription(
+                mailbox_id=live.id,
+                provider="google",
+                external_id="history-1",
+                expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+                last_delivery_success_at=datetime.now(timezone.utc),
+            ),
             WebhookSubscription(mailbox_id=expired.id, provider="google", external_id="history-2", expires_at=datetime.now(timezone.utc) - timedelta(minutes=1)),
         ])
         live_id, expired_id = live.id, expired.id
@@ -77,7 +83,9 @@ def test_auto_sync_skips_live_webhook_and_polls_expired_one(monkeypatch):
     monkeypatch.setattr(auto_sync, "start_mailbox_sync", sync)
     monkeypatch.setattr(auto_sync, "get_settings", lambda: SimpleNamespace(auto_sync_max_messages=200, auto_sync_interval_seconds=120))
     asyncio.run(auto_sync.poll_active_mailboxes())
-    sync.assert_awaited_once_with(expired_id, max_results=200, register_webhook=True)
+    assert sync.await_count == 2
+    sync.assert_any_await(live_id, max_results=200, register_webhook=True)
+    sync.assert_any_await(expired_id, max_results=200, register_webhook=True)
     with session_factory() as db:
         status = auto_sync.get_auto_sync_status(db)
         assert status["webhook_accounts"] == 1
@@ -87,7 +95,7 @@ def test_auto_sync_skips_live_webhook_and_polls_expired_one(monkeypatch):
     reset_webhook_delivery_health()
 
 
-def test_auto_sync_keeps_verified_webhook_active_after_process_restart(monkeypatch):
+def test_auto_sync_reconciles_verified_webhook_after_process_restart(monkeypatch):
     reset_webhook_delivery_health()
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
@@ -130,7 +138,7 @@ def test_auto_sync_keeps_verified_webhook_active_after_process_restart(monkeypat
 
     asyncio.run(auto_sync.poll_active_mailboxes())
 
-    sync.assert_not_awaited()
+    sync.assert_awaited_once_with(mailbox_id, max_results=200, register_webhook=True)
     with session_factory() as db:
         mailbox = db.get(MailboxConnection, mailbox_id)
         assert auto_sync.has_active_webhook(mailbox)
@@ -196,6 +204,48 @@ def test_auto_sync_polls_registered_webhook_after_delivery_auth_failure(monkeypa
         assert status["webhook_delivery"]["google"]["last_error"] == (
             "Missing Pub/Sub bearer token"
         )
+    reset_webhook_delivery_health()
+    engine.dispose()
+
+
+def test_webhook_health_is_isolated_per_mailbox():
+    reset_webhook_delivery_health()
+    record_webhook_delivery_success("microsoft")
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as db:
+        user = User(external_id="isolated-webhook-health")
+        db.add(user)
+        db.flush()
+        verified = MailboxConnection(
+            user_id=user.id, provider="microsoft", email_address="verified@example.com",
+            access_token_enc="x", is_active=True,
+        )
+        unverified = MailboxConnection(
+            user_id=user.id, provider="microsoft", email_address="unverified@example.com",
+            access_token_enc="x", is_active=True,
+        )
+        db.add_all([verified, unverified])
+        db.flush()
+        expires = datetime.now(timezone.utc) + timedelta(days=1)
+        db.add_all([
+            WebhookSubscription(
+                mailbox_id=verified.id, provider="microsoft", external_id="sub-1",
+                expires_at=expires, last_delivery_success_at=datetime.now(timezone.utc),
+            ),
+            WebhookSubscription(
+                mailbox_id=unverified.id, provider="microsoft", external_id="sub-2",
+                expires_at=expires,
+            ),
+        ])
+        db.commit()
+
+        assert auto_sync.has_active_webhook(verified)
+        assert not auto_sync.has_active_webhook(unverified)
+        assert auto_sync.get_auto_sync_status(db)["webhook_accounts"] == 1
     reset_webhook_delivery_health()
     engine.dispose()
 

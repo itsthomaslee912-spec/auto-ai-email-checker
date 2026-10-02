@@ -11,7 +11,6 @@ from app.db import SessionLocal
 from app.models import MailboxConnection
 from app.services.mailbox_sync import get_sync_status, start_mailbox_sync
 from app.services.webhook_health import (
-    webhook_delivery_is_healthy,
     webhook_delivery_status,
 )
 from app.timeutil import as_utc
@@ -35,13 +34,18 @@ def has_registered_webhook(mailbox: MailboxConnection, now: datetime | None = No
 
 
 def has_active_webhook(mailbox: MailboxConnection, now: datetime | None = None) -> bool:
+    """Return whether this mailbox has individually verified webhook delivery.
+
+    Provider-wide health is deliberately not used here: one working Outlook or
+    Gmail account must never make every other account look healthy.
+    """
     if not has_registered_webhook(mailbox, now):
         return False
     webhook = mailbox.webhook
     success = as_utc(webhook.last_delivery_success_at) if webhook else None
     failure = as_utc(webhook.last_delivery_failure_at) if webhook else None
     persisted_healthy = bool(success and (not failure or success >= failure))
-    return persisted_healthy or webhook_delivery_is_healthy(mailbox.provider)
+    return persisted_healthy
 
 
 def _provider_delivery_status(provider: str, mailboxes: list[MailboxConnection]) -> dict:
@@ -70,15 +74,18 @@ def _provider_delivery_status(provider: str, mailboxes: list[MailboxConnection])
 
 
 async def poll_active_mailboxes() -> int:
-    """Poll connected mailboxes only when they have no active webhook."""
+    """Reconcile every active mailbox; webhooks remain the low-latency path.
+
+    A webhook cannot report that a notification never arrived. Incremental
+    polling is therefore the safety net that closes gaps caused by a tunnel,
+    subscription, or provider delivery outage.
+    """
     with SessionLocal() as db:
-        now = datetime.now(timezone.utc)
         mailbox_ids = [
             mailbox.id
             for mailbox in db.query(MailboxConnection)
             .filter(MailboxConnection.is_active.is_(True))
             .all()
-            if not has_active_webhook(mailbox, now)
         ]
 
     limit = max(1, get_settings().auto_sync_max_messages)
@@ -101,12 +108,13 @@ def get_auto_sync_status(db: Session) -> dict:
     syncing = False
     webhook_accounts = 0
     registered_webhook_accounts = 0
+    mailbox_statuses = []
     for mailbox in mailboxes:
         if has_registered_webhook(mailbox):
             registered_webhook_accounts += 1
-        if has_active_webhook(mailbox):
+        webhook_verified = has_active_webhook(mailbox)
+        if webhook_verified:
             webhook_accounts += 1
-            continue
         job = get_sync_status(mailbox.id)
         if job["state"] == "running":
             syncing = True
@@ -116,6 +124,29 @@ def get_auto_sync_status(db: Session) -> dict:
                 "email_address": mailbox.email_address,
                 "message": job.get("message") or "Sync failed",
             })
+        elif mailbox.last_sync_error:
+            problems.append({
+                "mailbox_id": mailbox.id,
+                "email_address": mailbox.email_address,
+                "message": mailbox.last_sync_error,
+            })
+        mailbox_statuses.append({
+            "mailbox_id": mailbox.id,
+            "email_address": mailbox.email_address,
+            "provider": mailbox.provider,
+            "state": job["state"],
+            "last_sync_started_at": (
+                as_utc(mailbox.last_sync_started_at).isoformat()
+                if mailbox.last_sync_started_at else None
+            ),
+            "last_sync_completed_at": (
+                as_utc(mailbox.last_sync_completed_at).isoformat()
+                if mailbox.last_sync_completed_at else None
+            ),
+            "last_error": mailbox.last_sync_error,
+            "webhook_registered": has_registered_webhook(mailbox),
+            "webhook_verified": webhook_verified,
+        })
 
     recent = _last_check_at is not None and datetime.now(timezone.utc) - _last_check_at < timedelta(seconds=interval * 2)
     if not mailboxes:
@@ -142,6 +173,7 @@ def get_auto_sync_status(db: Session) -> dict:
         "last_check_at": _last_check_at.isoformat() if _last_check_at else None,
         "last_error": _last_error,
         "problem_mailboxes": problems,
+        "mailboxes": mailbox_statuses,
     }
 
 

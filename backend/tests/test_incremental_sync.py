@@ -294,3 +294,21 @@ def test_gmail_watch_renewal_keeps_unprocessed_history_cursor(monkeypatch):
     assert mailbox.sync_cursor == "100"
     db.close()
     engine.dispose()
+
+
+def test_outlook_notification_never_falls_back_to_another_mailbox(monkeypatch):
+    engine, db, _mailbox_row = _mailbox(Provider.MICROSOFT)
+    token = AsyncMock(return_value="token")
+    get_message = AsyncMock()
+    monkeypatch.setattr(mailbox_sync, "ensure_microsoft_access_token", token)
+    monkeypatch.setattr(mailbox_sync, "outlook_get_message", get_message)
+
+    created = asyncio.run(
+        mailbox_sync.process_outlook_notification(db, "unknown-subscription", "message-1")
+    )
+
+    assert created == 0
+    token.assert_not_awaited()
+    get_message.assert_not_awaited()
+    db.close()
+    engine.dispose()
