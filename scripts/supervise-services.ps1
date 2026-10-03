@@ -24,8 +24,11 @@ $backendStartedAt = Get-Date
 $frontendStartedAt = Get-Date
 $backendFailures = 0
 $frontendFailures = 0
-# Calendar backfill runs before the server accepts connections.
-$startupGraceSeconds = 300
+$backendRestartDelay = 0
+$frontendRestartDelay = 0
+# The API answers /api/health before background repair starts, so a hung
+# process should be replaced quickly instead of staying down for minutes.
+$startupGraceSeconds = 20
 
 function Write-SupervisorLog([string]$Message) {
     Add-Content -LiteralPath (Join-Path $Logs "supervisor.log") `
@@ -35,10 +38,31 @@ function Write-SupervisorLog([string]$Message) {
 function Test-Endpoint([string]$Url) {
     try {
         $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 3
-        return $response.StatusCode -ge 200 -and $response.StatusCode -lt 500
+        return $response.StatusCode -ge 200 -and $response.StatusCode -lt 300
     } catch {
         return $false
     }
+}
+
+function Ensure-Postgres {
+    try {
+        $pgCtl = Join-Path $Root ".local\postgresql\bin\pg_ctl.exe"
+        $data = Join-Path $Root ".local\postgresql\data"
+        if (-not (Test-Path $pgCtl) -or -not (Test-Path (Join-Path $data "PG_VERSION"))) { return }
+        & $pgCtl -D $data status *> $null
+        if ($LASTEXITCODE -eq 0) { return }
+        Write-SupervisorLog "PostgreSQL is down; starting it"
+        & (Join-Path $Root "scripts\run-postgres.ps1")
+    } catch {
+        Write-SupervisorLog "PostgreSQL could not be started: $($_.Exception.Message)"
+    }
+}
+
+function Get-RestartDelay([int]$Current, [datetime]$StartedAt) {
+    $ran = ((Get-Date) - $StartedAt).TotalSeconds
+    if ($ran -ge 30) { return 0 }
+    if ($Current -lt 3) { return 3 }
+    return [Math]::Min(30, $Current * 2)
 }
 
 function Start-Backend {
@@ -63,6 +87,14 @@ function Start-Frontend {
 
 try {
     while ($true) {
+        Ensure-Postgres
+        if ($backendProcess -and $backendProcess.HasExited) {
+            $backendRestartDelay = Get-RestartDelay $backendRestartDelay $backendStartedAt
+            if ($backendRestartDelay -gt 0) {
+                Write-SupervisorLog "Backend exited; waiting ${backendRestartDelay}s before starting it again"
+                Start-Sleep -Seconds $backendRestartDelay
+            }
+        }
         if (-not $backendProcess -or $backendProcess.HasExited) {
             $backendProcess = Start-Backend
             $backendStartedAt = Get-Date
@@ -71,6 +103,7 @@ try {
         }
         if (Test-Endpoint "http://127.0.0.1:8000/api/health") {
             $backendFailures = 0
+            if (((Get-Date) - $backendStartedAt).TotalSeconds -ge 30) { $backendRestartDelay = 0 }
         } elseif (((Get-Date) - $backendStartedAt).TotalSeconds -ge $startupGraceSeconds) {
             $backendFailures++
             if ($backendFailures -ge 3) {
@@ -78,12 +111,21 @@ try {
                 Stop-Process -Id $backendProcess.Id -Force -ErrorAction SilentlyContinue
                 $backendProcess = $null
                 $backendFailures = 0
+                $backendRestartDelay = Get-RestartDelay $(if ($backendRestartDelay -lt 3) { 3 } else { $backendRestartDelay }) $backendStartedAt
             }
         }
 
+        if ($frontendProcess -and $frontendProcess.HasExited) {
+            $frontendRestartDelay = Get-RestartDelay $frontendRestartDelay $frontendStartedAt
+            if ($frontendRestartDelay -gt 0) {
+                Write-SupervisorLog "Frontend exited; waiting ${frontendRestartDelay}s before starting it again"
+                Start-Sleep -Seconds $frontendRestartDelay
+            }
+        }
         if (-not $frontendProcess -or $frontendProcess.HasExited) {
             if (Test-Endpoint "http://127.0.0.1:5173") {
                 $frontendFailures = 0
+                $frontendRestartDelay = 0
             } else {
                 $frontendProcess = Start-Frontend
                 $frontendStartedAt = Get-Date
@@ -93,13 +135,15 @@ try {
         }
         if (Test-Endpoint "http://127.0.0.1:5173") {
             $frontendFailures = 0
-        } elseif (((Get-Date) - $frontendStartedAt).TotalSeconds -ge $startupGraceSeconds) {
+            if (((Get-Date) - $frontendStartedAt).TotalSeconds -ge 30) { $frontendRestartDelay = 0 }
+        } elseif ($frontendProcess -and ((Get-Date) - $frontendStartedAt).TotalSeconds -ge $startupGraceSeconds) {
             $frontendFailures++
             if ($frontendFailures -ge 3) {
                 Write-SupervisorLog "Frontend unhealthy; restarting PID $($frontendProcess.Id)"
                 Stop-Process -Id $frontendProcess.Id -Force -ErrorAction SilentlyContinue
                 $frontendProcess = $null
                 $frontendFailures = 0
+                $frontendRestartDelay = Get-RestartDelay $(if ($frontendRestartDelay -lt 3) { 3 } else { $frontendRestartDelay }) $frontendStartedAt
             }
         }
         Start-Sleep -Seconds 5

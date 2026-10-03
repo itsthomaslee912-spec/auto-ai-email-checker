@@ -25,6 +25,7 @@ const POINTER_DELAY_MS = 420;
 type TooltipState = {
   target: HTMLElement;
   message: string;
+  hint: string;
   full: boolean;
   placement: "below" | "right" | "top";
   left: number;
@@ -38,7 +39,12 @@ function isFull(target: HTMLElement): boolean {
 
 function placementFor(target: HTMLElement): TooltipState["placement"] {
   const placement = target.dataset.tooltipPlacement;
-  return placement === "right" || placement === "top" ? placement : "below";
+  if (placement === "right" || placement === "top") return placement;
+  return "below";
+}
+
+function hintFor(target: HTMLElement): string {
+  return target.dataset.tooltipHint?.replace(/\s+/g, " ").trim() || "";
 }
 
 function normalizedMessage(value: string | null | undefined): string {
@@ -121,6 +127,7 @@ export default function AppTooltip() {
       setTooltip({
         target,
         message: messageFor(target),
+        hint: isFull(target) ? "" : hintFor(target),
         full: isFull(target),
         placement,
         left: placement === "right" ? rect.right + 10 : placement === "top" ? rect.left : rect.left + rect.width / 2,
@@ -213,11 +220,16 @@ export default function AppTooltip() {
   return (
     <div
       ref={tooltipRef}
-      className={`app-tooltip placement-${tooltip.placement}${tooltip.full ? " is-detailed" : ""}${tooltip.visible ? " is-visible" : ""}`}
+      className={`app-tooltip placement-${tooltip.placement}${tooltip.full ? " is-detailed" : ""}${tooltip.hint ? " has-hint" : ""}${tooltip.visible ? " is-visible" : ""}`}
       role="tooltip"
       style={{ left: tooltip.left, top: tooltip.top }}
     >
-      {tooltip.full ? (
+      {tooltip.hint ? (
+        <>
+          <strong className="app-tooltip-title">{tooltip.message}</strong>
+          <span className="app-tooltip-hint">{tooltip.hint}</span>
+        </>
+      ) : tooltip.full ? (
         <>
           <strong className="app-tooltip-heading">{heading}</strong>
           {lines.map((line, index) => {

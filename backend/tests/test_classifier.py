@@ -335,3 +335,53 @@ def test_system_prompt_lists_every_label():
     assert normalize_label("tech") == EmailLabel.ASSESSMENT.value
     assert normalize_label("unknown") == EmailLabel.OTHER.value
     assert normalize_label("not_a_label") == EmailLabel.OTHER.value
+
+
+def test_booked_calendar_request_is_scheduled_and_a_decline_is_not():
+    booked = """BEGIN:VCALENDAR
+METHOD:REQUEST
+BEGIN:VEVENT
+DTSTART;TZID=America/New_York:20260922T123000
+DTEND;TZID=America/New_York:20260922T130000
+END:VEVENT
+END:VCALENDAR
+"""
+    declined = """BEGIN:VCALENDAR
+METHOD:REPLY
+BEGIN:VEVENT
+DTSTART;TZID=America/New_York:20260831T080000
+STATUS:CONFIRMED
+END:VEVENT
+END:VCALENDAR
+Please reply with your availability.
+"""
+    assert (
+        apply_label_guards(
+            EmailLabel.INTERVIEW_INVITATION.value,
+            subject="Book time with me - Ryan Queen and Mathius Ballesteros Pacheco",
+            sender="Mathius <mathius@synply.io>",
+            body_text=booked,
+            snippet="",
+        )
+        == EmailLabel.INTERVIEW_SCHEDULED.value
+    )
+    assert (
+        apply_label_guards(
+            EmailLabel.INTERVIEW_INVITATION.value,
+            subject="Declined: Fivecast intro call: AI Engineer",
+            sender="Nicole <nicole@fivecast.test>",
+            body_text=declined,
+            snippet="",
+        )
+        == EmailLabel.INTERVIEW_INVITATION.value
+    )
+    assert (
+        apply_label_guards(
+            EmailLabel.INTERVIEW_INVITATION.value,
+            subject="Interview invitation: Principal AI Engineer",
+            sender="noreply@taleri.es",
+            body_text="https://scheduler.zoom.us/mathius/hello",
+            snippet="",
+        )
+        == EmailLabel.INTERVIEW_INVITATION.value
+    )

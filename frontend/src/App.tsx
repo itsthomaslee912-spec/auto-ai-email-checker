@@ -5,6 +5,7 @@ import CompactSelect from "./components/CompactSelect";
 import ModernDateTimePicker from "./components/ModernDateTimePicker";
 import MessageRow from "./components/MessageRow";
 import SystemAlert, { type SystemIssue } from "./components/SystemAlert";
+import InterviewAlarm from "./components/InterviewAlarm";
 import SettingsPage, { type SettingsSection } from "./pages/SettingsPage";
 import CalendarPage from "./pages/CalendarPage";
 import {
@@ -13,6 +14,7 @@ import {
   fetchAiStatus,
   fetchAutoSyncStatus,
   fetchClassifyPromptStatus,
+  fetchEmailConversation,
   fetchEmailDetail,
   fetchEmails,
   createAiReply,
@@ -44,11 +46,13 @@ import { CLASSIFY_LABELS, CLASSIFY_LABEL_TITLES, EMPTY_LABEL_COUNTS, INTERVIEW_S
 import {
   applyFontFamily,
   applyFontSize,
+  loadConversationView,
   loadFontFamily,
   loadFontSize,
   loadInboxType,
   loadReadingPane,
   loadViewMode,
+  saveConversationView,
   saveFontFamily,
   saveFontSize,
   saveInboxType,
@@ -358,6 +362,9 @@ export default function App() {
   const [viewMode, setViewMode] = useState<ViewMode>(() => loadViewMode());
   const [inboxType, setInboxType] = useState<InboxType>(() => loadInboxType());
   const [readingPane, setReadingPane] = useState<ReadingPane>(() => loadReadingPane());
+  const [conversationView, setConversationView] = useState(() => loadConversationView());
+  const [threadMessages, setThreadMessages] = useState<EmailDetail[]>([]);
+  const [openThreadIds, setOpenThreadIds] = useState<number[]>([]);
   const [fontFamily, setFontFamily] = useState<FontFamily>(() => loadFontFamily());
   const [fontSize, setFontSize] = useState<FontSize>(() => loadFontSize());
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -383,6 +390,7 @@ export default function App() {
     folder,
     query: searchQuery,
     inboxType,
+    conversationView,
   });
   filterRef.current = {
     mailboxId: selectedMailboxId,
@@ -391,6 +399,7 @@ export default function App() {
     folder,
     query: searchQuery,
     inboxType,
+    conversationView,
   };
   const fetchGen = useRef(0);
   const detailGen = useRef(0);
@@ -471,6 +480,7 @@ export default function App() {
       folder: currentFolder,
       query,
       inboxType: currentInboxType,
+      conversationView: currentConversation,
     } = filterRef.current;
     setLoading(true);
     setLoadingMore(false);
@@ -489,6 +499,7 @@ export default function App() {
         folder: currentFolder,
         query,
         inboxType: currentInboxType,
+        conversation: currentConversation,
         limit: PAGE_SIZE,
       });
       if (gen !== fetchGen.current) return;
@@ -516,6 +527,7 @@ export default function App() {
       folder: currentFolder,
       query,
       inboxType: currentInboxType,
+      conversationView: currentConversation,
     } = filterRef.current;
     try {
       const page = await fetchEmails({
@@ -525,6 +537,7 @@ export default function App() {
         folder: currentFolder,
         query,
         inboxType: currentInboxType,
+        conversation: currentConversation,
         limit: PAGE_SIZE,
         beforeId: nextCursor,
         beforeReceivedAt: nextReceivedAt,
@@ -652,7 +665,7 @@ export default function App() {
 
   useEffect(() => {
     void refreshReclassifyStatuses();
-    const timer = window.setInterval(() => void refreshReclassifyStatuses(), 3_000);
+    const timer = window.setInterval(() => void refreshReclassifyStatuses(), 20_000);
     return () => window.clearInterval(timer);
   }, [refreshReclassifyStatuses]);
 
@@ -708,20 +721,38 @@ export default function App() {
 
         setEmails((prev) => {
           const inbox = filterRef.current.inboxType;
-          const existingIdx = prev.findIndex((e) => e.id === item.id);
+          const conversation = filterRef.current.conversationView;
+          const matches = matchesMailbox && matchesLabel && matchesSubtype && matchesFolder && matchesQuery;
+          const threadIdx = conversation && item.thread_id
+            ? prev.findIndex((email) => email.mailbox_id === item.mailbox_id && email.thread_id === item.thread_id)
+            : -1;
+          const existingIdx = threadIdx >= 0 ? threadIdx : prev.findIndex((email) => email.id === item.id);
           if (existingIdx >= 0) {
-            if (matchesMailbox && matchesLabel && matchesSubtype && matchesFolder && matchesQuery) {
-              const next = [...prev];
+            const current = prev[existingIdx];
+            const sameMessage = current.id === item.id;
+            if (!sameMessage && isUpdate) return prev;
+            if (!matches) return sameMessage ? prev.filter((email) => email.id !== item.id) : prev;
+            const newer = (item.received_at ?? "") >= (current.received_at ?? "");
+            const next = [...prev];
+            if (!sameMessage && !newer) {
               next[existingIdx] = {
-                ...next[existingIdx],
-                ...item,
-                is_read: Boolean(item.is_read ?? next[existingIdx].is_read),
+                ...current,
+                thread_count: (current.thread_count ?? 1) + 1,
+                is_read: current.is_read && Boolean(item.is_read),
               };
-              return sortEmailsForInbox(next, inbox);
+            } else {
+              next[existingIdx] = {
+                ...current,
+                ...item,
+                thread_count: sameMessage ? (current.thread_count ?? 1) : (current.thread_count ?? 1) + 1,
+                is_read: sameMessage
+                  ? Boolean(item.is_read ?? current.is_read)
+                  : Boolean(item.is_read) && current.is_read,
+              };
             }
-            return prev.filter((e) => e.id !== item.id);
+            return sortEmailsForInbox(next, inbox);
           }
-          if (!isUpdate && matchesMailbox && matchesLabel && matchesSubtype && matchesFolder && matchesQuery) {
+          if (!isUpdate && matches) {
             return sortEmailsForInbox([{ ...item, is_read: Boolean(item.is_read) }, ...prev], inbox);
           }
           return prev;
@@ -1001,6 +1032,15 @@ export default function App() {
     setInboxType(next);
     saveInboxType(next);
     filterRef.current = { ...filterRef.current, inboxType: next };
+    void loadFirstPage();
+  }
+
+  function chooseConversationView(next: boolean) {
+    setConversationView(next);
+    saveConversationView(next);
+    filterRef.current = { ...filterRef.current, conversationView: next };
+    setThreadMessages([]);
+    setOpenThreadIds([]);
     void loadFirstPage();
   }
 
@@ -1374,6 +1414,8 @@ export default function App() {
     const request = ++detailGen.current;
     setSelectedId(id);
     setSelected(null);
+    setThreadMessages([]);
+    setOpenThreadIds([]);
     setSaveTraining(false);
     setPendingLabel(null);
     setLoadingDetail(true);
@@ -1423,6 +1465,24 @@ export default function App() {
     setTableDialogOpen(true);
     void onOpenEmail(id);
   }
+
+  useEffect(() => {
+    if (!conversationView || selectedId == null) {
+      setThreadMessages([]);
+      return;
+    }
+    let cancel = false;
+    fetchEmailConversation(selectedId)
+      .then((items) => {
+        if (!cancel) setThreadMessages(items);
+      })
+      .catch(() => {
+        if (!cancel) setThreadMessages([]);
+      });
+    return () => {
+      cancel = true;
+    };
+  }, [conversationView, selectedId]);
 
   function closeTableDialog() {
     ++detailGen.current;
@@ -1937,6 +1997,8 @@ export default function App() {
 
   if (settingsOpen) {
     return (
+      <>
+      <InterviewAlarm mailboxes={mailboxes} />
       <SettingsPage
         section={settingsSection}
         onSectionChange={setSettingsSection}
@@ -1949,6 +2011,8 @@ export default function App() {
         onInboxTypeChange={chooseInboxType}
         readingPane={readingPane}
         onReadingPaneChange={chooseReadingPane}
+        conversationView={conversationView}
+        onConversationViewChange={chooseConversationView}
         fontFamily={fontFamily}
         onFontFamilyChange={chooseFontFamily}
         fontSize={fontSize}
@@ -1980,6 +2044,7 @@ export default function App() {
         reclassifyProgress={reclassifyProgress}
         initialMailboxId={selectedMailboxId}
       />
+      </>
     );
   }
 
@@ -1996,6 +2061,7 @@ export default function App() {
         } as CSSProperties
       }
     >
+      <InterviewAlarm mailboxes={mailboxes} />
       <SystemAlert
         issues={visibleIssues}
         open={systemAlertOpen}
@@ -2056,7 +2122,9 @@ export default function App() {
                 type="button"
                 className="sidebar-sync-trigger"
                 aria-label="Hide sidebar"
-                title="Hide sidebar"
+                data-tooltip="Hide sidebar"
+                data-tooltip-hint="Collapse this panel"
+                data-tooltip-placement="bottom"
                 onClick={() => {
                   setSyncMenuOpen(false);
                   setSidebarCollapsed(true);
@@ -2070,6 +2138,9 @@ export default function App() {
                 type="button"
                 className={`sidebar-sync-trigger ${syncMenuOpen ? "active" : ""} ${syncingIds.size ? "syncing" : ""}`}
                 aria-label="Open sync menu"
+                data-tooltip={syncMenuOpen ? undefined : "Sync"}
+                data-tooltip-hint={syncMenuOpen ? undefined : "Email or calendar"}
+                data-tooltip-placement="bottom"
                 aria-haspopup="menu"
                 aria-expanded={syncMenuOpen}
                 onClick={() => setSyncMenuOpen((open) => !open)}
@@ -2193,14 +2264,22 @@ export default function App() {
                 {selectedMailbox ? selectedMailbox.email_address : "All accounts"}
               </h2>
               <div className="list-header-actions">
-                <button
-                  type="button"
-                  className="action-btn"
-                  disabled={scopeUnread === 0 || markingAllRead}
-                  onClick={() => setMarkAllOpen(true)}
+                <span
+                  className="list-header-icon-wrap"
+                  data-tooltip={markingAllRead ? "Marking as read…" : scopeUnread === 0 ? "All caught up" : "Mark all as read"}
+                  data-tooltip-hint={markingAllRead ? "This list is being updated" : scopeUnread === 0 ? "Nothing unread in this list" : "Marks unread mail in this list"}
+                  data-tooltip-placement="bottom"
                 >
-                  Mark all as read
-                </button>
+                  <button
+                    type="button"
+                    className="list-header-icon"
+                    aria-label="Mark all as read"
+                    disabled={scopeUnread === 0 || markingAllRead}
+                    onClick={() => setMarkAllOpen(true)}
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5.5" width="13" height="11" rx="2" /><path d="m4.2 8 5.3 3.6L14.8 8" /><path d="m14.2 15.2 2.2 2.2 4.6-4.8" /></svg>
+                  </button>
+                </span>
               </div>
             </div>
           </div>
@@ -2249,7 +2328,7 @@ export default function App() {
                 <option key={value} value={value}>{title}</option>
               ))}
             </CompactSelect>
-            {!loading && <span className="subtype-filter-count" role="status">{filteredTotal} email{filteredTotal === 1 ? "" : "s"}</span>}
+            {!loading && <span className="subtype-filter-count" role="status">{filteredTotal} {conversationView ? (filteredTotal === 1 ? "conversation" : "conversations") : (filteredTotal === 1 ? "email" : "emails")}</span>}
           </div>
         )}
 
@@ -2509,6 +2588,27 @@ export default function App() {
                   </div>
                 </div>
               </div>
+              {conversationView && threadMessages.filter((message) => message.id !== selected.id).length > 0 && (
+                <div className="thread-older">
+                  {threadMessages.filter((message) => message.id !== selected.id).map((message) => {
+                    const open = openThreadIds.includes(message.id);
+                    const sender = message.sender.match(/^"?([^"<]+)"?\s*</)?.[1]?.trim() || message.sender || "Unknown";
+                    return (
+                      <section key={message.id} className={open ? "thread-card is-open" : "thread-card"}>
+                        <button
+                          type="button"
+                          aria-expanded={open}
+                          onClick={() => setOpenThreadIds((ids) => open ? ids.filter((item) => item !== message.id) : [...ids, message.id])}
+                        >
+                          <strong>{sender}</strong>
+                          <time>{formatReaderTime(message.received_at)}</time>
+                        </button>
+                        {open && <EmailBody html={message.body_html} text={message.body_text} snippet={message.snippet} />}
+                      </section>
+                    );
+                  })}
+                </div>
+              )}
               <EmailBody
                 html={selected.body_html}
                 text={selected.body_text}

@@ -1,4 +1,20 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
+
+type AppTheme = "dark" | "light";
+
+function useAppTheme(): AppTheme {
+  const [theme, setTheme] = useState<AppTheme>(() =>
+    document.documentElement.dataset.theme === "light" ? "light" : "dark",
+  );
+  useEffect(() => {
+    const root = document.documentElement;
+    const sync = () => setTheme(root.dataset.theme === "light" ? "light" : "dark");
+    const observer = new MutationObserver(sync);
+    observer.observe(root, { attributes: true, attributeFilter: ["data-theme"] });
+    return () => observer.disconnect();
+  }, []);
+  return theme;
+}
 
 function looksLikeHtml(value: string): boolean {
   return /<\/?[a-z][\s\S]*>/i.test(value);
@@ -14,9 +30,19 @@ function splitMixedPlainHtml(value: string): { html: string; text: string } {
   };
 }
 
-function buildHtmlDocument(html: string): string {
+function buildHtmlDocument(html: string, theme: AppTheme): string {
+  const dark = theme === "dark";
+  const page = dark ? "#171b24" : "#ffffff";
+  const ink = dark ? "#eef2f7" : "#1b2433";
+  const heading = dark ? "#eef2f7" : "#1b2433";
+  const link = dark ? "#4c8dff" : "#2f6fed";
+  const quote = dark ? "#8b95a7" : "#5c6778";
+  const quoteLine = dark ? "rgba(255,255,255,.18)" : "rgba(20,32,48,.18)";
+  const track = dark ? "#12151b" : "#e9edf4";
+  const thumb = dark ? "#4a5568" : "#b0b8c6";
+  const thumbHover = dark ? "#6b778c" : "#8b95a7";
   return `<!DOCTYPE html>
-<html>
+<html style="color-scheme: ${theme}">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -24,27 +50,28 @@ function buildHtmlDocument(html: string): string {
   * { box-sizing: border-box; }
   html {
     height: 100%;
+    color-scheme: ${theme};
     scrollbar-width: thin;
-    scrollbar-color: #9aa3b2 #eef1f6;
+    scrollbar-color: ${thumb} ${track};
   }
   html::-webkit-scrollbar { width: 12px; height: 12px; }
   html::-webkit-scrollbar-track {
-    background: #eef1f6;
+    background: ${track};
     border-radius: 8px;
   }
   html::-webkit-scrollbar-thumb {
-    background: #9aa3b2;
+    background: ${thumb};
     border-radius: 8px;
-    border: 3px solid #eef1f6;
+    border: 3px solid ${track};
   }
-  html::-webkit-scrollbar-thumb:hover { background: #6f7a8d; }
+  html::-webkit-scrollbar-thumb:hover { background: ${thumbHover}; }
 
   body {
     margin: 0;
     min-height: 100%;
     padding: 20px 22px 28px;
-    background: #ffffff;
-    color: #1f2430;
+    background: ${page};
+    color: ${ink};
     font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
     font-size: 16px;
     line-height: 1.7;
@@ -57,12 +84,12 @@ function buildHtmlDocument(html: string): string {
     margin: 0 auto;
   }
   p { margin: 0 0 1em; }
-  h1, h2, h3, h4 { line-height: 1.3; color: #12151c; }
+  h1, h2, h3, h4 { line-height: 1.3; color: ${heading}; }
   img, video {
     max-width: 100% !important;
     height: auto !important;
   }
-  a { color: #0b57d0; }
+  a { color: ${link}; }
   table {
     max-width: 100% !important;
     border-collapse: collapse;
@@ -76,8 +103,8 @@ function buildHtmlDocument(html: string): string {
   blockquote {
     margin: 0.75em 0;
     padding-left: 0.9em;
-    border-left: 3px solid #d5dbe7;
-    color: #4a5160;
+    border-left: 3px solid ${quoteLine};
+    color: ${quote};
   }
 </style>
 </head>
@@ -92,6 +119,7 @@ type Props = {
 };
 
 export default function EmailBody({ html, text, snippet }: Props) {
+  const theme = useAppTheme();
   const sourceHtml = (html || "").trim();
   const sourceText = (text || "").trim();
   const fallback = (snippet || "").trim();
@@ -108,6 +136,11 @@ export default function EmailBody({ html, text, snippet }: Props) {
     return "";
   }, [sourceHtml, sourceText]);
 
+  const framedHtml = useMemo(
+    () => (htmlToRender ? buildHtmlDocument(htmlToRender, theme) : ""),
+    [htmlToRender, theme],
+  );
+
   const plainToRender = useMemo(() => {
     if (htmlToRender) return "";
     if (!sourceText) return fallback;
@@ -122,7 +155,7 @@ export default function EmailBody({ html, text, snippet }: Props) {
           className="email-body-frame"
           aria-label="Email body"
           sandbox=""
-          srcDoc={buildHtmlDocument(htmlToRender)}
+          srcDoc={framedHtml}
         />
       </div>
     );

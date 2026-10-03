@@ -50,7 +50,10 @@ export default function MessageRow({
         }}
       >
         <span className="table-cell">
-          <strong className="table-primary">{senderName(email.sender)}</strong>
+          <strong className="table-primary">
+            {senderName(email.sender)}
+            {(email.thread_count ?? 1) > 1 && <span className="thread-count">{email.thread_count}</span>}
+          </strong>
           {accountAddress && <span className="table-secondary">{accountAddress}</span>}
         </span>
         <span className="table-cell">
@@ -80,7 +83,10 @@ export default function MessageRow({
       <span className="msg-body">
         <span className="msg-top">
           <span className="msg-from">
-            <strong>{senderName(email.sender)}</strong>
+            <span className="msg-sender-line">
+              <strong>{senderName(email.sender)}</strong>
+              {(email.thread_count ?? 1) > 1 && <span className="thread-count">{email.thread_count}</span>}
+            </span>
             {accountAddress ? <span className="msg-account">{accountAddress}</span> : null}
           </span>
           <span className="msg-meta">

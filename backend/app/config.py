@@ -49,8 +49,6 @@ class Settings(BaseSettings):
     mail_sync_excluded_senders: str = "{}"
     auto_sync_interval_seconds: int = 120
     auto_sync_max_messages: int = 200
-    # A verified webhook with no delivery for this long is backed up by polling.
-    webhook_quiet_seconds: int = 1800
 
 
 @lru_cache

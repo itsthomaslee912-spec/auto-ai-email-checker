@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -182,3 +184,88 @@ def test_list_emails_filters_folder():
     assert mixed.status_code == 200
     assert mixed.json()["total"] == 4
     assert mixed.json()["mailbox_unread_counts"] == {str(mailbox_id): 1}
+
+
+def test_conversation_view_keeps_the_newest_message_in_each_thread():
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    user = User(external_id="u-thread")
+    db.add(user)
+    db.flush()
+    mailbox = MailboxConnection(
+        user_id=user.id,
+        provider=Provider.GOOGLE.value,
+        email_address="thread@example.com",
+        access_token_enc="x",
+        refresh_token_enc="",
+        is_active=True,
+    )
+    db.add(mailbox)
+    db.flush()
+    older = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+    newer = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+    db.add_all([
+        EmailMessage(
+            mailbox_id=mailbox.id,
+            provider_message_id="thread-old",
+            thread_id="same-thread",
+            subject="Older note",
+            sender="a@b.com",
+            snippet="old",
+            label=EmailLabel.OTHER.value,
+            folder=MailFolder.INBOX.value,
+            received_at=older,
+            is_read=True,
+        ),
+        EmailMessage(
+            mailbox_id=mailbox.id,
+            provider_message_id="thread-new",
+            thread_id="same-thread",
+            subject="Newer note",
+            sender="a@b.com",
+            snippet="new",
+            label=EmailLabel.OTHER.value,
+            folder=MailFolder.INBOX.value,
+            received_at=newer,
+            is_read=True,
+        ),
+        EmailMessage(
+            mailbox_id=mailbox.id,
+            provider_message_id="alone",
+            thread_id=None,
+            subject="Solo",
+            sender="a@b.com",
+            snippet="solo",
+            label=EmailLabel.OTHER.value,
+            folder=MailFolder.INBOX.value,
+            received_at=older,
+            is_read=True,
+        ),
+    ])
+    db.commit()
+    db.close()
+
+    app = FastAPI()
+    app.include_router(emails.router)
+
+    def override_get_db():
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+
+    grouped = client.get("/api/emails", params={"conversation": "true"})
+    assert grouped.status_code == 200
+    body = grouped.json()
+    assert body["total"] == 2
+    subjects = [item["subject"] for item in body["items"]]
+    assert subjects == ["Newer note", "Solo"]
+    assert body["items"][0]["thread_count"] == 2
+    assert body["items"][1]["thread_count"] == 1
+
+    flat = client.get("/api/emails")
+    assert flat.json()["total"] == 3

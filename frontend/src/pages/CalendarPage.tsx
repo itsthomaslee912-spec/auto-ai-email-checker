@@ -1,4 +1,4 @@
-import { FormEvent, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import EmailBody from "../components/EmailBody";
 import CompactSelect from "../components/CompactSelect";
@@ -17,7 +17,7 @@ import {
 } from "../api";
 
 type ViewMode = "month" | "week" | "day";
-type CalendarStatusFilter = "active" | "passed" | "canceled" | "rejected" | "closed" | "available";
+type CalendarStatusFilter = "active" | "passed" | "canceled" | "rejected_closed" | "available";
 
 const VIEW_OPTIONS: { value: ViewMode; label: string }[] = [
   { value: "month", label: "Month" },
@@ -37,8 +37,7 @@ const CALENDAR_STATUS_FILTERS: { value: CalendarStatusFilter; label: string }[] 
   { value: "active", label: "Active" },
   { value: "passed", label: "Passed" },
   { value: "canceled", label: "Canceled" },
-  { value: "rejected", label: "Rejected" },
-  { value: "closed", label: "Closed" },
+  { value: "rejected_closed", label: "Rejected/Closed" },
   { value: "available", label: "Available" },
 ];
 const SYSTEM_TIME_ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
@@ -125,9 +124,21 @@ function localInput(date: Date) {
   return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}T${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
 }
 function formatWallTime(value: Date) { return new Intl.DateTimeFormat(undefined, { timeZone: "UTC", hour: "numeric", minute: "2-digit" }).format(value); }
-function formatDateTime(value: string, timeZone: string) { return new Intl.DateTimeFormat(undefined, { timeZone, month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }).format(new Date(value)); }
+const dateTimeFormatters = new Map<string, Intl.DateTimeFormat>();
+function cachedDateTime(timeZone: string, options: Intl.DateTimeFormatOptions, value: Date) {
+  const key = `${timeZone}|${options.weekday ?? ""}|${options.month ?? ""}|${options.day ?? ""}|${options.year ?? ""}|${options.hour ?? ""}|${options.minute ?? ""}|${options.timeZoneName ?? ""}`;
+  let formatter = dateTimeFormatters.get(key);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat("en-US", { timeZone, ...options });
+    dateTimeFormatters.set(key, formatter);
+  }
+  return formatter.format(value);
+}
+function formatDateTime(value: string, timeZone: string) {
+  return cachedDateTime(timeZone, { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }, new Date(value));
+}
 function formatClock(value: string, timeZone: string) {
-  return new Intl.DateTimeFormat("en-US", { timeZone, hour: "numeric", minute: "2-digit" }).format(new Date(value));
+  return cachedDateTime(timeZone, { hour: "numeric", minute: "2-digit" }, new Date(value));
 }
 function formatInterviewTimeRange(event: CalendarEvent, timeZone: string) {
   const startInstant = new Date(event.start_at);
@@ -135,33 +146,57 @@ function formatInterviewTimeRange(event: CalendarEvent, timeZone: string) {
   const startParts = partsInTimeZone(startInstant, timeZone);
   const endParts = partsInTimeZone(endInstant, timeZone);
   const sameDay = startParts.year === endParts.year && startParts.month === endParts.month && startParts.day === endParts.day;
-  const start = new Intl.DateTimeFormat("en-US", { timeZone, weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(startInstant);
+  const start = cachedDateTime(timeZone, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }, startInstant);
   const end = sameDay
     ? formatClock(event.end_at, timeZone)
-    : new Intl.DateTimeFormat("en-US", { timeZone, weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(endInstant);
+    : cachedDateTime(timeZone, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }, endInstant);
   return `${start} – ${end}`;
 }
 function periodTitle(anchor: Date, days: Date[], view: ViewMode) {
-  const monthName = (date: Date) => new Intl.DateTimeFormat(undefined, { timeZone: "UTC", month: "long" }).format(date);
-  if (view === "month") return { primary: monthName(anchor), secondary: String(anchor.getUTCFullYear()) };
+  const monthName = (date: Date, length: "long" | "short") => new Intl.DateTimeFormat("en-US", { timeZone: "UTC", month: length }).format(date);
+  const weekdayName = (date: Date) => new Intl.DateTimeFormat("en-US", { timeZone: "UTC", weekday: "long" }).format(date);
+  if (view === "month") return { primary: monthName(anchor, "long"), secondary: String(anchor.getUTCFullYear()) };
+  if (view === "day") {
+    const day = days[0] ?? anchor;
+    return { primary: `${weekdayName(day)}, ${monthName(day, "long")} ${day.getUTCDate()}`, secondary: String(day.getUTCFullYear()) };
+  }
   const first = days[0];
   const last = days[days.length - 1];
-  if (first.getUTCFullYear() === last.getUTCFullYear() && first.getUTCMonth() === last.getUTCMonth()) {
-    return { primary: monthName(first), secondary: String(first.getUTCFullYear()) };
+  const startLabel = `${monthName(first, "short")} ${first.getUTCDate()}`;
+  const endLabel = `${monthName(last, "short")} ${last.getUTCDate()}`;
+  if (first.getUTCFullYear() === last.getUTCFullYear()) {
+    return { primary: `${startLabel} – ${endLabel}`, secondary: String(last.getUTCFullYear()) };
   }
-  const startLabel = new Intl.DateTimeFormat(undefined, { timeZone: "UTC", month: "short", day: "numeric" }).format(first);
-  const endLabel = new Intl.DateTimeFormat(undefined, { timeZone: "UTC", month: "short", day: "numeric", year: "numeric" }).format(last);
-  return { primary: `${startLabel} – ${endLabel}`, secondary: "" };
-}
-function overlapsDay(event: CalendarEvent, day: Date, timeZone: string) {
-  const dayStart = instantForWallDate(startOfDay(day), timeZone);
-  const dayEnd = instantForWallDate(addDays(startOfDay(day), 1), timeZone);
-  return new Date(event.start_at) < dayEnd && new Date(event.end_at) > dayStart;
+  return { primary: `${startLabel} ${first.getUTCFullYear()} – ${endLabel} ${last.getUTCFullYear()}`, secondary: "" };
 }
 function sameDay(a: Date, b: Date) { return startOfDay(a).getTime() === startOfDay(b).getTime(); }
 function isAllDay(event: CalendarEvent, timeZone: string) {
   const instantStart = new Date(event.start_at); const wallStart = wallDateForInstant(instantStart, timeZone); const end = new Date(event.end_at);
   return wallStart.getUTCHours() === 0 && wallStart.getUTCMinutes() === 0 && end.getTime() - instantStart.getTime() >= 23 * 60 * 60 * 1000;
+}
+type DayEventGroup = { all: CalendarEvent[]; allDay: CalendarEvent[]; timed: CalendarEvent[] };
+function groupEventsByDay(events: CalendarEvent[], days: Date[], timeZone: string): DayEventGroup[] {
+  const bounds = days.map((day) => ({
+    start: instantForWallDate(startOfDay(day), timeZone).getTime(),
+    end: instantForWallDate(addDays(startOfDay(day), 1), timeZone).getTime(),
+  }));
+  const groups: DayEventGroup[] = bounds.map(() => ({ all: [], allDay: [], timed: [] }));
+  const ordered = events.map((event) => ({
+    event,
+    start: Date.parse(event.start_at),
+    end: Date.parse(event.end_at),
+    allDay: isAllDay(event, timeZone),
+  })).sort((a, b) => a.start - b.start || a.event.id - b.event.id);
+  for (const item of ordered) {
+    for (let index = 0; index < bounds.length; index += 1) {
+      const bound = bounds[index];
+      if (item.start >= bound.end || item.end <= bound.start) continue;
+      const group = groups[index];
+      group.all.push(item.event);
+      (item.allDay ? group.allDay : group.timed).push(item.event);
+    }
+  }
+  return groups;
 }
 function hourLabel(hour: number) {
   if (hour === 12) return "Midday";
@@ -193,20 +228,30 @@ function eventStatusFilter(event: CalendarEvent): CalendarStatusFilter {
   if (event.kind !== "confirmed") return "available";
   const outcome = visibleApplicationStatus(event);
   if (outcome == null) return "active";
-  if (outcome === "position_closed") return "closed";
+  if (outcome === "rejected" || outcome === "position_closed") return "rejected_closed";
   return outcome;
 }
 
+function defaultStatusFilters(): CalendarStatusFilter[] {
+  return CALENDAR_STATUS_FILTERS.map((item) => item.value).filter((value) => value !== "canceled");
+}
+
 function loadStatusFilters(): CalendarStatusFilter[] {
-  const all = CALENDAR_STATUS_FILTERS.map((item) => item.value);
+  const defaults = defaultStatusFilters();
   try {
     const stored = localStorage.getItem(CALENDAR_STATUS_VIEW_KEY);
-    if (!stored || stored === "all") return all;
+    if (!stored || stored === "all") return defaults;
     const parsed: unknown = stored.startsWith("[") ? JSON.parse(stored) : [stored];
-    if (!Array.isArray(parsed)) return all;
-    return [...new Set(parsed.filter((value): value is CalendarStatusFilter => all.includes(value as CalendarStatusFilter)))];
+    if (!Array.isArray(parsed)) return defaults;
+    const migrated = parsed.flatMap((value): CalendarStatusFilter[] => {
+      if (value === "rejected" || value === "closed" || value === "rejected_closed") return ["rejected_closed"];
+      if (value === "active" || value === "passed" || value === "canceled" || value === "available") return [value];
+      return [];
+    });
+    const unique = [...new Set(migrated)];
+    return unique.length ? unique : defaults;
   } catch {
-    return all;
+    return defaults;
   }
 }
 
@@ -215,15 +260,14 @@ function persistStatusFilters(next: CalendarStatusFilter[]) {
   catch { /* ignore unavailable storage */ }
 }
 
-type CardStatus = { key: "active" | "passed" | "rejected" | "closed" | "canceled" | "available"; label: string; className: string };
+type CardStatus = { key: "active" | "passed" | "rejected_closed" | "canceled" | "available"; label: string; className: string };
 type ConfirmableStatus = Exclude<CardStatus["key"], "available">;
 
 function cardStatus(event: CalendarEvent): CardStatus {
   if (event.kind !== "confirmed") return { key: "available", label: "Available", className: "" };
   if (event.interview_status === "cancellation") return { key: "canceled", label: "Canceled", className: "canceled status-canceled" };
   if (event.application_status === "passed") return { key: "passed", label: "Passed", className: "status-passed" };
-  if (event.application_status === "rejected") return { key: "rejected", label: "Rejected", className: "status-rejected" };
-  if (event.application_status === "position_closed") return { key: "closed", label: "Closed", className: "status-position-closed" };
+  if (event.application_status === "rejected" || event.application_status === "position_closed") return { key: "rejected_closed", label: "Rejected/Closed", className: "status-rejected" };
   return { key: "active", label: "Active", className: "status-active" };
 }
 
@@ -254,14 +298,12 @@ function messageCancelsAppointment(message: EmailDetail): boolean {
   return /^METHOD:CANCEL\b/im.test(calendar[0]) || /^STATUS:CANCELLED\b/im.test(calendar[0]);
 }
 
-function emailInterviewStatus(message: EmailDetail): { key: ConfirmableStatus; label: string; className: string } | null {
+function emailInterviewStatus(message: EmailDetail): { key: ConfirmableStatus; label: string; className: string; applicationStatus?: CalendarEvent["application_status"] } | null {
   if (messageCancelsAppointment(message)) return { key: "canceled", label: "Canceled", className: "status-canceled" };
   const text = `${message.subject || ""} ${message.snippet || ""} ${message.body_text || ""}`;
   if (message.label === "rejected_closed") {
     const closed = ["position has been closed", "role has been closed", "position is no longer available", "job has been filled"].some((pattern) => text.toLowerCase().includes(pattern));
-    return closed
-      ? { key: "closed", label: "Closed", className: "status-position-closed" }
-      : { key: "rejected", label: "Rejected", className: "status-rejected" };
+    return { key: "rejected_closed", label: "Rejected/Closed", className: "status-rejected", applicationStatus: closed ? "position_closed" : "rejected" };
   }
   if (message.label === "offer") return { key: "passed", label: "Passed", className: "status-passed" };
   if (message.label === "interview_follow_up") {
@@ -502,13 +544,22 @@ function layoutTimedEvents(events: CalendarEvent[], day: Date, hourHeight: numbe
   }));
 }
 
-function EventCard({ event, color, timeZone, compact, timed, position, selected, activeHoverId, onHoverActivate, onHoverDeactivate, onSelect }: { event: CalendarEvent; color: string; timeZone: string; compact?: boolean; timed?: boolean; position?: React.CSSProperties; selected?: boolean; activeHoverId: string | null; onHoverActivate: (hoverId: string) => void; onHoverDeactivate: (hoverId: string) => void; onSelect: (event: CalendarEvent) => void }) {
+let activeEventHoverId: string | null = null;
+const eventHoverListeners = new Set<(id: string | null) => void>();
+function setActiveEventHover(id: string | null) {
+  if (activeEventHoverId === id) return;
+  activeEventHoverId = id;
+  eventHoverListeners.forEach((listener) => listener(id));
+}
+
+const EventCard = memo(function EventCard({ event, color, timeZone, compact, timed, position, selected, onSelect }: { event: CalendarEvent; color: string; timeZone: string; compact?: boolean; timed?: boolean; position?: React.CSSProperties; selected?: boolean; onSelect: (event: CalendarEvent) => void }) {
   const eventRef = useRef<HTMLDivElement>(null);
   const hoverId = useId();
   const [hoverPosition, setHoverPosition] = useState<{ left: number; top: number; above: boolean } | null>(null);
   const [hoverVisible, setHoverVisible] = useState(false);
   const hoverHideTimer = useRef<number | null>(null);
   const hoverFrame = useRef<number | null>(null);
+  const showingHover = useRef(false);
   const status = cardStatus(event);
   const outcome = visibleApplicationStatus(event);
   const outcomeLabel = status.key === "available" ? null : status.label;
@@ -530,33 +581,37 @@ function EventCard({ event, color, timeZone, compact, timed, position, selected,
     if (hoverFrame.current != null) window.cancelAnimationFrame(hoverFrame.current);
     const nextPosition = getHoverPosition();
     if (!nextPosition) return;
-    onHoverActivate(hoverId);
+    showingHover.current = true;
+    setActiveEventHover(hoverId);
     setHoverPosition(nextPosition);
     setHoverVisible(false);
     hoverFrame.current = window.requestAnimationFrame(() => {
       setHoverVisible(true);
       hoverFrame.current = null;
     });
-  }, [getHoverPosition, hoverId, onHoverActivate]);
+  }, [getHoverPosition, hoverId]);
   const hideHover = useCallback(() => {
+    showingHover.current = false;
     if (hoverFrame.current != null) window.cancelAnimationFrame(hoverFrame.current);
     if (hoverHideTimer.current != null) window.clearTimeout(hoverHideTimer.current);
-    onHoverDeactivate(hoverId);
     setHoverVisible(false);
     hoverHideTimer.current = window.setTimeout(() => {
       setHoverPosition(null);
       hoverHideTimer.current = null;
     }, calendarMotionDelay(150));
-  }, [hoverId, onHoverDeactivate]);
+  }, []);
+  const hideHoverRef = useRef(hideHover);
+  hideHoverRef.current = hideHover;
   useEffect(() => {
-    if (activeHoverId == null || activeHoverId === hoverId) return;
-    if (hoverFrame.current != null) window.cancelAnimationFrame(hoverFrame.current);
-    if (hoverHideTimer.current != null) window.clearTimeout(hoverHideTimer.current);
-    hoverFrame.current = null;
-    hoverHideTimer.current = null;
-    setHoverVisible(false);
-    setHoverPosition(null);
-  }, [activeHoverId, hoverId]);
+    const listener = (next: string | null) => {
+      if (next !== hoverId && showingHover.current) hideHoverRef.current();
+    };
+    eventHoverListeners.add(listener);
+    return () => {
+      eventHoverListeners.delete(listener);
+      if (activeEventHoverId === hoverId) setActiveEventHover(null);
+    };
+  }, [hoverId]);
   useEffect(() => {
     if (!hoverPosition) return;
     const reposition = () => {
@@ -574,7 +629,7 @@ function EventCard({ event, color, timeZone, compact, timed, position, selected,
     if (hoverHideTimer.current != null) window.clearTimeout(hoverHideTimer.current);
     if (hoverFrame.current != null) window.cancelAnimationFrame(hoverFrame.current);
   }, []);
-  const selectEvent = () => { onHoverDeactivate(hoverId); setHoverVisible(false); setHoverPosition(null); onSelect(event); };
+  const selectEvent = () => { hideHover(); setActiveEventHover(null); onSelect(event); };
   return <>
     <div
     ref={eventRef}
@@ -593,7 +648,7 @@ function EventCard({ event, color, timeZone, compact, timed, position, selected,
     aria-label={`${interviewKindLabel(event)}, ${event.company || "Company not specified"}, ${formatInterviewTimeRange(event, timeZone)}, ${type.label}${outcomeLabel ? `, ${outcomeLabel}` : ""}`}
     aria-describedby={hoverPosition ? hoverId : undefined}
   >
-    {status.key !== "available" && status.key !== "active" && <span className="calendar-event-status-icon" role="img" aria-label={status.label}>{status.key === "canceled" ? <CanceledStatusIcon /> : <ApplicationStatusIcon status={status.key === "closed" ? "position_closed" : status.key} />}</span>}
+    {status.key !== "available" && status.key !== "active" && <span className="calendar-event-status-icon" role="img" aria-label={status.label}>{status.key === "canceled" ? <CanceledStatusIcon /> : <ApplicationStatusIcon status={status.key === "rejected_closed" ? "rejected" : status.key} />}</span>}
     <span className="calendar-event-main">
       <span className="calendar-event-company">{event.company || "Company not specified"}</span>
     </span>
@@ -621,6 +676,98 @@ function EventCard({ event, color, timeZone, compact, timed, position, selected,
       document.body,
     )}
   </>;
+});
+
+function monthDayLabel(day: Date) {
+  return new Intl.DateTimeFormat(undefined, { timeZone: "UTC", weekday: "long", month: "short", day: "numeric" }).format(day);
+}
+
+function MonthDayAgenda({
+  day,
+  events,
+  timeZone,
+  colorFor,
+  onClose,
+  onSelect,
+  onCreate,
+}: {
+  day: Date;
+  events: CalendarEvent[];
+  timeZone: string;
+  colorFor: (event: CalendarEvent) => string;
+  onClose: () => void;
+  onSelect: (event: CalendarEvent) => void;
+  onCreate: (() => void) | null;
+}) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const [box, setBox] = useState<{ left: number; top: number; maxHeight: number; width: number } | null>(null);
+  const place = useCallback(() => {
+    const cell = document.querySelector<HTMLElement>(`[data-month-day="${day.toISOString()}"]`);
+    if (!cell) return;
+    const rect = cell.getBoundingClientRect();
+    const width = Math.min(320, window.innerWidth - 24);
+    const left = Math.max(12, Math.min(rect.left, window.innerWidth - width - 12));
+    const gap = 8;
+    const spaceBelow = window.innerHeight - rect.bottom - gap - 12;
+    const spaceAbove = rect.top - gap - 12;
+    const preferBelow = spaceBelow >= 200 || spaceBelow >= spaceAbove;
+    const maxHeight = Math.max(168, Math.min(420, preferBelow ? spaceBelow : spaceAbove));
+    const top = preferBelow ? rect.bottom + gap : Math.max(12, rect.top - gap - maxHeight);
+    setBox((current) => current && current.left === left && current.top === top && current.maxHeight === maxHeight && current.width === width ? current : { left, top, maxHeight, width });
+  }, [day]);
+  useLayoutEffect(() => {
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [place]);
+  const focused = useRef(false);
+  useEffect(() => {
+    if (!box || focused.current) return;
+    focused.current = true;
+    panelRef.current?.focus();
+  }, [box]);
+  if (!box) return null;
+  const ordered = [...events].sort((a, b) => new Date(a.start_at).getTime() - new Date(b.start_at).getTime() || a.id - b.id);
+  return createPortal(
+    <div
+      ref={panelRef}
+      className="month-day-agenda"
+      data-month-agenda=""
+      role="dialog"
+      aria-label={`${monthDayLabel(day)} interviews`}
+      tabIndex={-1}
+      style={{ left: box.left, top: box.top, width: box.width, maxHeight: box.maxHeight }}
+    >
+      <header>
+        <div>
+          <strong>{monthDayLabel(day)}</strong>
+          <span>{ordered.length === 0 ? "No interviews" : `${ordered.length} interview${ordered.length === 1 ? "" : "s"}`}</span>
+        </div>
+        <button type="button" onClick={onClose} aria-label="Close day">×</button>
+      </header>
+      {ordered.length === 0 ? <p className="month-day-agenda-empty">Nothing is scheduled for this day.</p> : <ul>
+        {ordered.map((event) => {
+          const status = cardStatus(event);
+          return <li key={event.id}>
+            <button type="button" onClick={() => onSelect(event)}>
+              <span className="month-day-agenda-swatch" style={{ background: colorFor(event) }} />
+              <span className="month-day-agenda-copy">
+                <strong>{event.company || event.title || "Interview"}</strong>
+                <small>{formatClock(event.start_at, timeZone)} – {formatClock(event.end_at, timeZone)}{event.role ? ` · ${event.role}` : ""}</small>
+              </span>
+              {status.key !== "active" && status.key !== "available" && <em className={status.className}>{status.label}</em>}
+            </button>
+          </li>;
+        })}
+      </ul>}
+      {onCreate && <footer><button type="button" onClick={onCreate}>Add event</button></footer>}
+    </div>,
+    document.body,
+  );
 }
 
 type AccountInterviewCount = {
@@ -686,6 +833,58 @@ function CalendarLoading() {
   );
 }
 
+const MONTH_CHIP_GAP = 6;
+
+const MonthDayCell = memo(function MonthDayCell({
+  day,
+  events,
+  today,
+  outside,
+  selected,
+  selectedEventId,
+  timeZone,
+  colorFor,
+  onSelectEvent,
+  onToggle,
+  onOpen,
+}: {
+  day: Date;
+  events: CalendarEvent[];
+  today: boolean;
+  outside: boolean;
+  selected: boolean;
+  selectedEventId: number | null;
+  timeZone: string;
+  colorFor: (mailboxId: number) => string;
+  onSelectEvent: (event: CalendarEvent) => void;
+  onToggle: (day: Date) => void;
+  onOpen: (day: Date) => void;
+}) {
+  const eventsRef = useRef<HTMLDivElement>(null);
+  const [visibleCount, setVisibleCount] = useState(() => Math.min(events.length, 3));
+  useLayoutEffect(() => {
+    const area = eventsRef.current;
+    if (!area) return;
+    const update = () => {
+      const sample = area.querySelector<HTMLElement>(":scope > .calendar-event");
+      const row = (sample?.offsetHeight ?? 26) + MONTH_CHIP_GAP;
+      const next = Math.max(1, Math.floor((area.clientHeight + MONTH_CHIP_GAP) / row));
+      setVisibleCount((current) => current === next ? current : next);
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(area);
+    return () => observer.disconnect();
+  }, [events.length]);
+  const hidden = Math.max(0, events.length - visibleCount);
+  const shown = hidden > 0 ? events.slice(0, visibleCount) : events;
+  return <div className={`calendar-day ${today ? "today" : ""} ${outside ? "outside" : ""} ${selected ? "is-selected" : ""}`} data-month-day={day.toISOString()} onClick={() => onToggle(day)}>
+    <div className="calendar-day-heading"><strong>{day.getUTCDate()}</strong>{today && <em>Today</em>}</div>
+    <div className="calendar-day-events" ref={eventsRef}>{shown.map((event) => <EventCard event={event} color={colorFor(event.mailbox_id)} timeZone={timeZone} compact selected={selectedEventId === event.id} onSelect={onSelectEvent} key={event.id} />)}</div>
+    {hidden > 0 && <button className="calendar-day-more" type="button" onClick={(event) => { event.stopPropagation(); onOpen(day); }}>+{hidden} more</button>}
+  </div>;
+});
+
 type DragSelection = { dayIndex: number; startMinutes: number; endMinutes: number };
 
 export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailboxes: Mailbox[]; refreshKey: number; onClose: () => void }) {
@@ -696,7 +895,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
   const [statusFilters, setStatusFilters] = useState<CalendarStatusFilter[]>(loadStatusFilters);
   const [loading, setLoading] = useState(true); const [error, setError] = useState("");
   const [selected, setSelected] = useState<CalendarEvent | null>(null);
-  const [activeHoverId, setActiveHoverId] = useState<string | null>(null);
+  const [monthDay, setMonthDay] = useState<Date | null>(null);
   const [detailsClosing, setDetailsClosing] = useState(false);
   const [copiedMeetingEventId, setCopiedMeetingEventId] = useState<number | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -704,11 +903,10 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
   const [emailMessages, setEmailMessages] = useState<EmailDetail[]>([]); const [emailLoading, setEmailLoading] = useState(false); const [emailError, setEmailError] = useState(""); const [expandedEmailId, setExpandedEmailId] = useState<number | null>(null);
   const [editor, setEditor] = useState<Editor | null>(null); const [saving, setSaving] = useState(false); const [saveError, setSaveError] = useState("");
   const [statusSaving, setStatusSaving] = useState(false); const [statusError, setStatusError] = useState("");
-  const activateEventHover = useCallback((hoverId: string) => setActiveHoverId(hoverId), []);
-  const deactivateEventHover = useCallback((hoverId: string) => setActiveHoverId((current) => current === hoverId ? null : current), []);
   const [dragSelection, setDragSelection] = useState<DragSelection | null>(null);
   const [hourHeight, setHourHeight] = useState(HOUR_HEIGHT);
   const refreshRef = useRef(0);
+  const rangeCacheRef = useRef(new Map<string, CalendarEvent[]>());
   const abortRef = useRef<AbortController | null>(null);
   const detailsCloseTimer = useRef<number | null>(null);
   const sidebarCloseTimer = useRef<number | null>(null);
@@ -729,6 +927,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
     try {
       const rows = await fetchCalendarEvents(instantForWallDate(start, timeZone).toISOString(), instantForWallDate(end, timeZone).toISOString(), controller.signal);
       if (request === refreshRef.current) {
+        rangeCacheRef.current.set(`${start.getTime()}|${end.getTime()}|${timeZone}`, rows);
         setEvents(rows);
         setSelected((current) => current ? rows.find((event) => event.id === current.id) ?? current : null);
         setError("");
@@ -738,7 +937,12 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
     finally { if (request === refreshRef.current) setLoading(false); }
   }, [start.getTime(), end.getTime(), timeZone]);
   const seenRefreshKey = useRef(refreshKey);
-  useEffect(() => { void load("foreground"); return () => abortRef.current?.abort(); }, [load]);
+  useEffect(() => {
+    const cached = rangeCacheRef.current.get(`${start.getTime()}|${end.getTime()}|${timeZone}`);
+    if (cached) setEvents(cached);
+    void load(cached ? "background" : "foreground");
+    return () => abortRef.current?.abort();
+  }, [load]);
   useEffect(() => {
     if (seenRefreshKey.current === refreshKey) return;
     seenRefreshKey.current = refreshKey;
@@ -804,9 +1008,38 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
     if (view === "day") return [start];
     return Array.from({ length: view === "month" ? 42 : 7 }, (_, i) => addDays(start, i));
   }, [start, view]);
+  useEffect(() => {
+    if (view !== "month") {
+      setMonthDay(null);
+      return;
+    }
+    setMonthDay((current) => current && days.some((day) => sameDay(day, current)) ? current : null);
+  }, [view, days]);
+  useEffect(() => {
+    if (!monthDay) return;
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setMonthDay(null); };
+    const onPointer = (event: PointerEvent) => {
+      const element = event.target instanceof Element ? event.target : null;
+      if (element?.closest("[data-month-agenda], [data-month-day]")) return;
+      setMonthDay(null);
+    };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("pointerdown", onPointer);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("pointerdown", onPointer);
+    };
+  }, [monthDay]);
   const miniMonthStart = useMemo(() => startOfWeek(new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), 1))), [anchor.getUTCFullYear(), anchor.getUTCMonth()]);
   const miniMonthDays = useMemo(() => Array.from({ length: 42 }, (_, i) => addDays(miniMonthStart, i)), [miniMonthStart.getTime()]);
   const shownEvents = useMemo(() => events.filter((event) => statusFilters.includes(eventStatusFilter(event))), [events, statusFilters]);
+  const dayGroups = useMemo(() => groupEventsByDay(shownEvents, days, timeZone), [shownEvents, days, timeZone]);
+  const selectCalendarEventRef = useRef<(event: CalendarEvent) => void>(() => {});
+  const selectCalendarEvent = useCallback((event: CalendarEvent) => selectCalendarEventRef.current(event), []);
+  const toggleMonthDay = useCallback((day: Date) => {
+    setMonthDay((current) => current && sameDay(current, day) ? null : day);
+  }, []);
+  const openMonthDay = useCallback((day: Date) => setMonthDay(day), []);
   const mailboxColor = useCallback((mailboxId: number) => {
     const mailbox = mailboxes.find((item) => item.id === mailboxId);
     return mailbox ? accountColor(mailbox) : defaultAccountColor(mailboxId);
@@ -874,6 +1107,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
     setSidebarClosing(false);
     setSelected(event);
   };
+  selectCalendarEventRef.current = showEventDetails;
   const toggleSidebar = () => {
     if (sidebarOpen) {
       setSidebarOpen(false);
@@ -898,14 +1132,14 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
     finally { setSaving(false); }
   };
 
-  const confirmInterviewStatus = async (next: ConfirmableStatus) => {
+  const confirmInterviewStatus = async (next: ConfirmableStatus, applicationStatus?: CalendarEvent["application_status"]) => {
     if (!selected || selected.kind !== "confirmed" || statusSaving || cardStatus(selected).key === next) return;
     setStatusSaving(true);
     setStatusError("");
     const payload: CalendarEventPayload = next === "canceled"
       ? { interview_status: "cancellation" }
       : {
-          application_status: next === "closed" ? "position_closed" : next,
+          application_status: next === "rejected_closed" ? (applicationStatus === "position_closed" ? "position_closed" : "rejected") : next,
           ...(selected.interview_status === "cancellation" ? { interview_status: "confirmation" as const } : {}),
         };
     try {
@@ -937,6 +1171,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
     window.setTimeout(() => setCopiedMeetingEventId((current) => current === event.id ? null : current), 1800);
   };
 
+  const selectedEventId = selected && !detailsClosing ? selected.id : null;
   const selectedStatus = selected ? cardStatus(selected) : null;
   const title = periodTitle(anchor, days, view);
   const weekCrossesMonth = view !== "month" && (days[0].getUTCMonth() !== days[days.length - 1].getUTCMonth() || days[0].getUTCFullYear() !== days[days.length - 1].getUTCFullYear());
@@ -951,25 +1186,46 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
     <div className={`calendar-main ${selected ? "has-details" : ""}`}>
       <div className="calendar-board">
       {view === "month" ? (
+        <>
         <section className="calendar-grid month" aria-busy={loading}>
           {VISIBLE_WEEKDAYS.map((day) => <div className="calendar-weekday" key={day}>{day}</div>)}
-        {days.map((day) => { const dayEvents = shownEvents.filter((event) => overlapsDay(event, day, timeZone)); const today = sameDay(day, nowInTimeZone); return <div className={`calendar-day ${today ? "today" : ""} ${day.getUTCMonth() !== anchor.getUTCMonth() ? "outside" : ""}`} key={day.toISOString()} onClick={() => openCreate(day)}>
-            <div className="calendar-day-heading"><strong>{day.getUTCDate()}</strong>{today && <em>Today</em>}</div>
-            <div className="calendar-day-events">{dayEvents.map((event) => <EventCard event={event} color={mailboxColor(event.mailbox_id)} timeZone={timeZone} compact selected={selected?.id === event.id && !detailsClosing} activeHoverId={activeHoverId} onHoverActivate={activateEventHover} onHoverDeactivate={deactivateEventHover} onSelect={showEventDetails} key={event.id} />)}</div>
-          </div>; })}
+        {days.map((day, dayIndex) => <MonthDayCell
+            key={day.toISOString()}
+            day={day}
+            events={dayGroups[dayIndex].all}
+            today={sameDay(day, nowInTimeZone)}
+            outside={day.getUTCMonth() !== anchor.getUTCMonth()}
+            selected={monthDay != null && sameDay(day, monthDay)}
+            selectedEventId={selectedEventId}
+            timeZone={timeZone}
+            colorFor={mailboxColor}
+            onSelectEvent={selectCalendarEvent}
+            onToggle={toggleMonthDay}
+            onOpen={openMonthDay}
+          />)}
         </section>
+        {monthDay && <MonthDayAgenda
+          day={monthDay}
+          events={dayGroups[days.findIndex((day) => sameDay(day, monthDay))]?.all ?? []}
+          timeZone={timeZone}
+          colorFor={(event) => mailboxColor(event.mailbox_id)}
+          onClose={() => setMonthDay(null)}
+          onSelect={showEventDetails}
+          onCreate={defaultMailboxId == null ? null : () => { const day = monthDay; setMonthDay(null); openCreate(day); }}
+        />}
+        </>
       ) : (
         <section ref={timelineRef} className={`calendar-time-grid ${view}`} aria-busy={loading} aria-label={`${view} calendar. Drag on a time range to create an event.`} style={{ "--day-count": days.length, "--hour-height": `${hourHeight}px`, "--day-height": `${hourHeight * HOURS.length}px` } as React.CSSProperties}>
           <div ref={timelineHeaderRef} className="calendar-time-header">
             <div className="calendar-time-corner" />
             {days.map((day) => { const today = sameDay(day, nowInTimeZone); const weekday = new Intl.DateTimeFormat(undefined, { timeZone: "UTC", weekday: "short" }).format(day); const month = new Intl.DateTimeFormat(undefined, { timeZone: "UTC", month: "short" }).format(day); return <div className={`calendar-time-day-heading ${today ? "today" : ""}`} key={day.toISOString()}><span>{weekCrossesMonth ? `${weekday} ${month}` : weekday}</span><strong>{day.getUTCDate()}</strong></div>; })}
             <div className="calendar-all-day-label">all-day</div>
-          {days.map((day) => <div className="calendar-all-day-cell" key={`all-day-${day.toISOString()}`}>{shownEvents.filter((event) => isAllDay(event, timeZone) && overlapsDay(event, day, timeZone)).map((event) => <EventCard event={event} color={mailboxColor(event.mailbox_id)} timeZone={timeZone} compact selected={selected?.id === event.id && !detailsClosing} activeHoverId={activeHoverId} onHoverActivate={activateEventHover} onHoverDeactivate={deactivateEventHover} onSelect={showEventDetails} key={event.id} />)}</div>)}
+          {days.map((day, dayIndex) => <div className="calendar-all-day-cell" key={`all-day-${day.toISOString()}`}>{dayGroups[dayIndex]?.allDay.map((event) => <EventCard event={event} color={mailboxColor(event.mailbox_id)} timeZone={timeZone} compact selected={selectedEventId === event.id} onSelect={selectCalendarEvent} key={event.id} />)}</div>)}
           </div>
           <div className="calendar-time-body">
             <div className="calendar-time-axis">{HOURS.map((hour) => <span key={hour} style={{ top: `${hour * hourHeight}px` }}>{hourLabel(hour)}</span>)}</div>
             <div className="calendar-time-days">
-            {days.map((day, dayIndex) => { const dayEvents = shownEvents.filter((event) => overlapsDay(event, day, timeZone)); const today = sameDay(day, nowInTimeZone); const nowMinutes = nowInTimeZone.getUTCHours() * 60 + nowInTimeZone.getUTCMinutes(); return <div
+            {days.map((day, dayIndex) => { const dayEvents = dayGroups[dayIndex]?.timed ?? []; const today = sameDay(day, nowInTimeZone); const nowMinutes = nowInTimeZone.getUTCHours() * 60 + nowInTimeZone.getUTCMinutes(); return <div
                 className={`calendar-time-day ${today ? "today" : ""} ${defaultMailboxId == null ? "disabled" : ""}`}
                 key={day.toISOString()}
                 title={defaultMailboxId == null ? "Connect an email account to create events" : "Drag to create an event"}
@@ -981,7 +1237,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
                 {HOURS.map((hour) => <div className="calendar-hour-slot" key={hour} />)}
                 {today && <div className="calendar-now-line" style={{ top: `${(nowMinutes / 60) * hourHeight}px` }} />}
                 {dragSelection?.dayIndex === dayIndex && <div className="calendar-drag-selection" style={{ top: `${(dragSelection.startMinutes / 60) * hourHeight}px`, height: `${((dragSelection.endMinutes - dragSelection.startMinutes) / 60) * hourHeight}px` }}><span>{formatWallTime(new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), 0, dragSelection.startMinutes)))} – {formatWallTime(new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), 0, dragSelection.endMinutes)))}</span></div>}
-                {layoutTimedEvents(dayEvents, day, hourHeight, timeZone).map(({ event, position }) => <EventCard event={event} color={mailboxColor(event.mailbox_id)} timeZone={timeZone} timed position={position} selected={selected?.id === event.id && !detailsClosing} activeHoverId={activeHoverId} onHoverActivate={activateEventHover} onHoverDeactivate={deactivateEventHover} onSelect={showEventDetails} key={event.id} />)}
+                {layoutTimedEvents(dayEvents, day, hourHeight, timeZone).map(({ event, position }) => <EventCard event={event} color={mailboxColor(event.mailbox_id)} timeZone={timeZone} timed position={position} selected={selectedEventId === event.id} onSelect={selectCalendarEvent} key={event.id} />)}
               </div>; })}
             </div>
           </div>
@@ -1004,7 +1260,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
             <div className="details-row"><dt>Account</dt><dd>{selected.email_account}</dd></div>
             <div className="details-row"><dt>Company</dt><dd>{selected.company || "—"}</dd></div>
             <div className="details-row"><dt>Role</dt><dd>{selected.role || "—"}</dd></div>
-            {selected.kind === "confirmed" && selectedStatus && selectedStatus.key !== "available" && <div className={`details-row details-status-row ${selectedStatus.className}`}><dt>Status</dt><dd>{selectedStatus.key === "canceled" ? <CanceledStatusIcon /> : <ApplicationStatusIcon status={selectedStatus.key === "closed" ? "position_closed" : selectedStatus.key === "passed" || selectedStatus.key === "rejected" ? selectedStatus.key : "active"} />}<span>{selectedStatus.label}</span></dd></div>}
+            {selected.kind === "confirmed" && selectedStatus && selectedStatus.key !== "available" && <div className={`details-row details-status-row ${selectedStatus.className}`}><dt>Status</dt><dd>{selectedStatus.key === "canceled" ? <CanceledStatusIcon /> : <ApplicationStatusIcon status={selectedStatus.key === "rejected_closed" ? "rejected" : selectedStatus.key === "passed" ? "passed" : "active"} />}<span>{selectedStatus.label}</span></dd></div>}
             {interviewType(selected).type === "video" && <div className="details-row details-action-row"><dt>Meeting</dt><dd>{meetingProviderLabel(selected) !== "—" ? <span className="details-meeting-value">{selected.meeting_url ? <a className="details-meeting-link" href={selected.meeting_url} target="_blank" rel="noreferrer" aria-label={`Open ${meetingProviderLabel(selected)}`} title={`Open ${meetingProviderLabel(selected)}`}><span className="details-meeting-icon"><MeetingTypeIcon type="video" /></span><span>{meetingProviderLabel(selected)}</span><svg className="details-meeting-arrow" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3h7v7M13 3 5 11" /></svg></a> : <span className="details-meeting-label"><span className="details-meeting-icon"><MeetingTypeIcon type="video" /></span><span>{meetingProviderLabel(selected)}</span></span>}{selected.meeting_url && <button className="details-copy-link details-copy-icon" type="button" onClick={() => void copyMeetingLink(selected)} aria-label={copiedMeetingEventId === selected.id ? "Meeting link copied" : `Copy ${meetingProviderLabel(selected)} meeting link`} title={copiedMeetingEventId === selected.id ? "Copied" : "Copy meeting link"}>{copiedMeetingEventId === selected.id ? <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.2 3 3 6-6.4" /></svg> : <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="2.25" width="8.5" height="8.5" rx="1.5" /><path d="M10.75 10.75v1.5a1.5 1.5 0 0 1-1.5 1.5h-5.5a1.5 1.5 0 0 1-1.5-1.5v-5.5a1.5 1.5 0 0 1 1.5-1.5h1.5" /></svg>}</button>}</span> : "—"}</dd></div>}
           </dl>
           {statusError && <p className="error-text">{statusError}</p>}
@@ -1028,7 +1284,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
                 const messageStatus = selected.kind === "confirmed" ? emailInterviewStatus(message) : null;
                 const statusMatches = messageStatus != null && selectedStatus?.key === messageStatus.key;
                 return <li key={message.id}>
-                  {messageStatus && <div className="source-email-status-bar"><span className={`source-email-status ${messageStatus.className}`}>{messageStatus.label}</span>{statusMatches ? <span className="source-email-status-match">Confirmed for this interview</span> : <button type="button" disabled={statusSaving} onClick={() => void confirmInterviewStatus(messageStatus.key)}>Confirm this status</button>}</div>}
+                  {messageStatus && <div className="source-email-status-bar"><span className={`source-email-status ${messageStatus.className}`}>{messageStatus.label}</span>{statusMatches ? <span className="source-email-status-match">Confirmed for this interview</span> : <button type="button" disabled={statusSaving} onClick={() => void confirmInterviewStatus(messageStatus.key, messageStatus.applicationStatus)}>Confirm this status</button>}</div>}
                   <button className="source-email-list-item" type="button" aria-expanded={expanded} onClick={() => setExpandedEmailId(expanded ? null : message.id)}>
                     <span className="source-email-list-top"><strong>{message.subject || "(no subject)"}</strong><time dateTime={timestamp}>{formatDateTime(timestamp, timeZone)}</time></span>
                     <span className="source-email-meta">{message.sender}{message.interview_subtype && <><span>·</span>{message.interview_subtype.replaceAll("_", " ")}</>}</span>

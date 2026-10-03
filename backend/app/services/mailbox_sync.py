@@ -21,6 +21,7 @@ from app.email.gmail import (
     gmail_list_folder_id_map,
     gmail_list_history,
     gmail_list_inbox_message_ids,
+    is_transient_quota_error,
     normalize_gmail_message,
 )
 from app.email.folders import folder_from_outlook_well_known
@@ -646,9 +647,19 @@ async def _incremental_outlook(db: Session, mailbox: MailboxConnection) -> None:
 
 
 def _record_notification_failure(db: Session, mailbox: MailboxConnection, exc: Exception) -> None:
-    """Persist a webhook processing failure so polling and status stop trusting the webhook."""
+    """Persist a webhook processing failure so polling and status stop trusting the webhook.
+
+    A per-minute Gmail quota error is transient. Recording it would turn polling on,
+    and polling spends the same quota, so the webhook would stay failed.
+    """
     message = str(getattr(exc, "detail", None) or exc)[:512]
     db.rollback()
+    if is_transient_quota_error(message):
+        logger.warning(
+            "Gmail quota blocked a webhook fetch for mailbox %s; leaving webhook delivery on",
+            mailbox.id,
+        )
+        return
     now = datetime.now(timezone.utc)
     mailbox.last_sync_error = message
     if mailbox.webhook is not None:

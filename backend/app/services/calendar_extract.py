@@ -150,7 +150,9 @@ _REPLY_ATTRIBUTION_RE = re.compile(
     re.I,
 )
 _TIME_PATTERN = re.compile(
-    r"(?<![\d:])(?P<hour>1[0-2]|0?[1-9])(?::?(?P<minute>[0-5]\d))?\s*(?P<ampm>a\.?m\.?|p\.?m\.?)\b",
+    # "2026:1:30pm" glues the clock to the year. A colon after a year is still
+    # the start of the time; a colon after a digit is the middle of a clock.
+    r"(?:(?<![\d:])|(?<=\b20\d{2}:))(?P<hour>1[0-2]|0?[1-9])(?::?(?P<minute>[0-5]\d))?\s*(?P<ampm>a\.?m\.?|p\.?m\.?)\b",
     re.I,
 )
 _DURATION_PATTERNS = (
@@ -167,7 +169,7 @@ Rules:
 - Include only times explicitly offered or confirmed in the message.
 - Every start must include a reliable UTC offset. Do not guess a timezone.
 - Use an empty slots array for a scheduling link with no visible times.
-- company is the hiring employer, not an ATS, scheduler, or job board.
+- company is the hiring employer, not an ATS, scheduler, job board, or the sender's email domain. "position with Tapestry" from a google.com address is Tapestry. Google Meet, Zoom, and Teams are meeting tools, not the employer.
 - interviewer is the person conducting the interview; do not use a recruiter unless the email explicitly says they are the interviewer.
 - work_model describes the job arrangement, not whether the interview itself is virtual.
 - job_url must point to the job posting, not a scheduler, meeting, tracking, or unsubscribe URL.
@@ -184,6 +186,8 @@ class ExtractedSlot:
     end_at: datetime
     source_timezone: str | None = None
     end_is_explicit: bool = True
+    # "available between 12:00 and 3:00" is a window, not the interview length.
+    is_availability_window: bool = False
 
 
 @dataclass(frozen=True)
@@ -340,6 +344,16 @@ def _duration_from_nearby_text(value: str) -> timedelta | None:
     return None
 
 
+def _share_trailing_meridiem(text: str) -> str:
+    """Give "1:00-1:30 PM" a meridiem on the start clock so it is not read as 1:30."""
+    return re.sub(
+        r"\b(\d{1,2}:\d{2})\s*([-–—])\s*(\d{1,2}:\d{2})\s*(a\.?m\.?|p\.?m\.?)",
+        lambda match: f"{match.group(1)} {match.group(4)} {match.group(2)} {match.group(3)} {match.group(4)}",
+        text or "",
+        flags=re.I,
+    )
+
+
 def parse_text_slots(text: str, received_at: datetime | None = None) -> list[ExtractedSlot]:
     """Parse common human-readable calendar timestamps without an AI request.
 
@@ -347,7 +361,7 @@ def parse_text_slots(text: str, received_at: datetime | None = None) -> list[Ext
     Parsing those locally prevents an unavailable or inconsistent model from
     dropping an otherwise explicit appointment.
     """
-    source = (text or "").replace("&nbsp;", " ").replace("\xa0", " ")
+    source = _share_trailing_meridiem((text or "").replace("&nbsp;", " ").replace("\xa0", " "))
     reference = as_utc(received_at)
     candidates: list[tuple[int, re.Match[str]]] = []
     for pattern in _DATE_PATTERNS:
@@ -359,19 +373,38 @@ def parse_text_slots(text: str, received_at: datetime | None = None) -> list[Ext
         line_prefix = source[max(0, source.rfind("\n", 0, position) + 1) : position]
         if re.search(r"\bSent\s*:\s*[^\n]{0,100}$", line_prefix, re.I):
             continue
-        window = source[date_match.end() : date_match.end() + 240]
+        window_start = date_match.end()
+        window = source[window_start : window_start + 240]
         if re.search(r"\bwrote\s*:", window[:160], re.I) and re.search(r"\bOn\s+[^\n]{0,100}$", line_prefix, re.I):
             continue
-        times = list(_TIME_PATTERN.finditer(window))
-        if not times or times[0].start() > 100:
+        # Search the original text so "2026:1:30pm" can see the year before
+        # the clock. A sliced window would hide that year from the lookbehind.
+        times = list(_TIME_PATTERN.finditer(source, window_start, window_start + 240))
+        # "1:00-1:30 PM PT on Wednesday, September 10" puts the clock before the date.
+        lookback_start = max(0, position - 90)
+        before_times = list(_TIME_PATTERN.finditer(source, lookback_start, position))
+        if before_times:
+            gap = source[before_times[-1].end() : position]
+            # "1:30 PM PT on Wednesday, September 10" — not a clock earlier in the paragraph.
+            clock_introduces_date = re.fullmatch(
+                r"\s*(?:[A-Za-z]{1,5}\s+)?(?:on|for)\s+(?:[A-Za-z]+,?\s*)?",
+                gap,
+                re.I,
+            )
+            if clock_introduces_date:
+                if len(before_times) >= 2 and before_times[-1].start() - before_times[-2].end() <= 20:
+                    times = before_times[-2:]
+                else:
+                    times = [before_times[-1]]
+        if not times or (times[0].start() >= window_start and times[0].start() - window_start > 100):
             continue
         # "On Sep 28, 2026 at 7:24 PM <person@company> wrote" is the quoted
         # message timestamp, not the interview.
-        attribution = window[times[0].end() : times[0].end() + 100]
+        attribution = source[times[0].end() : times[0].end() + 100]
         if _REPLY_ATTRIBUTION_RE.search(attribution):
             continue
         used_end_time = times[1] if len(times) > 1 and times[1].start() - times[0].end() <= 20 else times[0]
-        zone_span = window[max(0, times[0].start() - 12) : used_end_time.end() + 48]
+        zone_span = source[max(0, times[0].start() - 12) : used_end_time.end() + 48]
         zone_match = _zone_from_nearby_text(zone_span)
         if zone_match is None:
             # Do not guess a timezone. Explicit timestamps with no zone remain
@@ -392,6 +425,7 @@ def parse_text_slots(text: str, received_at: datetime | None = None) -> list[Ext
         stated_duration = _duration_from_nearby_text(window[:240])
         end = start + (stated_duration or DEFAULT_INTERVIEW_DURATION)
         end_is_explicit = stated_duration is not None
+        is_window = False
         if len(times) > 1 and times[1].start() - times[0].end() <= 20:
             end_hour, end_minute = _clock_parts(times[1])
             proposed = start.replace(hour=end_hour, minute=end_minute)
@@ -400,13 +434,44 @@ def parse_text_slots(text: str, received_at: datetime | None = None) -> list[Ext
             if proposed - start <= timedelta(hours=12):
                 end = proposed
                 end_is_explicit = True
+                between = source[times[0].end() : times[1].start()]
+                before = source[max(0, times[0].start() - 70) : times[0].start()]
+                is_window = bool(
+                    len(between) <= 16
+                    and re.search(r"\b(?:and|to)\b", between, re.I)
+                    and re.search(r"\b(?:between|from|available|availability|free)\b", before, re.I)
+                )
         start_utc = start.astimezone(timezone.utc)
         end_utc = end.astimezone(timezone.utc)
         key = (start_utc, end_utc)
         if key not in seen:
-            slots.append(ExtractedSlot(start_utc, end_utc, zone_name, end_is_explicit))
+            slots.append(ExtractedSlot(start_utc, end_utc, zone_name, end_is_explicit, is_window))
             seen.add(key)
-    return slots
+    return _drop_end_time_phantoms(slots)
+
+
+def _drop_end_time_phantoms(slots: list[ExtractedSlot]) -> list[ExtractedSlot]:
+    """Drop a default 30-minute block that only repeats an explicit range's end.
+
+    "September 25, 2026:1:30pm - 2:15pm" used to miss the glued start and keep
+    2:15pm as its own interview. That second chip is the end of the first one.
+    """
+    explicit = [slot for slot in slots if slot.end_is_explicit]
+    if not explicit:
+        return slots
+    kept: list[ExtractedSlot] = []
+    for slot in slots:
+        phantom = (
+            not slot.end_is_explicit
+            and slot.end_at - slot.start_at == DEFAULT_INTERVIEW_DURATION
+            and any(
+                abs((slot.start_at - other.end_at).total_seconds()) <= 60 and other.start_at < slot.start_at
+                for other in explicit
+            )
+        )
+        if not phantom:
+            kept.append(slot)
+    return kept
 
 
 def _plausible_slot(slot: ExtractedSlot, received_at: datetime | None) -> bool:
@@ -781,14 +846,42 @@ def company_name_tokens(company: str | None) -> set[str]:
     }
 
 
+def _compact_company(company: str | None) -> str:
+    return re.sub(r"[^a-z0-9]", "", (company or "").casefold())
+
+
+def _unglued_token(token: str) -> str:
+    """Drop a domain prefix such as withremy.com -> remy."""
+    for prefix in _DOMAIN_GLUE_PREFIXES:
+        if token.startswith(prefix) and len(token) - len(prefix) >= 4:
+            return token[len(prefix) :]
+    return token
+
+
+def _match_tokens(company: str | None) -> set[str]:
+    tokens = company_name_tokens(company)
+    extra = {
+        unglued
+        for token in tokens
+        if (unglued := _unglued_token(token)) != token and unglued not in _GENERIC_COMPANY_TOKENS
+    }
+    return tokens | extra
+
+
 def companies_match(left: str | None, right: str | None) -> bool:
     """Treat shortened and legal variants as one employer.
 
-    "fanatics" and "Fanatics Commerce" match. Names that only share a generic
-    word, such as "group" or "labs", do not.
+    "fanatics" and "Fanatics Commerce" match. "C3 AI" and "c3.ai" match.
+    A scheduler domain with the employer glued on, such as "withremy" and
+    "Remy", is the same company. Names that only share a generic word, such
+    as "group" or "labs", do not.
     """
-    left_tokens = company_name_tokens(left)
-    right_tokens = company_name_tokens(right)
+    left_compact = _compact_company(left)
+    right_compact = _compact_company(right)
+    if left_compact and left_compact == right_compact:
+        return True
+    left_tokens = _match_tokens(left)
+    right_tokens = _match_tokens(right)
     if not left_tokens or not right_tokens:
         folded_left = (left or "").strip().casefold()
         folded_right = (right or "").strip().casefold()
@@ -803,6 +896,12 @@ def fuller_company_name(left: str | None, right: str | None) -> str:
     """Keep the more specific company text when two names are the same employer."""
     left_text = (left or "").strip()
     right_text = (right or "").strip()
+    left_compact = _compact_company(left_text)
+    right_compact = _compact_company(right_text)
+    left_bare = _unglued_token(left_compact)
+    right_bare = _unglued_token(right_compact)
+    if left_bare and left_bare == right_bare and (left_bare != left_compact) != (right_bare != right_compact):
+        return left_text if right_bare != right_compact else right_text
     left_tokens = company_name_tokens(left_text)
     right_tokens = company_name_tokens(right_text)
     if len(right_tokens) != len(left_tokens):
@@ -810,13 +909,22 @@ def fuller_company_name(left: str | None, right: str | None) -> str:
     return right_text if len(right_text) > len(left_text) else left_text
 
 
+def _role_key(role: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (role or "").casefold()).strip()
+
+
 def roles_compatible(left: str | None, right: str | None) -> bool:
-    """Same role when both sides name one. A missing role does not split the interview."""
-    left_role = (left or "").strip().casefold()
-    right_role = (right or "").strip().casefold()
-    if left_role and right_role:
-        return left_role == right_role
-    return True
+    """Same role when both sides name one. A missing role does not split the interview.
+
+    A longer title that keeps the shorter one is still that role:
+    "Lead Machine Learning Engineer" and "Lead Machine Learning Engineer - Engine".
+    """
+    left_role = _role_key(left)
+    right_role = _role_key(right)
+    if not left_role or not right_role or left_role == right_role:
+        return True
+    shorter, longer = (left_role, right_role) if len(left_role) <= len(right_role) else (right_role, left_role)
+    return len(shorter) >= 12 and longer.startswith(f"{shorter} ")
 
 
 def _cross_thread_score(
@@ -990,6 +1098,88 @@ def _company_quality(value: str) -> int:
     return 2
 
 
+_HIRING_EMPLOYER_RE = re.compile(
+    r"\b(?:position|role|opportunity|opening|job)\s+(?:with|at)\s+"
+    r"([A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,3})",
+)
+
+
+def explicit_hiring_employer(text: str) -> str:
+    """The employer a message names, as in 'position with Tapestry'."""
+    names = [
+        match.group(1).strip(" .,;:!?")
+        for match in _HIRING_EMPLOYER_RE.finditer(html.unescape(text or ""))
+    ]
+    names = [name for name in names if name and name.casefold() not in {"google meet", "microsoft teams"}]
+    if not names:
+        return ""
+    return max(set(names), key=lambda name: (names.count(name), len(name)))
+
+
+def sender_domain_brand(email: EmailMessage) -> str:
+    """The company-like word in the sender's domain, such as google.com -> google."""
+    _, address = parseaddr(email.sender or "")
+    domain = _normalized_address(address).partition("@")[2]
+    if not domain or domain in _PUBLIC_EMAIL_DOMAINS:
+        return ""
+    brand = domain.split(".", 1)[0]
+    if len(brand) < 3 or brand in _DOMAIN_STOPWORDS:
+        return ""
+    return brand
+
+
+def employer_instead_of_sender_domain(email: EmailMessage, company: str) -> str:
+    """Use the named employer when the stored company is only the sender's email domain.
+
+    A recruiter at gkrouse@google.com hiring for Tapestry is not a Google interview.
+    A clipped fragment of the real name, such as 'Corewe' for CoreWeave, is left alone.
+    """
+    named = explicit_hiring_employer(_fresh_message_text(email))
+    if not named:
+        return company
+    brand = sender_domain_brand(email)
+    if not brand or not companies_match(company, brand):
+        return company
+    if companies_match(named, company):
+        return fuller_company_name(company, named)
+    named_compact = _compact_company(named)
+    company_compact = _compact_company(company)
+    if named_compact and company_compact and (named_compact in company_compact or company_compact in named_compact):
+        return company
+    return named
+
+
+def correct_sender_domain_employers(db: Session) -> int:
+    """Replace a sender-domain company with the employer named in the linked mail."""
+    changed = 0
+    events = db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True)).all()
+    for event in events:
+        email_ids = {event.source_email_id} if event.source_email_id else set()
+        email_ids.update(
+            row[0]
+            for row in db.query(CalendarEventEmail.email_id).filter(CalendarEventEmail.event_id == event.id)
+        )
+        if not email_ids:
+            continue
+        emails = db.query(EmailMessage).filter(EmailMessage.id.in_(email_ids)).all()
+        corrected = ""
+        for email in emails:
+            candidate = employer_instead_of_sender_domain(email, event.company or email.company or "")
+            if candidate and not companies_match(candidate, event.company):
+                corrected = candidate
+                break
+        if not corrected:
+            continue
+        event.company = corrected
+        if event.origin == "email":
+            event.title = _title(emails[0], InterviewDetails(company=corrected, role=event.job_role or ""))
+        for email in emails:
+            if companies_match(email.company, sender_domain_brand(email)) and not companies_match(email.company, corrected):
+                email.company = corrected
+        changed += 1
+    return changed
+
+
 def _known_company(messages: list[EmailMessage]) -> str:
     values = [(index, (item.company or "").strip()) for index, item in enumerate(messages)]
     values = [(index, value) for index, value in values if value]
@@ -1018,7 +1208,9 @@ def _email_context(emails: list[EmailMessage]) -> str:
                     f"Category: {item.label or ''}",
                     f"Known company: {item.company or ''}",
                     f"Known role: {item.job_role or ''}",
-                    (item.body_text or item.snippet or "")[:6000],
+                    _without_quoted_history(item.body_text or item.snippet or "")[:6000]
+                    if index == len(emails)
+                    else (item.body_text or item.snippet or "")[:6000],
                 ]
             )
         )
@@ -1035,9 +1227,15 @@ def _calendar_text(email: EmailMessage) -> str:
 
 
 _QUOTE_START_RE = re.compile(
-    r"(?:\n_{5,}|\nFrom:\s|\nOn .{0,160}? wrote:|\nGet Outlook for )",
+    r"(?:\n_{5,}|\nFrom:\s|\nOn [\s\S]{0,400}? wrote:|\nGet Outlook for "
+    r"|<div[^>]*\bid=[\"']divRplyFwdMsg"
+    r"|<div[^>]*\bclass=[\"'][^\"']*gmail_quote"
+    r"|-----Original Message-----"
+    r"|<b>\s*Sent\s*:\s*</b>"
+    r"|<b>\s*From\s*:\s*</b>)",
     re.IGNORECASE,
 )
+_DOMAIN_GLUE_PREFIXES = ("with", "get", "try", "join", "hey")
 
 
 def _without_quoted_history(text: str) -> str:
@@ -1052,6 +1250,112 @@ def explicit_message_slots(email: EmailMessage) -> list[ExtractedSlot]:
     """Return a time written in this message, not one copied from the thread."""
     fresh = _without_quoted_history(_calendar_text(email))
     return parse_ics_slots(fresh) or parse_text_slots(fresh, email.received_at)
+
+
+def _prefer_specific_slots(slots: list[ExtractedSlot]) -> list[ExtractedSlot]:
+    specific = [slot for slot in slots if not slot.is_availability_window]
+    return specific or slots
+
+
+def _date_parts(date_match: re.Match[str], reference: datetime | None) -> tuple[int, int, int] | None:
+    try:
+        month = int(date_match.groupdict().get("month_num") or MONTH_NUMBERS[(date_match.group("month") or "").lower()])
+        day = int(date_match.group("day"))
+        year_raw = date_match.groupdict().get("year")
+        year = int(year_raw) if year_raw else (reference.year if reference else datetime.now(timezone.utc).year)
+    except (KeyError, TypeError, ValueError):
+        return None
+    return year, month, day
+
+
+def _is_header_date(source: str, date_match: re.Match[str]) -> bool:
+    """A Sent: line or 'On Sep 4, 2026, 12:33 PM ... wrote' is not the interview date.
+
+    "available on September 10" and "on Wednesday, September 10" stay interview dates.
+    """
+    before = source[max(0, date_match.start() - 48) : date_match.start()]
+    if re.search(r"\b(?:Sent|Date)\s*:\s*(?:<[^>]+>\s*)?(?:[A-Za-z]+,?\s+)?$", before, re.I):
+        return True
+    after = source[date_match.end() : date_match.end() + 80]
+    if re.search(r"\bwrote\b", after, re.I):
+        return True
+    return bool(re.search(r"\bOn\s+$", before, re.I) and re.search(r"^\s*,?\s*\d{1,2}:\d{2}", after))
+
+
+def _first_interview_date(text: str, reference: datetime | None) -> tuple[int, int, int] | None:
+    candidates: list[tuple[int, re.Match[str]]] = []
+    for pattern in _DATE_PATTERNS:
+        candidates.extend((match.start(), match) for match in pattern.finditer(text or ""))
+    candidates.sort(key=lambda item: item[0])
+    for _, match in candidates:
+        if _is_header_date(text, match):
+            continue
+        parts = _date_parts(match, reference)
+        if parts is not None:
+            return parts
+    return None
+
+
+def _slot_from_clock(
+    times: list[re.Match[str]],
+    year: int,
+    month: int,
+    day: int,
+    zone: timezone | ZoneInfo,
+    zone_name: str,
+    reference: datetime | None,
+) -> ExtractedSlot | None:
+    try:
+        hour, minute = _clock_parts(times[0])
+        start = datetime(year, month, day, hour, minute, tzinfo=zone)
+    except (ValueError, OverflowError):
+        return None
+    if reference is not None and start.astimezone(timezone.utc) < reference - timedelta(days=120):
+        start = start.replace(year=start.year + 1)
+    end = start + DEFAULT_INTERVIEW_DURATION
+    end_is_explicit = False
+    if len(times) > 1 and times[1].start() - times[0].end() <= 20:
+        end_hour, end_minute = _clock_parts(times[1])
+        proposed = start.replace(hour=end_hour, minute=end_minute)
+        if proposed <= start:
+            proposed += timedelta(days=1)
+        if proposed - start <= timedelta(hours=12):
+            end = proposed
+            end_is_explicit = True
+    return ExtractedSlot(
+        start.astimezone(timezone.utc),
+        end.astimezone(timezone.utc),
+        zone_name,
+        end_is_explicit,
+        False,
+    )
+
+
+def message_appointment_slots(email: EmailMessage) -> list[ExtractedSlot]:
+    """Times this message sets. A quoted availability window is not the appointment.
+
+    The newest lines win. "Move the call to 1pm PT" stays 1:00 even when the
+    quoted thread still says "available between 12:00 PM and 3:00 PM".
+    """
+    full = _calendar_text(email)
+    fresh = _without_quoted_history(full)
+    reference = as_utc(email.received_at)
+    fresh_slots = parse_text_slots(fresh, reference)
+    if fresh_slots:
+        return _prefer_specific_slots(fresh_slots)
+    quoted = full[len(fresh) :] if fresh and full.startswith(fresh) else ""
+    times = list(_TIME_PATTERN.finditer(fresh or ""))
+    if times and quoted:
+        zone_span = fresh[max(0, times[0].start() - 12) : times[0].end() + 48]
+        zone_match = _zone_from_nearby_text(zone_span)
+        date_parts = _first_interview_date(quoted, reference)
+        if zone_match is not None and date_parts is not None:
+            zone, zone_name = zone_match
+            year, month, day = date_parts
+            slot = _slot_from_clock(times, year, month, day, zone, zone_name, reference)
+            if slot is not None:
+                return [slot]
+    return _prefer_specific_slots(parse_text_slots(full, reference))
 
 
 _CLOCK_OR_DATE_RE = re.compile(
@@ -1167,12 +1471,14 @@ async def extract_calendar_details(
 ) -> tuple[list[ExtractedSlot], MeetingAccess, InterviewDetails, bool]:
     messages = [*(related_emails or []), email]
     text = "\n".join(_calendar_text(item) for item in messages)
-    current_text = _calendar_text(email)
+    current_full = _calendar_text(email)
+    current_text = _without_quoted_history(current_full)
     # The current message is authoritative for time and meeting changes. Related
     # mail supplies missing context without reviving an older offered slot.
-    slots = parse_ics_slots(current_text)
+    # A quoted "On Thu at 12:01 PM ... wrote" line is not an appointment.
+    slots = parse_ics_slots(current_full)
     if not slots:
-        slots = parse_text_slots(current_text, email.received_at)
+        slots = message_appointment_slots(email)
     access = extract_meeting_access(current_text)
     if access.meeting_type == "unspecified":
         access = extract_meeting_access(text)
@@ -1188,7 +1494,9 @@ async def extract_calendar_details(
                 access.phone_number,
                 access.access_code,
             )
-    known_company = _known_company(messages) or _company_named_in_message(email)
+    known_company = employer_instead_of_sender_domain(
+        email, _known_company(messages) or _company_named_in_message(email),
+    )
     known_role = _known_role(messages)
     deterministic_job_url = extract_job_url(text)
     deterministic_interviewer = extract_interviewer(current_text, email.sender or "")
@@ -1257,7 +1565,7 @@ async def extract_calendar_details(
         if work_model not in {"remote", "hybrid", "on_site"}:
             work_model = "unspecified"
         details = InterviewDetails(
-            company=_clean_text(data.get("company")) or known_company,
+            company=employer_instead_of_sender_domain(email, _clean_text(data.get("company")) or known_company),
             role=_clean_text(data.get("role")) or known_role,
             interviewer=_clean_text(data.get("interviewer")) or deterministic_interviewer,
             work_model=work_model,
@@ -1354,7 +1662,9 @@ def refresh_calendar_event_details(db: Session, email: EmailMessage) -> bool:
             ),
             "",
         )
-    company = _known_company(messages) or _company_named_in_message(email)
+    company = employer_instead_of_sender_domain(
+        email, _known_company(messages) or _company_named_in_message(email),
+    )
     found_role = None if (email.job_role or "").strip() else _open_role_for_employer(db, email, company or email.company or "")
     if found_role is None:
         role = _known_role(messages)
@@ -1574,16 +1884,17 @@ def _slot_for_event(event: CalendarEvent, slots: list[ExtractedSlot]) -> Extract
     return min(slots, key=lambda slot: abs((slot.start_at - event_start).total_seconds()))
 
 
-def ics_cancels_appointment(text: str) -> bool:
-    """Whether this message's own calendar part cancels the appointment.
+def _first_calendar(text: str) -> tuple[str, str, int, bool]:
+    """Method, status, event count, and whether the first calendar has a start.
 
     A quoted earlier invite can carry another calendar. The first one belongs
-    to this message. Outlook leaves the original "you are all set" description
-    inside a cancel, so the method and status are the signal, not the prose.
+    to this message.
     """
     in_calendar = False
     method = ""
     status = ""
+    events = 0
+    has_start = False
     for line in _unfold_ics(text):
         upper = line.upper()
         if upper == "BEGIN:VCALENDAR":
@@ -1592,6 +1903,8 @@ def ics_cancels_appointment(text: str) -> bool:
             in_calendar = True
             method = ""
             status = ""
+            events = 0
+            has_start = False
             continue
         if not in_calendar:
             continue
@@ -1599,9 +1912,54 @@ def ics_cancels_appointment(text: str) -> bool:
             method = upper.split(":", 1)[1].strip()
         elif upper.startswith("STATUS:"):
             status = upper.split(":", 1)[1].strip()
+        elif upper == "BEGIN:VEVENT":
+            events += 1
+        elif upper.startswith("DTSTART"):
+            has_start = True
         elif upper == "END:VCALENDAR":
             break
+    return method, status, events, has_start
+
+
+def ics_cancels_appointment(text: str) -> bool:
+    """Whether this message's own calendar part cancels the appointment.
+
+    Outlook leaves the original "you are all set" description inside a cancel,
+    so the method and status are the signal, not the prose.
+    """
+    method, status, _, _ = _first_calendar(text)
     return method == "CANCEL" or status == "CANCELLED"
+
+
+def _ics_uid(text: str) -> str:
+    in_calendar = False
+    in_event = False
+    for line in _unfold_ics(text):
+        upper = line.upper()
+        if upper == "BEGIN:VCALENDAR":
+            if in_calendar:
+                break
+            in_calendar = True
+            continue
+        if not in_calendar:
+            continue
+        if upper == "BEGIN:VEVENT":
+            in_event = True
+        elif in_event and upper.startswith("UID:"):
+            return line.split(":", 1)[1].strip()
+        elif upper == "END:VCALENDAR":
+            break
+    return ""
+
+
+def ics_requests_appointment(text: str) -> bool:
+    """A single calendar request is a booked time, not a list of open slots."""
+    method, status, events, has_start = _first_calendar(text)
+    if method in {"CANCEL", "REPLY"} or status in {"CANCELLED", "TENTATIVE"}:
+        return False
+    if method not in {"REQUEST", "PUBLISH"}:
+        return False
+    return events == 1 and has_start
 
 
 _CANCEL_SUBJECT_RE = re.compile(r"\bcancel(?:ed|led|lation)\b", re.I)
@@ -1615,6 +1973,33 @@ def message_cancels_appointment(email: EmailMessage) -> bool:
     if ics_cancels_appointment(text):
         return True
     return bool(_CANCEL_SUBJECT_RE.search(email.subject or ""))
+
+
+_BOOKED_SUBJECT_RE = re.compile(r"\bbook time with me\b.{0,180}\band\b", re.I)
+_CONFIRMED_SUBJECT_RE = re.compile(r"^\s*confirmed\s*:", re.I)
+_DECLINED_SUBJECT_RE = re.compile(r"^\s*(?:declined|tentative)\s*:", re.I)
+_JOIN_URL_RE = re.compile(
+    r"https?://(?:[\w.-]+\.)?(?:zoom\.us/j/|teams\.microsoft\.com/|meet\.google\.com/)",
+    re.I,
+)
+
+
+def message_is_booked_appointment(email: EmailMessage) -> bool:
+    """A held time, as opposed to an invitation that still asks the candidate to pick one.
+
+    Zoom Scheduler confirmations say "Book time with me" and attach METHOD:REQUEST.
+    A booking page (scheduler.zoom.us) and a declined reply are still invitations.
+    """
+    subject = email.subject or ""
+    if _DECLINED_SUBJECT_RE.search(subject) or message_cancels_appointment(email):
+        return False
+    fresh = _without_quoted_history(_calendar_text(email))
+    if ics_requests_appointment(fresh):
+        return True
+    has_time = bool(parse_ics_slots(fresh) or parse_text_slots(fresh, email.received_at))
+    if _BOOKED_SUBJECT_RE.search(subject) and (_JOIN_URL_RE.search(fresh) or has_time):
+        return True
+    return bool(_CONFIRMED_SUBJECT_RE.search(subject) and has_time)
 
 
 def _replacement_times(email: EmailMessage) -> list[ExtractedSlot]:
@@ -2083,15 +2468,30 @@ def _starts_within_minute(left: CalendarEvent, right: CalendarEvent) -> bool:
     return abs((left_start - right_start).total_seconds()) <= 60
 
 
+def _ends_within_minute(left: CalendarEvent, right: CalendarEvent) -> bool:
+    left_end = as_utc(left.end_at)
+    right_end = as_utc(right.end_at)
+    if left_end is None or right_end is None:
+        return False
+    return abs((left_end - right_end).total_seconds()) <= 60
+
+
 def _same_scheduled_interview(left: CalendarEvent, right: CalendarEvent) -> bool:
-    return (
+    """One visible chip for one booked interview.
+
+    The same employer and start time match when the role text agrees, including
+    a longer form of the same title. An identical start and end is still one
+    interview when the emails name the round differently.
+    """
+    if not (
         left.mailbox_id == right.mailbox_id
         and left.kind == "confirmed"
         and right.kind == "confirmed"
         and companies_match(left.company, right.company)
-        and roles_compatible(left.job_role, right.job_role)
         and _starts_within_minute(left, right)
-    )
+    ):
+        return False
+    return roles_compatible(left.job_role, right.job_role) or _ends_within_minute(left, right)
 
 
 def _same_available_window(left: CalendarEvent, right: CalendarEvent) -> bool:
@@ -2132,7 +2532,9 @@ def _cluster_events(events: list[CalendarEvent], same) -> list[list[CalendarEven
 
 def _absorb_calendar_event(db: Session, survivor: CalendarEvent, duplicate: CalendarEvent) -> None:
     survivor.company = fuller_company_name(survivor.company, duplicate.company)
-    if not (survivor.job_role or "").strip() and (duplicate.job_role or "").strip():
+    duplicate_role = (duplicate.job_role or "").strip()
+    survivor_role = (survivor.job_role or "").strip()
+    if duplicate_role and (not survivor_role or (roles_compatible(survivor_role, duplicate_role) and len(duplicate_role) > len(survivor_role))):
         survivor.job_role = duplicate.job_role
     if (survivor.application_status or "active") == "active" and (duplicate.application_status or "active") != "active":
         survivor.application_status = duplicate.application_status
@@ -2284,13 +2686,344 @@ def hide_open_reschedules(db: Session, mailbox_id: int | None = None) -> int:
     return hidden
 
 
+def _source_slots(email: EmailMessage) -> list[ExtractedSlot]:
+    text = _calendar_text(email)
+    return parse_ics_slots(text) or parse_text_slots(text, email.received_at)
+
+
+def repair_phantom_end_slots(db: Session, mailbox_id: int | None = None) -> int:
+    """Move a chip that starts at the end of the range its own email states.
+
+    The stored row is the default 30 minutes beginning where the message's
+    explicit range ends, for example 2:15–2:45pm from "1:30pm - 2:15pm".
+    """
+    query = db.query(CalendarEvent).filter(
+        CalendarEvent.is_visible.is_(True),
+        CalendarEvent.kind == "confirmed",
+        CalendarEvent.origin == "email",
+        CalendarEvent.source_email_id.is_not(None),
+    )
+    if mailbox_id is not None:
+        query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
+    repaired = 0
+    for event in query.all():
+        email = db.get(EmailMessage, event.source_email_id)
+        if email is None:
+            continue
+        explicit = [slot for slot in _source_slots(email) if slot.end_is_explicit]
+        if not explicit:
+            continue
+        event_start = as_utc(event.start_at)
+        event_end = as_utc(event.end_at)
+        if event_start is None or event_end is None:
+            continue
+        if any(abs((event_start - slot.start_at).total_seconds()) <= 60 for slot in explicit):
+            continue
+        if abs((event_end - event_start) - DEFAULT_INTERVIEW_DURATION) > timedelta(seconds=60):
+            continue
+        covering = [
+            slot
+            for slot in explicit
+            if abs((event_start - slot.end_at).total_seconds()) <= 60 and slot.start_at < event_start
+        ]
+        appointment = [
+            slot
+            for slot in message_appointment_slots(email)
+            if not slot.is_availability_window
+            and slot.start_at < event_start
+            and abs((event_start - as_utc(slot.end_at)).total_seconds()) <= 60
+        ]
+        # "3:30pm works" is the appointment. A quoted "3:00-4:00" window that
+        # ends at the same minute must not replace it.
+        if len(appointment) == 1:
+            slot = appointment[0]
+        elif len(covering) == 1 and not appointment:
+            slot = covering[0]
+        else:
+            continue
+        event.start_at = slot.start_at
+        event.end_at = slot.end_at
+        if slot.source_timezone:
+            event.source_timezone = slot.source_timezone
+        repaired += 1
+    return repaired
+
+
+def repair_availability_window_appointments(db: Session, mailbox_id: int | None = None) -> int:
+    """Replace a confirmed block that stored an availability window as the interview.
+
+    "I will move the call to 1pm" is the appointment. "Available between 12:00
+    and 3:00" in the quoted thread is the window the sender offered earlier.
+    """
+    query = db.query(CalendarEvent).filter(
+        CalendarEvent.is_visible.is_(True),
+        CalendarEvent.kind == "confirmed",
+        CalendarEvent.origin == "email",
+        CalendarEvent.source_email_id.is_not(None),
+    )
+    if mailbox_id is not None:
+        query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
+    repaired = 0
+    for event in query.all():
+        email = db.get(EmailMessage, event.source_email_id)
+        if email is None:
+            continue
+        windows = [slot for slot in parse_text_slots(_calendar_text(email), email.received_at) if slot.is_availability_window]
+        if not windows:
+            continue
+        event_start = as_utc(event.start_at)
+        event_end = as_utc(event.end_at)
+        if event_start is None or event_end is None:
+            continue
+        matches_window = any(
+            abs((event_start - slot.start_at).total_seconds()) <= 60
+            and abs((event_end - slot.end_at).total_seconds()) <= 60
+            for slot in windows
+        )
+        if not matches_window:
+            continue
+        specific = [slot for slot in message_appointment_slots(email) if not slot.is_availability_window]
+        if not specific:
+            continue
+        slot = specific[0]
+        if abs((event_start - slot.start_at).total_seconds()) <= 60 and abs((event_end - slot.end_at).total_seconds()) <= 60:
+            continue
+        event.start_at = slot.start_at
+        event.end_at = slot.end_at
+        if slot.source_timezone:
+            event.source_timezone = slot.source_timezone
+        repaired += 1
+    return repaired
+
+
+def promote_booked_availability(db: Session, mailbox_id: int | None = None) -> int:
+    """Turn a booked appointment that was stored as an open invitation into a scheduled interview."""
+    query = db.query(CalendarEvent).filter(
+        CalendarEvent.is_visible.is_(True),
+        CalendarEvent.kind == "availability",
+        CalendarEvent.source_email_id.isnot(None),
+    )
+    if mailbox_id is not None:
+        query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
+    promoted_rows: list[tuple[CalendarEvent, EmailMessage, str]] = []
+    for event in query.all():
+        email = db.get(EmailMessage, event.source_email_id)
+        if email is None or not message_is_booked_appointment(email):
+            continue
+        event.kind = "confirmed"
+        if not event.interview_status:
+            event.interview_status = "calendar_invite"
+        if email.label == EmailLabel.INTERVIEW_INVITATION.value:
+            email.label = EmailLabel.INTERVIEW_SCHEDULED.value
+            if not email.interview_subtype:
+                email.interview_subtype = "calendar_invite"
+        promoted_rows.append((event, email, _ics_uid(_calendar_text(email))))
+    # An updated invite for the same calendar item replaces the earlier copy.
+    by_uid: dict[tuple[int, str], list[tuple[CalendarEvent, EmailMessage]]] = {}
+    for event, email, uid in promoted_rows:
+        if uid:
+            by_uid.setdefault((event.mailbox_id, uid), []).append((event, email))
+    for group in by_uid.values():
+        if len(group) < 2:
+            continue
+        survivor, _email = max(group, key=lambda item: (as_utc(item[1].received_at) or datetime.min.replace(tzinfo=timezone.utc), item[0].id))
+        for event, _email in group:
+            if event.id == survivor.id:
+                continue
+            event.is_visible = False
+            event.superseded_by_event_id = survivor.id
+    if promoted_rows:
+        db.flush()
+    return len(promoted_rows)
+
+
+_APPOINTMENT_BOOKED_RE = re.compile(r"appointment booked:\s*(?P<title>.+?)\s+@", re.I)
+_ATTRIBUTION_CLOCK_RE = re.compile(
+    r"\bOn\b[\s\S]{0,240}?\bat\s+(?P<clock>\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))[\s\S]{0,240}?wrote:",
+    re.I,
+)
+_REBOOK_WINDOW = timedelta(hours=6)
+
+
+def _booking_title(email: EmailMessage) -> str:
+    match = _APPOINTMENT_BOOKED_RE.search(email.subject or "")
+    if match is None:
+        return ""
+    return re.sub(r"\s+", " ", match.group("title")).casefold().strip()
+
+
+def _linked_messages(db: Session, event: CalendarEvent) -> list[EmailMessage]:
+    email_ids = {event.source_email_id} - {None}
+    email_ids.update(
+        row[0]
+        for row in db.query(CalendarEventEmail.email_id).filter(CalendarEventEmail.event_id == event.id).all()
+    )
+    if not email_ids:
+        return []
+    return db.query(EmailMessage).filter(EmailMessage.id.in_(email_ids)).all()
+
+
+def _clock_matches_start(clock: str, event: CalendarEvent) -> bool:
+    match = _TIME_PATTERN.search(clock)
+    start = as_utc(event.start_at)
+    if match is None or start is None:
+        return False
+    hour, minute = _clock_parts(match)
+    zones = ["America/New_York"]
+    if event.source_timezone:
+        zones.append(event.source_timezone)
+    for name in zones:
+        try:
+            local = start.astimezone(ZoneInfo(name))
+        except ZoneInfoNotFoundError:
+            continue
+        if local.hour == hour and abs(local.minute - minute) <= 2:
+            return True
+    return False
+
+
+def _slot_matches_event(event: CalendarEvent, slots: list[ExtractedSlot]) -> bool:
+    start = as_utc(event.start_at)
+    if start is None:
+        return False
+    return any(abs((slot.start_at - start).total_seconds()) <= 120 for slot in slots)
+
+
+def hide_quote_clock_events(db: Session, mailbox_id: int | None = None) -> int:
+    """Hide an interview whose time is only the quoted message's send clock.
+
+    "I am waiting in the call" followed by "On Thu at 12:01 PM ... wrote" is not
+    a second appointment at 12:01.
+    """
+    query = db.query(CalendarEvent).filter(
+        CalendarEvent.is_visible.is_(True),
+        CalendarEvent.kind == "confirmed",
+        CalendarEvent.origin == "email",
+        CalendarEvent.source_email_id.isnot(None),
+    )
+    if mailbox_id is not None:
+        query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
+    events = query.all()
+    hidden = 0
+    for event in events:
+        email = db.get(EmailMessage, event.source_email_id)
+        if email is None or not event.is_visible:
+            continue
+        text = _calendar_text(email)
+        fresh = _without_quoted_history(text)
+        if _slot_matches_event(event, parse_ics_slots(fresh) or parse_text_slots(fresh, email.received_at)):
+            continue
+        clocks = [match.group("clock") for match in _ATTRIBUTION_CLOCK_RE.finditer(text)]
+        if not any(_clock_matches_start(clock, event) for clock in clocks):
+            continue
+        start = as_utc(event.start_at) or datetime.min.replace(tzinfo=timezone.utc)
+        candidates = [
+            other
+            for other in events
+            if other.id != event.id
+            and other.is_visible
+            and other.mailbox_id == event.mailbox_id
+            and companies_match(other.company, event.company)
+            and roles_compatible(other.job_role, event.job_role)
+        ]
+        same_day = [
+            other
+            for other in candidates
+            if as_utc(other.start_at) is not None and as_utc(other.start_at).date() == start.date()
+        ]
+        pool = same_day or candidates
+        keeper = min(pool, key=lambda other: abs((as_utc(other.start_at) - start).total_seconds()), default=None)
+        event.is_visible = False
+        if keeper is not None:
+            event.superseded_by_event_id = keeper.id
+            _transfer_event_email_links(db, event, keeper)
+        else:
+            event.source_email_id = None
+            event.source_thread_id = None
+        hidden += 1
+    if hidden:
+        db.flush()
+    return hidden
+
+
+def hide_replaced_bookings(db: Session, mailbox_id: int | None = None) -> int:
+    """A later booking of the same appointment replaces the time chosen a few minutes earlier."""
+    query = db.query(CalendarEvent).filter(
+        CalendarEvent.is_visible.is_(True),
+        CalendarEvent.kind == "confirmed",
+    )
+    if mailbox_id is not None:
+        query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
+    booked: list[tuple[CalendarEvent, datetime, str]] = []
+    for event in query.all():
+        start = as_utc(event.start_at)
+        if start is None:
+            continue
+        chosen: tuple[datetime, str] | None = None
+        for email in _linked_messages(db, event):
+            title = _booking_title(email)
+            if not title:
+                continue
+            slots = explicit_message_slots(email)
+            if not any(abs((slot.start_at - start).total_seconds()) <= 60 for slot in slots):
+                continue
+            received = as_utc(email.received_at) or datetime.min.replace(tzinfo=timezone.utc)
+            if chosen is None or received > chosen[0]:
+                chosen = (received, title)
+        if chosen is not None:
+            booked.append((event, chosen[0], chosen[1]))
+
+    parent = list(range(len(booked)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for index, (event, received, title) in enumerate(booked):
+        for earlier in range(index):
+            other, other_received, other_title = booked[earlier]
+            if (
+                title == other_title
+                and event.mailbox_id == other.mailbox_id
+                and companies_match(event.company, other.company)
+                and roles_compatible(event.job_role, other.job_role)
+                and abs((received - other_received).total_seconds()) <= _REBOOK_WINDOW.total_seconds()
+                and not _starts_within_minute(event, other)
+            ):
+                parent[find(index)] = find(earlier)
+    groups: dict[int, list[tuple[CalendarEvent, datetime, str]]] = {}
+    for index, row in enumerate(booked):
+        groups.setdefault(find(index), []).append(row)
+    hidden = 0
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        survivor = max(group, key=lambda item: (item[1], item[0].id))[0]
+        for event, _received, _title in group:
+            if event.id == survivor.id:
+                continue
+            _absorb_calendar_event(db, survivor, event)
+            hidden += 1
+    return hidden
+
+
 def collapse_duplicate_calendar_events(db: Session, mailbox_id: int | None = None) -> bool:
     """Keep one visible chip for each scheduled interview and each open window."""
+    changed = repair_phantom_end_slots(db, mailbox_id) > 0
+    if repair_availability_window_appointments(db, mailbox_id) > 0:
+        changed = True
+    if promote_booked_availability(db, mailbox_id):
+        changed = True
+    if hide_quote_clock_events(db, mailbox_id):
+        changed = True
+    if hide_replaced_bookings(db, mailbox_id):
+        changed = True
     query = db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True))
     if mailbox_id is not None:
         query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
     visible = query.all()
-    changed = False
     for group in _cluster_events([event for event in visible if event.kind == "confirmed"], _same_scheduled_interview):
         survivor = max(group, key=lambda event: (_event_received_at(event), event.id))
         for duplicate in group:
@@ -2417,6 +3150,17 @@ async def process_calendar_email(
     offered_replacements = cancels and len(_replacement_times(email)) > 1
     if cancels:
         slots = authoritative_cancellation_slots(email, slots)
+
+    if (
+        email.label == EmailLabel.INTERVIEW_INVITATION.value
+        and not cancels
+        and message_is_booked_appointment(email)
+    ):
+        # "Interview invitation" is the offer to pick a time. A calendar
+        # request or a scheduler confirmation already holds one.
+        email.label = EmailLabel.INTERVIEW_SCHEDULED.value
+        if not email.interview_subtype:
+            email.interview_subtype = "calendar_invite"
 
     if email.label == EmailLabel.INTERVIEW_INVITATION.value and not cancels:
         existing = {

@@ -357,9 +357,32 @@ def infer_interview_subtype(subject: str, sender: str, body_text: str, snippet: 
     return "confirmation"
 
 
+def _ics_books_one_appointment(text: str) -> bool:
+    """The message's own calendar request holds one time."""
+    match = re.search(r"begin:vcalendar[\s\S]*?end:vcalendar", text)
+    if match is None:
+        return False
+    block = match.group(0)
+    if re.search(r"(?:^|\n)\s*method:(?:cancel|reply)\b", block):
+        return False
+    if re.search(r"(?:^|\n)\s*status:(?:cancelled|tentative)\b", block):
+        return False
+    if not re.search(r"(?:^|\n)\s*method:(?:request|publish)\b", block):
+        return False
+    return len(re.findall(r"(?:^|\n)\s*begin:vevent\b", block)) == 1 and bool(
+        re.search(r"(?:^|\n)\s*dtstart\b", block)
+    )
+
+
 def _is_scheduled_interview(text: str) -> bool:
     if _looks_like_cold_jd_blast(text) or _is_application_received(text):
         return False
+    if _ics_books_one_appointment(text):
+        return True
+    if re.search(r"\bbook time with me\b.{0,180}\band\b", text):
+        return True
+    if re.search(r"(?:^|\n)\s*confirmed\s*:.{0,200}\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", text):
+        return True
     has_fixed_appointment = bool(
         re.search(
             r"\bdate\s*:\s*(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",

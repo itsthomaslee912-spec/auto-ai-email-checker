@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import SessionLocal
+from app.email.gmail import is_transient_quota_error
 from app.models import MailboxConnection
 from app.services.mailbox_sync import get_sync_status, start_mailbox_sync
 from app.services.ngrok_status import get_ngrok_status
@@ -18,6 +19,9 @@ from app.services.webhook_health import (
 from app.timeutil import as_utc
 
 logger = logging.getLogger(__name__)
+# A per-minute Gmail quota miss is not a dead webhook. Hold polling off briefly
+# so the next push can retry without competing for the same quota.
+_QUOTA_POLL_HOLDOFF = timedelta(minutes=15)
 _loop_running = False
 _last_check_at: datetime | None = None
 _last_error: str | None = None
@@ -47,6 +51,8 @@ def has_active_webhook(mailbox: MailboxConnection, now: datetime | None = None) 
     webhook = mailbox.webhook
     success = as_utc(webhook.last_delivery_success_at) if webhook else None
     failure = as_utc(webhook.last_delivery_failure_at) if webhook else None
+    if webhook is not None and is_transient_quota_error(webhook.last_delivery_error):
+        failure = None
     persisted_healthy = bool(success and (not failure or success >= failure))
     return persisted_healthy
 
@@ -62,6 +68,20 @@ def tunnel_problem(ngrok: dict | None) -> str | None:
     return None
 
 
+def _quota_poll_holdoff(mailbox: MailboxConnection, now: datetime) -> bool:
+    """Keep a registered webhook when its latest failure is a fresh Gmail quota limit."""
+    webhook = mailbox.webhook
+    if webhook is None or webhook.last_delivery_failure_at is None:
+        return False
+    if not is_transient_quota_error(webhook.last_delivery_error):
+        return False
+    failure = as_utc(webhook.last_delivery_failure_at)
+    success = as_utc(webhook.last_delivery_success_at)
+    if failure is None or (success is not None and success >= failure):
+        return False
+    return now - failure < _QUOTA_POLL_HOLDOFF
+
+
 def polling_reason(
     mailbox: MailboxConnection, ngrok: dict | None = None, now: datetime | None = None,
 ) -> str | None:
@@ -72,15 +92,15 @@ def polling_reason(
     problem = tunnel_problem(ngrok)
     if problem:
         return problem
+    if _quota_poll_holdoff(mailbox, now):
+        return None
     webhook = mailbox.webhook
     if not has_active_webhook(mailbox, now):
         if webhook.last_delivery_failure_at:
             return f"Webhook delivery failed: {webhook.last_delivery_error or 'unknown error'}"
         return "Webhook has not delivered mail yet"
-    quiet_seconds = max(60, getattr(get_settings(), "webhook_quiet_seconds", 1800))
-    success = as_utc(webhook.last_delivery_success_at)
-    if now - success > timedelta(seconds=quiet_seconds):
-        return f"No webhook delivery in the last {quiet_seconds // 60} minutes"
+    # A quiet inbox is not a broken webhook. Gmail and Outlook push only when
+    # mail arrives, so a registered, verified subscription stays on webhook.
     return None
 
 
@@ -95,6 +115,8 @@ def _provider_delivery_status(provider: str, mailboxes: list[MailboxConnection])
             continue
         stored_success = as_utc(webhook.last_delivery_success_at)
         stored_failure = as_utc(webhook.last_delivery_failure_at)
+        if is_transient_quota_error(webhook.last_delivery_error):
+            stored_failure = None
         if stored_success and (success is None or stored_success > success):
             success = stored_success
         if stored_failure and (failure is None or stored_failure > failure):
@@ -112,10 +134,11 @@ def _provider_delivery_status(provider: str, mailboxes: list[MailboxConnection])
 async def poll_active_mailboxes() -> int:
     """Poll only accounts whose webhook is not delivering mail.
 
-    A working webhook is the sync path. Polling stays off for an account while
-    its subscription is current, the ngrok tunnel is up, and it delivered
-    recently. It turns on when the webhook is missing, expired, failing, has
-    never delivered, has gone quiet, or the tunnel is down.
+    A working webhook is the sync path. Polling stays off while the subscription
+    is current, the tunnel can deliver, and the webhook has succeeded without a
+    later real failure. It turns on when the webhook is missing, expired,
+    failing, has never delivered, or the tunnel is down. Silence is not a
+    failure: providers push only when new mail arrives.
     """
     ngrok = await asyncio.to_thread(get_ngrok_status)
     mailbox_ids = []
@@ -172,7 +195,7 @@ def get_auto_sync_status(db: Session) -> dict:
                 "email_address": mailbox.email_address,
                 "message": job.get("message") or "Sync failed",
             })
-        elif mailbox.last_sync_error:
+        elif mailbox.last_sync_error and not is_transient_quota_error(mailbox.last_sync_error):
             problems.append({
                 "mailbox_id": mailbox.id,
                 "email_address": mailbox.email_address,
@@ -191,7 +214,9 @@ def get_auto_sync_status(db: Session) -> dict:
                 as_utc(mailbox.last_sync_completed_at).isoformat()
                 if mailbox.last_sync_completed_at else None
             ),
-            "last_error": mailbox.last_sync_error,
+            "last_error": (
+                None if is_transient_quota_error(mailbox.last_sync_error) else mailbox.last_sync_error
+            ),
             "needs_reconnect": needs_reconnect(mailbox.last_sync_error)
             or (job["state"] == "error" and needs_reconnect(job.get("message"))),
             "webhook_registered": has_registered_webhook(mailbox),

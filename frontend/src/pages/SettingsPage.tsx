@@ -136,6 +136,8 @@ export default function SettingsPage({
   onInboxTypeChange,
   readingPane,
   onReadingPaneChange,
+  conversationView,
+  onConversationViewChange,
   fontFamily,
   onFontFamilyChange,
   fontSize,
@@ -172,6 +174,8 @@ export default function SettingsPage({
   onInboxTypeChange: (type: InboxType) => void;
   readingPane: ReadingPane;
   onReadingPaneChange: (pane: ReadingPane) => void;
+  conversationView: boolean;
+  onConversationViewChange: (enabled: boolean) => void;
   fontFamily: FontFamily;
   onFontFamilyChange: (font: FontFamily) => void;
   fontSize: FontSize;
@@ -623,72 +627,85 @@ export default function SettingsPage({
                 <section className="settings-block">
                   <h3>View mode</h3>
                   <p className="settings-help">How the inbox message list is shown.</p>
-                  <div className="seg-control" role="radiogroup" aria-label="View mode">
+                  <div className="appearance-options" role="radiogroup" aria-label="View mode">
                     {VIEW_MODES.map((mode) => (
-                      <button
-                        key={mode}
-                        type="button"
-                        role="radio"
-                        aria-checked={viewMode === mode}
-                        className={viewMode === mode ? "seg-btn active" : "seg-btn"}
-                        onClick={() => onViewModeChange(mode)}
-                      >
-                        {mode === "list" ? "List" : "Table"}
-                      </button>
+                      <label key={mode} className={viewMode === mode ? "appearance-row is-selected" : "appearance-row"}>
+                        <input
+                          type="radio"
+                          name="view-mode"
+                          checked={viewMode === mode}
+                          onChange={() => onViewModeChange(mode)}
+                        />
+                        <span>{mode === "list" ? "List" : "Table"}</span>
+                        <span className={`appearance-preview preview-${mode}`} aria-hidden="true" />
+                      </label>
                     ))}
                   </div>
                 </section>
                 <section className="settings-block">
                   <h3>Reading pane</h3>
                   <p className="settings-help">Where the selected message appears beside the inbox.</p>
-                  <div className="seg-control" role="radiogroup" aria-label="Reading pane">
+                  <div className="appearance-options" role="radiogroup" aria-label="Reading pane">
                     {READING_PANES.map((pane) => (
-                      <button
-                        key={pane.id}
-                        type="button"
-                        role="radio"
-                        aria-checked={readingPane === pane.id}
-                        className={readingPane === pane.id ? "seg-btn active" : "seg-btn"}
-                        onClick={() => onReadingPaneChange(pane.id)}
-                      >
-                        {pane.label}
-                      </button>
+                      <label key={pane.id} className={readingPane === pane.id ? "appearance-row is-selected" : "appearance-row"}>
+                        <input
+                          type="radio"
+                          name="reading-pane"
+                          checked={readingPane === pane.id}
+                          onChange={() => onReadingPaneChange(pane.id)}
+                        />
+                        <span>{pane.label}</span>
+                        <span className={`appearance-preview preview-pane-${pane.id.replace("_", "-")}`} aria-hidden="true" />
+                      </label>
                     ))}
                   </div>
                 </section>
                 <section className="settings-block">
                   <h3>Inbox type</h3>
                   <p className="settings-help">Order of messages in the inbox list.</p>
-                  <div className="seg-control" role="radiogroup" aria-label="Inbox type">
+                  <div className="appearance-options" role="radiogroup" aria-label="Inbox type">
                     {INBOX_TYPES.map((type) => (
-                      <button
-                        key={type}
-                        type="button"
-                        role="radio"
-                        aria-checked={inboxType === type}
-                        className={inboxType === type ? "seg-btn active" : "seg-btn"}
-                        onClick={() => onInboxTypeChange(type)}
-                      >
-                        {type === "default" ? "Default" : "Unread first"}
-                      </button>
+                      <label key={type} className={inboxType === type ? "appearance-row is-selected" : "appearance-row"}>
+                        <input
+                          type="radio"
+                          name="inbox-type"
+                          checked={inboxType === type}
+                          onChange={() => onInboxTypeChange(type)}
+                        />
+                        <span>{type === "default" ? "Default" : "Unread first"}</span>
+                        <span className={`appearance-preview preview-inbox-${type === "default" ? "default" : "unread"}`} aria-hidden="true" />
+                      </label>
                     ))}
                   </div>
                 </section>
                 <section className="settings-block">
+                  <h3>Email threading</h3>
+                  <p className="settings-help">Group messages from the same conversation into one inbox row.</p>
+                  <label className={conversationView ? "appearance-row is-selected" : "appearance-row"}>
+                    <input
+                      type="checkbox"
+                      checked={conversationView}
+                      onChange={(event) => onConversationViewChange(event.target.checked)}
+                    />
+                    <span>Conversation view</span>
+                    <span className="appearance-preview preview-thread" aria-hidden="true" />
+                  </label>
+                </section>
+                <section className="settings-block">
                   <h3>Theme</h3>
                   <p className="settings-help">Color scheme for the app.</p>
-                  <div className="seg-control" role="radiogroup" aria-label="Theme">
+                  <div className="appearance-options" role="radiogroup" aria-label="Theme">
                     {(["system", "dark", "light"] as ThemePref[]).map((item) => (
-                      <button
-                        key={item}
-                        type="button"
-                        role="radio"
-                        aria-checked={themePref === item}
-                        className={themePref === item ? "seg-btn active" : "seg-btn"}
-                        onClick={() => onThemeChange(item)}
-                      >
-                        {item === "system" ? "System" : item === "dark" ? "Dark" : "Light"}
-                      </button>
+                      <label key={item} className={themePref === item ? "appearance-row is-selected" : "appearance-row"}>
+                        <input
+                          type="radio"
+                          name="theme"
+                          checked={themePref === item}
+                          onChange={() => onThemeChange(item)}
+                        />
+                        <span>{item === "system" ? "System" : item === "dark" ? "Dark" : "Light"}</span>
+                        <span className={`appearance-preview preview-theme-${item}`} aria-hidden="true" />
+                      </label>
                     ))}
                   </div>
                 </section>

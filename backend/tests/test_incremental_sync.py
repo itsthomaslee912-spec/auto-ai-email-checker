@@ -129,6 +129,68 @@ def test_gmail_webhook_classifies_new_messages_with_active_ai_settings(monkeypat
     engine.dispose()
 
 
+def test_gmail_quota_failure_keeps_the_webhook(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from app.models import WebhookSubscription
+
+    engine, db, mailbox = _mailbox(Provider.GOOGLE)
+    mailbox.sync_cursor = "100"
+    db.add(WebhookSubscription(
+        mailbox_id=mailbox.id, provider="google", external_id="watch",
+        expires_at=datetime.now(timezone.utc) + timedelta(days=3),
+        last_delivery_success_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+    ))
+    db.commit()
+    monkeypatch.setattr(mailbox_sync, "ensure_google_access_token", AsyncMock(return_value="token"))
+    monkeypatch.setattr(mailbox_sync, "gmail_list_history", AsyncMock(return_value={
+        "historyId": "200",
+        "history": [{"messagesAdded": [{"message": {"id": "new"}}]}],
+    }))
+    monkeypatch.setattr(
+        mailbox_sync, "gmail_get_message",
+        AsyncMock(side_effect=HTTPException(400, "Gmail get message failed: Quota exceeded for quota metric")),
+    )
+
+    with pytest.raises(HTTPException):
+        asyncio.run(mailbox_sync.process_gmail_notification(db, mailbox.email_address, "200"))
+
+    db.refresh(mailbox)
+    assert mailbox.last_sync_error is None
+    assert mailbox.sync_cursor == "100"
+    assert mailbox.webhook.last_delivery_failure_at is None
+    assert mailbox.webhook.last_delivery_success_at is not None
+    db.close()
+    engine.dispose()
+
+
+def test_gmail_get_message_retries_quota_then_returns_the_message(monkeypatch):
+    import httpx
+
+    calls = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(403, text='{"error":{"message":"Quota exceeded"}}')
+        return httpx.Response(200, json={"id": "m1", "payload": {}})
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+
+    def client(*_args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*_args, **kwargs)
+
+    monkeypatch.setattr(gmail.httpx, "AsyncClient", client)
+    monkeypatch.setattr(gmail.asyncio, "sleep", AsyncMock())
+
+    raw = asyncio.run(gmail.gmail_get_message("token", "m1"))
+
+    assert raw["id"] == "m1"
+    assert calls["n"] == 2
+
+
 def test_gmail_webhook_failure_marks_mailbox_webhook_unhealthy(monkeypatch):
     from datetime import datetime, timedelta, timezone
 

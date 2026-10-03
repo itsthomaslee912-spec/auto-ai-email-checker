@@ -8,7 +8,7 @@ import httpx
 from app.config import get_settings
 
 _AGENT_URL = "http://127.0.0.1:4040/api/tunnels"
-_CACHE_SECONDS = 5.0
+_CACHE_SECONDS = 30.0
 _cached: tuple[float, dict] | None = None
 
 

@@ -13,6 +13,19 @@ from fastapi import HTTPException
 logger = logging.getLogger(__name__)
 
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1"
+_QUOTA_RETRY_DELAYS = (2, 4, 8, 16, 30)
+
+
+def is_transient_quota_error(message: str | None) -> bool:
+    """Return whether Gmail rejected the call because the per-minute quota was used up."""
+    text = (message or "").casefold()
+    return "quota" in text or "rate limit" in text or "ratelimitexceeded" in text
+
+
+def _should_retry_gmail(resp: httpx.Response) -> bool:
+    if resp.status_code == 429 or resp.status_code in {500, 502, 503, 504}:
+        return True
+    return resp.status_code == 403 and is_transient_quota_error(resp.text)
 
 
 def _decode_body_data(data: str | None) -> str:
@@ -224,12 +237,34 @@ class GmailHistoryExpired(Exception):
     pass
 
 
+async def _gmail_get_with_backoff(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: dict,
+    params: dict,
+    what: str,
+) -> httpx.Response:
+    """Retry a Gmail read when the per-user minute quota, or a server error, clears shortly."""
+    response: httpx.Response | None = None
+    for attempt, delay in enumerate(_QUOTA_RETRY_DELAYS):
+        response = await client.get(url, headers=headers, params=params)
+        if not _should_retry_gmail(response) or attempt == len(_QUOTA_RETRY_DELAYS) - 1:
+            return response
+        logger.warning(
+            "%s hit %s, waiting %ss (attempt %s)",
+            what, response.status_code, delay, attempt + 1,
+        )
+        await asyncio.sleep(delay)
+    return response
+
+
 async def gmail_list_history(access_token: str, start_history_id: str) -> dict:
     """Read a complete history round before its returned cursor can be saved."""
     history: list[dict] = []
     page_token: str | None = None
     latest_history_id = start_history_id
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=45) as client:
         while True:
             params = {
                 "startHistoryId": start_history_id,
@@ -237,10 +272,12 @@ async def gmail_list_history(access_token: str, start_history_id: str) -> dict:
             }
             if page_token:
                 params["pageToken"] = page_token
-            resp = await client.get(
+            resp = await _gmail_get_with_backoff(
+                client,
                 f"{GMAIL_API}/users/me/history",
                 headers={"Authorization": f"Bearer {access_token}"},
                 params=params,
+                what="Gmail history",
             )
             if resp.status_code == 404:
                 raise GmailHistoryExpired("Gmail history cursor expired")
@@ -255,11 +292,13 @@ async def gmail_list_history(access_token: str, start_history_id: str) -> dict:
 
 
 async def gmail_get_message(access_token: str, message_id: str) -> dict:
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
+    async with httpx.AsyncClient(timeout=45) as client:
+        resp = await _gmail_get_with_backoff(
+            client,
             f"{GMAIL_API}/users/me/messages/{message_id}",
             headers={"Authorization": f"Bearer {access_token}"},
             params={"format": "full"},
+            what=f"Gmail get {message_id}",
         )
         if resp.status_code == 404:
             raise HTTPException(status_code=404, detail="Gmail message no longer exists")
@@ -285,11 +324,7 @@ async def gmail_get_messages(
     params = {"format": format}
 
     def _is_quota(resp: httpx.Response) -> bool:
-        if resp.status_code == 429:
-            return True
-        if resp.status_code != 403:
-            return False
-        return "quota" in (resp.text or "").lower()
+        return _should_retry_gmail(resp) and resp.status_code in {403, 429}
 
     async def fetch_one(client: httpx.AsyncClient, mid: str) -> dict | None:
         async with sem:

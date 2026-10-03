@@ -75,6 +75,8 @@ class EmailOut(BaseModel):
     is_read: bool = False
     human_corrected: bool = False
     folder: str = "inbox"
+    thread_id: str | None = None
+    thread_count: int = 1
     created_at: UtcDateTime | None = None
 
 

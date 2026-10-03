@@ -52,7 +52,7 @@ def _poll(monkeypatch, session_factory) -> AsyncMock:
     monkeypatch.setattr(auto_sync, "SessionLocal", session_factory)
     monkeypatch.setattr(auto_sync, "start_mailbox_sync", sync)
     monkeypatch.setattr(auto_sync, "get_settings", lambda: SimpleNamespace(
-        auto_sync_max_messages=200, auto_sync_interval_seconds=120, webhook_quiet_seconds=1800,
+        auto_sync_max_messages=200, auto_sync_interval_seconds=120,
     ))
     asyncio.run(auto_sync.poll_active_mailboxes())
     return sync
@@ -106,16 +106,18 @@ def test_ngrok_state_is_ignored_when_webhook_url_is_not_ngrok(monkeypatch, ngrok
     engine.dispose()
 
 
-def test_polling_turns_on_when_verified_webhook_goes_quiet(monkeypatch):
+def test_quiet_inbox_stays_on_webhook(monkeypatch):
     engine, session_factory = _session_factory()
-    mailbox_id = _verified_mailbox(session_factory, timedelta(hours=2))
+    _verified_mailbox(session_factory, timedelta(hours=2))
 
     sync = _poll(monkeypatch, session_factory)
 
-    sync.assert_awaited_once_with(mailbox_id, max_results=200, register_webhook=True)
+    sync.assert_not_awaited()
     with session_factory() as db:
-        reason = auto_sync.get_auto_sync_status(db)["mailboxes"][0]["polling_reason"]
-        assert reason == "No webhook delivery in the last 30 minutes"
+        detail = auto_sync.get_auto_sync_status(db)["mailboxes"][0]
+        assert detail["sync_method"] == "webhook"
+        assert detail["polling_reason"] is None
+        assert auto_sync.get_auto_sync_status(db)["polling_accounts"] == 0
     engine.dispose()
 
 
@@ -399,4 +401,74 @@ def test_auto_sync_status_distinguishes_no_account_stopped_and_failure(monkeypat
         status = auto_sync.get_auto_sync_status(db)
         assert status["state"] == "error"
         assert status["problem_mailboxes"][0]["email_address"] == "test@example.com"
+    engine.dispose()
+
+
+def _mailbox_with_webhook(session_factory, *, success_ago: timedelta, failure_ago: timedelta | None, error: str | None):
+    with session_factory() as db:
+        user = User(external_id="quota-webhook")
+        db.add(user)
+        db.flush()
+        mailbox = MailboxConnection(
+            user_id=user.id, provider="google", email_address="thomas@example.com",
+            access_token_enc="x", is_active=True, last_sync_error=error,
+        )
+        db.add(mailbox)
+        db.flush()
+        now = datetime.now(timezone.utc)
+        db.add(WebhookSubscription(
+            mailbox_id=mailbox.id, provider="google", external_id="history-1",
+            expires_at=now + timedelta(days=1),
+            last_delivery_success_at=now - success_ago,
+            last_delivery_failure_at=None if failure_ago is None else now - failure_ago,
+            last_delivery_error=error,
+        ))
+        mailbox_id = mailbox.id
+        db.commit()
+        return mailbox_id
+
+
+def test_auto_sync_keeps_webhook_after_a_fresh_gmail_quota_failure(monkeypatch):
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    quota = "Gmail get message failed: Quota exceeded for quota metric 'Total Query Cost'"
+    mailbox_id = _mailbox_with_webhook(
+        session_factory, success_ago=timedelta(hours=2), failure_ago=timedelta(minutes=1), error=quota,
+    )
+    sync = _poll(monkeypatch, session_factory)
+
+    sync.assert_not_awaited()
+    with session_factory() as db:
+        mailbox = db.get(MailboxConnection, mailbox_id)
+        assert auto_sync.polling_reason(mailbox) is None
+        assert auto_sync.has_active_webhook(mailbox)
+        status = auto_sync.get_auto_sync_status(db)
+        detail = status["mailboxes"][0]
+        assert detail["sync_method"] == "webhook"
+        assert detail["last_error"] is None
+        assert status["polling_accounts"] == 0
+        assert status["problem_mailboxes"] == []
+    engine.dispose()
+
+
+def test_gmail_quota_holdoff_expiry_stays_on_webhook(monkeypatch):
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    quota = "Gmail get message failed: Quota exceeded"
+    mailbox_id = _mailbox_with_webhook(
+        session_factory, success_ago=timedelta(hours=2), failure_ago=timedelta(minutes=20), error=quota,
+    )
+    sync = _poll(monkeypatch, session_factory)
+
+    sync.assert_not_awaited()
+    with session_factory() as db:
+        mailbox = db.get(MailboxConnection, mailbox_id)
+        assert auto_sync.polling_reason(mailbox) is None
+        assert auto_sync.get_auto_sync_status(db)["mailboxes"][0]["sync_method"] == "webhook"
     engine.dispose()

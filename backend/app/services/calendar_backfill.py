@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 
 from app.db import SessionLocal
 from app.models import EmailMessage
@@ -12,7 +13,51 @@ logger = logging.getLogger(__name__)
 
 
 async def backfill_calendar_events(stop_event: asyncio.Event) -> None:
-    """Extract calendar records for relevant stored mail without blocking startup."""
+    """Repair stored calendar mail without freezing the API.
+
+    The repair holds database locks and does synchronous work. Running it on
+    the request loop makes health checks, webhooks, and the calendar wait
+    behind it, so the work runs on its own thread and loop.
+    """
+    stop_flag = threading.Event()
+    main_loop = asyncio.get_running_loop()
+
+    async def mirror_stop() -> None:
+        await stop_event.wait()
+        stop_flag.set()
+
+    mirror = asyncio.create_task(mirror_stop())
+    try:
+        await asyncio.to_thread(_run_calendar_backfill, stop_flag, main_loop)
+    finally:
+        mirror.cancel()
+
+
+def _run_calendar_backfill(stop_flag: threading.Event, main_loop: asyncio.AbstractEventLoop) -> None:
+    asyncio.run(_backfill_calendar_events(stop_flag, main_loop))
+
+
+def _publish_from_backfill(
+    main_loop: asyncio.AbstractEventLoop, event: str, data: dict,
+) -> None:
+    """Queue an update on the API loop without waiting for it.
+
+    Waiting would deadlock on shutdown: the API loop is blocked until this
+    thread finishes, and this thread would be blocked until the API loop
+    publishes.
+    """
+    def _send() -> None:
+        asyncio.create_task(publish(event, data))
+
+    try:
+        main_loop.call_soon_threadsafe(_send)
+    except RuntimeError:
+        logger.debug("Skipped calendar backfill event; API loop is closed")
+
+
+async def _backfill_calendar_events(
+    stop_event: threading.Event, main_loop: asyncio.AbstractEventLoop,
+) -> None:
     def load_email_ids() -> list[int]:
         lookup = SessionLocal()
         try:
@@ -30,9 +75,11 @@ async def backfill_calendar_events(stop_event: asyncio.Event) -> None:
     db = SessionLocal()
     pending_mailboxes: set[int] = set()
 
-    async def publish_pending() -> None:
+    def publish_pending() -> None:
         for mailbox_id in list(pending_mailboxes):
-            await publish("calendar.changed", {"action": "backfilled", "mailbox_id": mailbox_id})
+            _publish_from_backfill(
+                main_loop, "calendar.changed", {"action": "backfilled", "mailbox_id": mailbox_id},
+            )
         pending_mailboxes.clear()
 
     try:
@@ -60,8 +107,8 @@ async def backfill_calendar_events(stop_event: asyncio.Event) -> None:
                 db.rollback()
                 logger.exception("Calendar backfill failed email_id=%s", email.id)
             if index % 5 == 0:
-                await publish_pending()
+                publish_pending()
                 await asyncio.sleep(0)
     finally:
         db.close()
-    await publish_pending()
+    publish_pending()

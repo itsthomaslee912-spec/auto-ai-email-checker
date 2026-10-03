@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -9,7 +10,8 @@ router = APIRouter(tags=["health"])
 
 
 @router.get("/api/health", response_model=HealthOut)
-def health() -> HealthOut:
+def health(db: Session = Depends(get_db)) -> HealthOut:
+    db.execute(text("SELECT 1"))
     return HealthOut(status="ok")
 
 

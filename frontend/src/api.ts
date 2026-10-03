@@ -82,6 +82,8 @@ export interface EmailItem {
   is_read: boolean;
   human_corrected?: boolean;
   folder?: MailFolder;
+  thread_id?: string | null;
+  thread_count?: number;
   created_at: string | null;
 }
 
@@ -187,6 +189,7 @@ export async function fetchEmails(opts?: {
   mailboxId?: number | null;
   query?: string | null;
   inboxType?: "default" | "unread_first";
+  conversation?: boolean;
   limit?: number;
   beforeId?: number | null;
   beforeReceivedAt?: string | null;
@@ -199,6 +202,7 @@ export async function fetchEmails(opts?: {
   if (opts?.query?.trim()) params.set("q", opts.query.trim());
   if (opts?.mailboxId != null) params.set("mailbox_id", String(opts.mailboxId));
   if (opts?.inboxType && opts.inboxType !== "default") params.set("inbox_type", opts.inboxType);
+  if (opts?.conversation) params.set("conversation", "true");
   params.set("limit", String(opts?.limit ?? 50));
   if (opts?.beforeId != null) params.set("before_id", String(opts.beforeId));
   if (opts?.beforeReceivedAt) params.set("before_received_at", opts.beforeReceivedAt);
@@ -217,6 +221,12 @@ export async function markAllRead(mailboxId?: number | null): Promise<{ marked: 
     method: "POST",
   });
   if (!res.ok) throw new Error(await readApiError(res, "Failed to mark messages read"));
+  return res.json();
+}
+
+export async function fetchEmailConversation(id: number): Promise<EmailDetail[]> {
+  const res = await apiFetch(`${API_BASE}/api/emails/${id}/conversation`);
+  if (!res.ok) throw new Error(await readApiError(res, "Failed to load conversation"));
   return res.json();
 }
 

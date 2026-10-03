@@ -16,10 +16,17 @@ if database_url.get_backend_name() == "sqlite" and database_url.database not in 
         database_url = database_url.set(database=str(database_path))
 
 connect_args = {}
+engine_kwargs: dict = {"pool_pre_ping": True, "pool_timeout": 10}
 if database_url.get_backend_name() == "sqlite":
     connect_args = {"check_same_thread": False, "timeout": 60}
+else:
+    # Drop connections older than this so a restarted PostgreSQL is picked up
+    # instead of leaving requests stuck on a dead socket.
+    engine_kwargs["pool_recycle"] = 300
+    engine_kwargs["pool_size"] = 8
+    engine_kwargs["max_overflow"] = 8
 
-engine = create_engine(database_url, connect_args=connect_args)
+engine = create_engine(database_url, connect_args=connect_args, **engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
@@ -368,6 +375,30 @@ def init_db() -> None:
             conn.execute(text("PRAGMA journal_mode=WAL"))
             conn.execute(text("PRAGMA busy_timeout=60000"))
             conn.commit()
+
+    if database_url.get_backend_name() == "postgresql":
+        with engine.begin() as conn:
+            if "email_messages" in inspect(conn).get_table_names():
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_email_messages_received_id "
+                    "ON email_messages (received_at DESC NULLS LAST, id DESC)"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_email_messages_label_received "
+                    "ON email_messages (label, received_at DESC NULLS LAST, id DESC)"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_email_messages_folder_received "
+                    "ON email_messages (folder, received_at DESC NULLS LAST, id DESC)"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_email_messages_sidebar_counts "
+                    "ON email_messages (mailbox_id, label, folder, is_read)"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_email_messages_thread "
+                    "ON email_messages (mailbox_id, thread_id, received_at DESC, id DESC)"
+                ))
 
     seed_default_classify_prompt()
     from app.services.mailbox_cleanup import purge_orphaned_mailbox_mail

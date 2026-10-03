@@ -18,6 +18,7 @@ export type FontSize = "extra-small" | "small" | "medium" | "large" | "extra-lar
 const VIEW_KEY = "email-checker-view";
 const INBOX_TYPE_KEY = "email-checker-inbox-type";
 const READING_PANE_KEY = "email-checker-reading-pane";
+const CONVERSATION_VIEW_KEY = "email-checker-conversation-view";
 const FONT_KEY = "email-checker-font";
 const FONT_SIZE_KEY = "email-checker-font-size";
 
@@ -94,6 +95,16 @@ export function loadReadingPane(): ReadingPane {
 
 export function saveReadingPane(pane: ReadingPane): void {
   writeStorage(READING_PANE_KEY, pane);
+}
+
+export function loadConversationView(): boolean {
+  const value = readStorage(CONVERSATION_VIEW_KEY);
+  if (value === "0") return false;
+  return true;
+}
+
+export function saveConversationView(enabled: boolean): void {
+  writeStorage(CONVERSATION_VIEW_KEY, enabled ? "1" : "0");
 }
 
 

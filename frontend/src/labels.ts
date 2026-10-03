@@ -42,15 +42,15 @@ export const EMPTY_LABEL_COUNTS: Record<EmailLabel, number> = Object.fromEntries
 ) as Record<EmailLabel, number>;
 
 export const LABEL_BAR_COLORS: Record<EmailLabel, string> = {
-  application_confirmation: "#b7a6ff",
-  application_action_required: "#e1adff",
-  screening: "#8ee0b5",
-  assessment: "#f0b429",
-  interview_invitation: "#91b8ff",
-  interview_scheduled: "#7ec8ff",
-  interview_follow_up: "#6dc4cf",
-  offer: "#5ecfc0",
-  rejected_closed: "#e36a6a",
-  recruitment_alert: "#ff9f43",
-  other: "#8b95a7",
+  application_confirmation: "var(--label-purple)",
+  application_action_required: "var(--label-purple)",
+  screening: "var(--label-mint)",
+  assessment: "var(--warn)",
+  interview_invitation: "var(--label-blue)",
+  interview_scheduled: "var(--label-blue)",
+  interview_follow_up: "var(--label-cyan)",
+  offer: "var(--label-green)",
+  rejected_closed: "var(--danger)",
+  recruitment_alert: "var(--label-orange)",
+  other: "var(--muted)",
 };
