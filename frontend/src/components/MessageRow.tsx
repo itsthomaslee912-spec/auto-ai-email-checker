@@ -40,7 +40,6 @@ export default function MessageRow({
       <button
         type="button"
         className={`msg-table table-columns${active ? " active" : ""}${email.is_read ? "" : " unread"}`}
-        title="Double-click to open email"
         onClick={() => onOpen(email.id)}
         onDoubleClick={() => onDoubleOpen(email.id)}
         onKeyDown={(event) => {
@@ -51,12 +50,12 @@ export default function MessageRow({
         }}
       >
         <span className="table-cell">
-          <strong className="table-primary" title={email.sender}>{senderName(email.sender)}</strong>
-          {accountAddress && <span className="table-secondary" title={accountAddress}>{accountAddress}</span>}
+          <strong className="table-primary">{senderName(email.sender)}</strong>
+          {accountAddress && <span className="table-secondary">{accountAddress}</span>}
         </span>
         <span className="table-cell">
-          <span className="table-primary table-subject" title={email.subject || "(no subject)"}>{email.subject || "(no subject)"}</span>
-          <span className="table-secondary" title={email.snippet}>{email.snippet}</span>
+          <span className="table-primary table-subject">{email.subject || "(no subject)"}</span>
+          <span className="table-secondary">{email.snippet}</span>
         </span>
         <span className="table-cell">
           <span className={`label list-label email-category-label label-${email.label}`}>

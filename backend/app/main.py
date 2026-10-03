@@ -24,25 +24,33 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     init_db()
     stop_event = asyncio.Event()
-    task = asyncio.create_task(renewal_loop(stop_event))
-    backfill_task = asyncio.create_task(backfill_outcomes(stop_event))
-    async def calendar_after_outcomes() -> None:
-        await backfill_task
-        await backfill_calendar_events(stop_event)
+    background_tasks: list[asyncio.Task] = []
 
-    calendar_backfill_task = asyncio.create_task(calendar_after_outcomes())
-    auto_sync_task = asyncio.create_task(auto_sync_loop(stop_event))
-    pending_reclassify_task = asyncio.create_task(start_all_pending_reclassify())
+    async def start_background() -> None:
+        renewal_task = asyncio.create_task(renewal_loop(stop_event))
+        backfill_task = asyncio.create_task(backfill_outcomes(stop_event))
+
+        async def calendar_after_outcomes() -> None:
+            await backfill_task
+            await backfill_calendar_events(stop_event)
+
+        background_tasks.extend([
+            renewal_task,
+            backfill_task,
+            asyncio.create_task(calendar_after_outcomes()),
+            asyncio.create_task(auto_sync_loop(stop_event)),
+            asyncio.create_task(start_all_pending_reclassify()),
+        ])
+
+    # Let the server accept health checks before backfill work starts.
+    asyncio.get_running_loop().call_later(1, lambda: asyncio.create_task(start_background()))
     logger.info("Auto AI Email Checker API started")
     try:
         yield
     finally:
         stop_event.set()
-        await task
-        await backfill_task
-        await calendar_backfill_task
-        await auto_sync_task
-        await pending_reclassify_task
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
 
 
 def create_app() -> FastAPI:

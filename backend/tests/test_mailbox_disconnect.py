@@ -232,3 +232,28 @@ def test_delete_emails_for_mailbox_is_scoped():
     assert db.query(EmailMessage).count() == 1
     assert db.query(EmailMessage).one().id == jordan_email.id
     db.close()
+
+
+def test_account_color_is_saved_and_listed():
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    mailbox, _ = _seed_mailbox(
+        db,
+        external_id="u1",
+        email_address="rtq199101@gmail.com",
+        provider_message_id="ryan-1",
+    )
+    mailbox_id = mailbox.id
+    db.close()
+
+    client = _client(SessionLocal)
+    missing = client.patch(f"/api/mailboxes/{mailbox_id}", json={"calendar_color": "blue"})
+    assert missing.status_code == 422
+
+    saved = client.patch(f"/api/mailboxes/{mailbox_id}", json={"calendar_color": "#E11D48"})
+    assert saved.status_code == 200
+    assert saved.json()["calendar_color"] == "#e11d48"
+
+    listed = client.get("/api/mailboxes")
+    assert listed.status_code == 200
+    assert listed.json()[0]["calendar_color"] == "#e11d48"

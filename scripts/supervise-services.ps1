@@ -20,8 +20,12 @@ $env:PATH = (Join-Path $Root ".local\postgresql\bin") + ";" + $env:PATH
 
 $backendProcess = $null
 $frontendProcess = $null
+$backendStartedAt = Get-Date
+$frontendStartedAt = Get-Date
 $backendFailures = 0
 $frontendFailures = 0
+# Calendar backfill runs before the server accepts connections.
+$startupGraceSeconds = 300
 
 function Write-SupervisorLog([string]$Message) {
     Add-Content -LiteralPath (Join-Path $Logs "supervisor.log") `
@@ -47,9 +51,11 @@ function Start-Backend {
 }
 
 function Start-Frontend {
-    Write-SupervisorLog "Starting frontend on 127.0.0.1:5173"
+    # 0.0.0.0 lets other computers on the LAN open the app; the Windows
+    # firewall rule decides which addresses may actually connect.
+    Write-SupervisorLog "Starting frontend on 0.0.0.0:5173"
     return Start-Process -FilePath $Node `
-        -ArgumentList @($Vite, "--host", "127.0.0.1", "--port", "5173", "--strictPort") `
+        -ArgumentList @($Vite, "--host", "0.0.0.0", "--port", "5173", "--strictPort") `
         -WorkingDirectory $Frontend -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput (Join-Path $Logs "frontend.log") `
         -RedirectStandardError (Join-Path $Logs "frontend-error.log")
@@ -59,12 +65,13 @@ try {
     while ($true) {
         if (-not $backendProcess -or $backendProcess.HasExited) {
             $backendProcess = Start-Backend
+            $backendStartedAt = Get-Date
             $backendFailures = 0
             Start-Sleep -Seconds 3
         }
         if (Test-Endpoint "http://127.0.0.1:8000/api/health") {
             $backendFailures = 0
-        } else {
+        } elseif (((Get-Date) - $backendStartedAt).TotalSeconds -ge $startupGraceSeconds) {
             $backendFailures++
             if ($backendFailures -ge 3) {
                 Write-SupervisorLog "Backend unhealthy; restarting PID $($backendProcess.Id)"
@@ -75,13 +82,18 @@ try {
         }
 
         if (-not $frontendProcess -or $frontendProcess.HasExited) {
-            $frontendProcess = Start-Frontend
-            $frontendFailures = 0
-            Start-Sleep -Seconds 2
+            if (Test-Endpoint "http://127.0.0.1:5173") {
+                $frontendFailures = 0
+            } else {
+                $frontendProcess = Start-Frontend
+                $frontendStartedAt = Get-Date
+                $frontendFailures = 0
+                Start-Sleep -Seconds 2
+            }
         }
         if (Test-Endpoint "http://127.0.0.1:5173") {
             $frontendFailures = 0
-        } else {
+        } elseif (((Get-Date) - $frontendStartedAt).TotalSeconds -ge $startupGraceSeconds) {
             $frontendFailures++
             if ($frontendFailures -ge 3) {
                 Write-SupervisorLog "Frontend unhealthy; restarting PID $($frontendProcess.Id)"

@@ -81,6 +81,7 @@ def _client():
                 subject="Acme offer follow up",
                 sender="jobs@other.com",
                 snippet="next steps",
+                body_text="The full message body mentions Paraform, but the preview does not.",
                 label=EmailLabel.APPLICATION_CONFIRMATION.value,
                 folder=MailFolder.INBOX.value,
             ),
@@ -154,6 +155,15 @@ def test_search_matches_sender_and_rejects_unrelated_query():
     assert empty.status_code == 200
     assert empty.json()["items"] == []
     assert empty.json()["total"] == 0
+
+
+def test_search_matches_full_message_body_across_accounts():
+    client, first_id = _client()
+    found = client.get("/api/emails", params={"q": "Paraform"})
+
+    assert found.status_code == 200
+    assert [item["subject"] for item in found.json()["items"]] == ["Acme offer follow up"]
+    assert found.json()["items"][0]["mailbox_id"] != first_id
 
 
 def test_search_keeps_folder_and_label_filters():

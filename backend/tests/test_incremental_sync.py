@@ -129,6 +129,67 @@ def test_gmail_webhook_classifies_new_messages_with_active_ai_settings(monkeypat
     engine.dispose()
 
 
+def test_gmail_webhook_failure_marks_mailbox_webhook_unhealthy(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from app.models import WebhookSubscription
+    from app.services.auto_sync import has_active_webhook
+
+    engine, db, mailbox = _mailbox(Provider.GOOGLE)
+    mailbox.sync_cursor = "100"
+    db.add(WebhookSubscription(
+        mailbox_id=mailbox.id, provider="google", external_id="watch",
+        expires_at=datetime.now(timezone.utc) + timedelta(days=3),
+        last_delivery_success_at=datetime.now(timezone.utc) - timedelta(hours=1),
+    ))
+    db.commit()
+    db.refresh(mailbox)
+    assert has_active_webhook(mailbox)
+    monkeypatch.setattr(
+        mailbox_sync, "ensure_google_access_token",
+        AsyncMock(side_effect=HTTPException(401, "Google sign-in expired or was revoked")),
+    )
+
+    with pytest.raises(HTTPException):
+        asyncio.run(mailbox_sync.process_gmail_notification(db, mailbox.email_address, "200"))
+
+    db.refresh(mailbox)
+    assert mailbox.last_sync_error == "Google sign-in expired or was revoked"
+    assert mailbox.webhook.last_delivery_error == "Google sign-in expired or was revoked"
+    assert not has_active_webhook(mailbox)
+    db.close()
+    engine.dispose()
+
+
+def test_reconnect_clears_sign_in_errors_but_keeps_other_failures():
+    from datetime import datetime, timezone
+
+    from app.models import WebhookSubscription
+    from app.services.reconnect import clear_reconnect_errors, needs_reconnect
+
+    engine, db, mailbox = _mailbox(Provider.GOOGLE)
+    expired = "401: Google sign-in expired or was revoked; reconnect this account"
+    mailbox.last_sync_error = expired
+    db.add(WebhookSubscription(
+        mailbox_id=mailbox.id, provider="google", external_id="watch",
+        last_delivery_failure_at=datetime.now(timezone.utc), last_delivery_error=expired,
+    ))
+    db.commit()
+    db.refresh(mailbox)
+    assert needs_reconnect(mailbox.last_sync_error)
+
+    clear_reconnect_errors(mailbox)
+    assert mailbox.last_sync_error is None
+    assert mailbox.webhook.last_delivery_failure_at is None
+
+    mailbox.last_sync_error = "Gmail API 503"
+    clear_reconnect_errors(mailbox)
+    assert mailbox.last_sync_error == "Gmail API 503"
+    assert not needs_reconnect("Gmail API 503")
+    db.close()
+    engine.dispose()
+
+
 def test_gmail_webhook_does_not_fall_back_to_another_mailbox(monkeypatch):
     engine, db, mailbox = _mailbox(Provider.GOOGLE)
     ensure_token = AsyncMock(return_value="token")

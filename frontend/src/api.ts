@@ -21,6 +21,7 @@ export interface Mailbox {
   provider: Provider;
   email_address: string;
   display_name: string | null;
+  calendar_color?: string | null;
   is_active: boolean;
   created_at: string | null;
 }
@@ -33,26 +34,38 @@ export interface AutoSyncStatus {
   connected_accounts: number;
   webhook_accounts: number;
   registered_webhook_accounts?: number;
+  polling_accounts?: number;
   webhook_delivery?: Record<string, {
     healthy: boolean;
     last_success_at: string | null;
     last_failure_at: string | null;
     last_error: string | null;
   }>;
+  ngrok?: {
+    state: "online" | "offline" | "mismatch";
+    public_url: string | null;
+    expected_url: string | null;
+  };
   last_check_at: string | null;
   last_error: string | null;
   problem_mailboxes: { mailbox_id: number; email_address: string; message: string }[];
-  mailboxes?: {
-    mailbox_id: number;
-    email_address: string;
-    provider: Provider;
-    state: string;
-    last_sync_started_at: string | null;
-    last_sync_completed_at: string | null;
-    last_error: string | null;
-    webhook_registered: boolean;
-    webhook_verified: boolean;
-  }[];
+  mailboxes?: AccountSyncDetail[];
+}
+
+export interface AccountSyncDetail {
+  mailbox_id: number;
+  email_address: string;
+  provider: Provider;
+  state: string;
+  last_sync_started_at: string | null;
+  last_sync_completed_at: string | null;
+  last_error: string | null;
+  needs_reconnect?: boolean;
+  webhook_registered: boolean;
+  webhook_verified: boolean;
+  sync_method?: "webhook" | "polling";
+  polling_reason?: string | null;
+  last_webhook_success_at?: string | null;
 }
 
 export interface EmailItem {
@@ -117,6 +130,16 @@ async function apiFetch(url: string, init?: RequestInit, attempts = 3): Promise<
 export async function fetchMailboxes(): Promise<Mailbox[]> {
   const res = await apiFetch(`${API_BASE}/api/mailboxes`);
   if (!res.ok) throw new Error(await readApiError(res, "Failed to load mailboxes"));
+  return res.json();
+}
+
+export async function updateMailboxColor(id: number, calendarColor: string): Promise<Mailbox> {
+  const res = await apiFetch(`${API_BASE}/api/mailboxes/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ calendar_color: calendarColor }),
+  });
+  if (!res.ok) throw new Error(await readApiError(res, "Failed to save account color"));
   return res.json();
 }
 
@@ -431,6 +454,7 @@ export interface AiStatus {
   provider: "openai" | "gemini" | "ollama";
   model: string;
   ready: boolean;
+  reason?: string | null;
 }
 
 export async function fetchAiStatus(): Promise<AiStatus> {

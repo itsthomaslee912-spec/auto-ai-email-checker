@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.crypto import decrypt_token, encrypt_token
 from app.models import MailboxConnection, Provider, User
+from app.services.reconnect import clear_reconnect_errors
 
 MS_SCOPES = [
     "openid",
@@ -77,6 +78,15 @@ async def refresh_microsoft_access_token(refresh_token: str) -> dict:
             },
         )
         if resp.status_code >= 400:
+            try:
+                error = resp.json().get("error")
+            except ValueError:
+                error = None
+            if error == "invalid_grant":
+                raise HTTPException(
+                    status_code=401,
+                    detail="Microsoft sign-in expired or was revoked; reconnect this account",
+                )
             raise HTTPException(status_code=400, detail=f"Microsoft token refresh failed: {resp.text}")
         return resp.json()
 
@@ -138,6 +148,7 @@ def upsert_microsoft_mailbox(
         mailbox.refresh_token_enc = encrypt_token(refresh_token)
     mailbox.token_expires_at = expires_at
     mailbox.is_active = True
+    clear_reconnect_errors(mailbox)
     db.commit()
     db.refresh(mailbox)
     return mailbox

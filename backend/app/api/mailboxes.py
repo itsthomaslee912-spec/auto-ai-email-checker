@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
@@ -20,6 +21,7 @@ from app.realtime.sse import publish
 from app.schemas import (
     LabelTimelineOut,
     LabelTimelineBucketOut,
+    MailboxColorIn,
     MailboxLabelStatsOut,
     MailboxOut,
     MailboxOutcomesOut,
@@ -28,6 +30,7 @@ from app.schemas import (
 from app.services.mailbox_cleanup import delete_emails_for_mailbox
 
 router = APIRouter(prefix="/api/mailboxes", tags=["mailboxes"])
+_ACCOUNT_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 TIMELINE_LABELS = frozenset(item.value for item in EmailLabel)
 _HOUR_SPAN = timedelta(hours=36)
@@ -119,6 +122,28 @@ def list_mailboxes(db: Session = Depends(get_db)) -> list[MailboxConnection]:
         .order_by(MailboxConnection.created_at.desc())
         .all()
     )
+
+
+@router.patch("/{mailbox_id}", response_model=MailboxOut)
+def update_mailbox_color(
+    mailbox_id: int,
+    payload: MailboxColorIn,
+    db: Session = Depends(get_db),
+) -> MailboxConnection:
+    mailbox = (
+        db.query(MailboxConnection)
+        .filter(MailboxConnection.id == mailbox_id, MailboxConnection.is_active.is_(True))
+        .one_or_none()
+    )
+    if mailbox is None:
+        raise HTTPException(status_code=404, detail="Email account not found")
+    color = payload.calendar_color.strip()
+    if _ACCOUNT_COLOR_RE.fullmatch(color) is None:
+        raise HTTPException(status_code=422, detail="Account color must be a hex color like #1d9bf0")
+    mailbox.calendar_color = color.lower()
+    db.commit()
+    db.refresh(mailbox)
+    return mailbox
 
 
 @router.get("/label-stats", response_model=MailboxLabelStatsOut)

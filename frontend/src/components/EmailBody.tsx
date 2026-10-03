@@ -120,7 +120,7 @@ export default function EmailBody({ html, text, snippet }: Props) {
       <div className="email-body-scroll">
         <iframe
           className="email-body-frame"
-          title="Email body"
+          aria-label="Email body"
           sandbox=""
           srcDoc={buildHtmlDocument(htmlToRender)}
         />

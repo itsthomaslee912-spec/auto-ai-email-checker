@@ -13,38 +13,55 @@ logger = logging.getLogger(__name__)
 
 async def backfill_calendar_events(stop_event: asyncio.Event) -> None:
     """Extract calendar records for relevant stored mail without blocking startup."""
+    def load_email_ids() -> list[int]:
+        lookup = SessionLocal()
+        try:
+            return [
+                row[0]
+                for row in lookup.query(EmailMessage.id)
+                .filter(EmailMessage.label.in_(CALENDAR_LABELS))
+                .order_by(EmailMessage.received_at.asc(), EmailMessage.id.asc())
+                .all()
+            ]
+        finally:
+            lookup.close()
+
+    email_ids = await asyncio.to_thread(load_email_ids)
     db = SessionLocal()
-    changed_mailboxes: set[int] = set()
+    pending_mailboxes: set[int] = set()
+
+    async def publish_pending() -> None:
+        for mailbox_id in list(pending_mailboxes):
+            await publish("calendar.changed", {"action": "backfilled", "mailbox_id": mailbox_id})
+        pending_mailboxes.clear()
+
     try:
-        rows = (
-            db.query(EmailMessage)
-            .filter(EmailMessage.label.in_(CALENDAR_LABELS))
-            .order_by(EmailMessage.received_at.asc(), EmailMessage.id.asc())
-            .all()
-        )
-        for index, email in enumerate(rows):
+        for index, email_id in enumerate(email_ids):
+            email = db.get(EmailMessage, email_id)
             if stop_event.is_set():
                 break
+            if email is None:
+                continue
             try:
                 if email.calendar_processed_hash == email_calendar_hash(email):
                     if needs_calendar_event_repair(db, email):
                         if await process_calendar_email(db, email, force=True, use_ai=False):
-                            changed_mailboxes.add(email.mailbox_id)
+                            pending_mailboxes.add(email.mailbox_id)
                         db.commit()
                         continue
                     if refresh_calendar_event_details(db, email):
-                        changed_mailboxes.add(email.mailbox_id)
+                        pending_mailboxes.add(email.mailbox_id)
                         db.commit()
                     continue
                 if await process_calendar_email(db, email):
-                    changed_mailboxes.add(email.mailbox_id)
+                    pending_mailboxes.add(email.mailbox_id)
                 db.commit()
             except Exception:
                 db.rollback()
                 logger.exception("Calendar backfill failed email_id=%s", email.id)
-            if index % 20 == 0:
+            if index % 5 == 0:
+                await publish_pending()
                 await asyncio.sleep(0)
     finally:
         db.close()
-    for mailbox_id in changed_mailboxes:
-        await publish("calendar.changed", {"action": "backfilled", "mailbox_id": mailbox_id})
+    await publish_pending()

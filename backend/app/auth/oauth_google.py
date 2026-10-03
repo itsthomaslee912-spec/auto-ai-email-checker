@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.crypto import decrypt_token, encrypt_token
 from app.models import MailboxConnection, Provider, User
+from app.services.reconnect import clear_reconnect_errors
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -72,6 +73,18 @@ async def refresh_google_access_token(refresh_token: str) -> dict:
             },
         )
         if resp.status_code >= 400:
+            try:
+                error = resp.json().get("error")
+            except ValueError:
+                error = None
+            if error == "invalid_grant":
+                raise HTTPException(
+                    status_code=401,
+                    detail=(
+                        "Google sign-in expired or was revoked; reconnect this account "
+                        "(apps in OAuth 'Testing' mode lose access after 7 days)"
+                    ),
+                )
             raise HTTPException(status_code=400, detail=f"Google token refresh failed: {resp.text}")
         return resp.json()
 
@@ -133,6 +146,7 @@ def upsert_google_mailbox(
         mailbox.refresh_token_enc = encrypt_token(refresh_token)
     mailbox.token_expires_at = expires_at
     mailbox.is_active = True
+    clear_reconnect_errors(mailbox)
     db.commit()
     db.refresh(mailbox)
     return mailbox

@@ -10,6 +10,8 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.models import MailboxConnection
 from app.services.mailbox_sync import get_sync_status, start_mailbox_sync
+from app.services.ngrok_status import get_ngrok_status
+from app.services.reconnect import needs_reconnect
 from app.services.webhook_health import (
     webhook_delivery_status,
 )
@@ -19,6 +21,7 @@ logger = logging.getLogger(__name__)
 _loop_running = False
 _last_check_at: datetime | None = None
 _last_error: str | None = None
+_polling_reasons: dict[int, str | None] = {}
 
 
 def has_registered_webhook(mailbox: MailboxConnection, now: datetime | None = None) -> bool:
@@ -48,6 +51,39 @@ def has_active_webhook(mailbox: MailboxConnection, now: datetime | None = None) 
     return persisted_healthy
 
 
+def tunnel_problem(ngrok: dict | None) -> str | None:
+    """Return why the ngrok tunnel cannot deliver webhooks, if the app relies on ngrok."""
+    if not ngrok or "ngrok" not in str(ngrok.get("expected_url") or "").lower():
+        return None
+    if ngrok.get("state") == "offline":
+        return "ngrok is not running, so webhooks cannot reach this app"
+    if ngrok.get("state") == "mismatch":
+        return "ngrok is serving a different address than the configured webhook URL"
+    return None
+
+
+def polling_reason(
+    mailbox: MailboxConnection, ngrok: dict | None = None, now: datetime | None = None,
+) -> str | None:
+    """Return why this mailbox needs polling, or None when its webhook is delivering mail."""
+    now = now or datetime.now(timezone.utc)
+    if not has_registered_webhook(mailbox, now):
+        return "Webhook is not registered or has expired"
+    problem = tunnel_problem(ngrok)
+    if problem:
+        return problem
+    webhook = mailbox.webhook
+    if not has_active_webhook(mailbox, now):
+        if webhook.last_delivery_failure_at:
+            return f"Webhook delivery failed: {webhook.last_delivery_error or 'unknown error'}"
+        return "Webhook has not delivered mail yet"
+    quiet_seconds = max(60, getattr(get_settings(), "webhook_quiet_seconds", 1800))
+    success = as_utc(webhook.last_delivery_success_at)
+    if now - success > timedelta(seconds=quiet_seconds):
+        return f"No webhook delivery in the last {quiet_seconds // 60} minutes"
+    return None
+
+
 def _provider_delivery_status(provider: str, mailboxes: list[MailboxConnection]) -> dict:
     status = webhook_delivery_status(provider)
     success = datetime.fromisoformat(status["last_success_at"]) if status["last_success_at"] else None
@@ -74,19 +110,26 @@ def _provider_delivery_status(provider: str, mailboxes: list[MailboxConnection])
 
 
 async def poll_active_mailboxes() -> int:
-    """Reconcile every active mailbox; webhooks remain the low-latency path.
+    """Poll only accounts whose webhook is not delivering mail.
 
-    A webhook cannot report that a notification never arrived. Incremental
-    polling is therefore the safety net that closes gaps caused by a tunnel,
-    subscription, or provider delivery outage.
+    A working webhook is the sync path. Polling stays off for an account while
+    its subscription is current, the ngrok tunnel is up, and it delivered
+    recently. It turns on when the webhook is missing, expired, failing, has
+    never delivered, has gone quiet, or the tunnel is down.
     """
+    ngrok = await asyncio.to_thread(get_ngrok_status)
+    mailbox_ids = []
     with SessionLocal() as db:
-        mailbox_ids = [
-            mailbox.id
-            for mailbox in db.query(MailboxConnection)
-            .filter(MailboxConnection.is_active.is_(True))
-            .all()
-        ]
+        for mailbox in db.query(MailboxConnection).filter(MailboxConnection.is_active.is_(True)).all():
+            reason = polling_reason(mailbox, ngrok)
+            if reason != _polling_reasons.get(mailbox.id):
+                if reason:
+                    logger.info("Polling mailbox %s: %s", mailbox.id, reason)
+                else:
+                    logger.info("Mailbox %s is back on webhook delivery", mailbox.id)
+                _polling_reasons[mailbox.id] = reason
+            if reason and not needs_reconnect(mailbox.last_sync_error):
+                mailbox_ids.append(mailbox.id)
 
     limit = max(1, get_settings().auto_sync_max_messages)
     errors = 0
@@ -104,10 +147,12 @@ async def poll_active_mailboxes() -> int:
 def get_auto_sync_status(db: Session) -> dict:
     interval = max(30, get_settings().auto_sync_interval_seconds)
     mailboxes = db.query(MailboxConnection).filter(MailboxConnection.is_active.is_(True)).all()
+    ngrok = get_ngrok_status()
     problems = []
     syncing = False
     webhook_accounts = 0
     registered_webhook_accounts = 0
+    polling_accounts = 0
     mailbox_statuses = []
     for mailbox in mailboxes:
         if has_registered_webhook(mailbox):
@@ -115,6 +160,9 @@ def get_auto_sync_status(db: Session) -> dict:
         webhook_verified = has_active_webhook(mailbox)
         if webhook_verified:
             webhook_accounts += 1
+        reason = polling_reason(mailbox, ngrok)
+        if reason:
+            polling_accounts += 1
         job = get_sync_status(mailbox.id)
         if job["state"] == "running":
             syncing = True
@@ -144,8 +192,17 @@ def get_auto_sync_status(db: Session) -> dict:
                 if mailbox.last_sync_completed_at else None
             ),
             "last_error": mailbox.last_sync_error,
+            "needs_reconnect": needs_reconnect(mailbox.last_sync_error)
+            or (job["state"] == "error" and needs_reconnect(job.get("message"))),
             "webhook_registered": has_registered_webhook(mailbox),
             "webhook_verified": webhook_verified,
+            "sync_method": "polling" if reason else "webhook",
+            "polling_reason": reason,
+            "last_webhook_success_at": (
+                as_utc(mailbox.webhook.last_delivery_success_at).isoformat()
+                if mailbox.webhook and mailbox.webhook.last_delivery_success_at
+                else None
+            ),
         })
 
     recent = _last_check_at is not None and datetime.now(timezone.utc) - _last_check_at < timedelta(seconds=interval * 2)
@@ -169,7 +226,9 @@ def get_auto_sync_status(db: Session) -> dict:
         "connected_accounts": len(mailboxes),
         "webhook_accounts": webhook_accounts,
         "registered_webhook_accounts": registered_webhook_accounts,
+        "polling_accounts": polling_accounts,
         "webhook_delivery": provider_delivery,
+        "ngrok": ngrok,
         "last_check_at": _last_check_at.isoformat() if _last_check_at else None,
         "last_error": _last_error,
         "problem_mailboxes": problems,

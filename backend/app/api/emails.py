@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import base64
 from datetime import datetime, timezone
@@ -7,7 +8,7 @@ from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy import and_, func, or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.auth.oauth_google import ensure_google_access_token
 from app.classify.outcome_extract import OUTCOME_LABELS, apply_outcome
@@ -46,6 +47,7 @@ from app.schemas import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/emails", tags=["emails"])
+_label_effect_locks: dict[int, asyncio.Lock] = {}
 
 InboxTypeLiteral = Literal["default", "unread_first"]
 InterviewSubtypeLiteral = Literal[
@@ -69,6 +71,7 @@ def _search_filter(query: str):
         EmailMessage.subject,
         EmailMessage.sender,
         EmailMessage.snippet,
+        EmailMessage.body_text,
         EmailMessage.company,
         EmailMessage.job_role,
     )
@@ -385,10 +388,49 @@ async def get_email(
 TRAINING_BODY_CAP = 4000
 
 
-@router.patch("/{email_id}/label", response_model=EmailDetailOut)
+async def _apply_label_side_effects(email_id: int, previous_label: str, new_label: str, bind) -> None:
+    """Extract company and role, then update the calendar, after the label is saved.
+
+    The category request returns as soon as the label is stored. These steps call
+    the model and rebuild that mailbox's calendar, so they must not hold the dropdown.
+    """
+    lock = _label_effect_locks.setdefault(email_id, asyncio.Lock())
+    async with lock:
+        db = sessionmaker(bind=bind)()
+        try:
+            email = db.query(EmailMessage).filter(EmailMessage.id == email_id).one_or_none()
+            if email is None or email.label != new_label:
+                return
+            if previous_label != new_label and new_label in OUTCOME_LABELS:
+                if await apply_outcome(db, email, force=True):
+                    db.commit()
+            db.refresh(email)
+            if email.label != new_label:
+                return
+            calendar_changed = False
+            if previous_label in CALENDAR_LABELS or new_label in CALENDAR_LABELS:
+                if email.label in CALENDAR_LABELS:
+                    calendar_changed = await process_calendar_email(db, email, force=True)
+                else:
+                    sourced = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == email.id).all()
+                    for event in sourced:
+                        event.is_visible = False
+                    calendar_changed = bool(sourced)
+                db.commit()
+            if calendar_changed:
+                await publish("calendar.changed", {"action": "reclassified", "mailbox_id": email.mailbox_id})
+        except Exception:
+            logger.exception("Label side effects failed email_id=%s", email_id)
+            db.rollback()
+        finally:
+            db.close()
+
+
+@router.patch("/{email_id}/label", response_model=EmailOut)
 async def update_email_label(
     email_id: int,
     payload: EmailLabelUpdateIn,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> EmailMessage:
     email = _email_from_active_mailbox(db, email_id)
@@ -427,29 +469,22 @@ async def update_email_label(
     db.commit()
     db.refresh(email)
 
-    if previous_label != new_label and new_label in OUTCOME_LABELS:
-        if await apply_outcome(db, email, force=True):
-            db.commit()
-            db.refresh(email)
-
-    calendar_changed = False
-    if previous_label in CALENDAR_LABELS or new_label in CALENDAR_LABELS:
-        if new_label in CALENDAR_LABELS:
-            calendar_changed = await process_calendar_email(db, email, force=True)
-        else:
-            sourced = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == email.id).all()
-            for event in sourced:
-                event.is_visible = False
-            calendar_changed = bool(sourced)
-        db.commit()
-        db.refresh(email)
+    needs_follow_up = (previous_label != new_label and new_label in OUTCOME_LABELS) or (
+        previous_label in CALENDAR_LABELS or new_label in CALENDAR_LABELS
+    )
+    if needs_follow_up:
+        background_tasks.add_task(
+            _apply_label_side_effects,
+            email.id,
+            previous_label,
+            new_label,
+            db.get_bind(),
+        )
 
     payload_out = EmailOut.model_validate(email).model_dump()
     payload_out["previous_label"] = previous_label
     payload_out["updated"] = previous_label != new_label
     await publish("email.classified", payload_out)
-    if calendar_changed:
-        await publish("calendar.changed", {"action": "reclassified", "mailbox_id": email.mailbox_id})
     return email
 
 

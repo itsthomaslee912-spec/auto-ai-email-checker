@@ -22,30 +22,34 @@ async def backfill_outcomes(stop_event: asyncio.Event) -> None:
 
     from app.db import SessionLocal
 
-    db = SessionLocal()
-    try:
-        rows = (
-            db.query(EmailMessage)
-            .filter(
-                EmailMessage.label.in_(BACKFILL_LABELS),
-                EmailMessage.outcome_extracted.is_(False),
-            )
-            .order_by(EmailMessage.mailbox_id.asc(), EmailMessage.id.asc())
-            .all()
-        )
-        pending: dict[int, list[tuple[int, str, str, str, str]]] = defaultdict(list)
-        for row in rows:
-            pending[row.mailbox_id].append(
-                (
-                    row.id,
-                    row.subject or "",
-                    row.sender or "",
-                    row.body_text or "",
-                    row.snippet or "",
+    def load_pending() -> dict[int, list[tuple[int, str, str, str, str]]]:
+        db = SessionLocal()
+        try:
+            rows = (
+                db.query(EmailMessage)
+                .filter(
+                    EmailMessage.label.in_(BACKFILL_LABELS),
+                    EmailMessage.outcome_extracted.is_(False),
                 )
+                .order_by(EmailMessage.mailbox_id.asc(), EmailMessage.id.asc())
+                .all()
             )
-    finally:
-        db.close()
+            grouped: dict[int, list[tuple[int, str, str, str, str]]] = defaultdict(list)
+            for row in rows:
+                grouped[row.mailbox_id].append(
+                    (
+                        row.id,
+                        row.subject or "",
+                        row.sender or "",
+                        row.body_text or "",
+                        row.snippet or "",
+                    )
+                )
+            return grouped
+        finally:
+            db.close()
+
+    pending = await asyncio.to_thread(load_pending)
 
     total = sum(len(items) for items in pending.values())
     if total == 0:

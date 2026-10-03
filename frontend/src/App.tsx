@@ -4,6 +4,7 @@ import EmailBody from "./components/EmailBody";
 import CompactSelect from "./components/CompactSelect";
 import ModernDateTimePicker from "./components/ModernDateTimePicker";
 import MessageRow from "./components/MessageRow";
+import SystemAlert, { type SystemIssue } from "./components/SystemAlert";
 import SettingsPage, { type SettingsSection } from "./pages/SettingsPage";
 import CalendarPage from "./pages/CalendarPage";
 import {
@@ -18,6 +19,7 @@ import {
   fetchReclassifyStatus,
   sendEmail,
   fetchMailboxes,
+  updateMailboxColor,
   markAllRead,
   oauthStartUrl,
   syncMailbox,
@@ -37,6 +39,7 @@ import {
   type Mailbox,
   type Provider,
 } from "./api";
+import { accountColor } from "./accountColor";
 import { CLASSIFY_LABELS, CLASSIFY_LABEL_TITLES, EMPTY_LABEL_COUNTS, INTERVIEW_SUBTYPE_TITLES } from "./labels";
 import {
   applyFontFamily,
@@ -75,6 +78,7 @@ const READER_MIN = 280;
 const LIST_HEIGHT_MIN = 180;
 const READER_HEIGHT_MIN = 240;
 const ACCOUNTS_W_KEY = "email-checker-accounts-w";
+const SIDEBAR_COLLAPSED_KEY = "email-checker-sidebar-collapsed";
 const LIST_W_KEY = "email-checker-list-w";
 const LIST_H_KEY = "email-checker-list-h";
 const ACCOUNTS_ORDER_KEY = "email-checker-accounts-order";
@@ -309,6 +313,11 @@ export default function App() {
   const [autoSyncStatus, setAutoSyncStatus] = useState<AutoSyncStatus | null>(null);
   const [autoSyncOffline, setAutoSyncOffline] = useState(false);
   const [banner, setBanner] = useState<string | null>(null);
+  const [stableIssueKey, setStableIssueKey] = useState("");
+  const [dismissedIssueKey, setDismissedIssueKey] = useState(
+    () => sessionStorage.getItem("systemAlertDismissed") ?? "",
+  );
+  const [recheckingStatus, setRecheckingStatus] = useState(false);
 
   const [connectEmail, setConnectEmail] = useState("");
   const [connectProvider, setConnectProvider] = useState<Provider>("google");
@@ -354,6 +363,9 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("appearance");
   const [sidebarSections, setSidebarSections] = useState({ inbox: true, categories: true, sent: false, spam: false, trash: false, archive: false });
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try { return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1"; } catch { return false; }
+  });
   const [resizing, setResizing] = useState<"accounts" | "list" | null>(null);
   const [replyOpen, setReplyOpen] = useState(false);
   const [replyText, setReplyText] = useState("");
@@ -1185,6 +1197,15 @@ export default function App() {
     window.location.href = oauthStartUrl(provider, { email });
   }
 
+  function onReconnect(id: number) {
+    const mailbox = mailboxById.get(id);
+    if (!mailbox) return;
+    window.location.href = oauthStartUrl(mailbox.provider, {
+      email: mailbox.email_address,
+      name: mailbox.display_name ?? undefined,
+    });
+  }
+
   function onConnectEmailSubmit(event: FormEvent) {
     event.preventDefault();
     connectWithEmail();
@@ -1203,6 +1224,14 @@ export default function App() {
     }
     if (selectedMailboxId === id) setSelectedMailboxId(null);
     await load();
+  }
+
+  function onAccountColor(id: number, calendarColor: string) {
+    const previous = mailboxes.find((box) => box.id === id)?.calendar_color ?? null;
+    setMailboxes((current) => current.map((box) => box.id === id ? { ...box, calendar_color: calendarColor } : box));
+    void updateMailboxColor(id, calendarColor).catch(() => {
+      setMailboxes((current) => current.map((box) => box.id === id ? { ...box, calendar_color: previous } : box));
+    });
   }
 
   async function onSync(id: number, selectAccount = true) {
@@ -1635,20 +1664,14 @@ export default function App() {
       ? aiReady ? "Gemini on" : "Gemini not configured"
       : aiReady ? "OpenAI on" : "AI not configured";
   const aiTitle = aiStatus?.model ? `${aiLabel} · ${aiStatus.model}` : aiLabel;
-  const aiTooltip = aiStatus?.provider === "ollama"
-    ? aiReady
-      ? `Local AI is ready · ${aiStatus.model}`
-      : `Local AI is unavailable · ${aiStatus.model}. Check the Ollama server in AI settings.`
-    : aiStatus?.provider === "gemini"
-      ? aiReady
-        ? `Gemini is ready · ${aiStatus.model}`
-        : `Gemini is not configured · ${aiStatus.model}. Add an API key in AI settings.`
-    : aiReady
-      ? "OpenAI is ready."
-      : "AI is not configured. Add a provider in AI settings.";
   const emailSyncState = syncingIds.size > 0 ? "syncing" : autoSyncOffline ? "offline" : autoSyncStatus?.state ?? "loading";
   const completedSyncTimes = (autoSyncStatus?.mailboxes ?? [])
-    .map((mailbox) => mailbox.last_sync_completed_at ? Date.parse(mailbox.last_sync_completed_at) : Number.NaN)
+    .map((mailbox) => {
+      const times = [mailbox.last_sync_completed_at, mailbox.webhook_verified ? mailbox.last_webhook_success_at : null]
+        .map((value) => value ? Date.parse(value) : Number.NaN)
+        .filter(Number.isFinite);
+      return times.length ? Math.max(...times) : Number.NaN;
+    })
     .filter(Number.isFinite);
   const oldestCompletedSync = completedSyncTimes.length === (autoSyncStatus?.connected_accounts ?? 0)
     && completedSyncTimes.length > 0
@@ -1664,14 +1687,141 @@ export default function App() {
         if (minutes < 60) return `Checked ${minutes}m ago`;
         return `Checked ${Math.floor(minutes / 60)}h ago`;
       })();
-  const registeredWebhookAccounts = autoSyncStatus?.registered_webhook_accounts ?? 0;
-  const emailSyncMethod = !autoSyncStatus || autoSyncStatus.connected_accounts === 0
+  const connectedAccounts = autoSyncStatus?.connected_accounts ?? 0;
+  const pollingAccounts = autoSyncStatus?.polling_accounts
+    ?? connectedAccounts - (autoSyncStatus?.webhook_accounts ?? 0);
+  const accountSyncDetails = Object.fromEntries(
+    (autoSyncStatus?.mailboxes ?? []).map((mailbox) => [mailbox.mailbox_id, mailbox]),
+  );
+
+  const systemIssues: SystemIssue[] = [];
+  const recheckStatus = async () => {
+    setRecheckingStatus(true);
+    try {
+      await Promise.all([refreshAutoSyncStatus(), refreshAiStatus()]);
+    } finally {
+      setRecheckingStatus(false);
+    }
+  };
+  if (autoSyncOffline && aiStatusOffline) {
+    systemIssues.push({
+      id: "service-offline",
+      kind: "service",
+      severity: "error",
+      title: "The app's background service is not responding",
+      detail: "Email sync and AI classification are both unavailable. Make sure the backend is running, then check again.",
+    });
+  } else {
+    if (autoSyncOffline) {
+      systemIssues.push({
+        id: "sync-offline",
+        kind: "sync",
+        severity: "error",
+        title: "Can't reach the email sync service",
+        detail: "New mail isn't being downloaded. Make sure the backend is running, then check again.",
+      });
+    } else if (autoSyncStatus) {
+      const syncMailboxes = autoSyncStatus.mailboxes ?? [];
+      const expired = syncMailboxes.filter((mailbox) => mailbox.needs_reconnect);
+      if (expired.length) {
+        systemIssues.push({
+          id: `sync-reconnect-${expired.map((mailbox) => mailbox.mailbox_id).join(",")}`,
+          kind: "sync",
+          severity: "error",
+          title: expired.length === 1 ? "An account's sign-in expired" : `${expired.length} accounts' sign-ins expired`,
+          detail: "These accounts stopped syncing. Reconnect each one to sign in again — your stored emails are kept.",
+          items: expired.map((mailbox) => ({
+            id: String(mailbox.mailbox_id),
+            label: mailbox.email_address,
+            note: mailbox.provider === "google" ? "Gmail" : "Outlook",
+            action: { label: "Reconnect", onClick: () => onReconnect(mailbox.mailbox_id), primary: true },
+          })),
+        });
+      }
+      const expiredIds = new Set(expired.map((mailbox) => mailbox.mailbox_id));
+      const failing = autoSyncStatus.problem_mailboxes.filter((problem) => !expiredIds.has(problem.mailbox_id));
+      if (failing.length) {
+        systemIssues.push({
+          id: `sync-failed-${failing.map((problem) => problem.mailbox_id).join(",")}`,
+          kind: "sync",
+          severity: "error",
+          title: failing.length === 1 ? "An account failed to sync" : `${failing.length} accounts failed to sync`,
+          detail: "The app will keep retrying automatically. You can also try syncing now.",
+          items: failing.map((problem) => ({
+            id: String(problem.mailbox_id),
+            label: problem.email_address,
+            note: problem.message,
+            action: { label: "Sync now", onClick: () => void onSync(problem.mailbox_id, false) },
+          })),
+        });
+      }
+      if (autoSyncStatus.state === "stopped" && autoSyncStatus.connected_accounts > 0) {
+        systemIssues.push({
+          id: "sync-stopped",
+          kind: "sync",
+          severity: "warning",
+          title: "Automatic email sync is paused",
+          detail: "The background sync hasn't run recently, so new mail may be missing. Restarting the backend usually fixes this.",
+        });
+      }
+    }
+    if (aiStatusOffline) {
+      systemIssues.push({
+        id: "ai-offline",
+        kind: "ai",
+        severity: "error",
+        title: "Can't check the AI model",
+        detail: "New emails won't be classified until the AI service responds.",
+        actions: [{ label: "Open AI settings", onClick: () => openSettings("ai") }],
+      });
+    } else if (aiStatus && !aiStatus.ready) {
+      const providerName = aiStatus.provider === "ollama" ? "Local AI (Ollama)" : aiStatus.provider === "gemini" ? "Gemini" : "OpenAI";
+      systemIssues.push({
+        id: `ai-not-ready-${aiStatus.provider}-${aiStatus.model}`,
+        kind: "ai",
+        severity: "error",
+        title: `${providerName} isn't ready`,
+        detail: `${aiStatus.reason ?? `The model ${aiStatus.model} can't be used right now.`} New emails won't be classified until this is fixed.`,
+        actions: [{ label: "Open AI settings", onClick: () => openSettings("ai"), primary: true }],
+      });
+    }
+  }
+  const issueKey = systemIssues.map((issue) => issue.id).join("|");
+  useEffect(() => {
+    if (!issueKey) {
+      setStableIssueKey("");
+      return;
+    }
+    const timer = window.setTimeout(() => setStableIssueKey(issueKey), 5_000);
+    return () => window.clearTimeout(timer);
+  }, [issueKey]);
+  const visibleIssues = stableIssueKey && stableIssueKey === issueKey ? systemIssues : [];
+  const systemAlertOpen = visibleIssues.length > 0 && issueKey !== dismissedIssueKey;
+  const dismissSystemAlert = useCallback(() => {
+    setDismissedIssueKey(issueKey);
+    sessionStorage.setItem("systemAlertDismissed", issueKey);
+  }, [issueKey]);
+  const reopenSystemAlert = () => {
+    setDismissedIssueKey("");
+    sessionStorage.removeItem("systemAlertDismissed");
+  };
+  const ngrokState = autoSyncStatus?.ngrok?.state ?? null;
+  const ngrokStatusLabel = ngrokState === "online" ? "ngrok on" : ngrokState === "offline" ? "ngrok off" : ngrokState === "mismatch" ? "ngrok mismatch" : null;
+  const deliveryMethod = !autoSyncStatus || autoSyncStatus.connected_accounts === 0
     ? null
-    : registeredWebhookAccounts >= autoSyncStatus.connected_accounts
-      ? "Webhook + backup"
-      : registeredWebhookAccounts > 0
-        ? "Mixed + backup"
+    : pollingAccounts <= 0
+      ? "Webhook"
+      : pollingAccounts < connectedAccounts
+        ? "Webhook + polling"
         : "Polling";
+  const emailSyncMethod = [deliveryMethod, ngrokStatusLabel].filter(Boolean).join(" · ") || null;
+  const ngrokTooltip = ngrokState === "online"
+    ? "The ngrok tunnel is up, so provider webhooks can reach this app."
+    : ngrokState === "mismatch"
+      ? "ngrok is running, but its public address is different from the webhook address configured for this app."
+      : ngrokState === "offline"
+        ? "ngrok is not running, so provider webhooks cannot reach this app."
+        : null;
   const emailSyncStatusLabel = emailSyncState === "syncing"
     ? syncingIds.size > 0
       ? `Syncing ${syncingIds.size} ${syncingIds.size === 1 ? "account" : "accounts"}`
@@ -1693,10 +1843,60 @@ export default function App() {
   const emailSyncTooltip = autoSyncOffline
     ? "The app cannot reach the email sync service."
     : autoSyncStatus?.last_error
-    ?? autoSyncStatus?.problem_mailboxes[0]?.message
     ?? (emailSyncState === "active"
-      ? `${syncAgeLabel ?? "The first sync has not completed yet"}. Webhooks deliver new mail immediately when available; polling reconciles every account every ${Math.round((autoSyncStatus?.interval_seconds ?? 120) / 60)} minute(s).`
+      ? deliveryMethod === "Webhook"
+        ? "New mail arrives through the webhook. Polling stays off while delivery is working."
+        : deliveryMethod === "Polling"
+          ? `The webhook is not delivering mail, so each account is polled every ${Math.round((autoSyncStatus?.interval_seconds ?? 120) / 60)} minute(s).`
+          : `Accounts with a working webhook stay on webhook only. The others are polled every ${Math.round((autoSyncStatus?.interval_seconds ?? 120) / 60)} minute(s).`
       : emailSyncLabel);
+  const pollMinutes = Math.max(1, Math.round((autoSyncStatus?.interval_seconds ?? 120) / 60));
+  const agoLabel = (value: string | null | undefined) => {
+    const time = value ? Date.parse(value) : Number.NaN;
+    if (!Number.isFinite(time)) return null;
+    const minutes = Math.floor(Math.max(0, Date.now() - time) / 60_000);
+    if (minutes < 1) return "just now";
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    return hours < 24 ? `${hours}h ago` : `${Math.floor(hours / 24)}d ago`;
+  };
+  const accountSyncLines = autoSyncOffline ? [] : (autoSyncStatus?.mailboxes ?? []).map((mailbox) => {
+    const synced = agoLabel(mailbox.last_sync_completed_at);
+    const syncedText = synced ? ` Last synced ${synced}.` : " Not synced yet.";
+    const error = mailbox.last_error?.replace(/^\d{3}:\s*/, "");
+    let state: string;
+    if (mailbox.needs_reconnect) {
+      state = `Not syncing — ${error ?? "the saved sign-in was rejected; reconnect this account"}`;
+    } else if (mailbox.state === "running") {
+      state = "Syncing now…";
+    } else if (error) {
+      state = `Sync failed: ${error}`;
+    } else if (mailbox.sync_method === "polling") {
+      state = `Checked every ${pollMinutes} min because: ${mailbox.polling_reason ?? "the webhook is not delivering mail"}.${syncedText}`;
+    } else {
+      state = `Live — new mail arrives instantly via webhook.${syncedText}`;
+    }
+    return `• ${mailbox.email_address}\t${state}`;
+  });
+  const emailSyncTooltipWithNgrok = [
+    `Email sync — ${emailSyncLabel}`,
+    emailSyncTooltip !== emailSyncLabel ? emailSyncTooltip : null,
+    ...accountSyncLines,
+    ngrokTooltip ? `ngrok: ${ngrokTooltip}` : null,
+    autoSyncStatus?.last_check_at ? `Last automatic check ${agoLabel(autoSyncStatus.last_check_at)}.` : null,
+  ].filter(Boolean).join("\n");
+  const aiTooltip = [
+    `AI model — ${aiStatusOffline ? "Unavailable" : aiLabel}`,
+    aiStatus ? `Provider: ${aiStatus.provider === "ollama" ? "Ollama (local)" : aiStatus.provider === "gemini" ? "Google Gemini" : "OpenAI"} · Model: ${aiStatus.model}` : null,
+    aiStatusOffline
+      ? "Can't reach the app's backend to check the AI model, so new emails can't be classified."
+      : !aiStatus
+        ? "Checking the AI model…"
+        : aiStatus.ready
+          ? "Ready — new emails are classified automatically."
+          : `Not ready: ${aiStatus.reason ?? "the selected model can't be used right now"} New emails won't be classified until this is fixed.`,
+    "Click to open AI settings.",
+  ].filter(Boolean).join("\n");
   const aiProviderLabel = aiStatus?.provider === "openai"
     ? "OpenAI"
     : aiStatus?.provider === "gemini"
@@ -1724,10 +1924,10 @@ export default function App() {
           onDragEnd={() => setDraggedAccountId(null)}
           key={`${scope}-${box.id}`}
         >
-          <button type="button" className={`sidebar-account-row ${active ? "active" : ""}`} onClick={() => selectMailboxFolder(box.id, scope)} title={box.email_address}>
-            <span className={`sidebar-account-avatar provider-${box.provider}`} style={{ "--avatar-hue": `${(box.id * 47) % 360}` } as CSSProperties}>{providerMark(box.provider)}</span>
+          <button type="button" className={`sidebar-account-row ${active ? "active" : ""}`} onClick={() => selectMailboxFolder(box.id, scope)}>
+            <span className={`sidebar-account-avatar provider-${box.provider}`} style={{ "--account-color": accountColor(box) } as CSSProperties}>{providerMark(box.provider)}</span>
             <span className="sidebar-account-email">{box.email_address}</span>
-            {showUnread && unread > 0 && <span className="sidebar-account-count" title={`${unread} unread messages`}>{unread}</span>}
+            {showUnread && unread > 0 && <span className="sidebar-account-count">{unread}</span>}
           </button>
         </div>;
       })}
@@ -1766,7 +1966,10 @@ export default function App() {
           setDialogStep("type");
           setAddAccountOpen(true);
         }}
+        onAccountColor={onAccountColor}
         onRemoveAccount={onDisconnect}
+        onReconnectAccount={onReconnect}
+        accountSyncDetails={accountSyncDetails}
         syncingIds={syncingIds}
         reclassifyingIds={reclassifyingIds}
         onSyncAccount={(id) => onSync(id, false)}
@@ -1783,22 +1986,85 @@ export default function App() {
   return (
     <div
       ref={shellRef}
-      className={`app-shell view-${viewMode} reading-${readingPane.replace("_", "-")}${activePage === "calendar" ? " calendar-open" : ""}${tableDialogOpen ? " table-dialog-open" : ""}${resizing ? ` is-resizing resizing-${resizing}` : ""}`}
+      className={`app-shell view-${viewMode} reading-${readingPane.replace("_", "-")}${activePage === "calendar" ? " calendar-open" : ""}${tableDialogOpen ? " table-dialog-open" : ""}${sidebarCollapsed ? " sidebar-collapsed" : ""}${resizing ? ` is-resizing resizing-${resizing}` : ""}`}
       style={
         {
-          "--accounts-w": `${accountsW}px`,
+          "--accounts-w": sidebarCollapsed ? "3.55rem" : `${accountsW}px`,
+          "--accounts-gap": sidebarCollapsed ? "0px" : "6px",
           "--list-w": `${listW}px`,
           "--list-h": `${listH}px`,
         } as CSSProperties
       }
     >
-      <aside className="pane-accounts" ref={accountsPaneRef}>
+      <SystemAlert
+        issues={visibleIssues}
+        open={systemAlertOpen}
+        checking={recheckingStatus}
+        onDismiss={dismissSystemAlert}
+        onReopen={reopenSystemAlert}
+        onRecheck={() => void recheckStatus()}
+      />
+      <aside className={`pane-accounts${sidebarCollapsed ? " is-collapsed" : ""}`} ref={accountsPaneRef}>
+        {sidebarCollapsed ? (
+          <nav className="sidebar-rail" aria-label="Mailbox navigation">
+            <div className="sidebar-rail-main">
+              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "all" && selectedMailboxId == null ? " active" : ""}`} aria-label="Home" title="Home" onClick={() => selectMailboxFolder(null, "all")}>
+                <SidebarIcon name="home" />
+              </button>
+              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "inbox" && selectedMailboxId == null ? " active" : ""}`} aria-label={inboxCount > 0 ? `Inbox, ${inboxCount} unread` : "Inbox"} title="Inbox" onClick={() => selectMailboxFolder(null, "inbox")}>
+                <SidebarIcon name="inbox" />
+                {inboxCount > 0 && <span className="sidebar-rail-badge">{inboxCount > 99 ? "99+" : inboxCount}</span>}
+              </button>
+              <button type="button" className={`sidebar-rail-btn${activePage === "calendar" ? " active" : ""}`} aria-label="Calendar" title="Calendar" onClick={() => setActivePage("calendar")}>
+                <SidebarIcon name="calendar" />
+              </button>
+              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && label !== "all" ? " active" : ""}`} aria-label="Categories" title="Categories" onClick={() => { setActivePage("inbox"); setSidebarSections((current) => ({ ...current, categories: true })); setSidebarCollapsed(false); try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, "0"); } catch { /* ignore */ } }}>
+                <svg className="sidebar-nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3.5h6" /><path d="M10 3.5v5.2L7 12.2h10L14 8.7V3.5" /><path d="M12 12.2v8.3" /></svg>
+              </button>
+              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "sent" && selectedMailboxId == null ? " active" : ""}`} aria-label="Sent" title="Sent" onClick={() => selectMailboxFolder(null, "sent")}>
+                <SidebarIcon name="sent" />
+              </button>
+              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "archive" && selectedMailboxId == null ? " active" : ""}`} aria-label="Archive" title="Archive" onClick={() => selectMailboxFolder(null, "archive")}>
+                <svg className="sidebar-nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3.5h7.2L19 8.2V20.5H7V3.5Z" /><path d="M14 3.5v5h5" /></svg>
+              </button>
+              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "trash" && selectedMailboxId == null ? " active" : ""}`} aria-label="Trash" title="Trash" onClick={() => selectMailboxFolder(null, "trash")}>
+                <SidebarIcon name="trash" />
+              </button>
+            </div>
+            <button
+              type="button"
+              className="sidebar-rail-btn sidebar-rail-menu"
+              aria-label="Show sidebar"
+              title="Show sidebar"
+              onClick={() => {
+                setSidebarCollapsed(false);
+                try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, "0"); } catch { /* ignore */ }
+              }}
+            >
+              <svg className="sidebar-nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
+            </button>
+          </nav>
+        ) : <>
         <div className="accounts-top">
           <div className="sidebar-brand-row">
             <button type="button" className="sidebar-brand" onClick={() => selectMailboxFolder(null, "all")} aria-label="Auto Email Check home">
               <img src="/favicon.svg" alt="" />
               <span>Auto Email Check</span>
             </button>
+            <div className="sidebar-brand-actions">
+              <button
+                type="button"
+                className="sidebar-sync-trigger"
+                aria-label="Hide sidebar"
+                title="Hide sidebar"
+                onClick={() => {
+                  setSyncMenuOpen(false);
+                  setSidebarCollapsed(true);
+                  try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, "1"); } catch { /* ignore */ }
+                }}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2" /><path d="M8 11V7.5a4 4 0 0 1 7.6-1.7" /></svg>
+              </button>
             <div className="sidebar-sync-menu" ref={syncMenuRef}>
               <button
                 type="button"
@@ -1806,7 +2072,6 @@ export default function App() {
                 aria-label="Open sync menu"
                 aria-haspopup="menu"
                 aria-expanded={syncMenuOpen}
-                title="Sync"
                 onClick={() => setSyncMenuOpen((open) => !open)}
               >
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5" /><path d="M6.1 8.2A7 7 0 0 1 18.8 7L20 12M4 12l1.2 5A7 7 0 0 0 17.9 15.8" /></svg>
@@ -1821,6 +2086,7 @@ export default function App() {
                   <span><strong>Calendar sync</strong><small>Refresh calendar events</small></span>
                 </button>
               </div>}
+            </div>
             </div>
           </div>
         </div>
@@ -1879,26 +2145,27 @@ export default function App() {
 
         <div className="sidebar-footer">
           <div className="sidebar-status-panel" aria-label="Service status">
-            <button type="button" className="sidebar-health-row" data-state={emailSyncState} title={emailSyncTooltip} aria-label={`Email sync: ${emailSyncLabel}. Open account settings`} onClick={() => openSettings("accounts")}>
+            <button type="button" className="sidebar-health-row email-sync-status" data-state={emailSyncState} data-ngrok={ngrokState ?? "unknown"} data-tooltip={emailSyncTooltipWithNgrok} data-tooltip-full data-tooltip-placement="top" aria-label={`Email sync: ${emailSyncLabel}. Open account settings`} onClick={() => openSettings("accounts")}>
               <span className="sidebar-health-dot" aria-hidden="true" />
               <span className="sidebar-health-copy">
                 <span className="sidebar-health-name">Email sync</span>
                 <span className="sidebar-health-value" role="status" aria-live="polite">
                   <span className="sidebar-health-status">{emailSyncStatusLabel}</span>
                   {emailSyncMethod && emailSyncState !== "offline" && emailSyncState !== "loading" && (
-                    <span className="sidebar-sync-method">{emailSyncMethod}</span>
+                    <span className={`sidebar-sync-method ngrok-${ngrokState ?? "unknown"}`}>{emailSyncMethod}</span>
                   )}
                 </span>
               </span>
             </button>
-            <button type="button" className="sidebar-health-row" data-state={aiReady ? "active" : "error"} title={aiTooltip} aria-label={`${aiTitle}. Open AI settings`} onClick={() => openSettings("ai")}>
+            <button type="button" className="sidebar-health-row ai-model-status" data-state={aiReady ? "active" : "error"} data-tooltip={aiTooltip} data-tooltip-full data-tooltip-placement="top" aria-label={`${aiTitle}. Open AI settings`} onClick={() => openSettings("ai")}>
               <span className="sidebar-health-dot" aria-hidden="true" />
-              <span className="sidebar-health-copy"><span className="sidebar-health-name">AI model</span><span className="sidebar-health-value" title={aiModelLabel}>{aiModelLabel}</span></span>
+              <span className="sidebar-health-copy"><span className="sidebar-health-name">AI model</span><span className="sidebar-health-value">{aiModelLabel}</span></span>
               <span className="sr-only" role="status" aria-live="polite">{aiLabel}</span>
             </button>
           </div>
           <button type="button" className="sidebar-footer-row" onClick={() => openSettings("appearance")}><SidebarIcon name="settings" /><span>Settings</span></button>
         </div>
+        </>}
       </aside>
 
       <button
@@ -1906,6 +2173,8 @@ export default function App() {
         className="pane-splitter accounts-splitter"
         role="separator"
         aria-label="Resize accounts pane"
+        aria-hidden={sidebarCollapsed}
+        tabIndex={sidebarCollapsed ? -1 : 0}
         aria-orientation="vertical"
         aria-valuenow={accountsW}
         onPointerDown={onSplitterPointerDown("accounts")}
@@ -2275,11 +2544,11 @@ export default function App() {
                   </form>
                   <footer>
                     <div className="reply-compose-actions">
-                      <div className="send-split"><button type="button" className="primary-btn" disabled={sendingReply || !replyText.trim() || !replyMailbox} onClick={() => { setScheduleAt(""); void sendReply(); }}>{sendingReply ? "Sending…" : "Send"}</button><button type="button" className="primary-btn send-menu" title="Schedule send" aria-label="Schedule send" disabled={sendingReply || !replyMailbox} onClick={() => setScheduleDialogOpen(true)}>◷</button></div>
-                      <label className="reply-attach" title="Attach files">📎 <span>Attach</span><input type="file" multiple onChange={(event) => setReplyFiles(Array.from(event.target.files ?? []))} /></label>
+                      <div className="send-split"><button type="button" className="primary-btn" disabled={sendingReply || !replyText.trim() || !replyMailbox} onClick={() => { setScheduleAt(""); void sendReply(); }}>{sendingReply ? "Sending…" : "Send"}</button><button type="button" className="primary-btn send-menu" aria-label="Schedule send" disabled={sendingReply || !replyMailbox} onClick={() => setScheduleDialogOpen(true)}>◷</button></div>
+                      <label className="reply-attach">📎 <span>Attach</span><input type="file" multiple onChange={(event) => setReplyFiles(Array.from(event.target.files ?? []))} /></label>
                       {replyFiles.length > 0 && <span>{replyFiles.map((file) => file.name).join(", ")}</span>}
                     </div>
-                    <button className="reply-delete" type="button" aria-label="Delete reply draft" title="Delete draft" onClick={() => { setReplyOpen(false); setReplyText(""); setReplyInstruction(""); setReplyFiles([]); setScheduleAt(""); }}>🗑</button>
+                    <button className="reply-delete" type="button" aria-label="Delete reply draft" onClick={() => { setReplyOpen(false); setReplyText(""); setReplyInstruction(""); setReplyFiles([]); setScheduleAt(""); }}>🗑</button>
                   </footer>
                 </section>
               )}

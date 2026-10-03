@@ -50,8 +50,13 @@ class MailboxOut(BaseModel):
     provider: ProviderLiteral
     email_address: str
     display_name: str | None = None
+    calendar_color: str | None = None
     is_active: bool
     created_at: UtcDateTime | None = None
+
+
+class MailboxColorIn(BaseModel):
+    calendar_color: str
 
 
 class EmailOut(BaseModel):

@@ -262,6 +262,55 @@ def test_outcomes_reads_stored_rows_without_calling_openai():
     assert page_body["rejected_closed"] == []
 
 
+def test_label_change_returns_before_company_extraction():
+    from fastapi import BackgroundTasks
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    box = _seed_mailbox(db, email_address="fast@example.com")
+    target = _add_email(
+        db,
+        box.id,
+        label=EmailLabel.OTHER.value,
+        received_at=datetime(2026, 8, 4, 12, 0, 0),
+        provider_message_id="fast-reject",
+        subject="Thanks for applying to DoorDash",
+    )
+    db.commit()
+    email_id = target.id
+    db.close()
+
+    recorded: list[tuple] = []
+
+    def capture(self, func, *args, **kwargs):
+        recorded.append((func, args, kwargs))
+
+    extract = AsyncMock(return_value=("DoorDash", "Software Engineer"))
+    client = _client(SessionLocal, emails.router)
+    with patch.object(BackgroundTasks, "add_task", capture), patch(
+        "app.classify.outcome_extract.extract_company_role",
+        extract,
+    ):
+        response = client.patch(
+            f"/api/emails/{email_id}/label",
+            json={"label": "rejected_closed", "save_training": False},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["label"] == "rejected_closed"
+        assert extract.await_count == 0
+        assert len(recorded) == 1
+        func, args, kwargs = recorded[0]
+        asyncio.run(func(*args, **kwargs))
+
+    assert extract.await_count == 1
+    db = SessionLocal()
+    stored = db.query(EmailMessage).filter(EmailMessage.id == email_id).one()
+    assert stored.label == EmailLabel.REJECTED_CLOSED.value
+    assert stored.company == "DoorDash"
+    assert stored.job_role == "Software Engineer"
+    db.close()
+
+
 def test_label_update_extracts_only_for_outcome_labels():
     SessionLocal = _session_factory()
     db = SessionLocal()

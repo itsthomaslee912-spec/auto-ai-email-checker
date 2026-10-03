@@ -645,6 +645,18 @@ async def _incremental_outlook(db: Session, mailbox: MailboxConnection) -> None:
     await _sync_outlook_delta(db, mailbox)
 
 
+def _record_notification_failure(db: Session, mailbox: MailboxConnection, exc: Exception) -> None:
+    """Persist a webhook processing failure so polling and status stop trusting the webhook."""
+    message = str(getattr(exc, "detail", None) or exc)[:512]
+    db.rollback()
+    now = datetime.now(timezone.utc)
+    mailbox.last_sync_error = message
+    if mailbox.webhook is not None:
+        mailbox.webhook.last_delivery_failure_at = now
+        mailbox.webhook.last_delivery_error = message
+    db.commit()
+
+
 async def process_gmail_notification(db: Session, email_address: str, history_id: str | None) -> int:
     normalized_address = (email_address or "").strip().casefold()
     candidates = (
@@ -667,6 +679,16 @@ async def process_gmail_notification(db: Session, email_address: str, history_id
         logger.warning("No Google mailbox for notification email=%s", email_address)
         return 0
 
+    try:
+        return await _process_gmail_notification_for(db, mailbox, history_id)
+    except Exception as exc:
+        _record_notification_failure(db, mailbox, exc)
+        raise
+
+
+async def _process_gmail_notification_for(
+    db: Session, mailbox: MailboxConnection, history_id: str | None,
+) -> int:
     async with _cursor_lock(mailbox.id):
         token = await ensure_google_access_token(db, mailbox)
         start_id = mailbox.sync_cursor
@@ -721,9 +743,13 @@ async def process_outlook_notification(db: Session, subscription_id: str, messag
         logger.warning("No Outlook mailbox for subscription %s", subscription_id)
         return 0
 
-    token = await ensure_microsoft_access_token(db, mailbox)
-    raw = await outlook_get_message(token, message_id)
-    raw = await outlook_attach_folder(token, raw)
+    try:
+        token = await ensure_microsoft_access_token(db, mailbox)
+        raw = await outlook_get_message(token, message_id)
+        raw = await outlook_attach_folder(token, raw)
+    except Exception as exc:
+        _record_notification_failure(db, mailbox, exc)
+        raise
     email = await ingest_normalized_message(db, mailbox, normalize_outlook_message(raw))
     mailbox.last_sync_completed_at = datetime.now(timezone.utc)
     mailbox.last_sync_error = None

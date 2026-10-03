@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import EmailBody from "../components/EmailBody";
 import CompactSelect from "../components/CompactSelect";
 import ModernDateTimePicker from "../components/ModernDateTimePicker";
+import { accountColor, accountInk, defaultAccountColor } from "../accountColor";
 import {
   createCalendarEvent,
   eventsUrl,
@@ -16,6 +17,7 @@ import {
 } from "../api";
 
 type ViewMode = "month" | "week" | "day";
+type CalendarStatusFilter = "active" | "passed" | "canceled" | "rejected" | "closed" | "available";
 
 const VIEW_OPTIONS: { value: ViewMode; label: string }[] = [
   { value: "month", label: "Month" },
@@ -23,7 +25,6 @@ const VIEW_OPTIONS: { value: ViewMode; label: string }[] = [
   { value: "day", label: "Day" },
 ];
 
-const COLORS = ["#2563eb", "#7c3aed", "#db2777", "#0891b2", "#059669", "#d97706", "#dc2626", "#4f46e5"];
 const HOURS = Array.from({ length: 24 }, (_, hour) => hour);
 const HOUR_HEIGHT = 64;
 const DAY_MINUTES = 24 * 60;
@@ -31,6 +32,15 @@ const SNAP_MINUTES = 15;
 const DEFAULT_EVENT_DURATION_MINUTES = 30;
 const VISIBLE_WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const CALENDAR_TIME_ZONE_KEY = "calendar-time-zone";
+const CALENDAR_STATUS_VIEW_KEY = "calendar-status-view";
+const CALENDAR_STATUS_FILTERS: { value: CalendarStatusFilter; label: string }[] = [
+  { value: "active", label: "Active" },
+  { value: "passed", label: "Passed" },
+  { value: "canceled", label: "Canceled" },
+  { value: "rejected", label: "Rejected" },
+  { value: "closed", label: "Closed" },
+  { value: "available", label: "Available" },
+];
 const SYSTEM_TIME_ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 const calendarMotionDelay = (duration: number) => typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? 0 : duration;
 const TIME_ZONES = (() => {
@@ -116,19 +126,33 @@ function localInput(date: Date) {
 }
 function formatWallTime(value: Date) { return new Intl.DateTimeFormat(undefined, { timeZone: "UTC", hour: "numeric", minute: "2-digit" }).format(value); }
 function formatDateTime(value: string, timeZone: string) { return new Intl.DateTimeFormat(undefined, { timeZone, month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }).format(new Date(value)); }
-function formatInterviewTimeRange(event: CalendarEvent, timeZone: string) {
-  const compactTime = (value: string) => {
-    const instant = new Date(value);
-    const minute = partsInTimeZone(instant, timeZone).minute;
-    return new Intl.DateTimeFormat("en-US", {
-      timeZone,
-      hour: "numeric",
-      ...(minute ? { minute: "2-digit" as const } : {}),
-    }).format(instant).replace(/\s/g, "").toUpperCase();
-  };
-  return `${compactTime(event.start_at)} - ${compactTime(event.end_at)}`;
+function formatClock(value: string, timeZone: string) {
+  return new Intl.DateTimeFormat("en-US", { timeZone, hour: "numeric", minute: "2-digit" }).format(new Date(value));
 }
-function accountColor(mailboxId: number) { return COLORS[Math.abs(mailboxId) % COLORS.length]; }
+function formatInterviewTimeRange(event: CalendarEvent, timeZone: string) {
+  const startInstant = new Date(event.start_at);
+  const endInstant = new Date(event.end_at);
+  const startParts = partsInTimeZone(startInstant, timeZone);
+  const endParts = partsInTimeZone(endInstant, timeZone);
+  const sameDay = startParts.year === endParts.year && startParts.month === endParts.month && startParts.day === endParts.day;
+  const start = new Intl.DateTimeFormat("en-US", { timeZone, weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(startInstant);
+  const end = sameDay
+    ? formatClock(event.end_at, timeZone)
+    : new Intl.DateTimeFormat("en-US", { timeZone, weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(endInstant);
+  return `${start} – ${end}`;
+}
+function periodTitle(anchor: Date, days: Date[], view: ViewMode) {
+  const monthName = (date: Date) => new Intl.DateTimeFormat(undefined, { timeZone: "UTC", month: "long" }).format(date);
+  if (view === "month") return { primary: monthName(anchor), secondary: String(anchor.getUTCFullYear()) };
+  const first = days[0];
+  const last = days[days.length - 1];
+  if (first.getUTCFullYear() === last.getUTCFullYear() && first.getUTCMonth() === last.getUTCMonth()) {
+    return { primary: monthName(first), secondary: String(first.getUTCFullYear()) };
+  }
+  const startLabel = new Intl.DateTimeFormat(undefined, { timeZone: "UTC", month: "short", day: "numeric" }).format(first);
+  const endLabel = new Intl.DateTimeFormat(undefined, { timeZone: "UTC", month: "short", day: "numeric", year: "numeric" }).format(last);
+  return { primary: `${startLabel} – ${endLabel}`, secondary: "" };
+}
 function overlapsDay(event: CalendarEvent, day: Date, timeZone: string) {
   const dayStart = instantForWallDate(startOfDay(day), timeZone);
   const dayEnd = instantForWallDate(addDays(startOfDay(day), 1), timeZone);
@@ -158,22 +182,94 @@ function interviewKindLabel(event: CalendarEvent): string {
   return event.kind === "availability" ? "Available interview" : "Scheduled interview";
 }
 
-function applicationStatusLabel(event: CalendarEvent): string {
-  if (event.application_status === "passed") return "Passed";
-  if (event.application_status === "position_closed") return "Position closed";
-  if (event.application_status === "rejected") return "Rejected";
-  return "Active";
+type VisibleApplicationStatus = Exclude<CalendarEvent["application_status"], "active"> | "canceled";
+
+function visibleApplicationStatus(event: CalendarEvent): VisibleApplicationStatus | null {
+  if (event.interview_status === "cancellation") return "canceled";
+  return event.application_status === "active" ? null : event.application_status;
+}
+
+function eventStatusFilter(event: CalendarEvent): CalendarStatusFilter {
+  if (event.kind !== "confirmed") return "available";
+  const outcome = visibleApplicationStatus(event);
+  if (outcome == null) return "active";
+  if (outcome === "position_closed") return "closed";
+  return outcome;
+}
+
+function loadStatusFilters(): CalendarStatusFilter[] {
+  const all = CALENDAR_STATUS_FILTERS.map((item) => item.value);
+  try {
+    const stored = localStorage.getItem(CALENDAR_STATUS_VIEW_KEY);
+    if (!stored || stored === "all") return all;
+    const parsed: unknown = stored.startsWith("[") ? JSON.parse(stored) : [stored];
+    if (!Array.isArray(parsed)) return all;
+    return [...new Set(parsed.filter((value): value is CalendarStatusFilter => all.includes(value as CalendarStatusFilter)))];
+  } catch {
+    return all;
+  }
+}
+
+function persistStatusFilters(next: CalendarStatusFilter[]) {
+  try { localStorage.setItem(CALENDAR_STATUS_VIEW_KEY, JSON.stringify(next)); }
+  catch { /* ignore unavailable storage */ }
+}
+
+type CardStatus = { key: "active" | "passed" | "rejected" | "closed" | "canceled" | "available"; label: string; className: string };
+type ConfirmableStatus = Exclude<CardStatus["key"], "available">;
+
+function cardStatus(event: CalendarEvent): CardStatus {
+  if (event.kind !== "confirmed") return { key: "available", label: "Available", className: "" };
+  if (event.interview_status === "cancellation") return { key: "canceled", label: "Canceled", className: "canceled status-canceled" };
+  if (event.application_status === "passed") return { key: "passed", label: "Passed", className: "status-passed" };
+  if (event.application_status === "rejected") return { key: "rejected", label: "Rejected", className: "status-rejected" };
+  if (event.application_status === "position_closed") return { key: "closed", label: "Closed", className: "status-position-closed" };
+  return { key: "active", label: "Active", className: "status-active" };
+}
+
+function ActiveStatusIcon() {
+  return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.2 8.3 3.1 3.1L12.8 4.6" /></svg>;
 }
 
 function ApplicationStatusIcon({ status }: { status: CalendarEvent["application_status"] }) {
   if (status === "passed") return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 12h6M6 12.2a2 2 0 0 0 4 0M4.5 10.5h7l-1-1.5V6a2.5 2.5 0 0 0-5 0v3l-1 1.5Z" /></svg>;
   if (status === "position_closed") return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 5.5h9v7h-9zM5.5 5.5V4a2.5 2.5 0 0 1 5 0v1.5M6 9h4" /></svg>;
   if (status === "rejected") return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg>;
-  return <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="4.5" /><path d="m6 8 1.3 1.3L10.5 6" /></svg>;
+  return <ActiveStatusIcon />;
 }
 
 function CanceledStatusIcon() {
   return <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.5" /><path d="m4.1 4.1 7.8 7.8" /></svg>;
+}
+
+function VisibleApplicationStatusIcon({ status }: { status: VisibleApplicationStatus }) {
+  return status === "canceled" ? <CanceledStatusIcon /> : <ApplicationStatusIcon status={status} />;
+}
+
+function messageCancelsAppointment(message: EmailDetail): boolean {
+  if (message.interview_subtype === "cancellation") return true;
+  if (/\bcancel(?:ed|led|lation)\b/i.test(message.subject || "")) return true;
+  const calendar = `${message.subject || ""}\n${message.body_text || ""}`.match(/BEGIN:VCALENDAR[\s\S]*?END:VCALENDAR/i);
+  if (!calendar) return false;
+  return /^METHOD:CANCEL\b/im.test(calendar[0]) || /^STATUS:CANCELLED\b/im.test(calendar[0]);
+}
+
+function emailInterviewStatus(message: EmailDetail): { key: ConfirmableStatus; label: string; className: string } | null {
+  if (messageCancelsAppointment(message)) return { key: "canceled", label: "Canceled", className: "status-canceled" };
+  const text = `${message.subject || ""} ${message.snippet || ""} ${message.body_text || ""}`;
+  if (message.label === "rejected_closed") {
+    const closed = ["position has been closed", "role has been closed", "position is no longer available", "job has been filled"].some((pattern) => text.toLowerCase().includes(pattern));
+    return closed
+      ? { key: "closed", label: "Closed", className: "status-position-closed" }
+      : { key: "rejected", label: "Rejected", className: "status-rejected" };
+  }
+  if (message.label === "offer") return { key: "passed", label: "Passed", className: "status-passed" };
+  if (message.label === "interview_follow_up") {
+    const passed = /\byou (?:have )?passed\b|\bsuccessfully (?:passed|cleared)\b|\b(?:move|moving|advance|advancing) (?:you )?(?:forward|to the next)\b|\b(?:invite|inviting) you to (?:the )?next (?:round|stage)\b|\b(?:pleased|happy|excited) to (?:move|invite|advance) you\b|\bcongratulations\b.{0,120}\bnext (?:round|stage)\b/i.test(text);
+    return passed ? { key: "passed", label: "Passed", className: "status-passed" } : null;
+  }
+  if (message.label === "interview_scheduled") return { key: "active", label: "Active", className: "status-active" };
+  return null;
 }
 
 function interviewType(event: CalendarEvent): { type: CalendarEvent["meeting_type"]; label: string } {
@@ -406,18 +502,16 @@ function layoutTimedEvents(events: CalendarEvent[], day: Date, hourHeight: numbe
   }));
 }
 
-function EventCard({ event, timeZone, compact, timed, position, selected, activeHoverId, onHoverActivate, onHoverDeactivate, onSelect }: { event: CalendarEvent; timeZone: string; compact?: boolean; timed?: boolean; position?: React.CSSProperties; selected?: boolean; activeHoverId: string | null; onHoverActivate: (hoverId: string) => void; onHoverDeactivate: (hoverId: string) => void; onSelect: (event: CalendarEvent) => void }) {
+function EventCard({ event, color, timeZone, compact, timed, position, selected, activeHoverId, onHoverActivate, onHoverDeactivate, onSelect }: { event: CalendarEvent; color: string; timeZone: string; compact?: boolean; timed?: boolean; position?: React.CSSProperties; selected?: boolean; activeHoverId: string | null; onHoverActivate: (hoverId: string) => void; onHoverDeactivate: (hoverId: string) => void; onSelect: (event: CalendarEvent) => void }) {
   const eventRef = useRef<HTMLDivElement>(null);
   const hoverId = useId();
   const [hoverPosition, setHoverPosition] = useState<{ left: number; top: number; above: boolean } | null>(null);
   const [hoverVisible, setHoverVisible] = useState(false);
   const hoverHideTimer = useRef<number | null>(null);
   const hoverFrame = useRef<number | null>(null);
-  const color = accountColor(event.mailbox_id);
-  const canceled = event.interview_status === "cancellation";
-  const outcome = event.application_status !== "active" ? event.application_status : null;
-  const outcomeClass = outcome ? `status-${outcome.replaceAll("_", "-")}` : "";
-  const outcomeLabel = applicationStatusLabel(event);
+  const status = cardStatus(event);
+  const outcome = visibleApplicationStatus(event);
+  const outcomeLabel = status.key === "available" ? null : status.label;
   const type = interviewType(event);
   const durationMinutes = Math.max(0, (new Date(event.end_at).getTime() - new Date(event.start_at).getTime()) / 60000);
   const getHoverPosition = useCallback(() => {
@@ -484,8 +578,8 @@ function EventCard({ event, timeZone, compact, timed, position, selected, active
   return <>
     <div
     ref={eventRef}
-    className={`calendar-event ${event.kind} ${canceled ? "canceled" : ""} ${outcomeClass} ${compact ? "compact" : ""} ${timed ? "timed" : ""} ${selected ? "selected" : ""} has-meeting-type ${outcome ? "has-outcome" : ""} ${timed && durationMinutes <= 30 ? "very-short" : timed && durationMinutes < 60 ? "short" : ""}`}
-    style={{ "--account-color": color, ...position } as React.CSSProperties}
+    className={`calendar-event ${event.kind} ${status.className} ${compact ? "compact" : ""} ${timed ? "timed" : ""} ${selected ? "selected" : ""} has-meeting-type ${status.key !== "available" && status.key !== "active" ? "has-status" : ""} ${timed && durationMinutes <= 30 ? "very-short" : timed && durationMinutes < 60 ? "short" : ""}`}
+    style={{ "--account-color": color, "--event-ink": accountInk(color), ...position } as React.CSSProperties}
     onPointerDown={(e) => e.stopPropagation()}
     onClick={(e) => { e.stopPropagation(); selectEvent(); }}
     onKeyDown={(e) => { if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); e.stopPropagation(); selectEvent(); } }}
@@ -496,13 +590,14 @@ function EventCard({ event, timeZone, compact, timed, position, selected, active
     role="button"
     tabIndex={0}
     aria-pressed={selected}
-    aria-label={`${interviewKindLabel(event)}, ${event.company || "Company not specified"}, ${type.label}, ${canceled ? "Canceled, " : ""}${outcomeLabel}`}
+    aria-label={`${interviewKindLabel(event)}, ${event.company || "Company not specified"}, ${formatInterviewTimeRange(event, timeZone)}, ${type.label}${outcomeLabel ? `, ${outcomeLabel}` : ""}`}
     aria-describedby={hoverPosition ? hoverId : undefined}
   >
-    <span className="calendar-event-company">{event.company || "Company not specified"}</span>
-    {canceled && <span className="event-canceled-badge"><CanceledStatusIcon />Canceled</span>}
+    {status.key !== "available" && status.key !== "active" && <span className="calendar-event-status-icon" role="img" aria-label={status.label}>{status.key === "canceled" ? <CanceledStatusIcon /> : <ApplicationStatusIcon status={status.key === "closed" ? "position_closed" : status.key} />}</span>}
+    <span className="calendar-event-main">
+      <span className="calendar-event-company">{event.company || "Company not specified"}</span>
+    </span>
     <span className={`event-type-badge meeting-${type.type}`} role="img" aria-label={type.label}><MeetingTypeIcon type={type.type} /></span>
-    {outcome && <span className="event-outcome-badge" role="img" aria-label={outcomeLabel} title={outcomeLabel}><ApplicationStatusIcon status={outcome} /></span>}
   </div>
     {hoverPosition && createPortal(
       <div
@@ -520,8 +615,7 @@ function EventCard({ event, timeZone, compact, timed, position, selected, active
             <dt>Interview type</dt>
             <dd><MeetingTypeIcon type={type.type} /><span>{type.label}</span></dd>
           </div>
-          {canceled && <div className="calendar-hover-canceled"><dt>Interview status</dt><dd><CanceledStatusIcon /><span>Canceled</span></dd></div>}
-          {outcome && <div className={`calendar-hover-status ${outcomeClass}`}><dt>Application status</dt><dd><ApplicationStatusIcon status={outcome} /><span>{outcomeLabel}</span></dd></div>}
+          {status.key !== "available" && <div className={`calendar-hover-status ${status.className}`}><dt>Status</dt><dd>{outcome ? <VisibleApplicationStatusIcon status={outcome} /> : <ApplicationStatusIcon status="active" />}<span>{status.label}</span></dd></div>}
         </dl>
       </div>,
       document.body,
@@ -574,11 +668,22 @@ function ScheduledInterviewChart({ accounts }: { accounts: AccountInterviewCount
   </section>;
 }
 
-type Editor = { id?: number; mailbox_id: number; title: string; company: string; role: string; interviewer: string; work_model: CalendarEvent["work_model"]; application_status: CalendarEvent["application_status"]; start: string; end: string; description: string; job_url: string; meeting_type: "video" | "phone"; meeting_provider: string; meeting_url: string; phone_number: string; phone_access_code: string };
+type Editor = { id?: number; mailbox_id: number; title: string; company: string; role: string; interviewer: string; work_model: CalendarEvent["work_model"]; application_status: CalendarEvent["application_status"]; interview_status: CalendarEvent["interview_status"]; start: string; end: string; description: string; job_url: string; meeting_type: "video" | "phone"; meeting_provider: string; meeting_url: string; phone_number: string; phone_access_code: string };
 function editorFor(date: Date, mailboxId: number, timeZone: string, event?: CalendarEvent, selectedEnd?: Date): Editor {
   const start = event ? wallDateForInstant(new Date(event.start_at), timeZone) : selectedEnd ? new Date(date) : new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 9));
   const end = event ? wallDateForInstant(new Date(event.end_at), timeZone) : selectedEnd ?? new Date(start.getTime() + DEFAULT_EVENT_DURATION_MINUTES * 60_000);
-  return { id: event?.id, mailbox_id: event?.mailbox_id ?? mailboxId, title: event?.title ?? "Interview", company: event?.company ?? "", role: event?.role ?? "", interviewer: event?.interviewer ?? "", work_model: event?.work_model ?? "unspecified", application_status: event?.application_status ?? "active", start: localInput(start), end: localInput(end), description: event?.description ?? "", job_url: event?.job_url ?? "", meeting_type: event?.meeting_type === "phone" ? "phone" : "video", meeting_provider: event?.meeting_provider ?? "", meeting_url: event?.meeting_url ?? "", phone_number: event?.phone_number ?? "", phone_access_code: event?.phone_access_code ?? "" };
+  return { id: event?.id, mailbox_id: event?.mailbox_id ?? mailboxId, title: event?.title ?? "Interview", company: event?.company ?? "", role: event?.role ?? "", interviewer: event?.interviewer ?? "", work_model: event?.work_model ?? "unspecified", application_status: event?.application_status ?? "active", interview_status: event?.interview_status ?? "confirmation", start: localInput(start), end: localInput(end), description: event?.description ?? "", job_url: event?.job_url ?? "", meeting_type: event?.meeting_type === "phone" ? "phone" : "video", meeting_provider: event?.meeting_provider ?? "", meeting_url: event?.meeting_url ?? "", phone_number: event?.phone_number ?? "", phone_access_code: event?.phone_access_code ?? "" };
+}
+
+function CalendarLoading() {
+  return (
+    <div className="calendar-loading" role="status" aria-live="polite">
+      <div className="calendar-loading-card">
+        <span className="calendar-loading-bar" aria-hidden="true"><span /></span>
+        <span className="calendar-loading-copy">Loading calendar</span>
+      </div>
+    </div>
+  );
 }
 
 type DragSelection = { dayIndex: number; startMinutes: number; endMinutes: number };
@@ -588,6 +693,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
   const [timeZone, setTimeZone] = useState(loadCalendarTimeZone);
   const [anchor, setAnchor] = useState(() => wallDateForInstant(new Date(), timeZone));
   const [events, setEvents] = useState<CalendarEvent[]>([]);
+  const [statusFilters, setStatusFilters] = useState<CalendarStatusFilter[]>(loadStatusFilters);
   const [loading, setLoading] = useState(true); const [error, setError] = useState("");
   const [selected, setSelected] = useState<CalendarEvent | null>(null);
   const [activeHoverId, setActiveHoverId] = useState<string | null>(null);
@@ -597,6 +703,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
   const [sidebarClosing, setSidebarClosing] = useState(false);
   const [emailMessages, setEmailMessages] = useState<EmailDetail[]>([]); const [emailLoading, setEmailLoading] = useState(false); const [emailError, setEmailError] = useState(""); const [expandedEmailId, setExpandedEmailId] = useState<number | null>(null);
   const [editor, setEditor] = useState<Editor | null>(null); const [saving, setSaving] = useState(false); const [saveError, setSaveError] = useState("");
+  const [statusSaving, setStatusSaving] = useState(false); const [statusError, setStatusError] = useState("");
   const activateEventHover = useCallback((hoverId: string) => setActiveHoverId(hoverId), []);
   const deactivateEventHover = useCallback((hoverId: string) => setActiveHoverId((current) => current === hoverId ? null : current), []);
   const [dragSelection, setDragSelection] = useState<DragSelection | null>(null);
@@ -611,23 +718,45 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
   const start = useMemo(() => rangeStart(anchor, view), [anchor, view]);
   const end = useMemo(() => view === "month" ? addDays(start, 42) : endExclusive(start, view), [start, view]);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (mode: "foreground" | "background" = "foreground") => {
     abortRef.current?.abort();
     const request = ++refreshRef.current; const controller = new AbortController();
     abortRef.current = controller;
-    setLoading(true); setError("");
+    if (mode === "foreground") {
+      setLoading(true);
+      setError("");
+    }
     try {
       const rows = await fetchCalendarEvents(instantForWallDate(start, timeZone).toISOString(), instantForWallDate(end, timeZone).toISOString(), controller.signal);
       if (request === refreshRef.current) {
         setEvents(rows);
         setSelected((current) => current ? rows.find((event) => event.id === current.id) ?? current : null);
+        setError("");
       }
     }
     catch (err) { if (request === refreshRef.current && (err as Error).name !== "AbortError") setError(err instanceof Error ? err.message : "Failed to load calendar"); }
     finally { if (request === refreshRef.current) setLoading(false); }
   }, [start.getTime(), end.getTime(), timeZone]);
-  useEffect(() => { void load(); return () => abortRef.current?.abort(); }, [load, refreshKey]);
-  useEffect(() => { const source = new EventSource(eventsUrl()); source.addEventListener("calendar.changed", () => void load()); return () => source.close(); }, [load]);
+  const seenRefreshKey = useRef(refreshKey);
+  useEffect(() => { void load("foreground"); return () => abortRef.current?.abort(); }, [load]);
+  useEffect(() => {
+    if (seenRefreshKey.current === refreshKey) return;
+    seenRefreshKey.current = refreshKey;
+    void load("background");
+  }, [load, refreshKey]);
+  useEffect(() => {
+    const source = new EventSource(eventsUrl());
+    let timer = 0;
+    const onChange = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => { void load("background"); }, 400);
+    };
+    source.addEventListener("calendar.changed", onChange);
+    return () => {
+      window.clearTimeout(timer);
+      source.close();
+    };
+  }, [load]);
   useEffect(() => { localStorage.setItem("calendar-view", view); }, [view]);
   useEffect(() => { try { localStorage.setItem(CALENDAR_TIME_ZONE_KEY, timeZone); } catch { /* ignore unavailable storage */ } }, [timeZone]);
   useEffect(() => () => {
@@ -657,7 +786,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
     setDragSelection(null); dragRef.current = null;
   }, [view, start.getTime(), hourHeight]);
   useEffect(() => {
-    setEmailMessages([]); setEmailError(""); setExpandedEmailId(null);
+    setEmailMessages([]); setEmailError(""); setExpandedEmailId(null); setStatusError("");
     if (!selected) return;
     let active = true; setEmailLoading(true);
     fetchCalendarEventEmails(selected.id).then((messages) => {
@@ -677,13 +806,18 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
   }, [start, view]);
   const miniMonthStart = useMemo(() => startOfWeek(new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), 1))), [anchor.getUTCFullYear(), anchor.getUTCMonth()]);
   const miniMonthDays = useMemo(() => Array.from({ length: 42 }, (_, i) => addDays(miniMonthStart, i)), [miniMonthStart.getTime()]);
+  const shownEvents = useMemo(() => events.filter((event) => statusFilters.includes(eventStatusFilter(event))), [events, statusFilters]);
+  const mailboxColor = useCallback((mailboxId: number) => {
+    const mailbox = mailboxes.find((item) => item.id === mailboxId);
+    return mailbox ? accountColor(mailbox) : defaultAccountColor(mailboxId);
+  }, [mailboxes]);
   const scheduledInterviewsByAccount = useMemo(() => mailboxes.filter((mailbox) => mailbox.is_active).map((mailbox) => ({
     mailboxId: mailbox.id,
     email: mailbox.email_address,
-    color: accountColor(mailbox.id),
-    count: events.filter((event) => event.mailbox_id === mailbox.id && event.kind === "confirmed" && event.interview_status !== "cancellation").length,
-  })), [events, mailboxes]);
-  const nextMeeting = useMemo(() => events.filter((event) => event.kind === "confirmed" && event.interview_status !== "cancellation" && new Date(event.end_at).getTime() > Date.now()).sort((a, b) => new Date(a.start_at).getTime() - new Date(b.start_at).getTime())[0] ?? null, [events]);
+    color: accountColor(mailbox),
+    count: shownEvents.filter((event) => event.mailbox_id === mailbox.id && event.kind === "confirmed").length,
+  })), [shownEvents, mailboxes]);
+  const nextMeeting = useMemo(() => shownEvents.filter((event) => event.kind === "confirmed" && new Date(event.end_at).getTime() > Date.now()).sort((a, b) => new Date(a.start_at).getTime() - new Date(b.start_at).getTime())[0] ?? null, [shownEvents]);
   const nowInTimeZone = wallDateForInstant(new Date(), timeZone);
   const move = (amount: number) => setAnchor((date) => { const out = new Date(date); if (view === "month") out.setUTCMonth(out.getUTCMonth() + amount); else out.setUTCDate(out.getUTCDate() + amount * (view === "week" ? 7 : 1)); return out; });
   const defaultMailboxId = mailboxes.find((m) => m.is_active)?.id;
@@ -758,10 +892,31 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
     e.preventDefault(); if (!editor) return; setSaving(true); setSaveError("");
     const startAt = instantForWallDate(wallDateFromInput(editor.start), timeZone);
     const endAt = instantForWallDate(wallDateFromInput(editor.end), timeZone);
-    const payload: CalendarEventPayload = { mailbox_id: editor.mailbox_id, title: editor.title, company: editor.company, role: editor.role, interviewer: editor.interviewer, work_model: editor.work_model, start_at: startAt.toISOString(), end_at: endAt.toISOString(), source_timezone: timeZone, description: editor.description, job_url: editor.job_url || null, meeting_type: editor.meeting_type, meeting_provider: editor.meeting_provider || null, meeting_url: editor.meeting_url || null, phone_number: editor.phone_number || null, phone_access_code: editor.phone_access_code || null, interview_status: "confirmation", application_status: editor.application_status };
+    const payload: CalendarEventPayload = { mailbox_id: editor.mailbox_id, title: editor.title, company: editor.company, role: editor.role, interviewer: editor.interviewer, work_model: editor.work_model, start_at: startAt.toISOString(), end_at: endAt.toISOString(), source_timezone: timeZone, description: editor.description, job_url: editor.job_url || null, meeting_type: editor.meeting_type, meeting_provider: editor.meeting_provider || null, meeting_url: editor.meeting_url || null, phone_number: editor.phone_number || null, phone_access_code: editor.phone_access_code || null, interview_status: editor.interview_status ?? "confirmation", application_status: editor.application_status };
     try { const saved = editor.id ? await updateCalendarEvent(editor.id, payload) : await createCalendarEvent(payload); setEvents((prev) => [...prev.filter((x) => x.id !== saved.id), saved]); showEventDetails(saved); setEditor(null); }
     catch (err) { setSaveError(err instanceof Error ? err.message : "Failed to save event"); }
     finally { setSaving(false); }
+  };
+
+  const confirmInterviewStatus = async (next: ConfirmableStatus) => {
+    if (!selected || selected.kind !== "confirmed" || statusSaving || cardStatus(selected).key === next) return;
+    setStatusSaving(true);
+    setStatusError("");
+    const payload: CalendarEventPayload = next === "canceled"
+      ? { interview_status: "cancellation" }
+      : {
+          application_status: next === "closed" ? "position_closed" : next,
+          ...(selected.interview_status === "cancellation" ? { interview_status: "confirmation" as const } : {}),
+        };
+    try {
+      const saved = await updateCalendarEvent(selected.id, payload);
+      setEvents((prev) => prev.map((item) => item.id === saved.id ? saved : item));
+      setSelected((current) => current?.id === saved.id ? saved : current);
+    } catch (err) {
+      setStatusError(err instanceof Error ? err.message : "Failed to confirm interview status");
+    } finally {
+      setStatusSaving(false);
+    }
   };
 
   const copyMeetingLink = async (event: CalendarEvent) => {
@@ -782,35 +937,39 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
     window.setTimeout(() => setCopiedMeetingEventId((current) => current === event.id ? null : current), 1800);
   };
 
+  const selectedStatus = selected ? cardStatus(selected) : null;
+  const title = periodTitle(anchor, days, view);
+  const weekCrossesMonth = view !== "month" && (days[0].getUTCMonth() !== days[days.length - 1].getUTCMonth() || days[0].getUTCFullYear() !== days[days.length - 1].getUTCFullYear());
+
   return <main className={`calendar-workspace ${sidebarOpen ? "sidebar-open" : ""} ${sidebarClosing ? "sidebar-closing" : ""} ${detailsClosing ? "details-closing" : ""}`}>
     <header className="calendar-toolbar">
-      <div className="calendar-title-group"><button className="calendar-back" type="button" onClick={onClose} aria-label="Back to inbox">←</button><h1><strong>{new Intl.DateTimeFormat(undefined, { timeZone: "UTC", month: "long" }).format(anchor)}</strong><span>{anchor.getUTCFullYear()}</span></h1></div>
+      <div className="calendar-title-group"><button className="calendar-back" type="button" onClick={onClose} aria-label="Back to inbox">←</button><h1><strong>{title.primary}</strong>{title.secondary && <span>{title.secondary}</span>}</h1></div>
       <div className="calendar-nav"><button type="button" onClick={() => move(-1)} aria-label="Previous period">‹</button><button className="calendar-today" type="button" onClick={() => setAnchor(startOfDay(wallDateForInstant(new Date(), timeZone)))}>Today</button><button type="button" onClick={() => move(1)} aria-label="Next period">›</button></div>
       <div className="calendar-toolbar-actions"><CalendarTimeZonePicker value={timeZone} onChange={setTimeZone} /><CalendarViewPicker value={view} onChange={setView} /><button className="calendar-sidebar-toggle" type="button" aria-label={sidebarOpen ? "Hide calendar sidebar" : "Show calendar sidebar"} title={sidebarOpen ? "Hide sidebar" : "Show sidebar"} aria-pressed={sidebarOpen} onClick={toggleSidebar}>▥</button></div>
     </header>
     {error && <div className="calendar-state error"><span>{error}</span><button type="button" onClick={() => void load()}>Retry</button></div>}
     <div className={`calendar-main ${selected ? "has-details" : ""}`}>
+      <div className="calendar-board">
       {view === "month" ? (
         <section className="calendar-grid month" aria-busy={loading}>
           {VISIBLE_WEEKDAYS.map((day) => <div className="calendar-weekday" key={day}>{day}</div>)}
-        {days.map((day) => { const dayEvents = events.filter((event) => overlapsDay(event, day, timeZone)); const today = sameDay(day, nowInTimeZone); return <div className={`calendar-day ${today ? "today" : ""} ${day.getUTCMonth() !== anchor.getUTCMonth() ? "outside" : ""}`} key={day.toISOString()} onClick={() => openCreate(day)}>
+        {days.map((day) => { const dayEvents = shownEvents.filter((event) => overlapsDay(event, day, timeZone)); const today = sameDay(day, nowInTimeZone); return <div className={`calendar-day ${today ? "today" : ""} ${day.getUTCMonth() !== anchor.getUTCMonth() ? "outside" : ""}`} key={day.toISOString()} onClick={() => openCreate(day)}>
             <div className="calendar-day-heading"><strong>{day.getUTCDate()}</strong>{today && <em>Today</em>}</div>
-            <div className="calendar-day-events">{dayEvents.map((event) => <EventCard event={event} timeZone={timeZone} compact selected={selected?.id === event.id && !detailsClosing} activeHoverId={activeHoverId} onHoverActivate={activateEventHover} onHoverDeactivate={deactivateEventHover} onSelect={showEventDetails} key={event.id} />)}</div>
+            <div className="calendar-day-events">{dayEvents.map((event) => <EventCard event={event} color={mailboxColor(event.mailbox_id)} timeZone={timeZone} compact selected={selected?.id === event.id && !detailsClosing} activeHoverId={activeHoverId} onHoverActivate={activateEventHover} onHoverDeactivate={deactivateEventHover} onSelect={showEventDetails} key={event.id} />)}</div>
           </div>; })}
-          {loading && <div className="calendar-loading">Loading calendar…</div>}
         </section>
       ) : (
         <section ref={timelineRef} className={`calendar-time-grid ${view}`} aria-busy={loading} aria-label={`${view} calendar. Drag on a time range to create an event.`} style={{ "--day-count": days.length, "--hour-height": `${hourHeight}px`, "--day-height": `${hourHeight * HOURS.length}px` } as React.CSSProperties}>
           <div ref={timelineHeaderRef} className="calendar-time-header">
             <div className="calendar-time-corner" />
-            {days.map((day) => { const today = sameDay(day, nowInTimeZone); return <div className={`calendar-time-day-heading ${today ? "today" : ""}`} key={day.toISOString()}><span>{new Intl.DateTimeFormat(undefined, { timeZone: "UTC", weekday: "short" }).format(day)}</span><strong>{day.getUTCDate()}</strong></div>; })}
+            {days.map((day) => { const today = sameDay(day, nowInTimeZone); const weekday = new Intl.DateTimeFormat(undefined, { timeZone: "UTC", weekday: "short" }).format(day); const month = new Intl.DateTimeFormat(undefined, { timeZone: "UTC", month: "short" }).format(day); return <div className={`calendar-time-day-heading ${today ? "today" : ""}`} key={day.toISOString()}><span>{weekCrossesMonth ? `${weekday} ${month}` : weekday}</span><strong>{day.getUTCDate()}</strong></div>; })}
             <div className="calendar-all-day-label">all-day</div>
-          {days.map((day) => <div className="calendar-all-day-cell" key={`all-day-${day.toISOString()}`}>{events.filter((event) => isAllDay(event, timeZone) && overlapsDay(event, day, timeZone)).map((event) => <EventCard event={event} timeZone={timeZone} compact selected={selected?.id === event.id && !detailsClosing} activeHoverId={activeHoverId} onHoverActivate={activateEventHover} onHoverDeactivate={deactivateEventHover} onSelect={showEventDetails} key={event.id} />)}</div>)}
+          {days.map((day) => <div className="calendar-all-day-cell" key={`all-day-${day.toISOString()}`}>{shownEvents.filter((event) => isAllDay(event, timeZone) && overlapsDay(event, day, timeZone)).map((event) => <EventCard event={event} color={mailboxColor(event.mailbox_id)} timeZone={timeZone} compact selected={selected?.id === event.id && !detailsClosing} activeHoverId={activeHoverId} onHoverActivate={activateEventHover} onHoverDeactivate={deactivateEventHover} onSelect={showEventDetails} key={event.id} />)}</div>)}
           </div>
           <div className="calendar-time-body">
             <div className="calendar-time-axis">{HOURS.map((hour) => <span key={hour} style={{ top: `${hour * hourHeight}px` }}>{hourLabel(hour)}</span>)}</div>
             <div className="calendar-time-days">
-            {days.map((day, dayIndex) => { const dayEvents = events.filter((event) => overlapsDay(event, day, timeZone)); const today = sameDay(day, nowInTimeZone); const nowMinutes = nowInTimeZone.getUTCHours() * 60 + nowInTimeZone.getUTCMinutes(); return <div
+            {days.map((day, dayIndex) => { const dayEvents = shownEvents.filter((event) => overlapsDay(event, day, timeZone)); const today = sameDay(day, nowInTimeZone); const nowMinutes = nowInTimeZone.getUTCHours() * 60 + nowInTimeZone.getUTCMinutes(); return <div
                 className={`calendar-time-day ${today ? "today" : ""} ${defaultMailboxId == null ? "disabled" : ""}`}
                 key={day.toISOString()}
                 title={defaultMailboxId == null ? "Connect an email account to create events" : "Drag to create an event"}
@@ -822,13 +981,14 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
                 {HOURS.map((hour) => <div className="calendar-hour-slot" key={hour} />)}
                 {today && <div className="calendar-now-line" style={{ top: `${(nowMinutes / 60) * hourHeight}px` }} />}
                 {dragSelection?.dayIndex === dayIndex && <div className="calendar-drag-selection" style={{ top: `${(dragSelection.startMinutes / 60) * hourHeight}px`, height: `${((dragSelection.endMinutes - dragSelection.startMinutes) / 60) * hourHeight}px` }}><span>{formatWallTime(new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), 0, dragSelection.startMinutes)))} – {formatWallTime(new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), 0, dragSelection.endMinutes)))}</span></div>}
-                {layoutTimedEvents(dayEvents, day, hourHeight, timeZone).map(({ event, position }) => <EventCard event={event} timeZone={timeZone} timed position={position} selected={selected?.id === event.id && !detailsClosing} activeHoverId={activeHoverId} onHoverActivate={activateEventHover} onHoverDeactivate={deactivateEventHover} onSelect={showEventDetails} key={event.id} />)}
+                {layoutTimedEvents(dayEvents, day, hourHeight, timeZone).map(({ event, position }) => <EventCard event={event} color={mailboxColor(event.mailbox_id)} timeZone={timeZone} timed position={position} selected={selected?.id === event.id && !detailsClosing} activeHoverId={activeHoverId} onHoverActivate={activateEventHover} onHoverDeactivate={deactivateEventHover} onSelect={showEventDetails} key={event.id} />)}
               </div>; })}
             </div>
           </div>
-          {loading && <div className="calendar-loading">Loading calendar…</div>}
         </section>
       )}
+      {loading && <CalendarLoading />}
+      </div>
       {(selected || sidebarOpen || sidebarClosing) && <button className="calendar-panel-scrim" type="button" aria-label="Close calendar panel" onClick={selected ? closeEventDetails : toggleSidebar} />}
       {selected ? <aside className={`calendar-details ${detailsClosing ? "is-closing" : ""}`} aria-label="Event details" key={`details-${selected.id}`}>
         <header className="details-sticky">
@@ -844,10 +1004,10 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
             <div className="details-row"><dt>Account</dt><dd>{selected.email_account}</dd></div>
             <div className="details-row"><dt>Company</dt><dd>{selected.company || "—"}</dd></div>
             <div className="details-row"><dt>Role</dt><dd>{selected.role || "—"}</dd></div>
-            {selected.interview_status === "cancellation" && <div className="details-row details-canceled-row"><dt>Interview status</dt><dd><CanceledStatusIcon /><span>Canceled</span></dd></div>}
-            <div className={`details-row details-status-row status-${selected.application_status.replaceAll("_", "-")}`}><dt>Application status</dt><dd><ApplicationStatusIcon status={selected.application_status} /><span>{applicationStatusLabel(selected)}</span></dd></div>
+            {selected.kind === "confirmed" && selectedStatus && selectedStatus.key !== "available" && <div className={`details-row details-status-row ${selectedStatus.className}`}><dt>Status</dt><dd>{selectedStatus.key === "canceled" ? <CanceledStatusIcon /> : <ApplicationStatusIcon status={selectedStatus.key === "closed" ? "position_closed" : selectedStatus.key === "passed" || selectedStatus.key === "rejected" ? selectedStatus.key : "active"} />}<span>{selectedStatus.label}</span></dd></div>}
             {interviewType(selected).type === "video" && <div className="details-row details-action-row"><dt>Meeting</dt><dd>{meetingProviderLabel(selected) !== "—" ? <span className="details-meeting-value">{selected.meeting_url ? <a className="details-meeting-link" href={selected.meeting_url} target="_blank" rel="noreferrer" aria-label={`Open ${meetingProviderLabel(selected)}`} title={`Open ${meetingProviderLabel(selected)}`}><span className="details-meeting-icon"><MeetingTypeIcon type="video" /></span><span>{meetingProviderLabel(selected)}</span><svg className="details-meeting-arrow" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3h7v7M13 3 5 11" /></svg></a> : <span className="details-meeting-label"><span className="details-meeting-icon"><MeetingTypeIcon type="video" /></span><span>{meetingProviderLabel(selected)}</span></span>}{selected.meeting_url && <button className="details-copy-link details-copy-icon" type="button" onClick={() => void copyMeetingLink(selected)} aria-label={copiedMeetingEventId === selected.id ? "Meeting link copied" : `Copy ${meetingProviderLabel(selected)} meeting link`} title={copiedMeetingEventId === selected.id ? "Copied" : "Copy meeting link"}>{copiedMeetingEventId === selected.id ? <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.2 3 3 6-6.4" /></svg> : <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="2.25" width="8.5" height="8.5" rx="1.5" /><path d="M10.75 10.75v1.5a1.5 1.5 0 0 1-1.5 1.5h-5.5a1.5 1.5 0 0 1-1.5-1.5v-5.5a1.5 1.5 0 0 1 1.5-1.5h1.5" /></svg>}</button>}</span> : "—"}</dd></div>}
           </dl>
+          {statusError && <p className="error-text">{statusError}</p>}
 
           {selected.kind === "confirmed" && <div className="details-actions">
             {selected.kind === "confirmed" && <button className="details-secondary-action" type="button" onClick={() => setEditor(editorFor(new Date(selected.start_at), selected.mailbox_id, timeZone, selected))}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m10.8 2.7 2.5 2.5-7.7 7.7-3 .5.5-3 7.7-7.7ZM9.4 4.1l2.5 2.5" /></svg>Edit event</button>}
@@ -865,7 +1025,10 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
               {emailMessages.map((message) => {
                 const timestamp = message.received_at || message.created_at || selected.start_at;
                 const expanded = expandedEmailId === message.id;
+                const messageStatus = selected.kind === "confirmed" ? emailInterviewStatus(message) : null;
+                const statusMatches = messageStatus != null && selectedStatus?.key === messageStatus.key;
                 return <li key={message.id}>
+                  {messageStatus && <div className="source-email-status-bar"><span className={`source-email-status ${messageStatus.className}`}>{messageStatus.label}</span>{statusMatches ? <span className="source-email-status-match">Confirmed for this interview</span> : <button type="button" disabled={statusSaving} onClick={() => void confirmInterviewStatus(messageStatus.key)}>Confirm this status</button>}</div>}
                   <button className="source-email-list-item" type="button" aria-expanded={expanded} onClick={() => setExpandedEmailId(expanded ? null : message.id)}>
                     <span className="source-email-list-top"><strong>{message.subject || "(no subject)"}</strong><time dateTime={timestamp}>{formatDateTime(timestamp, timeZone)}</time></span>
                     <span className="source-email-meta">{message.sender}{message.interview_subtype && <><span>·</span>{message.interview_subtype.replaceAll("_", " ")}</>}</span>
@@ -878,14 +1041,38 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
           </section>
         </div>
       </aside> : <aside className="calendar-sidebar">
+        <section className="calendar-status-card">
+          <h2>Interview view</h2>
+          <div className="calendar-status-options" role="group" aria-label="Interview view">
+            {CALENDAR_STATUS_FILTERS.map((item) => (
+              <label className="calendar-status-option" key={item.value}>
+                <input
+                  type="checkbox"
+                  checked={statusFilters.includes(item.value)}
+                  onChange={() => {
+                    setStatusFilters((current) => {
+                      const next = current.includes(item.value)
+                        ? current.filter((value) => value !== item.value)
+                        : [...current, item.value];
+                      persistStatusFilters(next);
+                      return next;
+                    });
+                  }}
+                />
+                <span className={`calendar-status-swatch is-${item.value}`} aria-hidden="true" />
+                <span>{item.label}</span>
+              </label>
+            ))}
+          </div>
+        </section>
         <section className="calendar-mini-month">
           <header><strong>{new Intl.DateTimeFormat(undefined, { timeZone: "UTC", month: "long", year: "numeric" }).format(anchor)}</strong><div><button type="button" aria-label="Previous month" onClick={() => setAnchor(new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth() - 1, 1)))}>‹</button><button type="button" aria-label="Next month" onClick={() => setAnchor(new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth() + 1, 1)))}>›</button></div></header>
           <div className="mini-weekdays">{VISIBLE_WEEKDAYS.map((day) => <span key={day}>{day.slice(0, 2)}</span>)}</div>
           <div className="mini-days">{miniMonthDays.map((day) => <button type="button" className={`${day.getUTCMonth() !== anchor.getUTCMonth() ? "outside" : ""} ${view === "week" && day >= start && day < end ? "in-range" : ""} ${sameDay(day, anchor) ? "selected" : ""} ${sameDay(day, nowInTimeZone) ? "today" : ""}`} key={day.toISOString()} onClick={() => setAnchor(day)}>{day.getUTCDate()}</button>)}</div>
         </section>
-        <section className="calendar-next-meeting"><h2>Next meeting</h2>{nextMeeting ? <button type="button" className="next-meeting-card" onClick={() => showEventDetails(nextMeeting)}><span className="next-meeting-logo" style={{ "--account-color": accountColor(nextMeeting.mailbox_id) } as React.CSSProperties}>{eventInitials(nextMeeting)}</span><span><strong>{nextMeeting.title}</strong><small>{startsIn(nextMeeting.start_at)}</small></span></button> : <p>No upcoming meetings in this view.</p>}</section>
+        <section className="calendar-next-meeting"><h2>Next meeting</h2>{nextMeeting ? <button type="button" className="next-meeting-card" onClick={() => showEventDetails(nextMeeting)}><span className="next-meeting-logo" style={{ "--account-color": mailboxColor(nextMeeting.mailbox_id) } as React.CSSProperties}>{eventInitials(nextMeeting)}</span><span><strong>{nextMeeting.title}</strong><small>{startsIn(nextMeeting.start_at)}</small></span></button> : <p>No upcoming meetings in this view.</p>}</section>
         <ScheduledInterviewChart accounts={scheduledInterviewsByAccount} />
-        <section className="calendar-legend"><h2>Calendars</h2>{mailboxes.filter((mailbox) => mailbox.is_active).map((mailbox) => <div key={mailbox.id}><span style={{ background: accountColor(mailbox.id) }} /><p title={mailbox.email_address}>{mailbox.email_address}</p></div>)}</section>
+        <section className="calendar-legend"><h2>Calendars</h2>{mailboxes.filter((mailbox) => mailbox.is_active).map((mailbox) => <div key={mailbox.id}><span style={{ background: accountColor(mailbox) }} /><p title={mailbox.email_address}>{mailbox.email_address}</p></div>)}</section>
       </aside>}
     </div>
     {editor && <div className="modal-backdrop" role="presentation" onMouseDown={() => !saving && setEditor(null)}><form className="calendar-editor" onSubmit={save} onMouseDown={(e) => e.stopPropagation()}><header><h2>{editor.id ? "Edit event" : "New event"}</h2><button type="button" onClick={() => setEditor(null)}>×</button></header>

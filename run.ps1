@@ -14,7 +14,7 @@ if (-not (Test-Path ".env") -and (Test-Path ".env.example")) {
 
 Write-Host "Starting AI Auto-Email Checker..."
 Write-Host "  Backend:  http://127.0.0.1:8000"
-Write-Host "  Frontend: http://127.0.0.1:5173"
+Write-Host "  Frontend: http://127.0.0.1:5173 (LAN: http://<this-pc-ip>:5173)"
 Write-Host ""
 
 & (Join-Path $Root "scripts\run-postgres.ps1")

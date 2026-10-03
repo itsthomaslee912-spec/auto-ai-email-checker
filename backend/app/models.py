@@ -56,6 +56,7 @@ class MailboxConnection(Base):
     provider: Mapped[str] = mapped_column(String(32), index=True)
     email_address: Mapped[str] = mapped_column(String(320), index=True)
     display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    calendar_color: Mapped[str | None] = mapped_column(String(7), nullable=True)
     access_token_enc: Mapped[str] = mapped_column(Text)
     refresh_token_enc: Mapped[str] = mapped_column(Text, default="")
     token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

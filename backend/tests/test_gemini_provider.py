@@ -102,6 +102,7 @@ def test_gemini_settings_are_saved_without_exposing_the_key():
         "provider": "gemini",
         "model": "gemini-test",
         "ready": True,
+        "reason": None,
     }
     with session_factory() as db:
         row = db.get(AiSettings, 1)

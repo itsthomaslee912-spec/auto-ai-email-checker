@@ -198,13 +198,23 @@ def init_db() -> None:
             if {"interview_status", "is_visible"}.issubset(calendar_cols):
                 # Cancellations used to be hidden. Preserve those historical
                 # appointments and let the calendar render their status.
+                # A superseded row is a discarded duplicate, not that appointment.
+                hidden_cancellations = (
+                    "UPDATE calendar_events SET is_visible = :visible "
+                    "WHERE interview_status = 'cancellation' AND is_visible = :hidden"
+                )
+                if "superseded_by_event_id" in calendar_cols:
+                    hidden_cancellations += " AND superseded_by_event_id IS NULL"
                 conn.execute(
-                    text(
-                        "UPDATE calendar_events SET is_visible = :visible "
-                        "WHERE interview_status = 'cancellation' AND is_visible = :hidden"
-                    ),
+                    text(hidden_cancellations),
                     {"visible": True, "hidden": False},
                 )
+        if "mailbox_connections" in tables:
+            mailbox_cols = {c["name"] for c in inspect(conn).get_columns("mailbox_connections")}
+            if "calendar_color" not in mailbox_cols:
+                conn.execute(text(
+                    "ALTER TABLE mailbox_connections ADD COLUMN calendar_color VARCHAR(7)"
+                ))
 
     # Lightweight SQLite column / label migrations for existing DBs
     if settings.database_url.startswith("sqlite"):
@@ -322,6 +332,11 @@ def init_db() -> None:
                     conn.execute(text(
                         "ALTER TABLE mailbox_connections "
                         "ADD COLUMN last_sync_error VARCHAR(512)"
+                    ))
+                if "calendar_color" not in mb_cols:
+                    conn.execute(text(
+                        "ALTER TABLE mailbox_connections "
+                        "ADD COLUMN calendar_color VARCHAR(7)"
                     ))
             if "classify_corrections" in tables:
                 correction_cols = {c["name"] for c in inspect(conn).get_columns("classify_corrections")}

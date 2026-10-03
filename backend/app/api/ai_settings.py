@@ -53,27 +53,34 @@ async def read_ai_status(db: Session = Depends(get_db)) -> dict:
     """Expose the selected provider's readiness without exposing credentials."""
     settings = _view(db.get(AiSettings, 1))
     if settings["provider"] == "openai":
+        ready = settings["openai_key_configured"]
         return {
             "provider": "openai",
             "model": settings["openai_model"],
-            "ready": settings["openai_key_configured"],
+            "ready": ready,
+            "reason": None if ready else "No OpenAI API key is saved.",
         }
     if settings["provider"] == "gemini":
+        ready = settings["gemini_key_configured"]
         return {
             "provider": "gemini",
             "model": settings["gemini_model"],
-            "ready": settings["gemini_key_configured"],
+            "ready": ready,
+            "reason": None if ready else "No Gemini API key is saved.",
         }
 
+    ollama_url = settings["ollama_url"].rstrip("/")
     try:
         async with httpx.AsyncClient(timeout=3) as client:
-            response = await client.get(f"{settings['ollama_url'].rstrip('/')}/api/tags")
+            response = await client.get(f"{ollama_url}/api/tags")
             response.raise_for_status()
             models = response.json().get("models", [])
         ready = any(item.get("name") == settings["ollama_model"] for item in models)
+        reason = None if ready else f"The model {settings['ollama_model']} is not installed on the Ollama server."
     except (httpx.HTTPError, ValueError, KeyError):
         ready = False
-    return {"provider": "ollama", "model": settings["ollama_model"], "ready": ready}
+        reason = f"The Ollama server at {ollama_url} is not responding."
+    return {"provider": "ollama", "model": settings["ollama_model"], "ready": ready, "reason": reason}
 
 
 @router.put("")

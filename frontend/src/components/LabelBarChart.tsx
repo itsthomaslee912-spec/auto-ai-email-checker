@@ -17,7 +17,7 @@ export default function LabelBarChart({
           const value = counts[key] ?? 0;
           const pct = (value / max) * 100;
           return (
-            <div key={key} className="stats-bar-col" title={`${CLASSIFY_LABEL_TITLES[key]}: ${value}`}>
+            <div key={key} className="stats-bar-col" aria-label={`${CLASSIFY_LABEL_TITLES[key]}: ${value}`}>
               <span className="stats-bar-value">{value}</span>
               <div className="stats-bar-track">
                 <div

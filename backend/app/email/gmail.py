@@ -33,6 +33,15 @@ def _looks_like_html(value: str) -> bool:
     return bool(re.search(r"</?[a-z][^>]*>", value or "", re.I))
 
 
+def _is_calendar_text(value: str) -> bool:
+    """Outlook/Teams invites put <https://...> links inside the ICS description.
+
+    That is not HTML. Cutting the part there drops DTSTART/DTEND, which sit
+    after the description, and the event is then timed from leftover prose.
+    """
+    return "BEGIN:VCALENDAR" in (value or "").upper()
+
+
 def split_mixed_plain_html(value: str) -> tuple[str, str]:
     """If plaintext was concatenated with HTML, return (plain, html)."""
     text = value or ""
@@ -45,6 +54,15 @@ def split_mixed_plain_html(value: str) -> tuple[str, str]:
     return text[:idx].strip(), text[idx:].strip()
 
 
+_CALENDAR_MIME_TYPES = {"text/calendar", "application/ics", "application/x-ics", "text/x-vcalendar"}
+
+
+def _is_calendar_part(payload: dict) -> bool:
+    """Microsoft Bookings sends the appointment as application/ics "invite.ics"."""
+    filename = (payload.get("filename") or "").lower()
+    return _mime_type(payload) in _CALENDAR_MIME_TYPES or filename.endswith(".ics")
+
+
 def _extract_parts(payload: dict) -> tuple[str, str]:
     """Return (plain_text, html)."""
     mime = _mime_type(payload)
@@ -54,9 +72,14 @@ def _extract_parts(payload: dict) -> tuple[str, str]:
 
     if data:
         decoded = _decode_body_data(data)
-        if mime == "text/plain":
-            p, h = split_mixed_plain_html(decoded)
-            plain, html = p, h
+        if _is_calendar_part(payload) and _is_calendar_text(decoded):
+            plain = decoded
+        elif mime == "text/plain":
+            if _is_calendar_text(decoded):
+                plain = decoded
+            else:
+                p, h = split_mixed_plain_html(decoded)
+                plain, html = p, h
         elif mime == "text/html" or mime.endswith("+html"):
             html = decoded
         elif "html" in mime:
@@ -66,12 +89,13 @@ def _extract_parts(payload: dict) -> tuple[str, str]:
 
     for part in payload.get("parts") or []:
         p, h = _extract_parts(part)
-        if p and _looks_like_html(p) and not h:
+        calendar = _is_calendar_text(p)
+        if p and _looks_like_html(p) and not h and not calendar:
             extra_plain, extra_html = split_mixed_plain_html(p)
             p, h = extra_plain, extra_html or h
         if p and not plain:
             plain = p
-        elif p and p not in plain and not _looks_like_html(p):
+        elif p and p not in plain and (calendar or not _looks_like_html(p)):
             plain = f"{plain}\n{p}".strip()
         if h and not html:
             html = h
@@ -88,7 +112,7 @@ def _calendar_attachment_parts(payload: dict) -> list[dict]:
         part = stack.pop()
         body = part.get("body") or {}
         filename = (part.get("filename") or "").lower()
-        if (_mime_type(part) == "text/calendar" or filename.endswith(".ics")) and body.get("attachmentId") and not body.get("data"):
+        if _is_calendar_part(part) and body.get("attachmentId") and not body.get("data"):
             matches.append(part)
         stack.extend(part.get("parts") or [])
     return matches

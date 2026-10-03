@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -15,6 +16,124 @@ from app.services.webhook_health import (
     record_webhook_delivery_success,
     reset_webhook_delivery_health,
 )
+
+NGROK_URL = "https://example.ngrok-free.dev"
+
+
+@pytest.fixture(autouse=True)
+def ngrok_online(monkeypatch):
+    status = {"state": "online", "public_url": NGROK_URL, "expected_url": NGROK_URL}
+    monkeypatch.setattr(auto_sync, "get_ngrok_status", lambda: status)
+    return status
+
+
+def _verified_mailbox(session_factory, delivered_ago: timedelta) -> int:
+    with session_factory() as db:
+        user = User(external_id="verified-webhook")
+        db.add(user)
+        db.flush()
+        mailbox = MailboxConnection(
+            user_id=user.id, provider="google", email_address="verified@example.com",
+            access_token_enc="x", is_active=True,
+        )
+        db.add(mailbox)
+        db.flush()
+        db.add(WebhookSubscription(
+            mailbox_id=mailbox.id, provider="google", external_id="history-1",
+            expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+            last_delivery_success_at=datetime.now(timezone.utc) - delivered_ago,
+        ))
+        db.commit()
+        return mailbox.id
+
+
+def _poll(monkeypatch, session_factory) -> AsyncMock:
+    sync = AsyncMock()
+    monkeypatch.setattr(auto_sync, "SessionLocal", session_factory)
+    monkeypatch.setattr(auto_sync, "start_mailbox_sync", sync)
+    monkeypatch.setattr(auto_sync, "get_settings", lambda: SimpleNamespace(
+        auto_sync_max_messages=200, auto_sync_interval_seconds=120, webhook_quiet_seconds=1800,
+    ))
+    asyncio.run(auto_sync.poll_active_mailboxes())
+    return sync
+
+
+def _session_factory():
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    return engine, sessionmaker(bind=engine)
+
+
+def test_recent_verified_webhook_keeps_polling_off(monkeypatch):
+    engine, session_factory = _session_factory()
+    _verified_mailbox(session_factory, timedelta(minutes=5))
+
+    sync = _poll(monkeypatch, session_factory)
+
+    sync.assert_not_awaited()
+    with session_factory() as db:
+        status = auto_sync.get_auto_sync_status(db)
+        assert status["polling_accounts"] == 0
+        assert status["mailboxes"][0]["sync_method"] == "webhook"
+    engine.dispose()
+
+
+@pytest.mark.parametrize("state", ["offline", "mismatch"])
+def test_polling_turns_on_when_ngrok_cannot_deliver(monkeypatch, ngrok_online, state):
+    engine, session_factory = _session_factory()
+    mailbox_id = _verified_mailbox(session_factory, timedelta(minutes=5))
+    ngrok_online["state"] = state
+
+    sync = _poll(monkeypatch, session_factory)
+
+    sync.assert_awaited_once_with(mailbox_id, max_results=200, register_webhook=True)
+    with session_factory() as db:
+        status = auto_sync.get_auto_sync_status(db)
+        assert status["polling_accounts"] == 1
+        assert status["mailboxes"][0]["sync_method"] == "polling"
+        assert "ngrok" in status["mailboxes"][0]["polling_reason"]
+    engine.dispose()
+
+
+def test_ngrok_state_is_ignored_when_webhook_url_is_not_ngrok(monkeypatch, ngrok_online):
+    engine, session_factory = _session_factory()
+    _verified_mailbox(session_factory, timedelta(minutes=5))
+    ngrok_online.update(state="offline", expected_url="https://mail.example.com")
+
+    sync = _poll(monkeypatch, session_factory)
+
+    sync.assert_not_awaited()
+    engine.dispose()
+
+
+def test_polling_turns_on_when_verified_webhook_goes_quiet(monkeypatch):
+    engine, session_factory = _session_factory()
+    mailbox_id = _verified_mailbox(session_factory, timedelta(hours=2))
+
+    sync = _poll(monkeypatch, session_factory)
+
+    sync.assert_awaited_once_with(mailbox_id, max_results=200, register_webhook=True)
+    with session_factory() as db:
+        reason = auto_sync.get_auto_sync_status(db)["mailboxes"][0]["polling_reason"]
+        assert reason == "No webhook delivery in the last 30 minutes"
+    engine.dispose()
+
+
+def test_polling_waits_for_reconnect_when_sign_in_expired(monkeypatch):
+    engine, session_factory = _session_factory()
+    mailbox_id = _verified_mailbox(session_factory, timedelta(hours=2))
+    with session_factory() as db:
+        db.get(MailboxConnection, mailbox_id).last_sync_error = (
+            "401: Google sign-in expired or was revoked; reconnect this account"
+        )
+        db.commit()
+
+    sync = _poll(monkeypatch, session_factory)
+
+    sync.assert_not_awaited()
+    with session_factory() as db:
+        assert auto_sync.get_auto_sync_status(db)["mailboxes"][0]["needs_reconnect"] is True
+    engine.dispose()
 
 
 def test_auto_sync_schedules_every_active_mailbox(monkeypatch):
@@ -83,9 +202,7 @@ def test_auto_sync_reconciles_live_and_expired_webhooks(monkeypatch):
     monkeypatch.setattr(auto_sync, "start_mailbox_sync", sync)
     monkeypatch.setattr(auto_sync, "get_settings", lambda: SimpleNamespace(auto_sync_max_messages=200, auto_sync_interval_seconds=120))
     asyncio.run(auto_sync.poll_active_mailboxes())
-    assert sync.await_count == 2
-    sync.assert_any_await(live_id, max_results=200, register_webhook=True)
-    sync.assert_any_await(expired_id, max_results=200, register_webhook=True)
+    sync.assert_awaited_once_with(expired_id, max_results=200, register_webhook=True)
     with session_factory() as db:
         status = auto_sync.get_auto_sync_status(db)
         assert status["webhook_accounts"] == 1
@@ -138,7 +255,7 @@ def test_auto_sync_reconciles_verified_webhook_after_process_restart(monkeypatch
 
     asyncio.run(auto_sync.poll_active_mailboxes())
 
-    sync.assert_awaited_once_with(mailbox_id, max_results=200, register_webhook=True)
+    sync.assert_not_awaited()
     with session_factory() as db:
         mailbox = db.get(MailboxConnection, mailbox_id)
         assert auto_sync.has_active_webhook(mailbox)

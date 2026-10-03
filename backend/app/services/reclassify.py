@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 from app.classify.openai_classifier import classify_email, infer_interview_subtype
@@ -142,24 +143,46 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
             await publish("reclassify.done", get_reclassify_status(mailbox_id))
             return
 
-        query = (
-            db.query(
-                EmailMessage.id,
-                EmailMessage.subject,
-                EmailMessage.sender,
-                EmailMessage.body_text,
-                EmailMessage.snippet,
-                EmailMessage.label,
-                EmailMessage.outcome_extracted,
-            )
-            .filter(
-                EmailMessage.mailbox_id == mailbox_id,
-                EmailMessage.human_corrected.is_not(True),
-            )
-        )
+        query_filters = [
+            EmailMessage.mailbox_id == mailbox_id,
+            EmailMessage.human_corrected.is_not(True),
+        ]
         if pending_only:
-            query = query.filter(EmailMessage.classification_pending.is_(True))
-        rows = query.order_by(EmailMessage.id.desc()).all()
+            query_filters.append(EmailMessage.classification_pending.is_(True))
+
+        def load_rows() -> list[SimpleNamespace]:
+            lookup = SessionLocal()
+            try:
+                loaded = (
+                    lookup.query(
+                        EmailMessage.id,
+                        EmailMessage.subject,
+                        EmailMessage.sender,
+                        EmailMessage.body_text,
+                        EmailMessage.snippet,
+                        EmailMessage.label,
+                        EmailMessage.outcome_extracted,
+                    )
+                    .filter(*query_filters)
+                    .order_by(EmailMessage.id.desc())
+                    .all()
+                )
+                return [
+                    SimpleNamespace(
+                        id=row.id,
+                        subject=row.subject,
+                        sender=row.sender,
+                        body_text=row.body_text,
+                        snippet=row.snippet,
+                        label=row.label,
+                        outcome_extracted=row.outcome_extracted,
+                    )
+                    for row in loaded
+                ]
+            finally:
+                lookup.close()
+
+        rows = await asyncio.to_thread(load_rows)
         total = len(rows)
         backend = get_ai_backend()
         await _publish_progress(

@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, contains_eager
 
 from app.db import get_db
 from app.models import CalendarEvent, CalendarEventEmail, EmailMessage, MailboxConnection
@@ -28,9 +28,12 @@ def _active_mailbox(db: Session, mailbox_id: int) -> MailboxConnection:
 
 
 def _event_query(db: Session):
-    return db.query(CalendarEvent).join(
-        MailboxConnection, MailboxConnection.id == CalendarEvent.mailbox_id
-    ).filter(MailboxConnection.is_active.is_(True))
+    return (
+        db.query(CalendarEvent)
+        .join(MailboxConnection, MailboxConnection.id == CalendarEvent.mailbox_id)
+        .options(contains_eager(CalendarEvent.mailbox))
+        .filter(MailboxConnection.is_active.is_(True))
+    )
 
 
 def _event_out(event: CalendarEvent, mailbox: MailboxConnection | None = None) -> CalendarEventOut:

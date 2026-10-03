@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState, type CSSProperties } from "react";
 import {
   deleteClassifyTrainingExample,
   deleteUnusedClassifyTraining,
@@ -11,6 +11,7 @@ import {
   fetchMailboxLabelStats,
   fetchMailboxOutcomes,
   saveAiSettings,
+  type AccountSyncDetail,
   type AiSettings,
   type OpenAiCosts,
   type ClassifyPromptStatus,
@@ -19,6 +20,7 @@ import {
   type MailboxLabelStats,
   type MailboxOutcomes,
 } from "../api";
+import { accountColor } from "../accountColor";
 import { CLASSIFY_LABEL_TITLES, INTERVIEW_SUBTYPE_TITLES } from "../labels";
 import {
   FONT_FAMILIES,
@@ -98,6 +100,30 @@ function initialsFrom(text: string): string {
   return (parts[0][0] + parts[1][0]).toUpperCase();
 }
 
+function timeAgo(value: string | null | undefined): string | null {
+  const time = value ? Date.parse(value) : Number.NaN;
+  if (!Number.isFinite(time)) return null;
+  const seconds = Math.max(0, Math.floor((Date.now() - time) / 1000));
+  if (seconds < 60) return "just now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+const ACCOUNT_ICONS = {
+  sync: <><path d="M20 7v5h-5M4 17v-5h5" /><path d="M6.1 8.2A7 7 0 0 1 18.8 7L20 12M4 12l1.2 5A7 7 0 0 0 17.9 15.8" /></>,
+  stop: <rect x="7" y="7" width="10" height="10" rx="2" />,
+  reclassify: <><path d="M11 3.5l1.7 4.4 4.4 1.7-4.4 1.7L11 15.7l-1.7-4.4-4.4-1.7 4.4-1.7z" /><path d="M18 14.5l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z" /></>,
+  reconnect: <><path d="M10 14a4.5 4.5 0 0 0 6.4 0l3.2-3.2a4.5 4.5 0 0 0-6.4-6.4l-1.1 1.1" /><path d="M14 10a4.5 4.5 0 0 0-6.4 0l-3.2 3.2a4.5 4.5 0 0 0 6.4 6.4l1.1-1.1" /></>,
+  remove: <><path d="M4 7h16M10 11v6M14 11v6" /><path d="M6 7l1 13h10l1-13M9 7V4h6v3" /></>,
+} as const;
+
+function AccountIcon({ name }: { name: keyof typeof ACCOUNT_ICONS }) {
+  return <svg viewBox="0 0 24 24" aria-hidden="true">{ACCOUNT_ICONS[name]}</svg>;
+}
+
 export default function SettingsPage({
   section,
   onSectionChange,
@@ -121,7 +147,10 @@ export default function SettingsPage({
   onTrainingDeleted,
   onAiSettingsSaved,
   onAddAccount,
+  onAccountColor,
   onRemoveAccount,
+  onReconnectAccount,
+  accountSyncDetails,
   syncingIds,
   reclassifyingIds,
   onSyncAccount,
@@ -154,7 +183,10 @@ export default function SettingsPage({
   onTrainingDeleted: () => Promise<void>;
   onAiSettingsSaved: () => Promise<void> | void;
   onAddAccount: () => void;
+  onAccountColor: (mailboxId: number, calendarColor: string) => void;
   onRemoveAccount: (mailboxId: number) => Promise<void>;
+  onReconnectAccount: (mailboxId: number) => void;
+  accountSyncDetails: Record<number, AccountSyncDetail>;
   syncingIds: Set<number>;
   reclassifyingIds: Set<number>;
   onSyncAccount: (mailboxId: number) => Promise<void>;
@@ -452,7 +484,7 @@ export default function SettingsPage({
                   <div className="settings-block-heading">
                     <div>
                       <h3>Email accounts</h3>
-                      <p className="settings-help">Add connected inboxes or remove accounts you no longer want to sync.</p>
+                      <p className="settings-help">Add connected inboxes, reconnect an account whose sign-in expired, remove accounts, or choose the color used for that account’s interviews on the calendar.</p>
                     </div>
                     <button type="button" className="action-btn primary" onClick={onAddAccount}>+ Add an account</button>
                   </div>
@@ -460,42 +492,104 @@ export default function SettingsPage({
                     {mailboxes.map((mailbox) => {
                       const isWorking = syncingIds.has(mailbox.id) || reclassifyingIds.has(mailbox.id);
                       const activeStatus = accountStatus[mailbox.id];
+                      const detail = accountSyncDetails[mailbox.id];
+                      const needsReconnect = Boolean(detail?.needs_reconnect);
+                      const syncing = syncingIds.has(mailbox.id);
+                      const reclassifying = reclassifyingIds.has(mailbox.id);
+                      const removing = removingMailboxId === mailbox.id;
+                      const color = accountColor(mailbox);
+                      const lastSync = timeAgo(detail?.last_sync_completed_at);
+                      const health = needsReconnect
+                        ? { tone: "error", label: "Sign-in expired" }
+                        : syncing
+                          ? { tone: "busy", label: "Syncing…" }
+                          : reclassifying
+                            ? { tone: "busy", label: "Reclassifying…" }
+                            : detail?.last_error
+                              ? { tone: "warn", label: "Sync problem" }
+                              : { tone: "ok", label: lastSync ? `Synced ${lastSync}` : "Connected" };
+                      const method = detail?.sync_method === "polling" ? "Polling" : detail?.sync_method === "webhook" ? "Live" : null;
+                      const statusTooltip = needsReconnect
+                        ? "Google stopped accepting this account's saved sign-in. Reconnect to resume syncing."
+                        : detail?.last_error ?? (detail?.polling_reason
+                          ? `Checked every 2 minutes: ${detail.polling_reason}.`
+                          : "New mail arrives instantly through the webhook.");
                       return (
-                      <div className="settings-account-row" key={mailbox.id}>
+                      <div className={`settings-account-row${needsReconnect ? " needs-attention" : ""}`} key={mailbox.id}>
+                        <label
+                          className="account-avatar"
+                          style={{ "--account-color": color } as CSSProperties}
+                          data-tooltip="Change calendar color"
+                        >
+                          {initialsFrom(mailbox.display_name || mailbox.email_address)}
+                          <input
+                            type="color"
+                            aria-label={`Calendar color for ${mailbox.email_address}`}
+                            value={color}
+                            onChange={(event) => onAccountColor(mailbox.id, event.target.value)}
+                          />
+                        </label>
                         <div className="settings-account-info">
-                          <strong>{mailbox.email_address}</strong>
-                          <span>{mailbox.provider === "google" ? "Google Gmail" : "Microsoft Outlook"}</span>
+                          <strong title={mailbox.email_address}>{mailbox.email_address}</strong>
+                          <div className="account-meta">
+                            <span className="account-provider">{mailbox.provider === "google" ? "Gmail" : "Outlook"}</span>
+                            <span className={`account-health ${health.tone}`} data-tooltip={statusTooltip}>{health.label}</span>
+                            {method && !needsReconnect && <span className="account-method">{method}</span>}
+                          </div>
                         </div>
                         <div className="settings-account-actions">
                           <button
                             type="button"
-                            className={syncingIds.has(mailbox.id) ? "action-btn busy" : "action-btn"}
-                            disabled={reclassifyingIds.has(mailbox.id) || removingMailboxId != null}
-                            onClick={() => void (syncingIds.has(mailbox.id) ? onStopSyncAccount(mailbox.id) : onSyncAccount(mailbox.id))}
+                            className={`account-icon-btn${syncing ? " is-active" : ""}`}
+                            aria-label={syncing ? "Stop sync" : "Sync now"}
+                            data-tooltip={syncing ? "Stop sync" : "Sync now"}
+                            disabled={reclassifying || removingMailboxId != null || needsReconnect}
+                            onClick={() => void (syncing ? onStopSyncAccount(mailbox.id) : onSyncAccount(mailbox.id))}
                           >
-                            {syncingIds.has(mailbox.id) ? "Stop sync" : "Sync"}
+                            <AccountIcon name={syncing ? "stop" : "sync"} />
                           </button>
                           <button
                             type="button"
-                            className={reclassifyingIds.has(mailbox.id) ? "action-btn busy" : "action-btn"}
-                            disabled={syncingIds.has(mailbox.id) || removingMailboxId != null}
-                            onClick={() => void (reclassifyingIds.has(mailbox.id) ? onStopReclassifyAccount(mailbox.id) : onReclassifyAccount(mailbox.id))}
+                            className={`account-icon-btn${reclassifying ? " is-active" : ""}`}
+                            aria-label={reclassifying ? "Stop reclassifying" : "Reclassify with AI"}
+                            data-tooltip={reclassifying ? "Stop reclassifying" : "Reclassify all emails with AI"}
+                            disabled={syncing || removingMailboxId != null}
+                            onClick={() => void (reclassifying ? onStopReclassifyAccount(mailbox.id) : onReclassifyAccount(mailbox.id))}
                           >
-                            {reclassifyingIds.has(mailbox.id) ? "Stop reclassify" : "Reclassify"}
+                            <AccountIcon name={reclassifying ? "stop" : "reclassify"} />
                           </button>
                           <button
                             type="button"
-                            className="action-btn danger"
-                            disabled={syncingIds.has(mailbox.id) || reclassifyingIds.has(mailbox.id) || removingMailboxId != null}
+                            className={`account-icon-btn${needsReconnect ? " is-urgent" : ""}`}
+                            aria-label="Reconnect"
+                            data-tooltip="Reconnect: sign in again (your emails are kept)"
+                            disabled={removingMailboxId != null}
+                            onClick={() => onReconnectAccount(mailbox.id)}
+                          >
+                            <AccountIcon name="reconnect" />
+                          </button>
+                          <span className="account-actions-divider" aria-hidden="true" />
+                          <button
+                            type="button"
+                            className="account-icon-btn danger"
+                            aria-label="Remove account"
+                            data-tooltip={removing ? "Removing…" : "Remove account and its stored emails"}
+                            disabled={syncing || reclassifying || removingMailboxId != null}
                             onClick={() => {
-                              if (!window.confirm(`Remove ${mailbox.email_address} from this app?`)) return;
+                              if (!window.confirm(`Remove ${mailbox.email_address}? Its stored emails will be deleted from this app.`)) return;
                               setRemovingMailboxId(mailbox.id);
                               void onRemoveAccount(mailbox.id).finally(() => setRemovingMailboxId(null));
                             }}
                           >
-                            {removingMailboxId === mailbox.id ? "Removing…" : "Remove"}
+                            <AccountIcon name="remove" />
                           </button>
                         </div>
+                        {needsReconnect && !isWorking && (
+                          <div className="account-alert" role="alert">
+                            <span>Sign-in expired — this account isn’t syncing.</span>
+                            <button type="button" onClick={() => onReconnectAccount(mailbox.id)}>Reconnect now</button>
+                          </div>
+                        )}
                         {isWorking && (
                           <p className={`settings-account-status ${activeStatus?.type ?? "sync"}`} role="status">
                             {activeStatus?.message ?? (syncingIds.has(mailbox.id) ? "Syncing this account…" : "Reclassifying this account…")}
@@ -927,8 +1021,8 @@ export default function SettingsPage({
                       <div className="outcome-browser-actions">
                           <div className="outcome-tabs" role="tablist" aria-label="Extraction category">{([ ["interview_invitation", "Interview Invitation"], ["interview_scheduled", "Interview Scheduled"], ["application_confirmation", "Applied"], ["rejected_closed", "Rejected"] ] as const).map(([label, title]) => <button key={label} type="button" role="tab" aria-selected={outcomeLabel === label} className={outcomeLabel === label ? "active" : ""} onClick={() => { setOutcomeLabel(label); setOutcomePage(0); void loadOutcomes(statsMailboxId, 0, label); }}>{title}</button>)}</div>
                           <input className="modern-control outcome-company-search" type="search" value={outcomeCompanyQuery} onChange={(event) => setOutcomeCompanyQuery(event.target.value)} placeholder="Search company" aria-label="Search company name" />
-                          <button type="button" className="settings-btn outcome-stats-btn" title="Show extracted-data statistics" aria-label="Show extracted-data statistics" aria-expanded={outcomePieOpen} onClick={() => { setOutcomePieOpen(true); void loadOutcomePie(); }}>◔</button>
-                          <button type="button" className="settings-btn outcome-copy-btn" title="Copy all results" aria-label="Copy all results" disabled={!outcomes?.items.length} onClick={() => void copyOutcomes()}>⧉</button>
+                          <button type="button" className="settings-btn outcome-stats-btn" aria-label="Show extracted-data statistics" aria-expanded={outcomePieOpen} onClick={() => { setOutcomePieOpen(true); void loadOutcomePie(); }}>◔</button>
+                          <button type="button" className="settings-btn outcome-copy-btn" aria-label="Copy all results" disabled={!outcomes?.items.length} onClick={() => void copyOutcomes()}>⧉</button>
                       </div>
                       {outcomesLoading && <p className="hint">Loading extracted data…</p>}
                       {!outcomesLoading && outcomes && (

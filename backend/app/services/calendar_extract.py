@@ -141,12 +141,21 @@ MONTH_NUMBERS = {
 _MONTH_PATTERN = "|".join(sorted(MONTH_NUMBERS, key=len, reverse=True))
 _DATE_PATTERNS = (
     re.compile(rf"\b(?P<month>{_MONTH_PATTERN})\.?\s+(?P<day>\d{{1,2}})(?:st|nd|rd|th)?(?:,)?(?:\s+(?P<year>20\d{{2}}))?\b", re.I),
-    re.compile(rf"\b(?P<day>\d{{1,2}})\s+(?P<month>{_MONTH_PATTERN})\.?(?:,)?\s+(?P<year>20\d{{2}})\b", re.I),
+    re.compile(rf"\b(?P<day>\d{{1,2}})(?:st|nd|rd|th)?\s+(?P<month>{_MONTH_PATTERN})\.?(?:,)?(?:\s+(?P<year>20\d{{2}}))?\b", re.I),
     re.compile(r"\b(?P<year>20\d{2})-(?P<month_num>\d{1,2})-(?P<day>\d{1,2})\b"),
+    re.compile(r"\b(?P<month_num>\d{1,2})/(?P<day>\d{1,2})(?:/(?P<year>20\d{2}))?\b"),
+)
+_REPLY_ATTRIBUTION_RE = re.compile(
+    r"(?:\bwrote\b|(?:<|&lt;)[^<>\n]{0,80}@[^<>\n]{0,80}(?:>|&gt;))",
+    re.I,
 )
 _TIME_PATTERN = re.compile(
     r"(?<![\d:])(?P<hour>1[0-2]|0?[1-9])(?::?(?P<minute>[0-5]\d))?\s*(?P<ampm>a\.?m\.?|p\.?m\.?)\b",
     re.I,
+)
+_DURATION_PATTERNS = (
+    re.compile(r"\bduration\s*:?\s*(?:up\s+to\s+)?(?P<amount>\d{1,3})\s*(?P<unit>minutes?|mins?|hours?|hrs?)\b", re.I),
+    re.compile(r"\b(?P<amount>\d{1,3})\s*[- ]\s*(?P<unit>minutes?|mins?|hours?|hrs?)\s+(?:interview|meeting|call|conversation)\b", re.I),
 )
 
 DEFAULT_INTERVIEW_DURATION = timedelta(minutes=30)
@@ -174,6 +183,7 @@ class ExtractedSlot:
     start_at: datetime
     end_at: datetime
     source_timezone: str | None = None
+    end_is_explicit: bool = True
 
 
 @dataclass(frozen=True)
@@ -258,9 +268,10 @@ def parse_ics_slots(text: str) -> list[ExtractedSlot]:
             start = _parse_ics_datetime(start_raw, start_tz)
             end = _parse_ics_datetime(end_raw, end_tz) if end_raw else None
             if start:
+                end_is_explicit = end is not None and end > start
                 if end is None or end <= start:
                     end = start + DEFAULT_INTERVIEW_DURATION
-                slots.append(ExtractedSlot(start, end, start_tz or ("UTC" if start_raw.endswith("Z") else None)))
+                slots.append(ExtractedSlot(start, end, start_tz or ("UTC" if start_raw.endswith("Z") else None), end_is_explicit))
             current = None
             continue
         if current is None or ":" not in line:
@@ -317,6 +328,18 @@ def _clock_parts(match: re.Match[str]) -> tuple[int, int]:
     return hour, minute
 
 
+def _duration_from_nearby_text(value: str) -> timedelta | None:
+    for pattern in _DURATION_PATTERNS:
+        match = pattern.search(value or "")
+        if not match:
+            continue
+        amount = int(match.group("amount"))
+        duration = timedelta(hours=amount) if match.group("unit").lower().startswith(("hour", "hr")) else timedelta(minutes=amount)
+        if timedelta(0) < duration <= timedelta(hours=12):
+            return duration
+    return None
+
+
 def parse_text_slots(text: str, received_at: datetime | None = None) -> list[ExtractedSlot]:
     """Parse common human-readable calendar timestamps without an AI request.
 
@@ -342,7 +365,14 @@ def parse_text_slots(text: str, received_at: datetime | None = None) -> list[Ext
         times = list(_TIME_PATTERN.finditer(window))
         if not times or times[0].start() > 100:
             continue
-        zone_match = _zone_from_nearby_text(window[:200])
+        # "On Sep 28, 2026 at 7:24 PM <person@company> wrote" is the quoted
+        # message timestamp, not the interview.
+        attribution = window[times[0].end() : times[0].end() + 100]
+        if _REPLY_ATTRIBUTION_RE.search(attribution):
+            continue
+        used_end_time = times[1] if len(times) > 1 and times[1].start() - times[0].end() <= 20 else times[0]
+        zone_span = window[max(0, times[0].start() - 12) : used_end_time.end() + 48]
+        zone_match = _zone_from_nearby_text(zone_span)
         if zone_match is None:
             # Do not guess a timezone. Explicit timestamps with no zone remain
             # available to the selected AI extractor.
@@ -359,7 +389,9 @@ def parse_text_slots(text: str, received_at: datetime | None = None) -> list[Ext
                 start = start.replace(year=start.year + 1)
         except (KeyError, TypeError, ValueError):
             continue
-        end = start + DEFAULT_INTERVIEW_DURATION
+        stated_duration = _duration_from_nearby_text(window[:240])
+        end = start + (stated_duration or DEFAULT_INTERVIEW_DURATION)
+        end_is_explicit = stated_duration is not None
         if len(times) > 1 and times[1].start() - times[0].end() <= 20:
             end_hour, end_minute = _clock_parts(times[1])
             proposed = start.replace(hour=end_hour, minute=end_minute)
@@ -367,11 +399,12 @@ def parse_text_slots(text: str, received_at: datetime | None = None) -> list[Ext
                 proposed += timedelta(days=1)
             if proposed - start <= timedelta(hours=12):
                 end = proposed
+                end_is_explicit = True
         start_utc = start.astimezone(timezone.utc)
         end_utc = end.astimezone(timezone.utc)
         key = (start_utc, end_utc)
         if key not in seen:
-            slots.append(ExtractedSlot(start_utc, end_utc, zone_name))
+            slots.append(ExtractedSlot(start_utc, end_utc, zone_name, end_is_explicit))
             seen.add(key)
     return slots
 
@@ -581,12 +614,209 @@ def _domain_identity_tokens(addresses: set[str]) -> set[str]:
     return tokens
 
 
+def _company_named_in_message(email: EmailMessage) -> str:
+    """Read the employer from the subject when it matches the sender's domain.
+
+    "Chat with itility" from jasper@us-itility.com is Itility, even when the
+    message row has no stored company.
+    """
+    tokens = _domain_identity_tokens(_organizer_addresses(email)) - _GENERIC_COMPANY_TOKENS
+    if not tokens:
+        return ""
+    for source in (email.subject or "", email.sender or ""):
+        hits = [word for word in re.findall(r"[A-Za-z0-9]+", source) if word.casefold() in tokens]
+        if len(hits) == 1:
+            word = hits[0]
+            return word if any(character.isupper() for character in word) else word[:1].upper() + word[1:]
+    return ""
+
+
+def _employer_context_messages(db: Session, email: EmailMessage) -> list[EmailMessage]:
+    """Nearby mail for this employer, used only to fill a missing company or role.
+
+    A calendar invite often comes from a person at the company and does not
+    repeat the job title. The application email does. This does not merge two
+    interviews when that company has more than one role in the same two days.
+    """
+    received_at = as_utc(email.received_at)
+    domain_tokens = _domain_identity_tokens(_organizer_addresses(email)) - _GENERIC_COMPANY_TOKENS
+    if received_at is None or not domain_tokens:
+        return []
+    candidates = (
+        db.query(EmailMessage)
+        .filter(
+            EmailMessage.mailbox_id == email.mailbox_id,
+            EmailMessage.id != email.id,
+            EmailMessage.label.in_(CONTEXT_LABELS),
+            EmailMessage.received_at >= received_at - _CROSS_THREAD_WINDOW,
+            EmailMessage.received_at <= received_at + timedelta(days=2),
+            or_(*[EmailMessage.company.ilike(f"%{token}%") for token in domain_tokens]),
+        )
+        .order_by(EmailMessage.received_at.desc(), EmailMessage.id.desc())
+        .limit(40)
+        .all()
+    )
+    matches = [
+        item
+        for item in candidates
+        if domain_tokens.intersection(company_name_tokens(item.company))
+    ]
+    if not matches:
+        return []
+
+    def distance(item: EmailMessage) -> timedelta:
+        return abs((as_utc(item.received_at) or received_at) - received_at)
+
+    matches.sort(key=lambda item: (distance(item), item.id))
+    nearby = [item for item in matches if distance(item) <= timedelta(days=2)] or matches[:1]
+    roles = {(item.job_role or "").strip().casefold() for item in nearby if (item.job_role or "").strip()}
+    if len(roles) > 1:
+        return []
+    return nearby[:3]
+
+
+_ROLE_LOOKBACK = timedelta(days=45)
+
+
+def _open_role_for_employer(db: Session, email: EmailMessage, company_hint: str = "") -> tuple[str, str] | None:
+    """Return the open job title for this employer, and that email's company.
+
+    The title comes from the latest application or interview mail before this
+    message. A role that was already rejected is skipped. Two different open
+    roles in the same three days are left blank rather than guessed.
+    """
+    received_at = as_utc(email.received_at)
+    tokens = company_name_tokens(company_hint) or (
+        _domain_identity_tokens(_organizer_addresses(email)) - _GENERIC_COMPANY_TOKENS
+    )
+    tokens = {token for token in tokens if token not in _GENERIC_COMPANY_TOKENS}
+    if received_at is None or not tokens:
+        return None
+    candidates = (
+        db.query(EmailMessage)
+        .filter(
+            EmailMessage.mailbox_id == email.mailbox_id,
+            EmailMessage.id != email.id,
+            EmailMessage.job_role != "",
+            EmailMessage.received_at >= received_at - _ROLE_LOOKBACK,
+            EmailMessage.received_at <= received_at + timedelta(days=1),
+            or_(*[EmailMessage.company.ilike(f"%{token}%") for token in tokens]),
+        )
+        .all()
+    )
+    matches = [
+        item
+        for item in candidates
+        if company_name_tokens(item.company).intersection(tokens) and (item.job_role or "").strip()
+    ]
+    rejected_roles = {
+        (item.job_role or "").strip().casefold()
+        for item in matches
+        if item.label == EmailLabel.REJECTED_CLOSED.value
+        and as_utc(item.received_at) is not None
+        and as_utc(item.received_at) <= received_at
+    }
+    open_rows = [
+        item
+        for item in matches
+        if item.label != EmailLabel.REJECTED_CLOSED.value
+        and (item.job_role or "").strip().casefold() not in rejected_roles
+        and as_utc(item.received_at) is not None
+        and as_utc(item.received_at) <= received_at
+    ]
+    if not open_rows:
+        return None
+    open_rows.sort(key=lambda item: (as_utc(item.received_at), item.id), reverse=True)
+    latest = open_rows[0]
+    latest_role = (latest.job_role or "").strip()
+    latest_time = as_utc(latest.received_at)
+    for other in open_rows[1:]:
+        other_role = (other.job_role or "").strip()
+        if other_role.casefold() == latest_role.casefold():
+            continue
+        other_time = as_utc(other.received_at)
+        if latest_time is not None and other_time is not None and latest_time - other_time <= timedelta(days=3):
+            return "", ""
+    return latest_role, (latest.company or "").strip()
+
+
+def _fill_missing_role(db: Session, email: EmailMessage, details: InterviewDetails) -> InterviewDetails:
+    if (email.job_role or "").strip():
+        return details
+    found = _open_role_for_employer(db, email, details.company or email.company or "")
+    if found is None:
+        return details
+    role, company = found
+    return InterviewDetails(
+        company=details.company or company,
+        role=role,
+        interviewer=details.interviewer,
+        work_model=details.work_model,
+        job_url=details.job_url,
+    )
+
+
 def _company_identity_tokens(company: str | None) -> set[str]:
     return {
         token
         for token in re.findall(r"[a-z0-9]+", (company or "").casefold())
         if len(token) >= 3 and token not in _DOMAIN_STOPWORDS
     }
+
+
+_GENERIC_COMPANY_TOKENS = {
+    "ag", "and", "co", "com", "commerce", "company", "consulting", "corp", "corporation",
+    "digital", "global", "gmbh", "group", "holdings", "inc", "incorporated", "international",
+    "lab", "labs", "limited", "llc", "ltd", "of", "partners", "plc", "sa", "services",
+    "solutions", "systems", "tech", "technologies", "technology", "the",
+}
+
+
+def company_name_tokens(company: str | None) -> set[str]:
+    """Distinctive words in a company name, without legal or generic suffixes."""
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", (company or "").casefold())
+        if len(token) >= 3 and token not in _GENERIC_COMPANY_TOKENS
+    }
+
+
+def companies_match(left: str | None, right: str | None) -> bool:
+    """Treat shortened and legal variants as one employer.
+
+    "fanatics" and "Fanatics Commerce" match. Names that only share a generic
+    word, such as "group" or "labs", do not.
+    """
+    left_tokens = company_name_tokens(left)
+    right_tokens = company_name_tokens(right)
+    if not left_tokens or not right_tokens:
+        folded_left = (left or "").strip().casefold()
+        folded_right = (right or "").strip().casefold()
+        return bool(folded_left) and folded_left == folded_right
+    if left_tokens == right_tokens:
+        return True
+    smaller, larger = (left_tokens, right_tokens) if len(left_tokens) <= len(right_tokens) else (right_tokens, left_tokens)
+    return smaller.issubset(larger)
+
+
+def fuller_company_name(left: str | None, right: str | None) -> str:
+    """Keep the more specific company text when two names are the same employer."""
+    left_text = (left or "").strip()
+    right_text = (right or "").strip()
+    left_tokens = company_name_tokens(left_text)
+    right_tokens = company_name_tokens(right_text)
+    if len(right_tokens) != len(left_tokens):
+        return right_text if len(right_tokens) > len(left_tokens) else left_text
+    return right_text if len(right_text) > len(left_text) else left_text
+
+
+def roles_compatible(left: str | None, right: str | None) -> bool:
+    """Same role when both sides name one. A missing role does not split the interview."""
+    left_role = (left or "").strip().casefold()
+    right_role = (right or "").strip().casefold()
+    if left_role and right_role:
+        return left_role == right_role
+    return True
 
 
 def _cross_thread_score(
@@ -720,6 +950,9 @@ def _related_interview_emails(
             ) >= 8:
                 related[candidate.id] = candidate
 
+    for item in _employer_context_messages(db, email):
+        related.setdefault(item.id, item)
+
     ordered = sorted(
         related.values(),
         key=lambda item: (as_utc(item.received_at) or datetime.min.replace(tzinfo=timezone.utc), item.id),
@@ -801,6 +1034,61 @@ def _calendar_text(email: EmailMessage) -> str:
     ])
 
 
+_QUOTE_START_RE = re.compile(
+    r"(?:\n_{5,}|\nFrom:\s|\nOn .{0,160}? wrote:|\nGet Outlook for )",
+    re.IGNORECASE,
+)
+
+
+def _without_quoted_history(text: str) -> str:
+    """Keep the new message. A quoted Sent: line is not a new appointment."""
+    match = _QUOTE_START_RE.search(text or "")
+    if match is None or match.start() <= 0:
+        return text or ""
+    return text[: match.start()]
+
+
+def explicit_message_slots(email: EmailMessage) -> list[ExtractedSlot]:
+    """Return a time written in this message, not one copied from the thread."""
+    fresh = _without_quoted_history(_calendar_text(email))
+    return parse_ics_slots(fresh) or parse_text_slots(fresh, email.received_at)
+
+
+_CLOCK_OR_DATE_RE = re.compile(
+    r"\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b"
+    r"|\b\d{1,2}:\d{2}\b"
+    r"|\b\d{1,2}/\d{1,2}\b"
+    r"|\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+\d{1,2}\b",
+    re.IGNORECASE,
+)
+_STILL_BOOKED_RE = re.compile(
+    r"has been scheduled|invitation has been sent|calendar invitation|now confirmed|confirmed for your|out of the office|currently away",
+    re.IGNORECASE,
+)
+
+
+def _fresh_message_text(email: EmailMessage) -> str:
+    # The snippet repeats quoted mail, including the old invite's "Sent:" time.
+    body = (email.body_text or "").strip() or (email.snippet or "")
+    return _without_quoted_history("\n".join([email.subject or "", body]))
+
+
+def leaves_interview_unbooked(email: EmailMessage) -> bool:
+    """True when this message drops the appointment and does not name a new time.
+
+    A reschedule that says "moved to 9:15 a.m." or "has been scheduled" still
+    belongs on the calendar. "I need to reschedule and will be in touch" does not.
+    """
+    if email.interview_subtype not in {"reschedule", "time_change"}:
+        return False
+    if explicit_message_slots(email):
+        return False
+    fresh = _fresh_message_text(email)
+    if _STILL_BOOKED_RE.search(fresh) or _CLOCK_OR_DATE_RE.search(fresh):
+        return False
+    return True
+
+
 async def _resolve_video_landing_page(text: str) -> MeetingAccess | None:
     """Resolve Teamtailor's public meeting-details gateway to a join URL.
 
@@ -851,16 +1139,23 @@ def _parse_ai_slot(item: object) -> ExtractedSlot | None:
     if start.tzinfo is None:
         return None
     end_raw = str(item.get("end") or "").strip()
+    end_parsed = False
     try:
-        end = datetime.fromisoformat(end_raw.replace("Z", "+00:00")) if end_raw else start + DEFAULT_INTERVIEW_DURATION
+        if end_raw:
+            end = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+            end_parsed = True
+        else:
+            end = start + DEFAULT_INTERVIEW_DURATION
     except ValueError:
         end = start + DEFAULT_INTERVIEW_DURATION
+    end_is_explicit = end_parsed and end.tzinfo is not None and end > start
     if end.tzinfo is None or end <= start:
         end = start + DEFAULT_INTERVIEW_DURATION
     return ExtractedSlot(
         start.astimezone(timezone.utc),
         end.astimezone(timezone.utc),
         str(item.get("timezone") or "").strip() or None,
+        end_is_explicit,
     )
 
 
@@ -893,7 +1188,7 @@ async def extract_calendar_details(
                 access.phone_number,
                 access.access_code,
             )
-    known_company = _known_company(messages)
+    known_company = _known_company(messages) or _company_named_in_message(email)
     known_role = _known_role(messages)
     deterministic_job_url = extract_job_url(text)
     deterministic_interviewer = extract_interviewer(current_text, email.sender or "")
@@ -912,7 +1207,10 @@ async def extract_calendar_details(
             "",
         )
     details = InterviewDetails(company=known_company, role=known_role, interviewer=deterministic_interviewer, job_url=deterministic_job_url)
-    if not use_ai:
+    # Google withholds the calendar file on an "unknown sender" invite, but the
+    # subject still has the clock time. Creating that item must not wait on the
+    # model; a slow model scan left these appointments off the calendar.
+    if slots or not use_ai:
         return slots, access, details, bool(slots)
     backend = get_ai_backend()
     if not backend.api_key:
@@ -981,7 +1279,9 @@ def _title(email: EmailMessage, details: InterviewDetails) -> str:
 
 def _apply_details(event: CalendarEvent, email: EmailMessage, access: MeetingAccess, details: InterviewDetails) -> None:
     candidate_company = details.company or (email.company or "").strip()
-    if _company_quality(candidate_company) >= _company_quality(event.company):
+    if companies_match(candidate_company, event.company):
+        event.company = fuller_company_name(event.company, candidate_company)
+    elif _company_quality(candidate_company) >= _company_quality(event.company):
         event.company = candidate_company or event.company
     event.job_role = details.role or (email.job_role or "").strip() or event.job_role
     event.interviewer = details.interviewer or event.interviewer
@@ -1011,9 +1311,13 @@ def _apply_common(
     details: InterviewDetails,
 ) -> None:
     _apply_details(event, email, access, details)
+    stored_end = as_utc(event.end_at) if event.end_at is not None else None
     event.start_at = slot.start_at
-    event.end_at = slot.end_at
-    event.source_timezone = slot.source_timezone
+    # A follow-up that only repeats the start ("10/1 at 10am PST") must not
+    # replace an invite that already has an explicit end.
+    if slot.end_is_explicit or stored_end is None or stored_end <= slot.start_at:
+        event.end_at = slot.end_at
+    event.source_timezone = slot.source_timezone or event.source_timezone
 
 
 def refresh_calendar_event_details(db: Session, email: EmailMessage) -> bool:
@@ -1050,8 +1354,14 @@ def refresh_calendar_event_details(db: Session, email: EmailMessage) -> bool:
             ),
             "",
         )
-    company = _known_company(messages)
-    role = _known_role(messages)
+    company = _known_company(messages) or _company_named_in_message(email)
+    found_role = None if (email.job_role or "").strip() else _open_role_for_employer(db, email, company or email.company or "")
+    if found_role is None:
+        role = _known_role(messages)
+    else:
+        role, role_company = found_role
+        if not company and role_company:
+            company = role_company
     job_url = extract_job_url(combined_text)
     changed = False
     for event in events:
@@ -1233,9 +1543,9 @@ def _confirmed_for_slots(db: Session, email: EmailMessage, slots: list[Extracted
         if sourced:
             return sourced[0]
         return threaded[0] if threaded else None
-    company = (email.company or "").strip().casefold()
+    company = (email.company or "").strip()
     if company:
-        same_company = [item for item in candidates if (item.company or "").strip().casefold() == company]
+        same_company = [item for item in candidates if companies_match(item.company, company)]
         matched = same_company[0] if same_company else None
     else:
         matched = candidates[0]
@@ -1264,16 +1574,264 @@ def _slot_for_event(event: CalendarEvent, slots: list[ExtractedSlot]) -> Extract
     return min(slots, key=lambda slot: abs((slot.start_at - event_start).total_seconds()))
 
 
+def ics_cancels_appointment(text: str) -> bool:
+    """Whether this message's own calendar part cancels the appointment.
+
+    A quoted earlier invite can carry another calendar. The first one belongs
+    to this message. Outlook leaves the original "you are all set" description
+    inside a cancel, so the method and status are the signal, not the prose.
+    """
+    in_calendar = False
+    method = ""
+    status = ""
+    for line in _unfold_ics(text):
+        upper = line.upper()
+        if upper == "BEGIN:VCALENDAR":
+            if in_calendar:
+                break
+            in_calendar = True
+            method = ""
+            status = ""
+            continue
+        if not in_calendar:
+            continue
+        if upper.startswith("METHOD:"):
+            method = upper.split(":", 1)[1].strip()
+        elif upper.startswith("STATUS:"):
+            status = upper.split(":", 1)[1].strip()
+        elif upper == "END:VCALENDAR":
+            break
+    return method == "CANCEL" or status == "CANCELLED"
+
+
+_CANCEL_SUBJECT_RE = re.compile(r"\bcancel(?:ed|led|lation)\b", re.I)
+
+
+def message_cancels_appointment(email: EmailMessage) -> bool:
+    """A cancel file or cancel subject wins over a confirmation label."""
+    if email.interview_subtype == "cancellation":
+        return True
+    text = _calendar_text(email)
+    if ics_cancels_appointment(text):
+        return True
+    return bool(_CANCEL_SUBJECT_RE.search(email.subject or ""))
+
+
+def _replacement_times(email: EmailMessage) -> list[ExtractedSlot]:
+    if ics_cancels_appointment(_calendar_text(email)):
+        return []
+    return parse_text_slots(_without_quoted_history(_calendar_text(email)), email.received_at)
+
+
+def authoritative_cancellation_slots(email: EmailMessage, slots: list[ExtractedSlot]) -> list[ExtractedSlot]:
+    """Times that name the appointment being canceled.
+
+    The cancel file's start time is that appointment. Several prose times are
+    proposed replacements ("updated availability"), not the canceled slot.
+    """
+    text = _calendar_text(email)
+    if ics_cancels_appointment(text):
+        ics_slots = parse_ics_slots(text)
+        return ics_slots or slots[:1]
+    prose_slots = _replacement_times(email)
+    if len(prose_slots) == 1:
+        return prose_slots
+    if len(prose_slots) > 1:
+        return []
+    return slots[:1] if len(slots) <= 1 else []
+
+
+def _event_matches_slots(event: CalendarEvent, slots: list[ExtractedSlot]) -> bool:
+    if not slots:
+        return True
+    start = as_utc(event.start_at)
+    if start is None:
+        return False
+    return any(abs((start - slot.start_at).total_seconds()) <= 60 for slot in slots)
+
+
+def _message_is_newer(incoming: EmailMessage, current: EmailMessage) -> bool:
+    incoming_at = as_utc(incoming.received_at)
+    current_at = as_utc(current.received_at)
+    if incoming_at is not None and current_at is not None and incoming_at != current_at:
+        return incoming_at > current_at
+    if incoming_at is not None and current_at is None:
+        return True
+    if incoming_at is None and current_at is not None:
+        return False
+    return incoming.id >= current.id
+
+
+def _matches_any_slot(event: CalendarEvent, slots: list[ExtractedSlot]) -> bool:
+    start = as_utc(event.start_at)
+    if start is None:
+        return False
+    return any(abs((start - slot.start_at).total_seconds()) <= 60 for slot in slots)
+
+
+def _owned_cancelled_booking(db: Session, email: EmailMessage) -> CalendarEvent | None:
+    """A booking already tied to this message, when its time is not a proposed replacement."""
+    slots = _replacement_times(email)
+    rows = (
+        db.query(CalendarEvent)
+        .filter(
+            CalendarEvent.mailbox_id == email.mailbox_id,
+            CalendarEvent.source_email_id == email.id,
+            CalendarEvent.kind == "confirmed",
+            CalendarEvent.superseded_by_event_id.is_(None),
+        )
+        .all()
+    )
+    real = [event for event in rows if not _matches_any_slot(event, slots)]
+    if len(real) == 1:
+        return real[0]
+    return None
+
+
+def _prior_confirmed_interview(db: Session, email: EmailMessage) -> CalendarEvent | None:
+    """The booking this message can cancel, excluding a slot invented from it."""
+    rows = [
+        event
+        for event in _identity_events(db, email, kind="confirmed")
+        if event.source_email_id != email.id and event.superseded_by_event_id is None
+    ]
+    if not rows:
+        rows = [
+            event
+            for event in _thread_events(db, email, kind="confirmed")
+            if event.source_email_id != email.id and event.superseded_by_event_id is None
+        ]
+    message_at = as_utc(email.received_at)
+    prior = []
+    for event in rows:
+        booked_at = as_utc(event.source_received_at)
+        if message_at is not None and booked_at is not None and booked_at > message_at:
+            continue
+        prior.append(event)
+    if not prior:
+        return None
+    active = [event for event in prior if event.is_visible and event.interview_status != "cancellation"]
+    pool = active or [event for event in prior if event.is_visible]
+    if not pool:
+        return None
+    return max(pool, key=lambda event: (_event_received_at(event), event.id))
+
+
+def _retire_invented_cancellation(
+    db: Session,
+    email: EmailMessage,
+    keeper: CalendarEvent | None,
+) -> bool:
+    """Hide a canceled-looking row whose time was a proposed replacement."""
+    changed = False
+    owned = (
+        db.query(CalendarEvent)
+        .filter(
+            CalendarEvent.mailbox_id == email.mailbox_id,
+            CalendarEvent.source_email_id == email.id,
+            CalendarEvent.kind == "confirmed",
+        )
+        .all()
+    )
+    for stale in owned:
+        if keeper is not None and stale.id == keeper.id:
+            continue
+        if not stale.is_visible and stale.superseded_by_event_id is not None:
+            continue
+        stale.is_visible = False
+        stale.interview_status = "cancellation"
+        # The real booking takes this message as its source. Leave the invented
+        # row linked by calendar_event_emails, not by the source unique key.
+        stale.source_email_id = None
+        if keeper is not None:
+            stale.superseded_by_event_id = keeper.id
+        changed = True
+    if changed:
+        db.flush()
+    return changed
+
+
 def needs_calendar_event_repair(db: Session, email: EmailMessage) -> bool:
     """Identify deterministic repairs for already-processed interview mail."""
     if email.label not in {EmailLabel.INTERVIEW_INVITATION.value, EmailLabel.INTERVIEW_SCHEDULED.value}:
         return False
-    if email.interview_subtype == "cancellation" or re.search(r"\bcancel(?:ed|led|lation)\b", f"{email.subject or ''} {email.snippet or ''}", re.I):
-        return False
+    if message_cancels_appointment(email):
+        text = _calendar_text(email)
+        parsed = parse_ics_slots(text) if ics_cancels_appointment(text) else _replacement_times(email)
+        authoritative = authoritative_cancellation_slots(email, parsed)
+        offered_replacements = len(_replacement_times(email)) > 1
+        existing = _thread_events(db, email, kind="confirmed")
+        owned = (
+            db.query(CalendarEvent)
+            .filter(
+                CalendarEvent.mailbox_id == email.mailbox_id,
+                CalendarEvent.source_email_id == email.id,
+                CalendarEvent.kind == "confirmed",
+            )
+            .all()
+        )
+        if offered_replacements and not authoritative:
+            visible_owned = [event for event in owned if event.is_visible]
+            owned_ids = {event.id for event in visible_owned}
+            company = (email.company or "").strip()
+            message_at = as_utc(email.received_at)
+            other_visible = []
+            for event in (
+                db.query(CalendarEvent)
+                .filter(
+                    CalendarEvent.mailbox_id == email.mailbox_id,
+                    CalendarEvent.kind == "confirmed",
+                    CalendarEvent.is_visible.is_(True),
+                )
+                .all()
+            ):
+                if not company or event.id in owned_ids or not companies_match(event.company, company):
+                    continue
+                booked_at = as_utc(event.source_received_at)
+                # A later rebook is a different appointment, not proof this row is invented.
+                if message_at is not None and booked_at is not None and booked_at > message_at:
+                    continue
+                other_visible.append(event)
+            if other_visible and any(
+                not any(abs((as_utc(item.start_at) - as_utc(other.start_at)).total_seconds()) <= 60 for other in other_visible)
+                for item in visible_owned
+            ):
+                return True
+            if any(event.interview_status != "cancellation" for event in visible_owned):
+                return True
+            prior = _prior_confirmed_interview(db, email)
+            return prior is not None and prior.interview_status != "cancellation"
+        actionable = [event for event in existing if event.superseded_by_event_id is None]
+        if actionable:
+            return any(
+                not event.is_visible
+                or event.interview_status != "cancellation"
+                or not _event_matches_slots(event, authoritative)
+                for event in actionable
+            )
+        if authoritative:
+            return True
+        prior = _prior_confirmed_interview(db, email)
+        return prior is not None and prior.interview_status != "cancellation"
     text = _calendar_text(email)
     slots = parse_ics_slots(text) or parse_text_slots(text, email.received_at)
     if not slots:
         return False
+    sourced_rows = (
+        db.query(CalendarEvent)
+        .filter(
+            CalendarEvent.mailbox_id == email.mailbox_id,
+            CalendarEvent.source_email_id == email.id,
+            CalendarEvent.kind == "confirmed",
+            CalendarEvent.is_visible.is_(True),
+        )
+        .all()
+    )
+    if any(
+        not any(abs((as_utc(event.start_at) - slot.start_at).total_seconds()) <= 60 for slot in slots)
+        for event in sourced_rows
+    ):
+        return True
     if email.label == EmailLabel.INTERVIEW_INVITATION.value:
         starts = {slot.start_at for slot in slots}
         rows = db.query(CalendarEvent.start_at).filter(
@@ -1284,16 +1842,205 @@ def needs_calendar_event_repair(db: Session, email: EmailMessage) -> bool:
     existing = _confirmed_for_slots(db, email, slots)
     if existing is None:
         return True
-    if not _plausible_slot(ExtractedSlot(as_utc(existing.start_at), as_utc(existing.end_at)), email.received_at):
+    if not existing.is_visible:
+        survivor = _surviving_event(db, existing)
+        if survivor is None:
+            latest = _latest_scheduling_email(db, existing)
+            if latest is not None and leaves_interview_unbooked(latest):
+                return False
+            return True
+        existing = survivor
+    expected = _slot_for_event(existing, slots)
+    stored = ExtractedSlot(as_utc(existing.start_at), as_utc(existing.end_at))
+    if not _plausible_slot(stored, email.received_at):
+        return True
+    owner = (
+        db.get(EmailMessage, existing.source_email_id)
+        if existing.source_email_id and existing.source_email_id != email.id
+        else None
+    )
+    newer_owner = owner is not None and not _message_is_newer(email, owner)
+    start_matches = abs((stored.start_at - expected.start_at).total_seconds()) <= 60
+    if (
+        not newer_owner
+        and start_matches
+        and expected.end_is_explicit
+        and abs((stored.end_at - expected.end_at).total_seconds()) > 60
+    ):
+        return True
+    return _same_interview_availability_visible(db, existing)
+
+
+def _surviving_event(db: Session, event: CalendarEvent) -> CalendarEvent | None:
+    """The visible item a merged duplicate now lives in, if any."""
+    seen = {event.id}
+    current = event
+    while current.superseded_by_event_id is not None:
+        nxt = db.get(CalendarEvent, current.superseded_by_event_id)
+        if nxt is None or nxt.id in seen:
+            return None
+        seen.add(nxt.id)
+        current = nxt
+        if current.is_visible:
+            return current
+    return None
+
+
+def _same_booked_role(confirmed: CalendarEvent, available: CalendarEvent) -> bool:
+    """Same interview when the company matches and the roles do not disagree.
+
+    An availability email often omits the role that the later invite names.
+    That missing role is still the same interview, so the old window comes off
+    the calendar once a time is booked. Two named roles stay separate.
+    """
+    if not companies_match(confirmed.company, available.company):
+        return False
+    return roles_compatible(confirmed.job_role, available.job_role)
+
+
+def _hide_booked_interview_availability(db: Session, confirmed: CalendarEvent) -> None:
+    """Hide earlier open windows once this interview has a booked time.
+
+    A booked slot often falls on a different day from the times that were
+    offered. Those windows are no longer available.
+    """
+    company = (confirmed.company or "").strip()
+    if not company or not confirmed.is_visible:
+        return
+    booked_at = as_utc(confirmed.source_received_at)
+    rows = [
+        event
+        for event in db.query(CalendarEvent)
+        .filter(
+            CalendarEvent.mailbox_id == confirmed.mailbox_id,
+            CalendarEvent.kind == "availability",
+            CalendarEvent.is_visible.is_(True),
+        )
+        .all()
+        if companies_match(confirmed.company, event.company)
+    ]
+    for event in rows:
+        if not _same_booked_role(confirmed, event):
+            continue
+        offered_at = as_utc(event.source_received_at)
+        if booked_at and offered_at and offered_at > booked_at:
+            continue
+        event.is_visible = False
+        event.superseded_by_event_id = confirmed.id
+        db.flush()
+        _transfer_event_email_links(db, event, confirmed)
+
+
+def _same_interview_availability_visible(db: Session, confirmed: CalendarEvent) -> bool:
+    company = (confirmed.company or "").strip()
+    if not company or not confirmed.is_visible:
+        return False
+    booked_at = as_utc(confirmed.source_received_at)
+    rows = [
+        event
+        for event in db.query(CalendarEvent)
+        .filter(
+            CalendarEvent.mailbox_id == confirmed.mailbox_id,
+            CalendarEvent.kind == "availability",
+            CalendarEvent.is_visible.is_(True),
+        )
+        .all()
+        if companies_match(confirmed.company, event.company)
+    ]
+    for event in rows:
+        if not _same_booked_role(confirmed, event):
+            continue
+        offered_at = as_utc(event.source_received_at)
+        if booked_at and offered_at and offered_at > booked_at:
+            continue
         return True
     return False
 
 
-def _hide_availability(db: Session, email: EmailMessage, confirmed: CalendarEvent) -> None:
+def _hide_booked_interview_availability_for_source(db: Session, available: CalendarEvent) -> None:
+    company = (available.company or "").strip()
+    if not company:
+        return
+    bookings = [
+        event
+        for event in db.query(CalendarEvent)
+        .filter(
+            CalendarEvent.mailbox_id == available.mailbox_id,
+            CalendarEvent.kind == "confirmed",
+            CalendarEvent.is_visible.is_(True),
+        )
+        .all()
+        if companies_match(company, event.company)
+    ]
+    for booking in bookings:
+        _hide_booked_interview_availability(db, booking)
+
+
+def _hide_availability(
+    db: Session,
+    email: EmailMessage,
+    confirmed: CalendarEvent,
+    related_email_ids: Iterable[int | None] = (),
+) -> None:
     candidates = _thread_events(db, email, kind="availability")
     if not candidates and (email.company or email.job_role):
         candidates = _identity_events(db, email, kind="availability")
+    related_ids = {email_id for email_id in related_email_ids if email_id is not None}
+    if related_ids:
+        candidates.extend(
+            db.query(CalendarEvent)
+            .filter(
+                CalendarEvent.mailbox_id == email.mailbox_id,
+                CalendarEvent.kind == "availability",
+                CalendarEvent.source_email_id.in_(related_ids),
+            )
+            .all()
+        )
+    seen: set[int] = set()
     for event in candidates:
+        if event.id in seen:
+            continue
+        seen.add(event.id)
+        event.is_visible = False
+        event.superseded_by_event_id = confirmed.id
+        db.flush()
+        _transfer_event_email_links(db, event, confirmed)
+    _hide_overlapping_availability(db, confirmed, seen)
+    _hide_booked_interview_availability(db, confirmed)
+
+
+def _hide_overlapping_availability(
+    db: Session,
+    confirmed: CalendarEvent,
+    already_hidden: set[int],
+) -> None:
+    """Hide an open slot once a booked interview occupies that time.
+
+    Company plus overlap is enough. Thread and role often differ between the
+    "here are times" email and the later calendar invite, which is why those
+    availability blocks were left on the calendar.
+    """
+    company = (confirmed.company or "").strip()
+    start_at = as_utc(confirmed.start_at)
+    end_at = as_utc(confirmed.end_at)
+    if not company or start_at is None or end_at is None:
+        return
+    rows = [
+        event
+        for event in db.query(CalendarEvent)
+        .filter(
+            CalendarEvent.mailbox_id == confirmed.mailbox_id,
+            CalendarEvent.kind == "availability",
+            CalendarEvent.is_visible.is_(True),
+            CalendarEvent.start_at < end_at,
+            CalendarEvent.end_at > start_at,
+        )
+        .all()
+        if companies_match(company, event.company)
+    ]
+    for event in rows:
+        if event.id in already_hidden:
+            continue
         event.is_visible = False
         event.superseded_by_event_id = confirmed.id
         db.flush()
@@ -1322,6 +2069,277 @@ def is_passed_outcome(email: EmailMessage) -> bool:
         r"\bcongratulations\b.{0,120}\bnext (?:round|stage)\b",
     )
     return any(re.search(pattern, text, re.I) for pattern in positive_patterns)
+
+
+def _event_received_at(event: CalendarEvent) -> datetime:
+    return as_utc(event.source_received_at) or datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _starts_within_minute(left: CalendarEvent, right: CalendarEvent) -> bool:
+    left_start = as_utc(left.start_at)
+    right_start = as_utc(right.start_at)
+    if left_start is None or right_start is None:
+        return False
+    return abs((left_start - right_start).total_seconds()) <= 60
+
+
+def _same_scheduled_interview(left: CalendarEvent, right: CalendarEvent) -> bool:
+    return (
+        left.mailbox_id == right.mailbox_id
+        and left.kind == "confirmed"
+        and right.kind == "confirmed"
+        and companies_match(left.company, right.company)
+        and roles_compatible(left.job_role, right.job_role)
+        and _starts_within_minute(left, right)
+    )
+
+
+def _same_available_window(left: CalendarEvent, right: CalendarEvent) -> bool:
+    if not (
+        left.mailbox_id == right.mailbox_id
+        and left.kind == "availability"
+        and right.kind == "availability"
+        and companies_match(left.company, right.company)
+        and roles_compatible(left.job_role, right.job_role)
+        and _starts_within_minute(left, right)
+    ):
+        return False
+    left_end = as_utc(left.end_at)
+    right_end = as_utc(right.end_at)
+    if left_end is None or right_end is None:
+        return False
+    return abs((left_end - right_end).total_seconds()) <= 60
+
+
+def _cluster_events(events: list[CalendarEvent], same) -> list[list[CalendarEvent]]:
+    parent = list(range(len(events)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for index, event in enumerate(events):
+        for earlier in range(index):
+            if same(event, events[earlier]):
+                parent[find(index)] = find(earlier)
+    groups: dict[int, list[CalendarEvent]] = {}
+    for index, event in enumerate(events):
+        groups.setdefault(find(index), []).append(event)
+    return [group for group in groups.values() if len(group) > 1]
+
+
+def _absorb_calendar_event(db: Session, survivor: CalendarEvent, duplicate: CalendarEvent) -> None:
+    survivor.company = fuller_company_name(survivor.company, duplicate.company)
+    if not (survivor.job_role or "").strip() and (duplicate.job_role or "").strip():
+        survivor.job_role = duplicate.job_role
+    if (survivor.application_status or "active") == "active" and (duplicate.application_status or "active") != "active":
+        survivor.application_status = duplicate.application_status
+        survivor.outcome_source_email_id = duplicate.outcome_source_email_id or survivor.outcome_source_email_id
+        survivor.outcome_at = duplicate.outcome_at or survivor.outcome_at
+    if not survivor.meeting_url and duplicate.meeting_url:
+        survivor.meeting_url = duplicate.meeting_url
+    if not survivor.meeting_provider and duplicate.meeting_provider:
+        survivor.meeting_provider = duplicate.meeting_provider
+    if (not survivor.meeting_type or survivor.meeting_type == "unspecified") and duplicate.meeting_type:
+        survivor.meeting_type = duplicate.meeting_type
+    if survivor.company and survivor.job_role:
+        survivor.title = f"{survivor.company} — {survivor.job_role}"
+    elif survivor.company:
+        survivor.title = survivor.company
+    duplicate.is_visible = False
+    duplicate.superseded_by_event_id = survivor.id
+    db.flush()
+    _transfer_event_email_links(db, duplicate, survivor)
+
+
+def _latest_scheduling_email(db: Session, event: CalendarEvent) -> EmailMessage | None:
+    """Newest interview-scheduled message tied to this event, including its threads."""
+    email_ids = {
+        email_id
+        for email_id in (event.source_email_id, event.outcome_source_email_id)
+        if email_id is not None
+    }
+    email_ids.update(
+        row[0]
+        for row in db.query(CalendarEventEmail.email_id)
+        .filter(CalendarEventEmail.event_id == event.id)
+        .all()
+    )
+    if not email_ids:
+        return None
+    linked = (
+        db.query(EmailMessage)
+        .filter(
+            EmailMessage.mailbox_id == event.mailbox_id,
+            EmailMessage.id.in_(email_ids),
+        )
+        .all()
+    )
+    thread_ids = {item.thread_id for item in linked if item.thread_id}
+    filters = [EmailMessage.id.in_(email_ids)]
+    if thread_ids:
+        filters.append(EmailMessage.thread_id.in_(thread_ids))
+    scheduled = (
+        db.query(EmailMessage)
+        .filter(
+            EmailMessage.mailbox_id == event.mailbox_id,
+            EmailMessage.label == EmailLabel.INTERVIEW_SCHEDULED.value,
+            or_(*filters),
+        )
+        .all()
+    )
+    if not scheduled:
+        return None
+    return max(scheduled, key=lambda item: (as_utc(item.received_at) or datetime.min.replace(tzinfo=timezone.utc), item.id))
+
+
+def _later_open_reschedule(email: EmailMessage, related_emails: list[EmailMessage]) -> EmailMessage | None:
+    """Return a newer message that drops this appointment without booking a new time."""
+    message_time = as_utc(email.received_at)
+    newer = []
+    for item in related_emails:
+        if not leaves_interview_unbooked(item):
+            continue
+        item_time = as_utc(item.received_at)
+        if message_time is not None and item_time is not None and item_time < message_time:
+            continue
+        newer.append(item)
+    if not newer:
+        return None
+    return max(newer, key=lambda item: (as_utc(item.received_at) or datetime.min.replace(tzinfo=timezone.utc), item.id))
+
+
+def _hide_open_reschedule(db: Session, email: EmailMessage, related_emails: list[EmailMessage]) -> bool:
+    """A reschedule with no new time means the interview is not booked.
+
+    The previous confirmation stays in the thread, but it is no longer a
+    calendar appointment. A later message that names a new time can book it
+    again.
+    """
+    email_ids = {email.id, *(item.id for item in related_emails)}
+    thread_ids = {item.thread_id for item in (email, *related_emails) if item.thread_id}
+    linked_event_ids = {
+        row[0]
+        for row in db.query(CalendarEventEmail.event_id)
+        .filter(CalendarEventEmail.email_id.in_(email_ids))
+        .all()
+    }
+    identities = [
+        ((item.company or "").strip(), (item.job_role or "").strip())
+        for item in related_emails
+        if (item.company or "").strip() and (item.job_role or "").strip()
+    ]
+    message_time = as_utc(email.received_at)
+    rows = (
+        db.query(CalendarEvent)
+        .filter(
+            CalendarEvent.mailbox_id == email.mailbox_id,
+            CalendarEvent.kind == "confirmed",
+            CalendarEvent.is_visible.is_(True),
+        )
+        .all()
+    )
+    changed = False
+    for event in rows:
+        linked = (
+            event.id in linked_event_ids
+            or event.source_email_id in email_ids
+            or (event.source_thread_id and event.source_thread_id in thread_ids)
+        )
+        if not linked:
+            source_time = as_utc(event.source_received_at)
+            booked_before = source_time is None or message_time is None or source_time <= message_time
+            linked = booked_before and any(
+                companies_match(event.company, company) and (event.job_role or "").strip().casefold() == role.casefold()
+                for company, role in identities
+            )
+        if not linked:
+            continue
+        event.is_visible = False
+        event.interview_status = email.interview_subtype or "reschedule"
+        _link_event_email(db, event, email.id)
+        changed = True
+    return changed
+
+
+def hide_open_reschedules(db: Session, mailbox_id: int | None = None) -> int:
+    """Hide booked interviews whose newest message asks to reschedule without a new time."""
+    query = db.query(CalendarEvent).filter(
+        CalendarEvent.kind == "confirmed",
+        CalendarEvent.is_visible.is_(True),
+    )
+    if mailbox_id is not None:
+        query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
+    hidden = 0
+    for event in query.all():
+        latest = _latest_scheduling_email(db, event)
+        if latest is None or not leaves_interview_unbooked(latest):
+            continue
+        event.is_visible = False
+        event.interview_status = latest.interview_subtype
+        _link_event_email(db, event, latest.id)
+        hidden += 1
+    return hidden
+
+
+def collapse_duplicate_calendar_events(db: Session, mailbox_id: int | None = None) -> bool:
+    """Keep one visible chip for each scheduled interview and each open window."""
+    query = db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True))
+    if mailbox_id is not None:
+        query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
+    visible = query.all()
+    changed = False
+    for group in _cluster_events([event for event in visible if event.kind == "confirmed"], _same_scheduled_interview):
+        survivor = max(group, key=lambda event: (_event_received_at(event), event.id))
+        for duplicate in group:
+            if duplicate.id == survivor.id:
+                continue
+            _absorb_calendar_event(db, survivor, duplicate)
+            changed = True
+    for group in _cluster_events([event for event in visible if event.kind == "availability" and event.is_visible], _same_available_window):
+        survivor = max(group, key=lambda event: (_event_received_at(event), event.id))
+        for duplicate in group:
+            if duplicate.id == survivor.id:
+                continue
+            _absorb_calendar_event(db, survivor, duplicate)
+            changed = True
+    confirmed = [
+        event
+        for event in db.query(CalendarEvent)
+        .filter(
+            CalendarEvent.kind == "confirmed",
+            CalendarEvent.is_visible.is_(True),
+            *([CalendarEvent.mailbox_id == mailbox_id] if mailbox_id is not None else []),
+        )
+        .all()
+    ]
+    for event in confirmed:
+        before = {
+            row.id
+            for row in db.query(CalendarEvent.id)
+            .filter(
+                CalendarEvent.mailbox_id == event.mailbox_id,
+                CalendarEvent.kind == "availability",
+                CalendarEvent.is_visible.is_(True),
+            )
+            .all()
+        }
+        _hide_overlapping_availability(db, event, set())
+        _hide_booked_interview_availability(db, event)
+        after = {
+            row.id
+            for row in db.query(CalendarEvent.id)
+            .filter(
+                CalendarEvent.mailbox_id == event.mailbox_id,
+                CalendarEvent.kind == "availability",
+                CalendarEvent.is_visible.is_(True),
+            )
+            .all()
+        }
+        changed = changed or before != after
+    return changed
 
 
 async def process_calendar_email(
@@ -1357,27 +2375,50 @@ async def process_calendar_email(
             target.outcome_at = as_utc(email.received_at) or datetime.now(timezone.utc)
             _link_event_email(db, target, email.id)
             changed = True
+        if collapse_duplicate_calendar_events(db, email.mailbox_id):
+            changed = True
         email.calendar_processed_hash = digest
         email.calendar_processed_at = datetime.now(timezone.utc)
         email.calendar_processing_error = None
         return changed
 
     related_emails = _related_interview_emails(db, email)
+    if email.label == EmailLabel.INTERVIEW_SCHEDULED.value and leaves_interview_unbooked(email):
+        # "I need to reschedule and will be in touch" does not keep the old
+        # appointment, and it does not create a new one.
+        if _hide_open_reschedule(db, email, related_emails):
+            changed = True
+        email.calendar_processed_hash = digest
+        email.calendar_processed_at = datetime.now(timezone.utc)
+        email.calendar_processing_error = None
+        return changed
+
+    recoverable_cancellation = (
+        email.label == EmailLabel.INTERVIEW_SCHEDULED.value
+        and message_cancels_appointment(email)
+        and bool(_thread_events(db, email, kind="confirmed") or _prior_confirmed_interview(db, email))
+    )
     if use_ai:
         slots, access, details, completed = await extract_calendar_details(email, related_emails)
     else:
         slots, access, details, completed = await extract_calendar_details(email, related_emails, use_ai=False)
+    details = _fill_missing_role(db, email, details)
     reusable_scheduled_availability = email.label == EmailLabel.INTERVIEW_SCHEDULED.value and db.query(
         CalendarEvent.id
     ).filter(
         CalendarEvent.source_email_id == email.id,
         CalendarEvent.kind == "availability",
     ).first() is not None
-    if not completed and not reusable_scheduled_availability:
+    if not completed and not reusable_scheduled_availability and not recoverable_cancellation:
         email.calendar_processing_error = "Calendar extraction deferred until the selected AI provider is available"
         return False
 
-    if email.label == EmailLabel.INTERVIEW_INVITATION.value:
+    cancels = message_cancels_appointment(email)
+    offered_replacements = cancels and len(_replacement_times(email)) > 1
+    if cancels:
+        slots = authoritative_cancellation_slots(email, slots)
+
+    if email.label == EmailLabel.INTERVIEW_INVITATION.value and not cancels:
         existing = {
             item.slot_index: item
             for item in db.query(CalendarEvent).filter(CalendarEvent.source_email_id == email.id).all()
@@ -1394,19 +2435,28 @@ async def process_calendar_email(
             _apply_common(event, email, slot, access, details)
             event.kind = "availability"
             event.interview_status = None
-            event.is_visible = True
+            # An older invitation can be refreshed after its confirmation.
+            # Do not resurrect an offer that was already superseded.
+            event.is_visible = event.superseded_by_event_id is None
             db.add(event)
+            db.flush()
+            _hide_booked_interview_availability_for_source(db, event)
             _link_event_emails(db, event, [email.id, *(related.id for related in related_emails)])
             changed = True
         for stale in existing.values():
             stale.is_visible = False
             changed = True
     else:
-        status = email.interview_subtype or "confirmation"
-        event = _confirmed_for_slots(db, email, slots)
-        if event is None and status == "cancellation":
-            identity_matches = _identity_events(db, email, kind="confirmed")
-            event = identity_matches[0] if identity_matches else None
+        status = "cancellation" if cancels else (email.interview_subtype or "confirmation")
+        if offered_replacements:
+            event = _prior_confirmed_interview(db, email) or _owned_cancelled_booking(db, email)
+            if _retire_invented_cancellation(db, email, event):
+                changed = True
+        else:
+            event = _confirmed_for_slots(db, email, slots)
+            if event is None and status == "cancellation":
+                identity_matches = _identity_events(db, email, kind="confirmed")
+                event = identity_matches[0] if identity_matches else None
         sourced_availability = (
             db.query(CalendarEvent)
             .filter(
@@ -1416,19 +2466,29 @@ async def process_calendar_email(
             .order_by(CalendarEvent.slot_index.asc(), CalendarEvent.id.asc())
             .all()
         )
-        if event is not None:
+        current_source = (
+            db.get(EmailMessage, event.source_email_id)
+            if event is not None and event.source_email_id and event.source_email_id != email.id
+            else None
+        )
+        stale_incoming = current_source is not None and not _message_is_newer(email, current_source)
+        if event is not None and stale_incoming:
+            # An earlier invite must not resurrect an appointment a later
+            # message already canceled or moved.
+            changed = _link_event_email(db, event, email.id) or changed
+        elif event is not None:
             event.source_email_id = email.id
             event.source_received_at = as_utc(email.received_at)
             event.interview_status = status
-            # Keep cancellations on the calendar so the user can see that the
-            # appointment was canceled instead of having it silently vanish.
-            event.is_visible = True
+            # Keep a real cancellation on the calendar. A retired replacement
+            # slot stays hidden so a later pass cannot bring that time back.
+            event.is_visible = event.superseded_by_event_id is None
             if slots:
                 _apply_common(event, email, _slot_for_event(event, slots), access, details)
             else:
                 _apply_details(event, email, access, details)
             changed = True
-        elif slots or (status != "cancellation" and sourced_availability):
+        elif not stale_incoming and (slots or (status != "cancellation" and sourced_availability)):
             event = sourced_availability[0] if sourced_availability else CalendarEvent(
                 mailbox_id=email.mailbox_id,
                 origin="email",
@@ -1448,10 +2508,21 @@ async def process_calendar_email(
             db.add(event)
             db.flush()
             changed = True
-        if event is not None:
+        if event is not None and not stale_incoming:
+            latest_schedule = _latest_scheduling_email(db, event)
+            later_reschedule = _later_open_reschedule(email, related_emails)
+            if latest_schedule is not None and leaves_interview_unbooked(latest_schedule):
+                later_reschedule = latest_schedule
+            if later_reschedule is not None and status != "cancellation":
+                event.is_visible = False
+                event.interview_status = later_reschedule.interview_subtype or "reschedule"
+                _link_event_email(db, event, later_reschedule.id)
             db.flush()
             _link_event_emails(db, event, [email.id, *(related.id for related in related_emails)])
-            _hide_availability(db, email, event)
+            _hide_availability(db, email, event, (related.id for related in related_emails))
+
+    if collapse_duplicate_calendar_events(db, email.mailbox_id):
+        changed = True
 
     email.calendar_processed_hash = digest
     email.calendar_processed_at = datetime.now(timezone.utc)
