@@ -1,3 +1,4 @@
+import type { CSSProperties } from "react";
 import type { EmailItem, EmailLabel, MailFolder } from "../api";
 import { CLASSIFY_LABEL_TITLES, INTERVIEW_SUBTYPE_TITLES } from "../labels";
 import type { ViewMode } from "../prefs";
@@ -7,6 +8,7 @@ export default function MessageRow({
   viewMode,
   active,
   accountAddress,
+  accountTint,
   when,
   folderTitle,
   folder,
@@ -17,6 +19,7 @@ export default function MessageRow({
   viewMode: ViewMode;
   active: boolean;
   accountAddress: string;
+  accountTint?: string;
   when: { time: string; day: string };
   folderTitle: string;
   folder: MailFolder;
@@ -54,7 +57,7 @@ export default function MessageRow({
             {senderName(email.sender)}
             {(email.thread_count ?? 1) > 1 && <span className="thread-count">{email.thread_count}</span>}
           </strong>
-          {accountAddress && <span className="table-secondary">{accountAddress}</span>}
+          {accountAddress && <AccountChip address={accountAddress} tint={accountTint} />}
         </span>
         <span className="table-cell">
           <span className="table-primary table-subject">{email.subject || "(no subject)"}</span>
@@ -88,7 +91,7 @@ export default function MessageRow({
               <strong>{senderName(email.sender)}</strong>
               {(email.thread_count ?? 1) > 1 && <span className="thread-count">{email.thread_count}</span>}
             </span>
-            {accountAddress ? <span className="msg-account">{accountAddress}</span> : null}
+            {accountAddress ? <AccountChip address={accountAddress} tint={accountTint} /> : null}
           </span>
           <span className="msg-meta">
             <time>
@@ -108,6 +111,18 @@ export default function MessageRow({
       </span>
       {!email.is_read && <span className="unread-corner-badge" aria-label="Unread">NEW</span>}
     </button>
+  );
+}
+
+function AccountChip({ address, tint }: { address: string; tint?: string }) {
+  const at = address.indexOf("@");
+  const name = at > 0 ? address.slice(0, at) : address;
+  const domain = at > 0 ? address.slice(at) : "";
+  return (
+    <span className="msg-account" title={address} style={tint ? ({ "--account-color": tint } as CSSProperties) : undefined}>
+      <span className="msg-account-dot" aria-hidden="true" />
+      <span className="msg-account-text">{name}<span className="msg-account-domain">{domain}</span></span>
+    </span>
   );
 }
 

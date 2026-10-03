@@ -1,6 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IconButton } from "./UiIcon";
+import { UiIcon } from "./UiIcon";
 
 type Parts = { y: number; m: number; d: number; hh: number; mm: number };
 
@@ -225,7 +225,7 @@ export default function ModernDateTimePicker({
           </div>
           <div className="picker-time-heading">
             <span><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" /><path d="M10 6v4l2.8 1.8" /></svg>Time</span>
-            <IconButton className="bare" name="clock" label="Use current time" onClick={useNow} />
+            <button type="button" className="picker-now" onClick={useNow} aria-label="Use current time"><UiIcon name="clock" />Now</button>
           </div>
           <div className="picker-time">
             <label><span>Hour</span><select value={displayHour} onChange={(event) => pickHour(event.target.value)}>{Array.from({ length: 12 }, (_, index) => index + 1).map((hour) => <option key={hour} value={hour}>{pad2(hour)}</option>)}</select></label>
@@ -234,8 +234,8 @@ export default function ModernDateTimePicker({
             <div className="picker-period" aria-label="AM or PM">{(["AM", "PM"] as const).map((item) => <button key={item} type="button" className={period === item ? "selected" : ""} aria-pressed={period === item} onClick={() => pickPeriod(item)}>{item}</button>)}</div>
           </div>
           <div className="picker-footer">
-            <IconButton className="picker-today bare" name="today" label="Today" onClick={() => pickDay(today)} />
-            <IconButton className="picker-done primary" name="check" label="Done" onClick={() => { setOpen(false); buttonRef.current?.focus(); }} />
+            <button type="button" className="picker-today" onClick={() => pickDay(today)}><UiIcon name="today" />Today</button>
+            <button type="button" className="picker-done" onClick={() => { setOpen(false); buttonRef.current?.focus(); }}><UiIcon name="check" />Done</button>
           </div>
         </div>,
         document.body,

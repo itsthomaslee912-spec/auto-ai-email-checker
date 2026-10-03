@@ -2563,10 +2563,8 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                 }
                 const email = row.email;
                 const when = formatItemTimeAndDay(email.received_at);
-                const accountAddress =
-                  selectedMailboxId == null
-                    ? mailboxById.get(email.mailbox_id)?.email_address ?? ""
-                    : "";
+                const rowMailbox = selectedMailboxId == null ? mailboxById.get(email.mailbox_id) : undefined;
+                const accountAddress = rowMailbox?.email_address ?? "";
                 return (
                   <div
                     key={virtualRow.key}
@@ -2580,6 +2578,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                       viewMode={viewMode}
                       active={selectedId === email.id}
                       accountAddress={accountAddress}
+                      accountTint={rowMailbox ? accountColor(rowMailbox) : undefined}
                       when={when}
                       folder={mailFolderOf(email)}
                       folderTitle={MAIL_FOLDER_TITLES[mailFolderOf(email)]}
