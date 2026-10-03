@@ -12,6 +12,7 @@ from sqlalchemy import String, and_, cast, func, or_
 from sqlalchemy.orm import Session, load_only, sessionmaker
 
 from app.auth.oauth_google import ensure_google_access_token
+from app.auth.session import current_user_id, mailbox_scope
 from app.classify.outcome_extract import OUTCOME_LABELS, apply_outcome
 from app.classify.openai_classifier import infer_interview_subtype
 from app.services.ai_backend import get_ai_backend
@@ -21,6 +22,7 @@ from app.email.gmail import (
     gmail_get_message,
     gmail_mark_read,
     gmail_mark_read_many,
+    gmail_reply_headers,
     gmail_send_message,
     split_mixed_plain_html,
 )
@@ -28,6 +30,7 @@ from app.email.outlook import (
     outlook_attach_folder,
     outlook_get_message,
     outlook_mark_read,
+    outlook_reply_message,
     outlook_send_message,
 )
 from app.email.folders import VALID_FOLDERS
@@ -79,7 +82,7 @@ InterviewSubtypeLiteral = Literal[
 def _from_active_mailbox(query):
     return query.join(
         MailboxConnection, MailboxConnection.id == EmailMessage.mailbox_id
-    ).filter(MailboxConnection.is_active.is_(True))
+    ).filter(mailbox_scope())
 
 
 def _search_filter(query: str):
@@ -185,6 +188,7 @@ def _list_meta(
     does not recount every message.
     """
     key = (
+        current_user_id.get(),
         mailbox_id,
         label or "",
         interview_subtype or "",
@@ -220,9 +224,17 @@ def _list_meta(
     folder_counts = {item: 0 for item in VALID_FOLDERS}
     mailbox_counts: dict[str, int] = {}
     mailbox_unread_counts: dict[str, int] = {}
+    breakdown: dict[tuple[int, str, str, bool], int] = {}
     for mid, lab, fold, is_read, count in grouped:
         amount = int(count)
         mailbox_key = str(mid)
+        cell = (
+            int(mid),
+            lab if lab in valid else EmailLabel.OTHER.value,
+            fold if fold in VALID_FOLDERS else MailFolder.INBOX.value,
+            not is_read,
+        )
+        breakdown[cell] = breakdown.get(cell, 0) + amount
         mailbox_counts[mailbox_key] = mailbox_counts.get(mailbox_key, 0) + amount
         if fold == MailFolder.INBOX.value and not is_read:
             mailbox_unread_counts[mailbox_key] = mailbox_unread_counts.get(mailbox_key, 0) + amount
@@ -239,6 +251,7 @@ def _list_meta(
         "folder_counts": folder_counts,
         "mailbox_counts": mailbox_counts,
         "mailbox_unread_counts": mailbox_unread_counts,
+        "count_breakdown": [[*cell, amount] for cell, amount in breakdown.items()],
     }
     _list_meta_cache[key] = (now, meta)
     if len(_list_meta_cache) > 32:
@@ -279,6 +292,7 @@ _conversation_total_cache: dict[tuple, tuple[float, int]] = {}
 
 
 def _conversation_total(filtered, key: tuple, before_id: int | None) -> int:
+    key = (current_user_id.get(), *key)
     now = time.monotonic()
     if before_id is not None:
         cached = _conversation_total_cache.get(key)
@@ -423,6 +437,7 @@ def list_emails(
         mailbox_counts=mailbox_counts,
         mailbox_unread_counts=mailbox_unread_counts,
         folder_counts=folder_counts,
+        count_breakdown=meta["count_breakdown"],
     )
 
 
@@ -476,7 +491,7 @@ async def _mark_provider_message_read(mailbox_id: int, provider_message_id: str)
     with SessionLocal() as db:
         mailbox = db.query(MailboxConnection).filter(
             MailboxConnection.id == mailbox_id,
-            MailboxConnection.is_active.is_(True),
+            mailbox_scope(),
         ).one_or_none()
         if mailbox is None:
             return
@@ -516,7 +531,7 @@ async def get_email(
     if not has_body:
         mailbox = (
             db.query(MailboxConnection)
-            .filter(MailboxConnection.id == email.mailbox_id, MailboxConnection.is_active.is_(True))
+            .filter(MailboxConnection.id == email.mailbox_id, mailbox_scope())
             .one_or_none()
         )
         if mailbox is not None:
@@ -691,7 +706,7 @@ async def send_email(payload: SendEmailIn, db: Session = Depends(get_db)) -> Sen
         db.query(MailboxConnection)
         .filter(
             MailboxConnection.id == payload.mailbox_id,
-            MailboxConnection.is_active.is_(True),
+            mailbox_scope(),
         )
         .one_or_none()
     )
@@ -711,8 +726,20 @@ async def send_email(payload: SendEmailIn, db: Session = Depends(get_db)) -> Sen
     except Exception as exc:
         raise HTTPException(status_code=400, detail="One attachment is invalid") from exc
 
+    original: EmailMessage | None = None
+    if payload.reply_to_email_id is not None:
+        original = (
+            db.query(EmailMessage)
+            .filter(EmailMessage.id == payload.reply_to_email_id, EmailMessage.mailbox_id == mailbox.id)
+            .one_or_none()
+        )
+    is_provider_original = original is not None and not original.provider_message_id.startswith("local-")
+
     if mailbox.provider == Provider.GOOGLE.value:
         token = await ensure_google_access_token(db, mailbox)
+        in_reply_to = references = None
+        if is_provider_original:
+            in_reply_to, references = await gmail_reply_headers(token, original.provider_message_id)
         result = await gmail_send_message(
             token,
             to_address=to_address,
@@ -721,18 +748,30 @@ async def send_email(payload: SendEmailIn, db: Session = Depends(get_db)) -> Sen
             from_name=mailbox.display_name,
             from_email=mailbox.email_address,
             attachments=attachments,
+            in_reply_to=in_reply_to,
+            references=references,
+            thread_id=original.thread_id if in_reply_to and original.thread_id else None,
         )
         provider_message_id = result.get("id")
 
     if mailbox.provider == Provider.MICROSOFT.value:
         token = await ensure_microsoft_access_token(db, mailbox)
-        await outlook_send_message(
-            token,
-            to_address=to_address,
-            subject=payload.subject.strip() or "(no subject)",
-            body_text=payload.body_text,
-            attachments=attachments,
-        )
+        if is_provider_original:
+            await outlook_reply_message(
+                token,
+                original.provider_message_id,
+                to_address=to_address,
+                body_text=payload.body_text,
+                attachments=attachments,
+            )
+        else:
+            await outlook_send_message(
+                token,
+                to_address=to_address,
+                subject=payload.subject.strip() or "(no subject)",
+                body_text=payload.body_text,
+                attachments=attachments,
+            )
         provider_message_id = None
 
     elif mailbox.provider not in (Provider.GOOGLE.value, Provider.MICROSOFT.value):
@@ -745,6 +784,7 @@ async def send_email(payload: SendEmailIn, db: Session = Depends(get_db)) -> Sen
         subject=payload.subject.strip() or "(no subject)", sender=f"To: {to_address}",
         received_at=datetime.now(timezone.utc), snippet=payload.body_text[:500], body_text=payload.body_text,
         folder=MailFolder.SENT.value, is_read=True, label=EmailLabel.OTHER.value,
+        thread_id=original.thread_id if original is not None else None,
     )
     db.add(sent)
     db.commit()

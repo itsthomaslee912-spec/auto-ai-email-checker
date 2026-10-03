@@ -91,6 +91,7 @@ class EmailPageOut(BaseModel):
     mailbox_counts: dict[str, int]
     mailbox_unread_counts: dict[str, int] = {}
     folder_counts: dict[str, int] = {}
+    count_breakdown: list[tuple[int, str, str, bool, int]] = []
 
 
 class MarkAllReadOut(BaseModel):
@@ -114,6 +115,7 @@ class SendEmailIn(BaseModel):
     subject: str
     body_text: str
     attachments: list[EmailAttachmentIn] = []
+    reply_to_email_id: int | None = None
 
 
 class SendEmailOut(BaseModel):

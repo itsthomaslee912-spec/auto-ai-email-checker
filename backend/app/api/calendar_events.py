@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, contains_eager
 
+from app.auth.session import mailbox_scope
 from app.db import get_db
 from app.models import CalendarEvent, CalendarEventEmail, EmailMessage, MailboxConnection
 from app.realtime.sse import publish
@@ -20,7 +21,7 @@ router = APIRouter(prefix="/api/calendar-events", tags=["calendar"])
 def _active_mailbox(db: Session, mailbox_id: int) -> MailboxConnection:
     mailbox = db.query(MailboxConnection).filter(
         MailboxConnection.id == mailbox_id,
-        MailboxConnection.is_active.is_(True),
+        mailbox_scope(),
     ).one_or_none()
     if mailbox is None:
         raise HTTPException(status_code=404, detail="Email account not found")
@@ -32,7 +33,7 @@ def _event_query(db: Session):
         db.query(CalendarEvent)
         .join(MailboxConnection, MailboxConnection.id == CalendarEvent.mailbox_id)
         .options(contains_eager(CalendarEvent.mailbox))
-        .filter(MailboxConnection.is_active.is_(True))
+        .filter(mailbox_scope())
     )
 
 

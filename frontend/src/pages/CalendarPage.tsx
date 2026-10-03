@@ -152,6 +152,31 @@ function formatInterviewTimeRange(event: CalendarEvent, timeZone: string) {
     : cachedDateTime(timeZone, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }, endInstant);
   return `${start} – ${end}`;
 }
+function InterviewTimeRange({ event, timeZone }: { event: CalendarEvent; timeZone: string }) {
+  const startInstant = new Date(event.start_at);
+  const endInstant = new Date(event.end_at);
+  const startParts = partsInTimeZone(startInstant, timeZone);
+  const endParts = partsInTimeZone(endInstant, timeZone);
+  const sameDay = startParts.year === endParts.year && startParts.month === endParts.month && startParts.day === endParts.day;
+  const dateOptions: Intl.DateTimeFormatOptions = { weekday: "short", month: "short", day: "numeric" };
+  const startDate = cachedDateTime(timeZone, dateOptions, startInstant);
+  const startClock = formatClock(event.start_at, timeZone);
+  const endClock = formatClock(event.end_at, timeZone);
+  if (sameDay) {
+    return (
+      <span className="interview-time-range">
+        <span>{startDate}</span>
+        <span>{startClock} – {endClock}</span>
+      </span>
+    );
+  }
+  return (
+    <span className="interview-time-range">
+      <span>{startDate}, {startClock} –</span>
+      <span>{cachedDateTime(timeZone, dateOptions, endInstant)}, {endClock}</span>
+    </span>
+  );
+}
 function periodTitle(anchor: Date, days: Date[], view: ViewMode) {
   const monthName = (date: Date, length: "long" | "short") => new Intl.DateTimeFormat("en-US", { timeZone: "UTC", month: length }).format(date);
   const weekdayName = (date: Date) => new Intl.DateTimeFormat("en-US", { timeZone: "UTC", weekday: "long" }).format(date);
@@ -234,6 +259,22 @@ function eventStatusFilter(event: CalendarEvent): CalendarStatusFilter {
 
 function defaultStatusFilters(): CalendarStatusFilter[] {
   return CALENDAR_STATUS_FILTERS.map((item) => item.value).filter((value) => value !== "canceled");
+}
+
+const CALENDAR_HIDDEN_MAILBOXES_KEY = "calendar-hidden-mailboxes";
+
+function loadHiddenMailboxIds(): number[] {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(CALENDAR_HIDDEN_MAILBOXES_KEY) ?? "[]");
+    return Array.isArray(parsed) ? parsed.filter((value): value is number => Number.isInteger(value)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistHiddenMailboxIds(next: number[]) {
+  try { localStorage.setItem(CALENDAR_HIDDEN_MAILBOXES_KEY, JSON.stringify(next)); }
+  catch { /* ignore unavailable storage */ }
 }
 
 function loadStatusFilters(): CalendarStatusFilter[] {
@@ -662,7 +703,7 @@ const EventCard = memo(function EventCard({ event, color, timeZone, compact, tim
         style={{ left: hoverPosition.left, top: hoverPosition.top }}
       >
         <dl>
-          <div className="calendar-hover-time"><dt>Interview time</dt><dd>{formatInterviewTimeRange(event, timeZone)}</dd></div>
+          <div className="calendar-hover-time"><dt>Interview time</dt><dd><InterviewTimeRange event={event} timeZone={timeZone} /></dd></div>
           <div><dt>Account</dt><dd>{event.email_account || "—"}</dd></div>
           <div><dt>Company</dt><dd>{event.company || "—"}</dd></div>
           <div><dt>Role</dt><dd>{event.role || "—"}</dd></div>
@@ -777,40 +818,79 @@ type AccountInterviewCount = {
   color: string;
 };
 
+const DONUT_RADIUS = 42;
+const DONUT_CIRCUMFERENCE = 2 * Math.PI * DONUT_RADIUS;
+
 function ScheduledInterviewChart({ accounts }: { accounts: AccountInterviewCount[] }) {
+  const [hoveredId, setHoveredId] = useState<number | null>(null);
   const total = accounts.reduce((sum, account) => sum + account.count, 0);
   const activeAccounts = accounts.filter((account) => account.count > 0);
-  let cursor = 0;
-  const chartFill = total === 0
-    ? "var(--calendar-border-soft)"
-    : `conic-gradient(${activeAccounts.map((account) => {
-      const start = (cursor / total) * 100;
-      cursor += account.count;
-      const end = (cursor / total) * 100;
-      return `${account.color} ${start}% ${end}%`;
-    }).join(", ")})`;
+  const sorted = [...accounts].sort((a, b) => b.count - a.count);
+  const hovered = activeAccounts.find((account) => account.mailboxId === hoveredId) ?? null;
+  const gap = activeAccounts.length > 1 ? 3 : 0;
+  let offset = 0;
+  const segments = activeAccounts.map((account) => {
+    const length = (account.count / total) * DONUT_CIRCUMFERENCE;
+    const segment = { account, dash: Math.max(length - gap, 0.5), offset };
+    offset += length;
+    return segment;
+  });
   const ariaSummary = total === 0
     ? "No scheduled interviews in this view"
     : `${total} scheduled interview${total === 1 ? "" : "s"} in this view. ${activeAccounts.map((account) => `${account.email}: ${account.count}`).join(". ")}`;
+  const percentOf = (count: number) => total > 0 ? Math.round((count / total) * 100) : 0;
 
   return <section className="calendar-interview-summary" aria-label="Scheduled interviews by email account">
     <div className="interview-chart-card">
-      <div className="interview-donut-wrap">
-        <div className="interview-donut" style={{ background: chartFill }} role="img" aria-label={ariaSummary}>
-          <div className="interview-donut-hole"><strong>{total}</strong><span>scheduled</span></div>
+      <header className="interview-chart-header">
+        <h2>Scheduled interviews</h2>
+        <span>This view</span>
+      </header>
+      <div className="interview-donut" role="img" aria-label={ariaSummary}>
+        <svg viewBox="0 0 100 100" aria-hidden="true">
+          <circle className="interview-donut-track" cx="50" cy="50" r={DONUT_RADIUS} />
+          {segments.map(({ account, dash, offset: start }) => (
+            <circle
+              key={account.mailboxId}
+              className={`interview-donut-segment${hovered && hovered.mailboxId !== account.mailboxId ? " is-dimmed" : ""}${hovered?.mailboxId === account.mailboxId ? " is-active" : ""}`}
+              cx="50" cy="50" r={DONUT_RADIUS}
+              stroke={account.color}
+              strokeDasharray={`${dash} ${DONUT_CIRCUMFERENCE}`}
+              strokeDashoffset={-start}
+              onMouseEnter={() => setHoveredId(account.mailboxId)}
+              onMouseLeave={() => setHoveredId(null)}
+            />
+          ))}
+        </svg>
+        <div className="interview-donut-center">
+          <strong>{hovered ? hovered.count : total}</strong>
+          <span>{hovered ? `${percentOf(hovered.count)}% · ${hovered.email.split("@")[0]}` : total === 1 ? "interview" : "interviews"}</span>
         </div>
       </div>
       <ul className="interview-account-list" aria-label="Scheduled interview counts by email account">
-        {accounts.map((account) => {
-          const percentage = total > 0 ? Math.round((account.count / total) * 100) : 0;
-          return <li className={account.count === 0 ? "is-empty" : undefined} key={account.mailboxId} title={account.email}>
-            <span className="interview-account-swatch" style={{ background: account.color }} aria-hidden="true" />
-            <span className="interview-account-copy"><strong>{account.email}</strong><small>{percentage}% of scheduled</small></span>
-            <span className="interview-account-count" aria-label={`${account.count} scheduled`}>{account.count}</span>
+        {sorted.map((account) => {
+          const percentage = percentOf(account.count);
+          const [name, domain] = account.email.split("@");
+          return <li
+            className={`${account.count === 0 ? "is-empty" : ""}${hovered?.mailboxId === account.mailboxId ? " is-active" : ""}`}
+            key={account.mailboxId}
+            style={{ "--account-color": account.color } as React.CSSProperties}
+            onMouseEnter={() => account.count > 0 && setHoveredId(account.mailboxId)}
+            onMouseLeave={() => setHoveredId(null)}
+          >
+            <span className="interview-account-swatch" aria-hidden="true" />
+            <span className="interview-account-copy">
+              <strong>{name}<em>@{domain}</em></strong>
+              <span className="interview-account-bar" aria-hidden="true"><span style={{ width: `${percentage}%` }} /></span>
+            </span>
+            <span className="interview-account-stat" aria-label={`${account.count} scheduled, ${percentage}%`}>
+              <strong>{account.count}</strong>
+              <small>{percentage}%</small>
+            </span>
           </li>;
         })}
       </ul>
-      {!accounts.length && <p className="interview-chart-empty">Connect an email account to see interview activity.</p>}
+      {!accounts.length && <p className="interview-chart-empty">Select a calendar to see interview activity.</p>}
     </div>
   </section>;
 }
@@ -893,6 +973,14 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
   const [anchor, setAnchor] = useState(() => wallDateForInstant(new Date(), timeZone));
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [statusFilters, setStatusFilters] = useState<CalendarStatusFilter[]>(loadStatusFilters);
+  const [hiddenMailboxIds, setHiddenMailboxIds] = useState<number[]>(loadHiddenMailboxIds);
+  const updateHiddenMailboxIds = useCallback((update: (current: number[]) => number[]) => {
+    setHiddenMailboxIds((current) => {
+      const next = update(current);
+      persistHiddenMailboxIds(next);
+      return next;
+    });
+  }, []);
   const [loading, setLoading] = useState(true); const [error, setError] = useState("");
   const [selected, setSelected] = useState<CalendarEvent | null>(null);
   const [monthDay, setMonthDay] = useState<Date | null>(null);
@@ -1032,7 +1120,9 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
   }, [monthDay]);
   const miniMonthStart = useMemo(() => startOfWeek(new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), 1))), [anchor.getUTCFullYear(), anchor.getUTCMonth()]);
   const miniMonthDays = useMemo(() => Array.from({ length: 42 }, (_, i) => addDays(miniMonthStart, i)), [miniMonthStart.getTime()]);
-  const shownEvents = useMemo(() => events.filter((event) => statusFilters.includes(eventStatusFilter(event))), [events, statusFilters]);
+  const shownEvents = useMemo(() => events.filter((event) => statusFilters.includes(eventStatusFilter(event)) && !hiddenMailboxIds.includes(event.mailbox_id)), [events, statusFilters, hiddenMailboxIds]);
+  const activeMailboxes = useMemo(() => mailboxes.filter((mailbox) => mailbox.is_active), [mailboxes]);
+  const allCalendarsShown = activeMailboxes.every((mailbox) => !hiddenMailboxIds.includes(mailbox.id));
   const dayGroups = useMemo(() => groupEventsByDay(shownEvents, days, timeZone), [shownEvents, days, timeZone]);
   const selectCalendarEventRef = useRef<(event: CalendarEvent) => void>(() => {});
   const selectCalendarEvent = useCallback((event: CalendarEvent) => selectCalendarEventRef.current(event), []);
@@ -1044,12 +1134,12 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
     const mailbox = mailboxes.find((item) => item.id === mailboxId);
     return mailbox ? accountColor(mailbox) : defaultAccountColor(mailboxId);
   }, [mailboxes]);
-  const scheduledInterviewsByAccount = useMemo(() => mailboxes.filter((mailbox) => mailbox.is_active).map((mailbox) => ({
+  const scheduledInterviewsByAccount = useMemo(() => mailboxes.filter((mailbox) => mailbox.is_active && !hiddenMailboxIds.includes(mailbox.id)).map((mailbox) => ({
     mailboxId: mailbox.id,
     email: mailbox.email_address,
     color: accountColor(mailbox),
     count: shownEvents.filter((event) => event.mailbox_id === mailbox.id && event.kind === "confirmed").length,
-  })), [shownEvents, mailboxes]);
+  })), [shownEvents, mailboxes, hiddenMailboxIds]);
   const nextMeeting = useMemo(() => shownEvents.filter((event) => event.kind === "confirmed" && new Date(event.end_at).getTime() > Date.now()).sort((a, b) => new Date(a.start_at).getTime() - new Date(b.start_at).getTime())[0] ?? null, [shownEvents]);
   const nowInTimeZone = wallDateForInstant(new Date(), timeZone);
   const move = (amount: number) => setAnchor((date) => { const out = new Date(date); if (view === "month") out.setUTCMonth(out.getUTCMonth() + amount); else out.setUTCDate(out.getUTCDate() + amount * (view === "week" ? 7 : 1)); return out; });
@@ -1256,7 +1346,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
         </header>
         <div className="details-content">
           <dl className="details-list">
-            <div className="details-row details-time-row"><dt>Interview time</dt><dd>{formatInterviewTimeRange(selected, timeZone)}</dd></div>
+            <div className="details-row details-time-row"><dt>Interview time</dt><dd><InterviewTimeRange event={selected} timeZone={timeZone} /></dd></div>
             <div className="details-row"><dt>Account</dt><dd>{selected.email_account}</dd></div>
             <div className="details-row"><dt>Company</dt><dd>{selected.company || "—"}</dd></div>
             <div className="details-row"><dt>Role</dt><dd>{selected.role || "—"}</dd></div>
@@ -1328,7 +1418,28 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
         </section>
         <section className="calendar-next-meeting"><h2>Next meeting</h2>{nextMeeting ? <button type="button" className="next-meeting-card" onClick={() => showEventDetails(nextMeeting)}><span className="next-meeting-logo" style={{ "--account-color": mailboxColor(nextMeeting.mailbox_id) } as React.CSSProperties}>{eventInitials(nextMeeting)}</span><span><strong>{nextMeeting.title}</strong><small>{startsIn(nextMeeting.start_at)}</small></span></button> : <p>No upcoming meetings in this view.</p>}</section>
         <ScheduledInterviewChart accounts={scheduledInterviewsByAccount} />
-        <section className="calendar-legend"><h2>Calendars</h2>{mailboxes.filter((mailbox) => mailbox.is_active).map((mailbox) => <div key={mailbox.id}><span style={{ background: accountColor(mailbox) }} /><p title={mailbox.email_address}>{mailbox.email_address}</p></div>)}</section>
+        <section className="calendar-legend">
+          <header>
+            <h2>Calendars</h2>
+            {activeMailboxes.length > 1 && (
+              <button type="button" onClick={() => updateHiddenMailboxIds(() => allCalendarsShown ? activeMailboxes.map((mailbox) => mailbox.id) : [])}>
+                {allCalendarsShown ? "Hide all" : "Show all"}
+              </button>
+            )}
+          </header>
+          <div className="calendar-legend-options" role="group" aria-label="Calendars">
+            {activeMailboxes.map((mailbox) => (
+              <label className="calendar-legend-option" key={mailbox.id} title={mailbox.email_address} style={{ "--account-color": accountColor(mailbox) } as React.CSSProperties}>
+                <input
+                  type="checkbox"
+                  checked={!hiddenMailboxIds.includes(mailbox.id)}
+                  onChange={() => updateHiddenMailboxIds((current) => current.includes(mailbox.id) ? current.filter((id) => id !== mailbox.id) : [...current, mailbox.id])}
+                />
+                <span>{mailbox.email_address}</span>
+              </label>
+            ))}
+          </div>
+        </section>
       </aside>}
     </div>
     {editor && <div className="modal-backdrop" role="presentation" onMouseDown={() => !saving && setEditor(null)}><form className="calendar-editor" onSubmit={save} onMouseDown={(e) => e.stopPropagation()}><header><h2>{editor.id ? "Edit event" : "New event"}</h2><button type="button" onClick={() => setEditor(null)}>×</button></header>

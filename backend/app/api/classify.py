@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.auth.session import current_user_is_admin, mailbox_scope, require_admin
 from app.db import get_db
-from app.models import ClassifyCorrection
+from app.models import ClassifyCorrection, EmailMessage, MailboxConnection
 from app.schemas import (
     ClassifyPromptStatusOut,
     ClassifyPromptUpdateOut,
@@ -21,6 +23,18 @@ from app.services.prompt_update import (
 router = APIRouter(prefix="/api/classify", tags=["classify"])
 
 
+def _visible_corrections(query):
+    """Admins see every training example; other sign-in accounts only their own mail's."""
+    if current_user_is_admin.get():
+        return query
+    owned_email_ids = (
+        select(EmailMessage.id)
+        .join(MailboxConnection, MailboxConnection.id == EmailMessage.mailbox_id)
+        .where(mailbox_scope())
+    )
+    return query.filter(ClassifyCorrection.email_id.in_(owned_email_ids))
+
+
 @router.get("/prompt", response_model=ClassifyPromptStatusOut)
 def classify_prompt_status(db: Session = Depends(get_db)) -> ClassifyPromptStatusOut:
     return get_prompt_status(db)
@@ -32,10 +46,10 @@ def list_training_examples(
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ) -> ClassifyTrainingPageOut:
-    query = db.query(ClassifyCorrection).order_by(ClassifyCorrection.id.desc())
+    query = _visible_corrections(db.query(ClassifyCorrection)).order_by(ClassifyCorrection.id.desc())
     total = query.count()
     rows = query.offset(offset).limit(limit).all()
-    unused_count = unused_corrections_query(db).count()
+    unused_count = _visible_corrections(unused_corrections_query(db)).count()
     return ClassifyTrainingPageOut(
         items=[ClassifyTrainingExampleOut.model_validate(row) for row in rows],
         unused_count=unused_count,
@@ -45,16 +59,24 @@ def list_training_examples(
 
 @router.delete("/training/unused")
 def delete_unused_training_examples(db: Session = Depends(get_db)) -> dict[str, int]:
-    deleted = db.query(ClassifyCorrection).filter(
-        ClassifyCorrection.used_in_prompt_version_id.is_(None)
-    ).delete(synchronize_session=False)
+    ids = [
+        row.id
+        for row in _visible_corrections(
+            db.query(ClassifyCorrection).filter(ClassifyCorrection.used_in_prompt_version_id.is_(None))
+        ).all()
+    ]
+    deleted = 0
+    if ids:
+        deleted = db.query(ClassifyCorrection).filter(ClassifyCorrection.id.in_(ids)).delete(
+            synchronize_session=False
+        )
     db.commit()
     return {"deleted": deleted}
 
 
 @router.delete("/training/{example_id}")
 def delete_training_example(example_id: int, db: Session = Depends(get_db)) -> dict[str, int]:
-    row = db.query(ClassifyCorrection).filter(ClassifyCorrection.id == example_id).one_or_none()
+    row = _visible_corrections(db.query(ClassifyCorrection)).filter(ClassifyCorrection.id == example_id).one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="Training example not found")
     if row.used_in_prompt_version_id is not None:
@@ -66,6 +88,7 @@ def delete_training_example(example_id: int, db: Session = Depends(get_db)) -> d
 
 @router.post("/prompt/update", response_model=ClassifyPromptUpdateOut)
 async def classify_prompt_update(db: Session = Depends(get_db)) -> ClassifyPromptUpdateOut:
+    require_admin()
     try:
         return await update_prompt_from_corrections(db)
     except PromptUpdateError as exc:

@@ -19,6 +19,7 @@ import {
   type Mailbox,
   type MailboxLabelStats,
   type MailboxOutcomes,
+  type SessionUser,
 } from "../api";
 import { accountColor } from "../accountColor";
 import { CLASSIFY_LABEL_TITLES, INTERVIEW_SUBTYPE_TITLES } from "../labels";
@@ -39,8 +40,10 @@ import AccountSelect from "../components/AccountSelect";
 import CompactSelect from "../components/CompactSelect";
 import ModernDateTimePicker from "../components/ModernDateTimePicker";
 import LabelPieChart from "../components/LabelPieChart";
+import { IconButton } from "../components/UiIcon";
+import SignInAccountsPanel from "../components/SignInAccountsPanel";
 
-export type SettingsSection = "accounts" | "appearance" | "ai" | "training" | "statistics";
+export type SettingsSection = "signin" | "accounts" | "appearance" | "ai" | "training" | "statistics";
 
 const TRAINING_PAGE_SIZE = 20;
 const DEFAULT_GEMINI_MODELS = [
@@ -162,6 +165,8 @@ export default function SettingsPage({
   accountStatus,
   reclassifyProgress,
   initialMailboxId = null,
+  sessionUser,
+  onSignOut,
 }: {
   section: SettingsSection;
   onSectionChange: (section: SettingsSection) => void;
@@ -200,6 +205,8 @@ export default function SettingsPage({
   accountStatus: Record<number, { type: "sync" | "reclassify" | "success" | "error"; message: string }>;
   reclassifyProgress: Record<number, { processed: number; total: number; failed: number }>;
   initialMailboxId?: number | null;
+  sessionUser: SessionUser;
+  onSignOut: () => void;
 }) {
   const [promptStatus, setPromptStatus] = useState<ClassifyPromptStatus | null>(null);
   const [training, setTraining] = useState<ClassifyTrainingExample[]>([]);
@@ -298,6 +305,22 @@ export default function SettingsPage({
   const [outcomePieCounts, setOutcomePieCounts] = useState<Record<string, number> | null>(null);
   const [outcomePieLoading, setOutcomePieLoading] = useState(false);
   const OUTCOME_PAGE_SIZE = 20;
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      if (outcomePieOpen) {
+        event.preventDefault();
+        setOutcomePieOpen(false);
+        return;
+      }
+      if (document.querySelector("[aria-expanded='true']")) return;
+      event.preventDefault();
+      onClose();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [onClose, outcomePieOpen]);
 
   useEffect(() => {
     if (section !== "training") return;
@@ -446,7 +469,8 @@ export default function SettingsPage({
   }
 
   const navItems: { id: SettingsSection; label: string }[] = [
-    { id: "accounts", label: "Accounts" },
+    { id: "signin", label: "Sign-in" },
+    { id: "accounts", label: "Email accounts" },
     { id: "appearance", label: "Appearance" },
     { id: "ai", label: "AI model" },
     { id: "training", label: "Training" },
@@ -458,9 +482,7 @@ export default function SettingsPage({
       <div className="settings-shell">
         <header className="settings-top">
           <h2 id="settings-title">Settings</h2>
-          <button type="button" className="action-btn" onClick={onClose}>
-            Back to inbox
-          </button>
+          <IconButton name="back" label="Back to inbox" onClick={onClose} />
         </header>
         <div className="settings-body">
           <nav className="settings-nav" aria-label="Settings sections">
@@ -482,6 +504,7 @@ export default function SettingsPage({
             ))}
           </nav>
           <div className="settings-content">
+            {section === "signin" && <SignInAccountsPanel sessionUser={sessionUser} onSignOut={onSignOut} />}
             {section === "accounts" && (
               <div className="settings-panel">
                 <section className="settings-block">

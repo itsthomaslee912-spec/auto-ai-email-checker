@@ -1,4 +1,5 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useId, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { Mailbox } from "../api";
 
 export default function AccountSelect({
@@ -13,44 +14,66 @@ export default function AccountSelect({
   const fieldId = useId();
   const rootRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
-  const [anchor, setAnchor] = useState<{ top: number; left: number; width: number; maxHeight: number } | null>(null);
+  const [anchor, setAnchor] = useState<{ top: number; left: number; minWidth: number; maxWidth: number; maxHeight: number } | null>(null);
   const selected = value === "all" ? null : mailboxes.find((box) => box.id === value);
   const label = selected?.email_address ?? "All accounts";
 
-  useEffect(() => {
-    if (!open) return;
-    const rect = buttonRef.current?.getBoundingClientRect();
-    if (rect) {
-      const width = 264;
-      const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
-      setAnchor({
-        top: rect.bottom + 6,
-        left,
-        width,
-        maxHeight: Math.max(120, window.innerHeight - rect.bottom - 16),
-      });
+  useLayoutEffect(() => {
+    if (!open) {
+      setAnchor(null);
+      return;
     }
+    let frame = 0;
+    const place = () => {
+      const rect = buttonRef.current?.getBoundingClientRect();
+      if (rect) {
+        const maxWidth = Math.min(360, window.innerWidth - 16);
+        const minWidth = Math.min(Math.max(rect.width, 220), maxWidth);
+        const width = Math.min(Math.max(minWidth, menuRef.current?.offsetWidth ?? 0), maxWidth);
+        const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+        const below = window.innerHeight - rect.bottom - 16;
+        const above = rect.top - 16;
+        const menuHeight = menuRef.current?.scrollHeight ?? 0;
+        const flip = below < Math.min(menuHeight, 240) && above > below;
+        const next = {
+          top: flip ? Math.max(8, rect.top - 6 - Math.min(menuHeight, above)) : rect.bottom + 6,
+          left,
+          minWidth,
+          maxWidth,
+          maxHeight: Math.max(120, flip ? above : below),
+        };
+        setAnchor((current) =>
+          current
+          && Math.abs(current.top - next.top) < 0.5
+          && Math.abs(current.left - next.left) < 0.5
+          && Math.abs(current.minWidth - next.minWidth) < 0.5
+          && Math.abs(current.maxWidth - next.maxWidth) < 0.5
+          && Math.abs(current.maxHeight - next.maxHeight) < 0.5
+            ? current
+            : next,
+        );
+      }
+      frame = window.requestAnimationFrame(place);
+    };
+    place();
     const onPointer = (event: MouseEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+      const target = event.target as Node;
+      if (!rootRef.current?.contains(target) && !menuRef.current?.contains(target)) setOpen(false);
     };
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false);
-    };
-    const close = () => setOpen(false);
-    const closeOnScroll = (event: Event) => {
-      if (rootRef.current?.contains(event.target as Node)) return;
+      if (event.key !== "Escape") return;
+      event.preventDefault();
       setOpen(false);
+      buttonRef.current?.focus();
     };
     document.addEventListener("mousedown", onPointer);
     document.addEventListener("keydown", onKey);
-    window.addEventListener("resize", close);
-    window.addEventListener("scroll", closeOnScroll, true);
     return () => {
+      window.cancelAnimationFrame(frame);
       document.removeEventListener("mousedown", onPointer);
       document.removeEventListener("keydown", onKey);
-      window.removeEventListener("resize", close);
-      window.removeEventListener("scroll", closeOnScroll, true);
     };
   }, [open]);
 
@@ -78,8 +101,9 @@ export default function AccountSelect({
           <path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
         </svg>
       </button>
-      {open && (
+      {open && createPortal(
         <div
+          ref={menuRef}
           className="modern-popover account-menu"
           role="listbox"
           aria-labelledby={fieldId}
@@ -87,15 +111,16 @@ export default function AccountSelect({
             anchor
               ? {
                   position: "fixed",
+                  zIndex: 10000,
                   top: anchor.top,
                   left: anchor.left,
-                  width: anchor.width,
-                  minWidth: anchor.width,
-                  maxWidth: anchor.width,
+                  width: "max-content",
+                  minWidth: anchor.minWidth,
+                  maxWidth: anchor.maxWidth,
                   boxSizing: "border-box",
                   maxHeight: anchor.maxHeight,
                 }
-              : undefined
+              : { position: "fixed", visibility: "hidden" }
           }
         >
           <button
@@ -119,7 +144,8 @@ export default function AccountSelect({
               {box.email_address}
             </button>
           ))}
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.auth.session import require_user
 from app.db import get_db
 from app.schemas import HealthOut
 from app.services.auto_sync import get_auto_sync_status, run_auto_sync_check
@@ -15,12 +16,12 @@ def health(db: Session = Depends(get_db)) -> HealthOut:
     return HealthOut(status="ok")
 
 
-@router.get("/api/auto-sync/status")
+@router.get("/api/auto-sync/status", dependencies=[Depends(require_user)])
 def auto_sync_status(db: Session = Depends(get_db)) -> dict:
     return get_auto_sync_status(db)
 
 
-@router.post("/api/auto-sync/check")
+@router.post("/api/auto-sync/check", dependencies=[Depends(require_user)])
 async def auto_sync_check(db: Session = Depends(get_db)) -> dict:
     await run_auto_sync_check()
     return get_auto_sync_status(db)

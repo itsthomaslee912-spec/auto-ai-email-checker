@@ -192,6 +192,31 @@ async def outlook_mark_read(access_token: str, message_id: str) -> None:
             raise HTTPException(status_code=400, detail=f"Outlook mark read failed: {resp.text}")
 
 
+async def outlook_reply_message(
+    access_token: str,
+    message_id: str,
+    *,
+    to_address: str,
+    body_text: str,
+    attachments: list[dict] | None = None,
+) -> None:
+    """Reply inside the original conversation (Graph sets In-Reply-To/References and quotes the original)."""
+    message: dict = {"toRecipients": [{"emailAddress": {"address": to_address}}]}
+    if attachments:
+        message["attachments"] = [
+            {"@odata.type": "#microsoft.graph.fileAttachment", "name": item["name"], "contentType": item["content_type"], "contentBytes": item["content_base64"]}
+            for item in attachments
+        ]
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{GRAPH}/me/messages/{message_id}/reply",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={"message": message, "comment": body_text},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=400, detail=f"Outlook reply failed: {resp.text}")
+
+
 async def outlook_send_message(
     access_token: str,
     *,

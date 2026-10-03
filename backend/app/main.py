@@ -4,10 +4,11 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import ai_settings, auth, calendar_events, classify, emails, events, health, mailboxes, webhooks
+from app.api import ai_settings, app_auth, auth, calendar_events, classify, emails, events, health, mailboxes, webhooks
+from app.auth.session import require_user
 from app.config import get_settings
 from app.db import init_db
 from app.realtime.renewal import renewal_loop
@@ -63,15 +64,20 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    signed_in = [Depends(require_user)]
+    # Public: health, sign-in, OAuth callbacks (state-bound), provider webhooks.
     app.include_router(health.router)
-    app.include_router(ai_settings.router)
+    app.include_router(app_auth.router)
+    app.include_router(app_auth.users_router)
     app.include_router(auth.router)
-    app.include_router(mailboxes.router)
-    app.include_router(emails.router)
-    app.include_router(calendar_events.router)
-    app.include_router(classify.router)
-    app.include_router(events.router)
     app.include_router(webhooks.router)
+    # Everything else is scoped to the signed-in account.
+    app.include_router(ai_settings.router, dependencies=signed_in)
+    app.include_router(mailboxes.router, dependencies=signed_in)
+    app.include_router(emails.router, dependencies=signed_in)
+    app.include_router(calendar_events.router, dependencies=signed_in)
+    app.include_router(classify.router, dependencies=signed_in)
+    app.include_router(events.router)
     return app
 
 

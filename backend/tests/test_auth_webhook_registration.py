@@ -6,6 +6,11 @@ from urllib.parse import parse_qs, urlparse
 from fastapi import BackgroundTasks, HTTPException
 
 from app.api import auth
+from app.auth.pending_oauth import PendingOAuth
+
+
+def _pending():
+    return PendingOAuth(provider="google", email="person@example.com", name="Person", created_at=0.0, user_id=1)
 
 
 def test_google_callback_registers_webhook_before_starting_sync(monkeypatch):
@@ -16,7 +21,7 @@ def test_google_callback_registers_webhook_before_starting_sync(monkeypatch):
         provider="google",
     )
     register = AsyncMock()
-    monkeypatch.setattr(auth, "pop_pending", lambda _state: None)
+    monkeypatch.setattr(auth, "pop_pending", lambda _state: _pending())
     monkeypatch.setattr(
         auth, "exchange_google_code", AsyncMock(return_value={"access_token": "access"})
     )
@@ -51,7 +56,7 @@ def test_google_callback_uses_polling_fallback_when_webhook_registration_fails(m
         display_name=None,
         provider="google",
     )
-    monkeypatch.setattr(auth, "pop_pending", lambda _state: None)
+    monkeypatch.setattr(auth, "pop_pending", lambda _state: _pending())
     monkeypatch.setattr(
         auth, "exchange_google_code", AsyncMock(return_value={"access_token": "access"})
     )

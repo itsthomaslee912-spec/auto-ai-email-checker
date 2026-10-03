@@ -66,11 +66,12 @@ export default function MessageRow({
           </span>
         </span>
         <span className="table-cell table-folder"><span className={`folder-pill folder-${folder}`}>{folderTitle}</span></span>
-        <span className="table-cell table-status"><span className={email.is_read ? "read-pill" : "new-pill"}>{email.is_read ? "Read" : "NEW"}</span></span>
+        <span className="table-cell table-status"><span className={email.is_read ? "read-pill" : "unread-pill"}>{email.is_read ? "Read" : "Unread"}</span></span>
         <time className="table-cell table-date">
           <span className="table-primary">{when.day || when.time}</span>
           {when.day && <span className="table-secondary">{when.time}</span>}
         </time>
+        {!email.is_read && <span className="unread-corner-badge" aria-label="Unread">NEW</span>}
       </button>
     );
   }
@@ -102,12 +103,10 @@ export default function MessageRow({
             {categoryTitle}{subtypeTitle ? ` / ${subtypeTitle}` : ""}
           </span>
           <span className={`folder-pill folder-${folder}`}>{folderTitle}</span>
-          <span className={email.is_read ? "read-pill" : "new-pill"}>
-            {email.is_read ? "Read" : "NEW"}
-          </span>
         </span>
         <span className="msg-snippet">{email.snippet}</span>
       </span>
+      {!email.is_read && <span className="unread-corner-badge" aria-label="Unread">NEW</span>}
     </button>
   );
 }

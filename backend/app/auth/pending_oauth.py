@@ -10,18 +10,20 @@ class PendingOAuth:
     email: str
     name: str
     created_at: float
+    user_id: int | None = None
 
 
 _PENDING: dict[str, PendingOAuth] = {}
 _TTL_SECONDS = 600
 
 
-def put_pending(state: str, *, provider: str, email: str, name: str) -> None:
+def put_pending(state: str, *, provider: str, email: str, name: str, user_id: int | None = None) -> None:
     _PENDING[state] = PendingOAuth(
         provider=provider,
         email=email.strip().lower(),
         name=name.strip(),
         created_at=time.time(),
+        user_id=user_id,
     )
 
 

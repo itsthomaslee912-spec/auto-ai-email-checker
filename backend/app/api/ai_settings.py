@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.auth.session import require_admin
 from app.config import get_settings
 from app.crypto import decrypt_token, encrypt_token
 from app.db import get_db
@@ -85,6 +86,7 @@ async def read_ai_status(db: Session = Depends(get_db)) -> dict:
 
 @router.put("")
 def save_ai_settings(payload: AiSettingsIn, db: Session = Depends(get_db)) -> dict:
+    require_admin()
     if payload.provider not in {"openai", "gemini", "ollama"}:
         raise HTTPException(422, "Choose OpenAI, Gemini, or Ollama")
     parsed = urlparse(payload.ollama_url)

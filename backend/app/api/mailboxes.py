@@ -7,6 +7,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.auth.session import mailbox_scope
 from app.auth.oauth_google import ensure_google_access_token
 from app.auth.oauth_microsoft import ensure_microsoft_access_token
 from app.db import SessionLocal, get_db
@@ -65,7 +66,7 @@ def _parse_bound(value: str, *, is_end: bool) -> tuple[datetime, str]:
 def _active_mailbox(db: Session, mailbox_id: int) -> MailboxConnection:
     mailbox = (
         db.query(MailboxConnection)
-        .filter(MailboxConnection.id == mailbox_id, MailboxConnection.is_active.is_(True))
+        .filter(MailboxConnection.id == mailbox_id, mailbox_scope())
         .one_or_none()
     )
     if mailbox is None:
@@ -118,7 +119,7 @@ def _stats_out(
 def list_mailboxes(db: Session = Depends(get_db)) -> list[MailboxConnection]:
     return (
         db.query(MailboxConnection)
-        .filter(MailboxConnection.is_active.is_(True))
+        .filter(mailbox_scope())
         .order_by(MailboxConnection.created_at.desc())
         .all()
     )
@@ -132,7 +133,7 @@ def update_mailbox_color(
 ) -> MailboxConnection:
     mailbox = (
         db.query(MailboxConnection)
-        .filter(MailboxConnection.id == mailbox_id, MailboxConnection.is_active.is_(True))
+        .filter(MailboxConnection.id == mailbox_id, mailbox_scope())
         .one_or_none()
     )
     if mailbox is None:
@@ -155,7 +156,7 @@ def all_mailboxes_label_stats(
     start, end, start_label, end_label = _parse_range(date_from, date_to)
     mailbox_ids = [
         row.id
-        for row in db.query(MailboxConnection.id).filter(MailboxConnection.is_active.is_(True)).all()
+        for row in db.query(MailboxConnection.id).filter(mailbox_scope()).all()
     ]
     label_counts, total = _count_labels(db, mailbox_ids, start, end)
     return _stats_out(None, start_label, end_label, label_counts, total)
@@ -330,10 +331,14 @@ async def extract_mailbox_outcomes(
 
 @router.delete("/{mailbox_id}")
 async def disconnect_mailbox(mailbox_id: int, db: Session = Depends(get_db)) -> dict:
-    mailbox = db.query(MailboxConnection).filter(MailboxConnection.id == mailbox_id).one_or_none()
-    if mailbox is None:
-        raise HTTPException(status_code=404, detail="Mailbox not found")
+    mailbox = _active_mailbox(db, mailbox_id)
+    deleted_emails = await disconnect_mailbox_record(db, mailbox)
+    return {"ok": True, "deleted_emails": deleted_emails}
 
+
+async def disconnect_mailbox_record(db: Session, mailbox: MailboxConnection) -> int:
+    """Stop provider push, stop jobs, delete stored mail, and deactivate the mailbox."""
+    mailbox_id = mailbox.id
     try:
         if mailbox.provider == Provider.GOOGLE.value:
             token = await ensure_google_access_token(db, mailbox)
@@ -361,7 +366,7 @@ async def disconnect_mailbox(mailbox_id: int, db: Session = Depends(get_db)) -> 
     mailbox.is_active = False
     db.commit()
     await publish("mailbox.disconnected", {"mailbox_id": mailbox_id, "deleted_emails": deleted_emails})
-    return {"ok": True, "deleted_emails": deleted_emails}
+    return deleted_emails
 
 
 @router.post("/{mailbox_id}/sync")
@@ -370,7 +375,7 @@ async def sync_mailbox(mailbox_id: int, db: Session = Depends(get_db)) -> dict:
 
     mailbox = (
         db.query(MailboxConnection)
-        .filter(MailboxConnection.id == mailbox_id, MailboxConnection.is_active.is_(True))
+        .filter(MailboxConnection.id == mailbox_id, mailbox_scope())
         .one_or_none()
     )
     if mailbox is None:
@@ -385,7 +390,7 @@ async def stop_mailbox_sync(mailbox_id: int, db: Session = Depends(get_db)) -> d
 
     mailbox = (
         db.query(MailboxConnection)
-        .filter(MailboxConnection.id == mailbox_id, MailboxConnection.is_active.is_(True))
+        .filter(MailboxConnection.id == mailbox_id, mailbox_scope())
         .one_or_none()
     )
     if mailbox is None:
@@ -400,7 +405,7 @@ async def full_rescan_mailbox(mailbox_id: int, db: Session = Depends(get_db)) ->
 
     mailbox = (
         db.query(MailboxConnection)
-        .filter(MailboxConnection.id == mailbox_id, MailboxConnection.is_active.is_(True))
+        .filter(MailboxConnection.id == mailbox_id, mailbox_scope())
         .one_or_none()
     )
     if mailbox is None:
@@ -410,9 +415,10 @@ async def full_rescan_mailbox(mailbox_id: int, db: Session = Depends(get_db)) ->
 
 
 @router.get("/{mailbox_id}/sync-status")
-def mailbox_sync_status(mailbox_id: int) -> dict:
+def mailbox_sync_status(mailbox_id: int, db: Session = Depends(get_db)) -> dict:
     from app.services.mailbox_sync import get_sync_status
 
+    _active_mailbox(db, mailbox_id)
     return get_sync_status(mailbox_id)
 
 
@@ -422,7 +428,7 @@ async def reclassify_mailbox(mailbox_id: int, db: Session = Depends(get_db)) -> 
 
     mailbox = (
         db.query(MailboxConnection)
-        .filter(MailboxConnection.id == mailbox_id, MailboxConnection.is_active.is_(True))
+        .filter(MailboxConnection.id == mailbox_id, mailbox_scope())
         .one_or_none()
     )
     if mailbox is None:
@@ -437,7 +443,7 @@ async def stop_mailbox_reclassify(mailbox_id: int, db: Session = Depends(get_db)
 
     mailbox = (
         db.query(MailboxConnection)
-        .filter(MailboxConnection.id == mailbox_id, MailboxConnection.is_active.is_(True))
+        .filter(MailboxConnection.id == mailbox_id, mailbox_scope())
         .one_or_none()
     )
     if mailbox is None:
@@ -447,7 +453,8 @@ async def stop_mailbox_reclassify(mailbox_id: int, db: Session = Depends(get_db)
 
 
 @router.get("/{mailbox_id}/reclassify-status")
-def mailbox_reclassify_status(mailbox_id: int) -> dict:
+def mailbox_reclassify_status(mailbox_id: int, db: Session = Depends(get_db)) -> dict:
     from app.services.reclassify import get_reclassify_status
 
+    _active_mailbox(db, mailbox_id)
     return get_reclassify_status(mailbox_id)

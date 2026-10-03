@@ -40,6 +40,7 @@ import {
   type MailFolder,
   type Mailbox,
   type Provider,
+  type SessionUser,
 } from "./api";
 import { accountColor } from "./accountColor";
 import { CLASSIFY_LABELS, CLASSIFY_LABEL_TITLES, EMPTY_LABEL_COUNTS, INTERVIEW_SUBTYPE_TITLES } from "./labels";
@@ -119,6 +120,31 @@ function parseFolderCounts(raw: Record<string, number> | undefined): Record<Mail
     counts[key] = raw?.[key] ?? 0;
   }
   return counts;
+}
+
+type CountCell = { mailbox_id: number; label: string; folder: string; unread: boolean; count: number };
+type CountTally = { total: number; unread: number };
+
+function adjustCountCell(cells: CountCell[], key: Omit<CountCell, "count">, delta: number): CountCell[] {
+  const index = cells.findIndex((cell) =>
+    cell.mailbox_id === key.mailbox_id && cell.label === key.label && cell.folder === key.folder && cell.unread === key.unread,
+  );
+  if (index < 0) {
+    return delta > 0 ? [...cells, { ...key, count: delta }] : cells;
+  }
+  const next = [...cells];
+  next[index] = { ...cells[index], count: Math.max(0, cells[index].count + delta) };
+  return next;
+}
+
+function tallyCounts(cells: CountCell[], match: (cell: CountCell) => boolean): CountTally {
+  const tally = { total: 0, unread: 0 };
+  for (const cell of cells) {
+    if (!match(cell)) continue;
+    tally.total += cell.count;
+    if (cell.unread) tally.unread += cell.count;
+  }
+  return tally;
 }
 
 function mailFolderOf(email: { folder?: MailFolder | string | null }): MailFolder {
@@ -287,7 +313,7 @@ function SidebarIcon({ name }: { name: SidebarIconName }) {
   return <svg className="sidebar-nav-icon" viewBox="0 0 24 24" aria-hidden="true">{path}</svg>;
 }
 
-export default function App() {
+export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUser; onSignOut: () => void }) {
   const [activePage, setActivePage] = useState<"inbox" | "calendar">("inbox");
   const [mailboxes, setMailboxes] = useState<Mailbox[]>([]);
   const [accountOrder, setAccountOrder] = useState<number[]>(() => {
@@ -311,6 +337,7 @@ export default function App() {
   const [labelCounts, setLabelCounts] = useState<Record<EmailLabel, number>>(EMPTY_LABEL_COUNTS);
   const [mailboxUnreadCounts, setMailboxUnreadCounts] = useState<Record<number, number>>({});
   const [folderCounts, setFolderCounts] = useState<Record<MailFolder, number>>(EMPTY_FOLDER_COUNTS);
+  const [countCells, setCountCells] = useState<CountCell[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [aiStatus, setAiStatus] = useState<AiStatus | null>(null);
   const [aiStatusOffline, setAiStatusOffline] = useState(false);
@@ -406,6 +433,7 @@ export default function App() {
   const loadingMoreRef = useRef(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const readerDialogRef = useRef<HTMLElement>(null);
+  const conversationScrollRef = useRef<HTMLDivElement>(null);
   const readerCloseRef = useRef<HTMLButtonElement>(null);
   const syncMenuRef = useRef<HTMLDivElement>(null);
   const didMountFilters = useRef(false);
@@ -469,6 +497,9 @@ export default function App() {
     setLabelCounts(parseLabelCounts(page.label_counts));
     setMailboxUnreadCounts(parseMailboxCounts(page.mailbox_unread_counts ?? {}));
     setFolderCounts(parseFolderCounts(page.folder_counts));
+    if (page.count_breakdown) {
+      setCountCells(page.count_breakdown.map(([mailbox_id, label, folder, unread, count]) => ({ mailbox_id, label, folder, unread, count })));
+    }
   }, []);
 
   const loadFirstPage = useCallback(async () => {
@@ -775,8 +806,24 @@ export default function App() {
               return next;
             });
           }
+          if (item.previous_label && item.previous_label !== item.label) {
+            const fromLabel = item.previous_label;
+            setCountCells((prev) => {
+              const preferUnread = item.is_read == null ? undefined : !item.is_read;
+              const unread = preferUnread ?? !prev.some((cell) =>
+                cell.mailbox_id === item.mailbox_id && cell.label === fromLabel && cell.folder === itemFolder && !cell.unread && cell.count > 0,
+              );
+              return adjustCountCell(
+                adjustCountCell(prev, { mailbox_id: item.mailbox_id, label: fromLabel, folder: itemFolder, unread }, -1),
+                { mailbox_id: item.mailbox_id, label: item.label, folder: itemFolder, unread },
+                1,
+              );
+            });
+          }
           return;
         }
+
+        setCountCells((prev) => adjustCountCell(prev, { mailbox_id: item.mailbox_id, label: item.label, folder: itemFolder, unread: !item.is_read }, 1));
 
         if (!item.is_read) {
           setMailboxUnreadCounts((prev) => ({
@@ -1098,10 +1145,38 @@ export default function App() {
     [mailboxUnreadCounts]
   );
 
-  const allCount = useMemo(
-    () => CLASSIFY_LABELS.reduce((sum, key) => sum + (labelCounts[key] ?? 0), 0),
-    [labelCounts]
+  const labelTallies = useMemo(() => {
+    const tallies = {} as Record<EmailLabel, CountTally>;
+    for (const key of CLASSIFY_LABELS) {
+      tallies[key] = countCells.length
+        ? tallyCounts(countCells, (cell) => cell.label === key && (selectedMailboxId == null || cell.mailbox_id === selectedMailboxId))
+        : { total: labelCounts[key] ?? 0, unread: 0 };
+    }
+    return tallies;
+  }, [countCells, labelCounts, selectedMailboxId]);
+
+  const allCategoriesTally = useMemo(
+    () => CLASSIFY_LABELS.reduce<CountTally>(
+      (sum, key) => ({ total: sum.total + labelTallies[key].total, unread: sum.unread + labelTallies[key].unread }),
+      { total: 0, unread: 0 },
+    ),
+    [labelTallies]
   );
+
+  const folderTally = (scope: MailFolder, mailboxId?: number): CountTally =>
+    countCells.length
+      ? tallyCounts(countCells, (cell) => cell.folder === scope && (mailboxId == null || cell.mailbox_id === mailboxId))
+      : { total: mailboxId == null ? folderCounts[scope] ?? 0 : 0, unread: 0 };
+
+  const renderCountBadge = (tally: CountTally, className: string, showZero = false) => {
+    if (tally.unread > 0) {
+      return <span className={`${className} is-unread`} aria-label={`${tally.unread} unread`}>+{tally.unread}</span>;
+    }
+    if (tally.total > 0 || showZero) {
+      return <span className={`${className} is-total`} aria-label={`${tally.total} total`}>{tally.total}</span>;
+    }
+    return null;
+  };
 
   const dateGroups = useMemo(() => groupEmailsByDate(emails), [emails]);
 
@@ -1432,6 +1507,8 @@ export default function App() {
           ...counts,
           [opened.mailbox_id]: Math.max(0, (counts[opened.mailbox_id] ?? 1) - 1),
         }));
+        const cell = { mailbox_id: opened.mailbox_id, label: opened.label, folder: mailFolderOf(opened) };
+        setCountCells((prev) => adjustCountCell(adjustCountCell(prev, { ...cell, unread: true }, -1), { ...cell, unread: false }, 1));
       }
       setEmails((prev) => {
         return sortEmailsForInbox(
@@ -1474,10 +1551,20 @@ export default function App() {
     let cancel = false;
     fetchEmailConversation(selectedId)
       .then((items) => {
-        if (!cancel) setThreadMessages(items);
+        if (cancel) return;
+        setThreadMessages(items);
+        const newestId = items[items.length - 1]?.id;
+        setOpenThreadIds(
+          items
+            .filter((message) => message.id === newestId || message.id === selectedId || !message.is_read)
+            .map((message) => message.id),
+        );
       })
       .catch(() => {
-        if (!cancel) setThreadMessages([]);
+        if (!cancel) {
+          setThreadMessages([]);
+          setOpenThreadIds([]);
+        }
       });
     return () => {
       cancel = true;
@@ -1602,7 +1689,7 @@ export default function App() {
     const run = async () => {
       setSendingReply(true);
       try {
-        await sendEmail({ mailbox_id: replyMailbox.id, to_address: selected.sender.match(/<([^>]+)>/)?.[1] ?? selected.sender, subject: /^re:/i.test(selected.subject) ? selected.subject : `Re: ${selected.subject}`, body_text: replyText, attachments: await filePayload(replyFiles) });
+        await sendEmail({ mailbox_id: replyMailbox.id, to_address: selected.sender.match(/<([^>]+)>/)?.[1] ?? selected.sender, subject: /^re:/i.test(selected.subject) ? selected.subject : `Re: ${selected.subject}`, body_text: replyText, attachments: await filePayload(replyFiles), reply_to_email_id: selected.id });
         setBanner(scheduleAt ? "Reply scheduled and sent." : "Reply sent. It is now in Sent.");
         setReplyOpen(false); setReplyText(""); setReplyInstruction(""); setReplyFiles([]); setScheduleAt("");
         if (folder === "sent") void loadFirstPage();
@@ -1708,6 +1795,14 @@ export default function App() {
         }
         return { ...counts, [scopeId]: 0 };
       });
+      setCountCells((prev) => {
+        let next = prev;
+        for (const cell of prev) {
+          if (!cell.unread || cell.count <= 0 || (scopeId != null && cell.mailbox_id !== scopeId)) continue;
+          next = adjustCountCell(adjustCountCell(next, cell, -cell.count), { ...cell, unread: false }, cell.count);
+        }
+        return next;
+      });
       setMarkAllOpen(false);
     } catch (err) {
       setBanner(err instanceof Error ? err.message : "Could not mark messages read");
@@ -1717,6 +1812,57 @@ export default function App() {
   }
   const readerAccount =
     selected != null ? mailboxById.get(selected.mailbox_id)?.email_address ?? "" : "";
+  const selectedSenderAddress = selected
+    ? (selected.sender.match(/<([^>]+)>/)?.[1] ?? (selected.sender.includes("@") ? selected.sender.trim() : "")).trim()
+    : "";
+  const conversationMessages = conversationView && threadMessages.length > 1 ? threadMessages : [];
+  const selectedThreadIndex = selected == null ? -1 : conversationMessages.findIndex((message) => message.id === selected.id);
+  const showConversation = selectedThreadIndex >= 0;
+  const earlierThread = showConversation ? conversationMessages.slice(0, selectedThreadIndex) : [];
+  const laterThread = showConversation ? conversationMessages.slice(selectedThreadIndex + 1) : [];
+  const selectedThreadOpen = !showConversation || (selected != null && openThreadIds.includes(selected.id));
+
+  useEffect(() => {
+    if (!showConversation) return;
+    const frame = window.requestAnimationFrame(() => {
+      const node = conversationScrollRef.current;
+      const selectedCard = node?.querySelector<HTMLElement>(".thread-card.is-selected");
+      if (!node || !selectedCard) return;
+      const top = selectedCard.getBoundingClientRect().top - node.getBoundingClientRect().top + node.scrollTop;
+      node.scrollTop = Math.max(0, top - 8);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [showConversation, selected?.id, threadMessages.length]);
+
+  function renderThreadMessage(message: EmailDetail) {
+    const open = openThreadIds.includes(message.id);
+    const name = senderName(message.sender);
+    const preview = (message.snippet || message.body_text || "").replace(/\s+/g, " ").trim();
+    const read = message.id === selected?.id ? Boolean(selected.is_read) : message.is_read;
+    return (
+      <section key={message.id} className={`thread-card${open ? " is-open" : ""}${read ? "" : " is-unread"}`}>
+        <button
+          type="button"
+          className="thread-summary"
+          aria-expanded={open}
+          onClick={() => setOpenThreadIds((ids) => open ? ids.filter((item) => item !== message.id) : [...ids, message.id])}
+        >
+          <span className={`avatar soft label-${message.label}`}>{initialsFrom(name)}</span>
+          <span className="thread-summary-text">
+            <strong>{name}</strong>
+            {!open && preview ? <span className="thread-snippet">{preview}</span> : null}
+          </span>
+          <time>{formatReaderTime(message.received_at)}</time>
+        </button>
+        {open && (
+          <>
+            {readerAccount ? <p className="thread-to">to <span className="to-address">{readerAccount}</span></p> : null}
+            <EmailBody html={message.body_html} text={message.body_text} snippet={message.snippet} />
+          </>
+        )}
+      </section>
+    );
+  }
   const aiReady = Boolean(aiStatus?.ready) && !aiStatusOffline;
   const aiLabel = aiStatus?.provider === "ollama"
     ? aiReady ? "Local AI on" : "Local AI off"
@@ -1987,7 +2133,9 @@ export default function App() {
           <button type="button" className={`sidebar-account-row ${active ? "active" : ""}`} onClick={() => selectMailboxFolder(box.id, scope)}>
             <span className={`sidebar-account-avatar provider-${box.provider}`} style={{ "--account-color": accountColor(box) } as CSSProperties}>{providerMark(box.provider)}</span>
             <span className="sidebar-account-email">{box.email_address}</span>
-            {showUnread && unread > 0 && <span className="sidebar-account-count">{unread}</span>}
+            {showUnread
+              ? unread > 0 && <span className="sidebar-account-count is-unread" aria-label={`${unread} unread`}>+{unread}</span>
+              : renderCountBadge(folderTally(scope, box.id), "sidebar-account-count")}
           </button>
         </div>;
       })}
@@ -2002,6 +2150,8 @@ export default function App() {
       <SettingsPage
         section={settingsSection}
         onSectionChange={setSettingsSection}
+        sessionUser={sessionUser}
+        onSignOut={onSignOut}
         onClose={() => setSettingsOpen(false)}
         themePref={themePref}
         onThemeChange={chooseTheme}
@@ -2079,7 +2229,7 @@ export default function App() {
               </button>
               <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "inbox" && selectedMailboxId == null ? " active" : ""}`} aria-label={inboxCount > 0 ? `Inbox, ${inboxCount} unread` : "Inbox"} title="Inbox" onClick={() => selectMailboxFolder(null, "inbox")}>
                 <SidebarIcon name="inbox" />
-                {inboxCount > 0 && <span className="sidebar-rail-badge">{inboxCount > 99 ? "99+" : inboxCount}</span>}
+                {inboxCount > 0 && <span className="sidebar-rail-badge">{inboxCount > 99 ? "+99" : `+${inboxCount}`}</span>}
               </button>
               <button type="button" className={`sidebar-rail-btn${activePage === "calendar" ? " active" : ""}`} aria-label="Calendar" title="Calendar" onClick={() => setActivePage("calendar")}>
                 <SidebarIcon name="calendar" />
@@ -2165,7 +2315,7 @@ export default function App() {
           <section className="sidebar-tree-section">
             <div className="sidebar-section-heading">
               <button type="button" className={`sidebar-disclosure ${sidebarSections.inbox ? "open" : ""}`} aria-label={`${sidebarSections.inbox ? "Collapse" : "Expand"} Inbox accounts`} aria-expanded={sidebarSections.inbox} onClick={() => toggleSidebarSection("inbox")}><span>›</span></button>
-              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "inbox" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, inbox: true })); selectMailboxFolder(null, "inbox"); }}><SidebarIcon name="inbox" /><span>Inbox</span>{inboxCount > 0 && <span className="sidebar-row-count">{inboxCount}</span>}</button>
+              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "inbox" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, inbox: true })); selectMailboxFolder(null, "inbox"); }}><SidebarIcon name="inbox" /><span>Inbox</span>{inboxCount > 0 && <span className="sidebar-row-count is-unread" aria-label={`${inboxCount} unread`}>+{inboxCount}</span>}</button>
             </div>
             {sidebarSections.inbox && renderSidebarAccounts("inbox", true)}
           </section>
@@ -2178,8 +2328,8 @@ export default function App() {
               <button type="button" className={`sidebar-nav-row ${label !== "all" ? "active" : ""}`} onClick={() => toggleSidebarSection("categories")}><SidebarIcon name="categories" /><span>Categories</span></button>
             </div>
             {sidebarSections.categories && <div className="sidebar-category-list">
-              <button type="button" className={`sidebar-filter-row ${label === "all" ? "active" : ""}`} onClick={() => { setActivePage("inbox"); selectLabel("all"); }}><span>All categories</span><span>{allCount}</span></button>
-              {CLASSIFY_LABELS.map((item) => <button type="button" className={`sidebar-filter-row ${label === item ? "active" : ""}`} onClick={() => { setActivePage("inbox"); selectLabel(item); }} key={item}><span>{CLASSIFY_LABEL_TITLES[item]}</span><span>{labelCounts[item]}</span></button>)}
+              <button type="button" className={`sidebar-filter-row ${label === "all" ? "active" : ""}`} onClick={() => { setActivePage("inbox"); selectLabel("all"); }}><span>All categories</span>{renderCountBadge(allCategoriesTally, "sidebar-filter-count", true)}</button>
+              {CLASSIFY_LABELS.map((item) => <button type="button" className={`sidebar-filter-row ${label === item ? "active" : ""}`} onClick={() => { setActivePage("inbox"); selectLabel(item); }} key={item}><span>{CLASSIFY_LABEL_TITLES[item]}</span>{renderCountBadge(labelTallies[item], "sidebar-filter-count", true)}</button>)}
             </div>}
           </section>
 
@@ -2187,28 +2337,28 @@ export default function App() {
           <section className="sidebar-tree-section">
             <div className="sidebar-section-heading">
               <button type="button" className={`sidebar-disclosure ${sidebarSections.sent ? "open" : ""}`} aria-label={`${sidebarSections.sent ? "Collapse" : "Expand"} Sent accounts`} aria-expanded={sidebarSections.sent} onClick={() => toggleSidebarSection("sent")}><span>›</span></button>
-              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "sent" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, sent: true })); selectMailboxFolder(null, "sent"); }}><SidebarIcon name="sent" /><span>Sent</span>{folderCounts.sent > 0 && <span className="sidebar-row-count">{folderCounts.sent}</span>}</button>
+              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "sent" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, sent: true })); selectMailboxFolder(null, "sent"); }}><SidebarIcon name="sent" /><span>Sent</span>{renderCountBadge(folderTally("sent"), "sidebar-row-count")}</button>
             </div>
             {sidebarSections.sent && renderSidebarAccounts("sent")}
           </section>
           <section className="sidebar-tree-section">
             <div className="sidebar-section-heading">
               <button type="button" className={`sidebar-disclosure ${sidebarSections.spam ? "open" : ""}`} aria-label={`${sidebarSections.spam ? "Collapse" : "Expand"} Spam accounts`} aria-expanded={sidebarSections.spam} onClick={() => toggleSidebarSection("spam")}><span>›</span></button>
-              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "spam" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, spam: true })); selectMailboxFolder(null, "spam"); }}><SidebarIcon name="spam" /><span>Spam</span>{folderCounts.spam > 0 && <span className="sidebar-row-count">{folderCounts.spam}</span>}</button>
+              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "spam" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, spam: true })); selectMailboxFolder(null, "spam"); }}><SidebarIcon name="spam" /><span>Spam</span>{renderCountBadge(folderTally("spam"), "sidebar-row-count")}</button>
             </div>
             {sidebarSections.spam && renderSidebarAccounts("spam")}
           </section>
           <section className="sidebar-tree-section">
             <div className="sidebar-section-heading">
               <button type="button" className={`sidebar-disclosure ${sidebarSections.trash ? "open" : ""}`} aria-label={`${sidebarSections.trash ? "Collapse" : "Expand"} Trash accounts`} aria-expanded={sidebarSections.trash} onClick={() => toggleSidebarSection("trash")}><span>›</span></button>
-              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "trash" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, trash: true })); selectMailboxFolder(null, "trash"); }}><SidebarIcon name="trash" /><span>Trash</span>{folderCounts.trash > 0 && <span className="sidebar-row-count">{folderCounts.trash}</span>}</button>
+              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "trash" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, trash: true })); selectMailboxFolder(null, "trash"); }}><SidebarIcon name="trash" /><span>Trash</span>{renderCountBadge(folderTally("trash"), "sidebar-row-count")}</button>
             </div>
             {sidebarSections.trash && renderSidebarAccounts("trash")}
           </section>
           <section className="sidebar-tree-section">
             <div className="sidebar-section-heading">
               <button type="button" className={`sidebar-disclosure ${sidebarSections.archive ? "open" : ""}`} aria-label={`${sidebarSections.archive ? "Collapse" : "Expand"} Archive accounts`} aria-expanded={sidebarSections.archive} onClick={() => toggleSidebarSection("archive")}><span>›</span></button>
-              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "archive" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, archive: true })); selectMailboxFolder(null, "archive"); }}><SidebarIcon name="archive" /><span>Archive</span>{folderCounts.archive > 0 && <span className="sidebar-row-count">{folderCounts.archive}</span>}</button>
+              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "archive" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, archive: true })); selectMailboxFolder(null, "archive"); }}><SidebarIcon name="archive" /><span>Archive</span>{renderCountBadge(folderTally("archive"), "sidebar-row-count")}</button>
             </div>
             {sidebarSections.archive && renderSidebarAccounts("archive")}
           </section>
@@ -2234,7 +2384,21 @@ export default function App() {
               <span className="sr-only" role="status" aria-live="polite">{aiLabel}</span>
             </button>
           </div>
-          <button type="button" className="sidebar-footer-row" onClick={() => openSettings("appearance")}><SidebarIcon name="settings" /><span>Settings</span></button>
+          <div className="sidebar-signin-row">
+            <button type="button" className="sidebar-signin-user" data-tooltip="Account & settings" data-tooltip-placement="top" aria-label={`Signed in as ${sessionUser.email}. Open account settings`} onClick={() => openSettings("signin")}>
+              <span className="sidebar-signin-avatar" aria-hidden="true">{(sessionUser.display_name || sessionUser.email).charAt(0).toUpperCase()}</span>
+              <span className="sidebar-signin-copy">
+                <span className="sidebar-signin-name">
+                  {sessionUser.display_name || sessionUser.email.split("@")[0]}
+                  <span className={`sidebar-signin-role${sessionUser.is_admin ? " is-admin" : ""}`}>{sessionUser.is_admin ? "Admin" : "Member"}</span>
+                </span>
+                <span className="sidebar-signin-email">{sessionUser.email}</span>
+              </span>
+            </button>
+            <button type="button" className="sidebar-signin-out" data-tooltip="Sign out" data-tooltip-placement="top" aria-label="Sign out" onClick={onSignOut}>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3" /><path d="M10 16l-4-4 4-4" /><path d="M6 12h10" /></svg>
+            </button>
+          </div>
         </div>
         </>}
       </aside>
@@ -2499,28 +2663,51 @@ export default function App() {
         {selected && !loadingDetail && (
           <article className="reader-article">
             <h1 id="reader-title">{selected.subject || "(no subject)"}</h1>
-            <div className="reader-card">
+            <div className={showConversation ? "reader-card is-conversation" : "reader-card"} ref={conversationScrollRef}>
+              {earlierThread.map((message) => renderThreadMessage(message))}
+              {showConversation && selected && !selectedThreadOpen ? (
+                renderThreadMessage(selected)
+              ) : (
+              <section className={showConversation ? "thread-card is-open is-selected" : "thread-selected"}>
               <div className="reader-meta">
                 <div className="reader-people">
                   <span className={`avatar soft label-${selected.label}`}>
                     {initialsFrom(senderName(selected.sender))}
                   </span>
                   <div>
-                    <strong>{selected.sender || senderName(selected.sender)}</strong>
-                    {readerAccount ? (
-                      <p>
-                        Account <span className="to-address">{readerAccount}</span>
-                      </p>
-                    ) : null}
-                    <p>
-                      Folder{" "}
+                    <div className="reader-from-line">
+                      <strong>{senderName(selected.sender)}</strong>
+                      {selectedSenderAddress && selectedSenderAddress !== senderName(selected.sender) ? (
+                        <span className="reader-address">&lt;{selectedSenderAddress}&gt;</span>
+                      ) : null}
+                    </div>
+                    <div className="reader-chips">
+                      {readerAccount ? (
+                        <span className="reader-chip">
+                          to <span className="to-address">{readerAccount}</span>
+                        </span>
+                      ) : null}
                       <span className={`folder-pill folder-${mailFolderOf(selected)}`}>
                         {MAIL_FOLDER_TITLES[mailFolderOf(selected)]}
                       </span>
-                    </p>
+                    </div>
                   </div>
                 </div>
                 <div className="reader-side">
+                  <div className="reader-time-line">
+                    <time title={selected.received_at ?? undefined}>{formatReaderTime(selected.received_at)}</time>
+                    {showConversation && (
+                      <button
+                        type="button"
+                        className="thread-collapse"
+                        aria-label="Collapse message"
+                        data-tooltip="Collapse message"
+                        onClick={() => setOpenThreadIds((ids) => ids.filter((item) => item !== selected.id))}
+                      >
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 14.5 6-6 6 6" /></svg>
+                      </button>
+                    )}
+                  </div>
                   <div className="reader-controls">
                     <CompactSelect
                       className={`label-select label-${selected.label}`}
@@ -2584,40 +2771,22 @@ export default function App() {
                       />
                       <span>Save as training data</span>
                     </label>
-                    <time>{formatReaderTime(selected.received_at)}</time>
                   </div>
                 </div>
               </div>
-              {conversationView && threadMessages.filter((message) => message.id !== selected.id).length > 0 && (
-                <div className="thread-older">
-                  {threadMessages.filter((message) => message.id !== selected.id).map((message) => {
-                    const open = openThreadIds.includes(message.id);
-                    const sender = message.sender.match(/^"?([^"<]+)"?\s*</)?.[1]?.trim() || message.sender || "Unknown";
-                    return (
-                      <section key={message.id} className={open ? "thread-card is-open" : "thread-card"}>
-                        <button
-                          type="button"
-                          aria-expanded={open}
-                          onClick={() => setOpenThreadIds((ids) => open ? ids.filter((item) => item !== message.id) : [...ids, message.id])}
-                        >
-                          <strong>{sender}</strong>
-                          <time>{formatReaderTime(message.received_at)}</time>
-                        </button>
-                        {open && <EmailBody html={message.body_html} text={message.body_text} snippet={message.snippet} />}
-                      </section>
-                    );
-                  })}
-                </div>
-              )}
               <EmailBody
                 html={selected.body_html}
                 text={selected.body_text}
                 snippet={selected.snippet}
               />
+              </section>
+              )}
+              {laterThread.map((message) => renderThreadMessage(message))}
               {!replyOpen && (
                 <div className="reply-action-row">
-                  <button type="button" className="action-btn primary" onClick={() => { setScheduleAt(""); setReplyInstruction(""); setReplyOpen(true); }}>
-                    ↩ Reply
+                  <button type="button" className="reply-pill" onClick={() => { setScheduleAt(""); setReplyInstruction(""); setReplyOpen(true); }}>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 8 4 12l5 4" /><path d="M4 12h9.5a5.5 5.5 0 0 1 5.5 5.5V19" /></svg>
+                    <span>Reply</span>
                   </button>
                 </div>
               )}

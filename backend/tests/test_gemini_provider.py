@@ -68,7 +68,8 @@ def test_selected_gemini_backend_is_used_for_classification(monkeypatch):
     assert result.confidence == 0.91
 
 
-def test_gemini_settings_are_saved_without_exposing_the_key():
+def test_gemini_settings_are_saved_without_exposing_the_key(monkeypatch):
+    monkeypatch.setattr(ai_settings, "require_admin", lambda: None)
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},

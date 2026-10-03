@@ -524,6 +524,20 @@ async def gmail_mark_read_many(access_token: str, message_ids: list[str]) -> Non
                 raise HTTPException(status_code=400, detail=f"Gmail mark read failed: {resp.text}")
 
 
+async def gmail_reply_headers(access_token: str, message_id: str) -> tuple[str | None, str | None]:
+    """Return the original message's (Message-ID, References) so a reply threads for every recipient."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(
+            f"{GMAIL_API}/users/me/messages/{message_id}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params=[("format", "metadata"), ("metadataHeaders", "Message-ID"), ("metadataHeaders", "References")],
+        )
+    if resp.status_code >= 400:
+        return None, None
+    headers = {h["name"].lower(): h["value"] for h in resp.json().get("payload", {}).get("headers", [])}
+    return headers.get("message-id"), headers.get("references")
+
+
 async def gmail_send_message(
     access_token: str,
     *,
@@ -533,11 +547,15 @@ async def gmail_send_message(
     from_name: str | None = None,
     from_email: str | None = None,
     attachments: list[dict] | None = None,
+    in_reply_to: str | None = None,
+    references: str | None = None,
+    thread_id: str | None = None,
 ) -> dict:
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
     from email.mime.base import MIMEBase
     from email import encoders
+    from email.utils import formataddr, formatdate
 
     message = MIMEMultipart() if attachments else MIMEText(body_text, "plain", "utf-8")
     if attachments:
@@ -548,17 +566,24 @@ async def gmail_send_message(
             encoders.encode_base64(part)
             part.add_header("Content-Disposition", "attachment", filename=item["name"])
             message.attach(part)
-    message["to"] = to_address
-    message["subject"] = subject
+    message["To"] = to_address
+    message["Subject"] = subject
     if from_email:
-        message["from"] = f"{from_name} <{from_email}>" if from_name else from_email
+        message["From"] = formataddr((from_name, from_email)) if from_name else from_email
+    message["Date"] = formatdate(localtime=True)
+    if in_reply_to:
+        message["In-Reply-To"] = in_reply_to
+        message["References"] = f"{references} {in_reply_to}".strip() if references else in_reply_to
 
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode().rstrip("=")
+    body: dict = {"raw": raw}
+    if thread_id:
+        body["threadId"] = thread_id
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             f"{GMAIL_API}/users/me/messages/send",
             headers={"Authorization": f"Bearer {access_token}"},
-            json={"raw": raw},
+            json=body,
         )
         if resp.status_code >= 400:
             raise HTTPException(status_code=400, detail=f"Gmail send failed: {resp.text}")

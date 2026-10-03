@@ -84,6 +84,39 @@ def seed_default_classify_prompt() -> None:
         db.close()
 
 
+DEFAULT_ADMIN_EMAIL = "admin123@gmail.com"
+DEFAULT_ADMIN_PASSWORD = "123"
+
+
+def seed_admin_account() -> None:
+    """Make sure at least one admin can sign in.
+
+    The pre-auth installation kept every mailbox under a placeholder user
+    ("default"); that user becomes the admin so existing mail stays visible.
+    """
+    from app.auth.session import hash_password
+    from app.models import User
+
+    db = SessionLocal()
+    try:
+        if db.query(User.id).filter(User.email.is_not(None), User.is_admin.is_(True)).first():
+            return
+        user = (
+            db.query(User).filter(User.external_id == "default").one_or_none()
+            or db.query(User).filter(User.email.is_(None)).order_by(User.id).first()
+        )
+        if user is None:
+            user = User(external_id=f"user:{DEFAULT_ADMIN_EMAIL}")
+            db.add(user)
+        user.email = DEFAULT_ADMIN_EMAIL
+        user.password_hash = hash_password(DEFAULT_ADMIN_PASSWORD)
+        user.display_name = user.display_name or "Admin"
+        user.is_admin = True
+        db.commit()
+    finally:
+        db.close()
+
+
 def _is_current_taxonomy_prompt(text: str) -> bool:
     if not text:
         return False
@@ -222,6 +255,24 @@ def init_db() -> None:
                 conn.execute(text(
                     "ALTER TABLE mailbox_connections ADD COLUMN calendar_color VARCHAR(7)"
                 ))
+        if "users" in tables:
+            user_cols = {c["name"] for c in inspect(conn).get_columns("users")}
+            false_default = "FALSE" if database_url.get_backend_name() == "postgresql" else "0"
+            timestamp_type = (
+                "TIMESTAMP WITH TIME ZONE"
+                if database_url.get_backend_name() == "postgresql"
+                else "TIMESTAMP"
+            )
+            for column, ddl in (
+                ("email", "VARCHAR(320)"),
+                ("password_hash", "VARCHAR(255)"),
+                ("display_name", "VARCHAR(255)"),
+                ("is_admin", f"BOOLEAN DEFAULT {false_default}"),
+                ("last_login_at", timestamp_type),
+            ):
+                if column not in user_cols:
+                    conn.execute(text(f"ALTER TABLE users ADD COLUMN {column} {ddl}"))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email ON users (email)"))
 
     # Lightweight SQLite column / label migrations for existing DBs
     if settings.database_url.startswith("sqlite"):
@@ -401,6 +452,7 @@ def init_db() -> None:
                 ))
 
     seed_default_classify_prompt()
+    seed_admin_account()
     from app.services.mailbox_cleanup import purge_orphaned_mailbox_mail
 
     purge_orphaned_mailbox_mail()

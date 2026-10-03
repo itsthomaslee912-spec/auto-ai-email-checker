@@ -168,8 +168,10 @@ async def poll_active_mailboxes() -> int:
 
 
 def get_auto_sync_status(db: Session) -> dict:
+    from app.auth.session import mailbox_scope
+
     interval = max(30, get_settings().auto_sync_interval_seconds)
-    mailboxes = db.query(MailboxConnection).filter(MailboxConnection.is_active.is_(True)).all()
+    mailboxes = db.query(MailboxConnection).filter(mailbox_scope()).all()
     ngrok = get_ngrok_status()
     problems = []
     syncing = False

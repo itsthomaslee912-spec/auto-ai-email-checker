@@ -1,4 +1,4 @@
-param([switch]$WithNgrok)
+param([switch]$WithNgrok, [switch]$NoBrowser)
 
 # Start PostgreSQL plus a watchdog that keeps backend and frontend healthy.
 $ErrorActionPreference = "Stop"
@@ -82,4 +82,32 @@ if ($WithNgrok) {
   Write-Host "  Webhook tunnel: not started (use .\run.ps1 -WithNgrok)"
 }
 
-Write-Host "PostgreSQL, backend, frontend, and service supervisor started."
+function Test-Endpoint([string]$Url) {
+  try {
+    $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 3
+    return $response.StatusCode -ge 200 -and $response.StatusCode -lt 300
+  } catch {
+    return $false
+  }
+}
+
+Write-Host ""
+Write-Host "Waiting for backend and frontend to respond..."
+$deadline = (Get-Date).AddSeconds(120)
+$backendUp = $false
+$frontendUp = $false
+while ((Get-Date) -lt $deadline -and -not ($backendUp -and $frontendUp)) {
+  if (-not $backendUp) { $backendUp = Test-Endpoint "http://127.0.0.1:8000/api/health" }
+  if (-not $frontendUp) { $frontendUp = Test-Endpoint "http://127.0.0.1:5173" }
+  if (-not ($backendUp -and $frontendUp)) { Start-Sleep -Seconds 2 }
+}
+Write-Host ("  Backend:  " + $(if ($backendUp) { "ready" } else { "NOT responding (see logs\backend-error.log)" }))
+Write-Host ("  Frontend: " + $(if ($frontendUp) { "ready" } else { "NOT responding (see logs\frontend-error.log)" }))
+if (-not ($backendUp -and $frontendUp)) {
+  Write-Warning "The app did not become ready within 2 minutes. The supervisor keeps retrying in the background; run stop.bat to shut everything down."
+  exit 1
+}
+
+Write-Host ""
+Write-Host "AI Auto-Email Checker is running at http://localhost:5173"
+if (-not $NoBrowser) { Start-Process "http://localhost:5173" }

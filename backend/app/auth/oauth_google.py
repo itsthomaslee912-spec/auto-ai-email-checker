@@ -7,6 +7,7 @@ import httpx
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from app.auth.session import claim_mailbox_for_user
 from app.config import get_settings
 from app.crypto import decrypt_token, encrypt_token
 from app.models import MailboxConnection, Provider, User
@@ -106,13 +107,16 @@ def upsert_google_mailbox(
     token_payload: dict,
     userinfo: dict,
     preferred_name: str | None = None,
+    owner_user_id: int | None = None,
     default_user_external_id: str = "default",
 ) -> MailboxConnection:
     email = userinfo.get("email")
     if not email:
         raise HTTPException(status_code=400, detail="Google account email missing")
 
-    user = db.query(User).filter(User.external_id == default_user_external_id).one_or_none()
+    user = db.get(User, owner_user_id) if owner_user_id is not None else None
+    if user is None:
+        user = db.query(User).filter(User.external_id == default_user_external_id).one_or_none()
     if user is None:
         user = User(external_id=default_user_external_id)
         db.add(user)
@@ -138,6 +142,8 @@ def upsert_google_mailbox(
             email_address=email,
         )
         db.add(mailbox)
+    else:
+        claim_mailbox_for_user(db, mailbox, user.id)
 
     mailbox.display_name = (preferred_name or "").strip() or userinfo.get("name")
     mailbox.provider_user_id = str(userinfo.get("id") or "")

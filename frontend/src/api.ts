@@ -115,12 +115,21 @@ async function readApiError(res: Response, fallback: string): Promise<string> {
   return `${fallback} (${res.status})`;
 }
 
+export const AUTH_EXPIRED_EVENT = "email-checker:auth-expired";
+
+function noteUnauthorized(res: Response): Response {
+  if (res.status === 401 && !res.url.includes("/api/session/")) {
+    window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
+  }
+  return res;
+}
+
 async function apiFetch(url: string, init?: RequestInit, attempts = 3): Promise<Response> {
   let lastError: unknown = null;
   for (let i = 0; i < attempts; i += 1) {
     try {
-      const res = await fetch(url, init);
-      return res;
+      const res = await fetch(url, { credentials: "include", ...init });
+      return noteUnauthorized(res);
     } catch (err) {
       lastError = err;
       await new Promise((resolve) => window.setTimeout(resolve, 350 * (i + 1)));
@@ -149,11 +158,12 @@ async function autoSyncRequest(method: "GET" | "POST", path: string): Promise<Au
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 5000);
   try {
-    const res = await fetch(`${API_BASE}${path}`, {
+    const res = noteUnauthorized(await fetch(`${API_BASE}${path}`, {
       method,
       signal: controller.signal,
       cache: "no-store",
-    });
+      credentials: "include",
+    }));
     if (!res.ok) throw new Error(await readApiError(res, "Failed to check automatic sync"));
     return res.json();
   } finally {
@@ -180,6 +190,8 @@ export interface EmailPage {
   mailbox_counts: Record<string, number>;
   mailbox_unread_counts: Record<string, number>;
   folder_counts?: Record<string, number>;
+  /** [mailbox_id, label, folder, unread, count] cells across all active mailboxes. */
+  count_breakdown?: [number, string, string, boolean, number][];
 }
 
 export async function fetchEmails(opts?: {
@@ -340,6 +352,7 @@ export async function sendEmail(payload: {
   subject: string;
   body_text: string;
   attachments?: EmailAttachment[];
+  reply_to_email_id?: number;
 }): Promise<{ ok: boolean; provider_message_id: string | null }> {
   const res = await apiFetch(`${API_BASE}/api/emails/send`, {
     method: "POST",
@@ -429,7 +442,7 @@ export interface CalendarEventPayload {
 
 export async function fetchCalendarEvents(start: string, end: string, signal?: AbortSignal): Promise<CalendarEvent[]> {
   const params = new URLSearchParams({ start, end });
-  const res = await fetch(`${API_BASE}/api/calendar-events?${params}`, { signal, cache: "no-store" });
+  const res = noteUnauthorized(await fetch(`${API_BASE}/api/calendar-events?${params}`, { signal, cache: "no-store", credentials: "include" }));
   if (!res.ok) throw new Error(await readApiError(res, "Failed to load calendar"));
   return res.json();
 }
@@ -691,4 +704,80 @@ export function oauthStartUrl(
 
 export function eventsUrl(): string {
   return `${API_BASE}/api/events`;
+}
+
+export interface SessionUser {
+  id: number;
+  email: string;
+  display_name: string | null;
+  is_admin: boolean;
+}
+
+export interface SignInAccount extends SessionUser {
+  mailbox_count: number;
+  created_at: string | null;
+  last_login_at: string | null;
+}
+
+/** Returns the signed-in account, or null when there is no valid session. */
+export async function fetchSession(): Promise<SessionUser | null> {
+  const res = await apiFetch(`${API_BASE}/api/session/me`);
+  if (res.status === 401) return null;
+  if (!res.ok) throw new Error(await readApiError(res, "Could not check sign-in"));
+  return res.json();
+}
+
+export async function signIn(email: string, password: string): Promise<SessionUser> {
+  const res = await apiFetch(`${API_BASE}/api/session/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  }, 1);
+  if (!res.ok) throw new Error(await readApiError(res, "Sign-in failed"));
+  return res.json();
+}
+
+export async function signOut(): Promise<void> {
+  await apiFetch(`${API_BASE}/api/session/logout`, { method: "POST" }, 1);
+}
+
+export async function changeOwnPassword(currentPassword: string, newPassword: string): Promise<void> {
+  const res = await apiFetch(`${API_BASE}/api/session/password`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+  }, 1);
+  if (!res.ok) throw new Error(await readApiError(res, "Could not change password"));
+}
+
+export async function fetchSignInAccounts(): Promise<SignInAccount[]> {
+  const res = await apiFetch(`${API_BASE}/api/users`);
+  if (!res.ok) throw new Error(await readApiError(res, "Could not load sign-in accounts"));
+  return res.json();
+}
+
+export async function createSignInAccount(payload: { email: string; password: string; display_name?: string; is_admin?: boolean }): Promise<SignInAccount> {
+  const res = await apiFetch(`${API_BASE}/api/users`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }, 1);
+  if (!res.ok) throw new Error(await readApiError(res, "Could not add sign-in account"));
+  return res.json();
+}
+
+export async function updateSignInAccount(id: number, payload: { password?: string; display_name?: string; is_admin?: boolean }): Promise<SignInAccount> {
+  const res = await apiFetch(`${API_BASE}/api/users/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }, 1);
+  if (!res.ok) throw new Error(await readApiError(res, "Could not update sign-in account"));
+  return res.json();
+}
+
+export async function deleteSignInAccount(id: number): Promise<{ removed_mailboxes: number }> {
+  const res = await apiFetch(`${API_BASE}/api/users/${id}`, { method: "DELETE" }, 1);
+  if (!res.ok) throw new Error(await readApiError(res, "Could not delete sign-in account"));
+  return res.json();
 }
