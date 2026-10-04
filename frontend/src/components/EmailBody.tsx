@@ -273,7 +273,9 @@ export default function EmailBody({ html, text, snippet }: Props) {
           className="email-body-frame"
           aria-label="Email body"
           sandbox=""
+          tabIndex={-1}
           srcDoc={framedHtml}
+          onFocus={(event) => event.currentTarget.blur()}
         />
       </div>
     );

@@ -1472,6 +1472,25 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [activePage, settingsOpen, categoryPickerOpen, selectedId, savingLabel, pendingLabel]);
 
+  useEffect(() => {
+    const releaseIframeFocus = () => {
+      const active = document.activeElement;
+      if (active instanceof HTMLIFrameElement && active.classList.contains("email-body-frame")) {
+        active.blur();
+      }
+    };
+    const onWindowBlur = () => {
+      requestAnimationFrame(releaseIframeFocus);
+    };
+    const onFocusIn = () => releaseIframeFocus();
+    window.addEventListener("blur", onWindowBlur);
+    document.addEventListener("focusin", onFocusIn, true);
+    return () => {
+      window.removeEventListener("blur", onWindowBlur);
+      document.removeEventListener("focusin", onFocusIn, true);
+    };
+  }, []);
+
   async function applyCategoryChange(useTraining: boolean) {
     if (!pendingLabel || savingLabel) return;
     if (pendingLabel.nextLabel === "interview_scheduled" && !pendingSubtype) return;
