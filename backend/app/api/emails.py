@@ -34,7 +34,7 @@ from app.email.outlook import (
     outlook_send_message,
 )
 from app.email.folders import VALID_FOLDERS
-from app.models import CalendarEvent, ClassifyCorrection, EmailLabel, EmailMessage, MailboxConnection, MailFolder, Provider
+from app.models import CalendarEvent, CalendarEventEmail, ClassifyCorrection, EmailLabel, EmailMessage, MailboxConnection, MailFolder, Provider
 from app.realtime.sse import publish
 from app.services.calendar_extract import CALENDAR_LABELS, process_calendar_email
 from app.schemas import (
@@ -44,6 +44,7 @@ from app.schemas import (
     EmailLabelUpdateIn,
     EmailOut,
     EmailPageOut,
+    InterviewEmailAlertOut,
     MarkAllReadOut,
     SendEmailIn,
     SendEmailOut,
@@ -131,6 +132,11 @@ def _apply_default_cursor(page_q, before_id: int, before_received_at: datetime |
     return page_q.filter(and_(EmailMessage.received_at.is_(None), EmailMessage.id < before_id))
 
 
+def _is_unread_expr():
+    """SQL expression: treat NULL is_read the same as FALSE (unread)."""
+    return func.coalesce(EmailMessage.is_read, False)
+
+
 def _apply_unread_first_cursor(
     page_q,
     before_id: int,
@@ -140,33 +146,19 @@ def _apply_unread_first_cursor(
     cursor_read = bool(before_is_read) if before_is_read is not None else False
 
     def same_bucket_older(is_read_value: bool):
+        bucket_expr = _is_unread_expr().is_(is_read_value)
         if before_received_at is not None:
             cursor_at = _normalize_cursor_at(before_received_at)
             return or_(
-                and_(
-                    EmailMessage.is_read.is_(is_read_value),
-                    EmailMessage.received_at < cursor_at,
-                ),
-                and_(
-                    EmailMessage.is_read.is_(is_read_value),
-                    EmailMessage.received_at == cursor_at,
-                    EmailMessage.id < before_id,
-                ),
-                and_(
-                    EmailMessage.is_read.is_(is_read_value),
-                    EmailMessage.received_at.is_(None),
-                    EmailMessage.id < before_id,
-                ),
+                and_(bucket_expr, EmailMessage.received_at < cursor_at),
+                and_(bucket_expr, EmailMessage.received_at == cursor_at, EmailMessage.id < before_id),
+                and_(bucket_expr, EmailMessage.received_at.is_(None), EmailMessage.id < before_id),
             )
-        return and_(
-            EmailMessage.is_read.is_(is_read_value),
-            EmailMessage.received_at.is_(None),
-            EmailMessage.id < before_id,
-        )
+        return and_(bucket_expr, EmailMessage.received_at.is_(None), EmailMessage.id < before_id)
 
     if not cursor_read:
-        # Still in unread bucket, then any read message.
-        return page_q.filter(or_(same_bucket_older(False), EmailMessage.is_read.is_(True)))
+        # Still in unread bucket (FALSE or NULL), then any read message.
+        return page_q.filter(or_(same_bucket_older(False), _is_unread_expr().is_(True)))
     return page_q.filter(same_bucket_older(True))
 
 
@@ -357,7 +349,7 @@ def list_emails(
 
     if unread_first:
         page_q = page_q.order_by(
-            EmailMessage.is_read.asc(),
+            _is_unread_expr().asc(),
             EmailMessage.received_at.desc(),
             EmailMessage.id.desc(),
         )
@@ -506,6 +498,67 @@ async def _mark_provider_message_read(mailbox_id: int, provider_message_id: str)
             logger.exception("Failed to mark provider message read mailbox_id=%s", mailbox_id)
 
 
+_ALERT_LABELS = (EmailLabel.INTERVIEW_INVITATION.value, EmailLabel.INTERVIEW_SCHEDULED.value)
+
+
+@router.get("/interview-alerts", response_model=list[InterviewEmailAlertOut])
+def list_interview_alerts(db: Session = Depends(get_db)) -> list[InterviewEmailAlertOut]:
+    rows = (
+        _from_active_mailbox(db.query(EmailMessage))
+        .filter(
+            MailboxConnection.is_active.is_(True),
+            EmailMessage.is_read.is_not(True),
+            EmailMessage.folder == MailFolder.INBOX.value,
+            EmailMessage.label.in_(_ALERT_LABELS),
+        )
+        .order_by(EmailMessage.received_at.desc(), EmailMessage.id.desc())
+        .limit(50)
+        .all()
+    )
+    if not rows:
+        return []
+    ids = [row.id for row in rows]
+    accounts = dict(
+        db.query(MailboxConnection.id, MailboxConnection.email_address)
+        .filter(MailboxConnection.id.in_({row.mailbox_id for row in rows}))
+        .all()
+    )
+    linked = (
+        db.query(CalendarEventEmail.email_id, CalendarEvent)
+        .join(CalendarEvent, CalendarEvent.id == CalendarEventEmail.event_id)
+        .filter(CalendarEventEmail.email_id.in_(ids), CalendarEvent.is_visible.is_(True), CalendarEvent.kind == "confirmed")
+        .all()
+    )
+    sourced = (
+        db.query(CalendarEvent)
+        .filter(CalendarEvent.source_email_id.in_(ids), CalendarEvent.is_visible.is_(True), CalendarEvent.kind == "confirmed")
+        .all()
+    )
+    events: dict[int, CalendarEvent] = {event.source_email_id: event for event in sourced}
+    for email_id, event in linked:
+        events.setdefault(email_id, event)
+    out: list[InterviewEmailAlertOut] = []
+    for row in rows:
+        event = events.get(row.id)
+        out.append(InterviewEmailAlertOut(
+            email_id=row.id,
+            mailbox_id=row.mailbox_id,
+            email_account=accounts.get(row.mailbox_id, ""),
+            label=row.label,
+            interview_subtype=row.interview_subtype,
+            company=(event.company if event and event.company else row.company) or "",
+            role=(event.job_role if event and event.job_role else row.job_role) or "",
+            subject=row.subject or "",
+            sender=row.sender or "",
+            received_at=row.received_at,
+            event_id=event.id if event else None,
+            start_at=event.start_at if event else None,
+            end_at=event.end_at if event else None,
+            meeting_type=event.meeting_type if event else None,
+        ))
+    return out
+
+
 @router.get("/{email_id}", response_model=EmailDetailOut)
 async def get_email(
     email_id: int,
@@ -570,7 +623,6 @@ async def get_email(
     if email.label not in {item.value for item in EmailLabel}:
         email.label = EmailLabel.OTHER.value
     db.commit()
-    db.refresh(email)
     return email
 
 

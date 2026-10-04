@@ -4,8 +4,10 @@ import EmailBody from "./components/EmailBody";
 import CompactSelect from "./components/CompactSelect";
 import ModernDateTimePicker from "./components/ModernDateTimePicker";
 import MessageRow from "./components/MessageRow";
+import CategoryPicker, { type CategoryChoice } from "./components/CategoryPicker";
 import SystemAlert, { type SystemIssue } from "./components/SystemAlert";
 import InterviewAlarm from "./components/InterviewAlarm";
+import InterviewEmailAlert from "./components/InterviewEmailAlert";
 import SettingsPage, { type SettingsSection } from "./pages/SettingsPage";
 import CalendarPage from "./pages/CalendarPage";
 import {
@@ -370,6 +372,8 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     null
   );
   const [pendingSubtype, setPendingSubtype] = useState<InterviewSubtype | "">("");
+  const [categoryPickerOpen, setCategoryPickerOpen] = useState(false);
+  const [stickyUnreadId, setStickyUnreadId] = useState<number | null>(null);
   const [markAllOpen, setMarkAllOpen] = useState(false);
   const [markingAllRead, setMarkingAllRead] = useState(false);
 
@@ -1199,14 +1203,19 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     };
 
     if (inboxType === "unread_first") {
-      const unread = emails.filter((email) => !email.is_read);
-      const read = emails.filter((email) => email.is_read);
+      const keptId = stickyUnreadId != null && stickyUnreadId === selectedId ? stickyUnreadId : null;
+      const inUnread = (email: EmailItem) => !email.is_read || email.id === keptId;
+      const unread = emails.filter(inUnread);
+      if (keptId != null) {
+        unread.sort((a, b) => receivedTime(b) - receivedTime(a) || b.id - a.id);
+      }
+      const read = emails.filter((email) => !inUnread(email));
       if (unread.length) {
         rows.push({
           kind: "group",
           key: "phase-unread",
           heading: "Unread",
-          count: unread.length,
+          count: unread.filter((email) => !email.is_read).length,
         });
         if (!collapsedDates.has("phase-unread")) {
           appendDateGroups("unread", unread);
@@ -1239,7 +1248,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
       }
     }
     return rows;
-  }, [collapsedDates, dateGroups, emails, inboxType]);
+  }, [collapsedDates, dateGroups, emails, inboxType, stickyUnreadId, selectedId]);
 
   const listRowsRef = useRef(listRows);
   listRowsRef.current = listRows;
@@ -1429,14 +1438,45 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     setPendingLabel({ emailId: selected.id, nextLabel });
   }
 
+  function onPickCategory(choice: CategoryChoice) {
+    setCategoryPickerOpen(false);
+    if (savingLabel || pendingLabel) return;
+    const targetId = selected?.id ?? selectedId;
+    if (targetId == null) return;
+    const listItem = emails.find((e) => e.id === targetId);
+    const currentLabel = selected?.label ?? listItem?.label;
+    const currentSubtype = selected?.interview_subtype ?? listItem?.interview_subtype ?? null;
+    if (currentLabel == null) return;
+    const sameSubtype = choice.label !== "interview_scheduled" || choice.subtype === currentSubtype;
+    if (currentLabel === choice.label && sameSubtype) return;
+    setPendingSubtype(choice.subtype ?? "");
+    setPendingLabel({ emailId: targetId, nextLabel: choice.label });
+  }
+
+  useEffect(() => {
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key.toLowerCase() !== "l" || event.ctrlKey || event.metaKey || event.altKey || event.repeat) return;
+      if (activePage !== "inbox" || settingsOpen || categoryPickerOpen || selectedId == null || savingLabel || pendingLabel) return;
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (target?.closest("input, textarea, select, [contenteditable='true'], [contenteditable='']")) return;
+      if (document.querySelector(".dialog-backdrop, .category-picker-backdrop, .mail-alert-backdrop")) return;
+      event.preventDefault();
+      setCategoryPickerOpen(true);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [activePage, settingsOpen, categoryPickerOpen, selectedId, savingLabel, pendingLabel]);
+
   async function applyCategoryChange(useTraining: boolean) {
-    if (!selected || !pendingLabel || savingLabel) return;
+    if (!pendingLabel || savingLabel) return;
     if (pendingLabel.nextLabel === "interview_scheduled" && !pendingSubtype) return;
     const emailId = pendingLabel.emailId;
     const nextLabel = pendingLabel.nextLabel;
     const subtype = nextLabel === "interview_scheduled" ? pendingSubtype as InterviewSubtype : undefined;
-    const previous = selected.label;
-    const previousSubtype = selected.interview_subtype;
+    const baseItem = (selected?.id === emailId ? selected : null) ?? emails.find((e) => e.id === emailId);
+    if (!baseItem) return;
+    const previous = baseItem.label;
+    const previousSubtype = baseItem.interview_subtype;
     setPendingLabel(null);
     setSaveTraining(useTraining);
     setSavingLabel(true);
@@ -1487,12 +1527,15 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   async function onOpenEmail(id: number) {
     setActivePage("inbox");
     const request = ++detailGen.current;
+    const target = emails.find((item) => item.id === id);
+    setStickyUnreadId((current) => (current === id ? current : target && !target.is_read ? id : null));
     setSelectedId(id);
-    setSelected(null);
+    setSelected(target ? { ...target, body_text: "", body_html: "" } : null);
     setThreadMessages([]);
     setOpenThreadIds([]);
     setSaveTraining(false);
     setPendingLabel(null);
+    setCategoryPickerOpen(false);
     setLoadingDetail(true);
     try {
       const detail = await fetchEmailDetail(id);
@@ -1637,23 +1680,46 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
     const target = event.target as HTMLElement;
     if (target.closest("input, textarea, select, [contenteditable='true']")) return;
+    if (moveListSelection(event.key === "ArrowDown" ? 1 : -1)) event.preventDefault();
+  }
+
+  function moveListSelection(step: 1 | -1) {
     const emailRows = listRows
       .map((row, index) => row.kind === "email" ? { id: row.email.id, index } : null)
       .filter((row): row is { id: number; index: number } => row !== null);
-    if (!emailRows.length) return;
+    if (!emailRows.length) return false;
 
-    event.preventDefault();
     const current = emailRows.findIndex((row) => row.id === selectedId);
     const next = current < 0
-      ? event.key === "ArrowDown" ? 0 : emailRows.length - 1
-      : Math.max(0, Math.min(emailRows.length - 1, current + (event.key === "ArrowDown" ? 1 : -1)));
+      ? step === 1 ? 0 : emailRows.length - 1
+      : Math.max(0, Math.min(emailRows.length - 1, current + step));
     const row = emailRows[next];
-    event.currentTarget.focus();
-    if (row.id === selectedId) return;
+    scrollRef.current?.focus({ preventScroll: true });
+    if (row.id === selectedId) return true;
     listVirtualizer.scrollToIndex(row.index, { align: "auto" });
     if (viewMode === "table" && readingPane === "no_split") selectTableEmail(row.id);
     else void onOpenEmail(row.id);
+    return true;
   }
+
+  const moveListSelectionRef = useRef(moveListSelection);
+  moveListSelectionRef.current = moveListSelection;
+
+  useEffect(() => {
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+      if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+      if (activePage !== "inbox" || settingsOpen) return;
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (target && target !== document.body) {
+        if (target.closest("input, textarea, select, [contenteditable='true'], [contenteditable=''], [role='listbox'], [role='menu'], [role='slider'], .reader-article, .pane-splitter, .message-scroll")) return;
+      }
+      if (document.querySelector(".dialog-backdrop, .category-picker-backdrop, .mail-alert-backdrop")) return;
+      if (moveListSelectionRef.current(event.key === "ArrowDown" ? 1 : -1)) event.preventDefault();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [activePage, settingsOpen]);
 
   function selectMailbox(id: number | null) {
     setActivePage("inbox");
@@ -1810,8 +1876,8 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
       setMarkingAllRead(false);
     }
   }
-  const readerAccount =
-    selected != null ? mailboxById.get(selected.mailbox_id)?.email_address ?? "" : "";
+  const readerMailbox = selected != null ? mailboxById.get(selected.mailbox_id) : undefined;
+  const readerAccount = readerMailbox?.email_address ?? "";
   const selectedSenderAddress = selected
     ? (selected.sender.match(/<([^>]+)>/)?.[1] ?? (selected.sender.includes("@") ? selected.sender.trim() : "")).trim()
     : "";
@@ -2212,6 +2278,13 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
       }
     >
       <InterviewAlarm mailboxes={mailboxes} />
+      <InterviewEmailAlert
+        mailboxes={mailboxes}
+        refreshKey={selectedId}
+        suppressed={systemAlertOpen && visibleIssues.length > 0}
+        onOpenEmail={(id) => void onOpenEmail(id)}
+        onOpenCalendar={() => setActivePage("calendar")}
+      />
       <SystemAlert
         issues={visibleIssues}
         open={systemAlertOpen}
@@ -2224,26 +2297,26 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         {sidebarCollapsed ? (
           <nav className="sidebar-rail" aria-label="Mailbox navigation">
             <div className="sidebar-rail-main">
-              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "all" && selectedMailboxId == null ? " active" : ""}`} aria-label="Home" title="Home" onClick={() => selectMailboxFolder(null, "all")}>
+              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "all" && selectedMailboxId == null ? " active" : ""}`} aria-label="Home" data-tooltip="Home" data-tooltip-hint="All mail from every account" data-tooltip-placement="right" onClick={() => selectMailboxFolder(null, "all")}>
                 <SidebarIcon name="home" />
               </button>
-              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "inbox" && selectedMailboxId == null ? " active" : ""}`} aria-label={inboxCount > 0 ? `Inbox, ${inboxCount} unread` : "Inbox"} title="Inbox" onClick={() => selectMailboxFolder(null, "inbox")}>
+              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "inbox" && selectedMailboxId == null ? " active" : ""}`} aria-label={inboxCount > 0 ? `Inbox, ${inboxCount} unread` : "Inbox"} data-tooltip="Inbox" data-tooltip-hint={inboxCount > 0 ? `${inboxCount.toLocaleString()} unread messages` : "You're all caught up"} data-tooltip-placement="right" onClick={() => selectMailboxFolder(null, "inbox")}>
                 <SidebarIcon name="inbox" />
                 {inboxCount > 0 && <span className="sidebar-rail-badge">{inboxCount > 99 ? "+99" : `+${inboxCount}`}</span>}
               </button>
-              <button type="button" className={`sidebar-rail-btn${activePage === "calendar" ? " active" : ""}`} aria-label="Calendar" title="Calendar" onClick={() => setActivePage("calendar")}>
+              <button type="button" className={`sidebar-rail-btn${activePage === "calendar" ? " active" : ""}`} aria-label="Calendar" data-tooltip="Calendar" data-tooltip-hint="Interviews and meetings" data-tooltip-placement="right" onClick={() => setActivePage("calendar")}>
                 <SidebarIcon name="calendar" />
               </button>
-              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && label !== "all" ? " active" : ""}`} aria-label="Categories" title="Categories" onClick={() => { setActivePage("inbox"); setSidebarSections((current) => ({ ...current, categories: true })); setSidebarCollapsed(false); try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, "0"); } catch { /* ignore */ } }}>
+              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && label !== "all" ? " active" : ""}`} aria-label="Categories" data-tooltip="Categories" data-tooltip-hint="Opens the sidebar to filter by category" data-tooltip-placement="right" onClick={() => { setActivePage("inbox"); setSidebarSections((current) => ({ ...current, categories: true })); setSidebarCollapsed(false); try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, "0"); } catch { /* ignore */ } }}>
                 <svg className="sidebar-nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3.5h6" /><path d="M10 3.5v5.2L7 12.2h10L14 8.7V3.5" /><path d="M12 12.2v8.3" /></svg>
               </button>
-              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "sent" && selectedMailboxId == null ? " active" : ""}`} aria-label="Sent" title="Sent" onClick={() => selectMailboxFolder(null, "sent")}>
+              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "sent" && selectedMailboxId == null ? " active" : ""}`} aria-label="Sent" data-tooltip="Sent" data-tooltip-hint="Messages you've sent" data-tooltip-placement="right" onClick={() => selectMailboxFolder(null, "sent")}>
                 <SidebarIcon name="sent" />
               </button>
-              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "archive" && selectedMailboxId == null ? " active" : ""}`} aria-label="Archive" title="Archive" onClick={() => selectMailboxFolder(null, "archive")}>
+              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "archive" && selectedMailboxId == null ? " active" : ""}`} aria-label="Archive" data-tooltip="Archive" data-tooltip-hint="Messages moved out of the inbox" data-tooltip-placement="right" onClick={() => selectMailboxFolder(null, "archive")}>
                 <svg className="sidebar-nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3.5h7.2L19 8.2V20.5H7V3.5Z" /><path d="M14 3.5v5h5" /></svg>
               </button>
-              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "trash" && selectedMailboxId == null ? " active" : ""}`} aria-label="Trash" title="Trash" onClick={() => selectMailboxFolder(null, "trash")}>
+              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "trash" && selectedMailboxId == null ? " active" : ""}`} aria-label="Trash" data-tooltip="Trash" data-tooltip-hint="Deleted messages" data-tooltip-placement="right" onClick={() => selectMailboxFolder(null, "trash")}>
                 <SidebarIcon name="trash" />
               </button>
             </div>
@@ -2251,7 +2324,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
               type="button"
               className="sidebar-rail-btn sidebar-rail-menu"
               aria-label="Show sidebar"
-              title="Show sidebar"
+              data-tooltip="Show sidebar"
+              data-tooltip-hint="Expand accounts, folders and categories"
+              data-tooltip-placement="right"
               onClick={() => {
                 setSidebarCollapsed(false);
                 try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, "0"); } catch { /* ignore */ }
@@ -2682,8 +2757,14 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                     </div>
                     <div className="reader-chips">
                       {readerAccount ? (
-                        <span className="reader-chip">
-                          to <span className="to-address">{readerAccount}</span>
+                        <span
+                          className="reader-chip reader-to-chip"
+                          title={readerAccount}
+                          style={readerMailbox ? ({ "--account-color": accountColor(readerMailbox) } as CSSProperties) : undefined}
+                        >
+                          <span className="reader-to-dot" aria-hidden="true" />
+                          <span className="reader-to-label">To</span>
+                          <span className="to-address">{readerAccount}</span>
                         </span>
                       ) : null}
                       <span className={`folder-pill folder-${mailFolderOf(selected)}`}>
@@ -2694,7 +2775,10 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                 </div>
                 <div className="reader-side">
                   <div className="reader-time-line">
-                    <time title={selected.received_at ?? undefined}>{formatReaderTime(selected.received_at)}</time>
+                    <time className="reader-time" title={selected.received_at ?? undefined}>
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5" /><path d="M12 7.5V12l3 2" /></svg>
+                      {formatReaderTime(selected.received_at)}
+                    </time>
                     {showConversation && (
                       <button
                         type="button"
@@ -2723,48 +2807,46 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                       ))}
                     </CompactSelect>
                     {selected.label === "interview_scheduled" && selected.interview_subtype && (
-                      <label className="interview-subtype-field">
-                        <span>Interview event</span>
-                        <span className="interview-subtype-control">
-                          <CompactSelect
-                          value={selected.interview_subtype}
-                          disabled={savingLabel || pendingLabel != null}
-                          aria-label="Interview subtype"
-                          onChange={async (event) => {
-                            const subtype = event.target.value as InterviewSubtype;
-                            const emailId = selected.id;
-                            setSavingLabel(true);
-                            try {
-                              const updated = await updateEmailLabel(emailId, "interview_scheduled", true, subtype);
-                              setSelected((prev) => prev?.id === emailId ? { ...prev, ...updated } : prev);
-                              setEmails((prev) => {
-                                const currentSubtype = filterRef.current.interviewSubtype;
-                                if (currentSubtype !== "all" && currentSubtype !== updated.interview_subtype) {
-                                  return prev.filter((item) => item.id !== emailId);
-                                }
-                                return prev.map((item) => item.id === emailId ? { ...item, ...updated } : item);
-                              });
-                              setUnusedTraining((count) => count + 1);
-                              void refreshPromptStatus();
-                            } catch (err) {
-                              setBanner(err instanceof Error ? err.message : "Could not update interview subtype");
-                            } finally {
-                              setSavingLabel(false);
-                            }
-                          }}
-                          >
-                            {(Object.entries(INTERVIEW_SUBTYPE_TITLES) as [InterviewSubtype, string][]).map(([value, title]) => (
-                              <option key={value} value={value}>{title}</option>
-                            ))}
-                          </CompactSelect>
-                        </span>
-                      </label>
+                      <CompactSelect
+                        value={selected.interview_subtype}
+                        disabled={savingLabel || pendingLabel != null}
+                        aria-label="Interview subtype"
+                        className="label-select label-interview_scheduled"
+                        containerClassName="category-compact-select label-interview_scheduled"
+                        onChange={async (event) => {
+                          const subtype = event.target.value as InterviewSubtype;
+                          const emailId = selected.id;
+                          setSavingLabel(true);
+                          try {
+                            const updated = await updateEmailLabel(emailId, "interview_scheduled", true, subtype);
+                            setSelected((prev) => prev?.id === emailId ? { ...prev, ...updated } : prev);
+                            setEmails((prev) => {
+                              const currentSubtype = filterRef.current.interviewSubtype;
+                              if (currentSubtype !== "all" && currentSubtype !== updated.interview_subtype) {
+                                return prev.filter((item) => item.id !== emailId);
+                              }
+                              return prev.map((item) => item.id === emailId ? { ...item, ...updated } : item);
+                            });
+                            setUnusedTraining((count) => count + 1);
+                            void refreshPromptStatus();
+                          } catch (err) {
+                            setBanner(err instanceof Error ? err.message : "Could not update interview subtype");
+                          } finally {
+                            setSavingLabel(false);
+                          }
+                        }}
+                      >
+                        {(Object.entries(INTERVIEW_SUBTYPE_TITLES) as [InterviewSubtype, string][]).map(([value, title]) => (
+                          <option key={value} value={value}>{title}</option>
+                        ))}
+                      </CompactSelect>
                     )}
                   </div>
                   <div className="reader-secondary">
-                    <label className="train-check">
+                    <label className={`train-check train-switch${saveTraining ? " is-on" : ""}`} data-tooltip="Use category changes to improve the AI" data-tooltip-placement="bottom">
                       <input
                         type="checkbox"
+                        role="switch"
                         checked={saveTraining}
                         onChange={(event) => setSaveTraining(event.target.checked)}
                       />
@@ -2872,6 +2954,15 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         </div>
       )}
 
+      {categoryPickerOpen && selected && (
+        <CategoryPicker
+          current={{ label: selected.label, subtype: selected.interview_subtype ?? null }}
+          subject={selected.subject}
+          onPick={onPickCategory}
+          onClose={() => setCategoryPickerOpen(false)}
+        />
+      )}
+
       {pendingLabel && (
         <div className="dialog-backdrop" role="presentation">
           <div
@@ -2879,6 +2970,22 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
             role="dialog"
             aria-modal="true"
             aria-labelledby="train-confirm-title"
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setPendingLabel(null);
+                return;
+              }
+              if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) return;
+              const target = event.target as HTMLElement;
+              if (target.closest("select, .compact-select-menu, [role='listbox']")) return;
+              const buttons = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>(".dialog-actions button:not(:disabled)"));
+              if (!buttons.length) return;
+              event.preventDefault();
+              const at = buttons.indexOf(document.activeElement as HTMLButtonElement);
+              const step = event.key === "ArrowDown" || event.key === "ArrowRight" ? 1 : -1;
+              buttons[(at + step + buttons.length) % buttons.length].focus();
+            }}
           >
             <header className="dialog-header">
               <h3 id="train-confirm-title">Prompt training</h3>
@@ -2900,6 +3007,13 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                   </CompactSelect>
                 </label>
               )}
+              <p className="dialog-change-summary">
+                <span>Category</span>
+                <strong>
+                  {CLASSIFY_LABEL_TITLES[pendingLabel.nextLabel]}
+                  {pendingLabel.nextLabel === "interview_scheduled" && pendingSubtype ? ` / ${INTERVIEW_SUBTYPE_TITLES[pendingSubtype]}` : ""}
+                </strong>
+              </p>
               <p className="dialog-hint">Use this email as prompt update training data?</p>
               <div className="dialog-actions">
                 <button
@@ -2913,6 +3027,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                 <button
                   type="button"
                   className="primary-btn"
+                  autoFocus
                   disabled={pendingLabel.nextLabel === "interview_scheduled" && !pendingSubtype}
                   onClick={() => void applyCategoryChange(true)}
                 >

@@ -284,6 +284,7 @@ def init_db() -> None:
                     conn.execute(text("ALTER TABLE email_messages ADD COLUMN body_html TEXT DEFAULT ''"))
                 if "is_read" not in cols:
                     conn.execute(text("ALTER TABLE email_messages ADD COLUMN is_read BOOLEAN DEFAULT 0"))
+                conn.execute(text("UPDATE email_messages SET is_read = 0 WHERE is_read IS NULL"))
                 if "human_corrected" not in cols:
                     conn.execute(
                         text(
@@ -356,6 +357,22 @@ def init_db() -> None:
                         "ON email_messages (received_at, id)"
                     )
                 )
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_email_messages_mailbox_received "
+                    "ON email_messages (mailbox_id, received_at, id)"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_email_messages_mailbox_label_received "
+                    "ON email_messages (mailbox_id, label, received_at, id)"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_email_messages_mailbox_folder_received "
+                    "ON email_messages (mailbox_id, folder, received_at, id)"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_email_messages_mailbox_unread_received "
+                    "ON email_messages (mailbox_id, is_read, received_at, id)"
+                ))
             if "ai_settings" in tables:
                 ai_cols = {c["name"] for c in inspect(conn).get_columns("ai_settings")}
                 if "openai_admin_key_enc" not in ai_cols:
@@ -430,6 +447,8 @@ def init_db() -> None:
     if database_url.get_backend_name() == "postgresql":
         with engine.begin() as conn:
             if "email_messages" in inspect(conn).get_table_names():
+                # Backfill rows where is_read is NULL (added before server DEFAULT was set).
+                conn.execute(text("UPDATE email_messages SET is_read = FALSE WHERE is_read IS NULL"))
                 conn.execute(text(
                     "CREATE INDEX IF NOT EXISTS ix_email_messages_received_id "
                     "ON email_messages (received_at DESC NULLS LAST, id DESC)"
@@ -449,6 +468,24 @@ def init_db() -> None:
                 conn.execute(text(
                     "CREATE INDEX IF NOT EXISTS ix_email_messages_thread "
                     "ON email_messages (mailbox_id, thread_id, received_at DESC, id DESC)"
+                ))
+                # Mailbox-scoped list queries: filter by mailbox_id then sort.
+                # Leading mailbox_id lets the planner avoid a full-table sort.
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_email_messages_mailbox_received "
+                    "ON email_messages (mailbox_id, received_at DESC NULLS LAST, id DESC)"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_email_messages_mailbox_label_received "
+                    "ON email_messages (mailbox_id, label, received_at DESC NULLS LAST, id DESC)"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_email_messages_mailbox_folder_received "
+                    "ON email_messages (mailbox_id, folder, received_at DESC NULLS LAST, id DESC)"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_email_messages_mailbox_unread_received "
+                    "ON email_messages (mailbox_id, is_read, received_at DESC NULLS LAST, id DESC)"
                 ))
 
     seed_default_classify_prompt()
