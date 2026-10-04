@@ -12,7 +12,7 @@ import SettingsPage, { type SettingsSection } from "./pages/SettingsPage";
 import CalendarPage from "./pages/CalendarPage";
 import {
   disconnectMailbox,
-  eventsUrl,
+  openEvents,
   fetchAiStatus,
   fetchAutoSyncStatus,
   fetchClassifyPromptStatus,
@@ -604,9 +604,11 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     }
   }, []);
 
+  const mailboxIdsKey = useMemo(() => mailboxes.map((mailbox) => mailbox.id).join(","), [mailboxes]);
   const refreshReclassifyStatuses = useCallback(async () => {
-    if (!mailboxes.length) return;
-    const results = await Promise.allSettled(mailboxes.map((mailbox) => fetchReclassifyStatus(mailbox.id)));
+    if (!mailboxIdsKey) return;
+    const ids = mailboxIdsKey.split(",").map(Number);
+    const results = await Promise.allSettled(ids.map((id) => fetchReclassifyStatus(id)));
     const running = new Set<number>();
     const progress: Record<number, { processed: number; total: number; failed: number }> = {};
     results.forEach((result) => {
@@ -620,7 +622,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     reclassifyingIdsRef.current = running;
     setReclassifyingIds(running);
     setReclassifyProgress((previous) => ({ ...previous, ...progress }));
-  }, [mailboxes]);
+  }, [mailboxIdsKey]);
 
   const load = useCallback(async () => {
     setError(null);
@@ -719,9 +721,12 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   }, [selectedMailboxId, label, interviewSubtype, folder, searchQuery, loadFirstPage]);
 
   useEffect(() => {
-    const source = new EventSource(eventsUrl());
+    const source = openEvents();
+    let reconnecting = false;
     source.addEventListener("connected", () => {
-      void load();
+      // The mount effect already loaded; only refetch what a dropped stream missed.
+      if (reconnecting) void load();
+      reconnecting = true;
     });
     source.addEventListener("mailbox.disconnected", (evt) => {
       try {

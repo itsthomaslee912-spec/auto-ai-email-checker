@@ -2308,3 +2308,32 @@ END:VCALENDAR
         assert db.get(CalendarEvent, three_pm.id).superseded_by_event_id == two_pm.id
         assert db.get(CalendarEvent, two_pm.id).is_visible is True
         assert db.get(CalendarEvent, hasan.id).is_visible is True
+
+
+def test_discarded_pending_interview_leaves_alerts_and_calendar_until_restored():
+    factory, (mailbox_id, _) = _database()
+    received = datetime.now(timezone.utc) - timedelta(days=1)
+    with factory() as db:
+        older = EmailMessage(mailbox_id=mailbox_id, provider_message_id="ask-1", thread_id="acme", subject="Interview times", sender="recruiter@acme.test", received_at=received - timedelta(days=2), label=EmailLabel.INTERVIEW_INVITATION.value, company="Acme", job_role="Engineer")
+        request = EmailMessage(mailbox_id=mailbox_id, provider_message_id="ask-2", thread_id="acme", subject="Need to reschedule", sender="recruiter@acme.test", received_at=received, label=EmailLabel.INTERVIEW_INVITATION.value, company="Acme", job_role="Engineer")
+        db.add_all([older, request])
+        db.flush()
+        start = datetime.now(timezone.utc) + timedelta(days=3)
+        db.add(CalendarEvent(mailbox_id=mailbox_id, source_email_id=request.id, kind="availability", origin="email", title="Available interview", start_at=start, end_at=start + timedelta(minutes=30), meeting_type="unspecified", is_visible=True))
+        db.commit()
+        request_id = request.id
+
+    client = _client(factory)
+    window = {"start": (start - timedelta(days=1)).isoformat(), "end": (start + timedelta(days=1)).isoformat()}
+    assert [item["email_id"] for item in client.get("/api/calendar-events/pending").json()] == [request_id]
+    assert len(client.get("/api/calendar-events", params=window).json()) == 1
+
+    assert client.post(f"/api/calendar-events/pending/{request_id}/dismiss").status_code == 204
+    # The older request for the same interview must not resurface in its place.
+    assert client.get("/api/calendar-events/pending").json() == []
+    assert client.get("/api/calendar-events", params=window).json() == []
+    assert request_id not in [item["email_id"] for item in client.get("/api/emails/interview-alerts").json()]
+
+    assert client.delete(f"/api/calendar-events/pending/{request_id}/dismiss").status_code == 204
+    assert [item["email_id"] for item in client.get("/api/calendar-events/pending").json()] == [request_id]
+    assert client.post("/api/calendar-events/pending/999999/dismiss").status_code == 404

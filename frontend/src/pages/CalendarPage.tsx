@@ -6,14 +6,16 @@ import ModernDateTimePicker from "../components/ModernDateTimePicker";
 import { accountColor, accountInk, defaultAccountColor } from "../accountColor";
 import {
   createCalendarEvent,
-  eventsUrl,
+  openEvents,
   fetchCalendarEvents,
   fetchCalendarEventEmails,
+  fetchPendingInterviews,
   updateCalendarEvent,
   type CalendarEvent,
   type CalendarEventPayload,
   type EmailDetail,
   type Mailbox,
+  type PendingInterview,
 } from "../api";
 
 type ViewMode = "month" | "week" | "day";
@@ -325,6 +327,15 @@ function ApplicationStatusIcon({ status }: { status: CalendarEvent["application_
 
 function CanceledStatusIcon() {
   return <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.5" /><path d="m4.1 4.1 7.8 7.8" /></svg>;
+}
+
+function pendingBadgeLabel(event: CalendarEvent) {
+  return event.request_kind === "reschedule" ? "Rescheduled time offered, not booked yet" : "Available time offered, not booked yet";
+}
+
+function PendingRequestIcon({ kind }: { kind: "invitation" | "reschedule" }) {
+  if (kind === "reschedule") return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M12.6 6.2A4.9 4.9 0 0 0 3.6 5" /><path d="M3.4 2.6V5.2H6" /><path d="M3.4 9.8a4.9 4.9 0 0 0 9 1.2" /><path d="M12.6 13.4v-2.6H10" /></svg>;
+  return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 2.5h7M4.5 13.5h7" /><path d="M5.2 2.5c0 2.6 2.8 3.6 2.8 5.5S5.2 10.9 5.2 13.5M10.8 2.5c0 2.6-2.8 3.6-2.8 5.5s2.8 2.9 2.8 5.5" /></svg>;
 }
 
 function VisibleApplicationStatusIcon({ status }: { status: VisibleApplicationStatus }) {
@@ -674,7 +685,7 @@ const EventCard = memo(function EventCard({ event, color, timeZone, compact, tim
   return <>
     <div
     ref={eventRef}
-    className={`calendar-event ${event.kind} ${status.className} ${compact ? "compact" : ""} ${timed ? "timed" : ""} ${selected ? "selected" : ""} has-meeting-type ${status.key !== "available" && status.key !== "active" ? "has-status" : ""} ${timed && durationMinutes <= 30 ? "very-short" : timed && durationMinutes < 60 ? "short" : ""}`}
+    className={`calendar-event ${event.kind} ${status.className} ${compact ? "compact" : ""} ${timed ? "timed" : ""} ${selected ? "selected" : ""} has-meeting-type ${status.key !== "active" ? "has-status" : ""} ${timed && durationMinutes <= 30 ? "very-short" : timed && durationMinutes < 60 ? "short" : ""}`}
     style={{ "--account-color": color, "--event-ink": accountInk(color), ...position } as React.CSSProperties}
     onPointerDown={(e) => e.stopPropagation()}
     onClick={(e) => { e.stopPropagation(); selectEvent(); }}
@@ -686,12 +697,14 @@ const EventCard = memo(function EventCard({ event, color, timeZone, compact, tim
     role="button"
     tabIndex={0}
     aria-pressed={selected}
-    aria-label={`${interviewKindLabel(event)}, ${event.company || "Company not specified"}, ${formatInterviewTimeRange(event, timeZone)}, ${type.label}${outcomeLabel ? `, ${outcomeLabel}` : ""}`}
+    aria-label={`${interviewKindLabel(event)}, ${event.company || "Company not specified"}, ${formatInterviewTimeRange(event, timeZone)}, ${type.label}${outcomeLabel ? `, ${outcomeLabel}` : ""}${status.key === "available" ? `, ${pendingBadgeLabel(event)}` : ""}`}
     aria-describedby={hoverPosition ? hoverId : undefined}
   >
+    {status.key === "available" && <span className={`calendar-event-status-icon calendar-event-pending-icon is-${event.request_kind ?? "invitation"}`} role="img" aria-label={pendingBadgeLabel(event)}><PendingRequestIcon kind={event.request_kind ?? "invitation"} /></span>}
     {status.key !== "available" && status.key !== "active" && <span className="calendar-event-status-icon" role="img" aria-label={status.label}>{status.key === "canceled" ? <CanceledStatusIcon /> : <ApplicationStatusIcon status={status.key === "rejected_closed" ? "rejected" : status.key} />}</span>}
     <span className="calendar-event-main">
       <span className="calendar-event-company">{event.company || "Company not specified"}</span>
+      {status.key === "available" && event.role && <span className="calendar-event-role">{event.role}</span>}
     </span>
     <span className={`event-type-badge meeting-${type.type}`} role="img" aria-label={type.label}><MeetingTypeIcon type={type.type} /></span>
   </div>
@@ -711,6 +724,7 @@ const EventCard = memo(function EventCard({ event, color, timeZone, compact, tim
             <dt>Interview type</dt>
             <dd><MeetingTypeIcon type={type.type} /><span>{type.label}</span></dd>
           </div>
+          {status.key === "available" && <div className={`calendar-hover-offer is-${event.request_kind ?? "invitation"}`}><dt>Status</dt><dd><PendingRequestIcon kind={event.request_kind ?? "invitation"} /><span>{event.request_kind === "reschedule" ? "Reschedule offered, not booked yet" : "Available time, not booked yet"}</span></dd></div>}
           {status.key !== "available" && <div className={`calendar-hover-status ${status.className}`}><dt>Status</dt><dd>{outcome ? <VisibleApplicationStatusIcon status={outcome} /> : <ApplicationStatusIcon status="active" />}<span>{status.label}</span></dd></div>}
         </dl>
       </div>,
@@ -820,6 +834,131 @@ type AccountInterviewCount = {
 
 const DONUT_RADIUS = 42;
 const DONUT_CIRCUMFERENCE = 2 * Math.PI * DONUT_RADIUS;
+
+function requestedAgo(value: string | null) {
+  if (!value) return "";
+  const days = Math.floor((Date.now() - new Date(value).getTime()) / 86400000);
+  if (days <= 0) return "Today";
+  if (days === 1) return "Yesterday";
+  return `${days} days ago`;
+}
+
+const PENDING_DISMISSED_KEY = "calendar.pendingAlert.dismissed";
+
+function readDismissedPending(): number[] {
+  try {
+    localStorage.removeItem(PENDING_DISMISSED_KEY);
+    const value = JSON.parse(sessionStorage.getItem(PENDING_DISMISSED_KEY) || "[]");
+    return Array.isArray(value) ? value.filter((id) => typeof id === "number") : [];
+  } catch {
+    return [];
+  }
+}
+
+function PendingInterviewCard({ item, isNew, timeZone, color, onJump }: {
+  item: PendingInterview;
+  isNew: boolean;
+  timeZone: string;
+  color: string;
+  onJump: (startAt: string) => void;
+}) {
+  return (
+    <li className={`pending-interview is-${item.kind}`} style={{ "--account-color": color } as React.CSSProperties}>
+      <div className="pending-interview-top">
+        <span className={`pending-interview-kind is-${item.kind}`}>
+          <PendingKindIcon kind={item.kind} />
+          {item.kind === "reschedule" ? "Reschedule" : "Invitation"}
+        </span>
+        {isNew && <span className="pending-interview-new">New</span>}
+        {item.received_at && <span className="pending-interview-age">{requestedAgo(item.received_at)}</span>}
+      </div>
+      <strong className="pending-interview-company" title={item.company || item.subject}>{item.company || item.subject || "Interview request"}</strong>
+      <span className="pending-interview-role" title={item.role || undefined}>{item.role || "Role not mentioned"}</span>
+      <span className="pending-interview-meta">
+        <span className="pending-interview-dot" aria-hidden="true" />
+        <span className="pending-interview-account">{item.email_account}</span>
+      </span>
+      {item.slots.length > 0 ? (
+        <div className="pending-interview-slots" aria-label="Proposed times">
+          {item.slots.map((slot) => (
+            <button type="button" key={slot.event_id} onClick={() => onJump(slot.start_at)} title="Show this day on the calendar">
+              <span>{cachedDateTime(timeZone, { weekday: "short", month: "short", day: "numeric" }, new Date(slot.start_at))}</span>
+              <small>
+                {cachedDateTime(timeZone, { hour: "numeric", minute: "2-digit" }, new Date(slot.start_at))}
+                {" – "}
+                {cachedDateTime(timeZone, { hour: "numeric", minute: "2-digit" }, new Date(slot.end_at))}
+              </small>
+            </button>
+          ))}
+        </div>
+      ) : <span className="pending-interview-note">No times proposed yet. Reply with your availability.</span>}
+    </li>
+  );
+}
+
+function pendingSummary(items: PendingInterview[]) {
+  const invitations = items.filter((item) => item.kind !== "reschedule").length;
+  const reschedules = items.length - invitations;
+  const parts = [];
+  if (invitations) parts.push(`${invitations} invitation${invitations === 1 ? "" : "s"}`);
+  if (reschedules) parts.push(`${reschedules} reschedule${reschedules === 1 ? "" : "s"}`);
+  return parts.join(" and ");
+}
+
+function PendingKindIcon({ kind }: { kind: PendingInterview["kind"] }) {
+  return kind === "reschedule"
+    ? <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 5.5A5.5 5.5 0 0 0 3.2 4.3M3 2v2.6h2.6M3 10.5a5.5 5.5 0 0 0 9.8 1.2M13 14v-2.6h-2.6" /></svg>
+    : <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2.5" y="3.5" width="11" height="10" rx="2" /><path d="M2.5 6.5h11M5.5 2v3M10.5 2v3" /></svg>;
+}
+
+function PendingInterviewsAlert({ items, timeZone, mailboxColor, onJump }: {
+  items: PendingInterview[];
+  timeZone: string;
+  mailboxColor: (mailboxId: number) => string;
+  onJump: (startAt: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [dismissed, setDismissed] = useState<number[]>(readDismissedPending);
+  const hasNew = items.some((item) => !dismissed.includes(item.email_id));
+  if (items.length === 0 || !hasNew) return null;
+  const newCount = items.filter((item) => !dismissed.includes(item.email_id)).length;
+  const dismiss = () => {
+    const ids = items.map((item) => item.email_id);
+    try { sessionStorage.setItem(PENDING_DISMISSED_KEY, JSON.stringify(ids)); } catch { /* ignore unavailable storage */ }
+    setDismissed(ids);
+    setExpanded(false);
+  };
+  const companies = items.map((item) => item.company || item.subject || "Interview request");
+  return (
+    <section className={`pending-alert ${expanded ? "is-expanded" : ""}`} role="status" aria-live="polite">
+      <div className="pending-alert-bar">
+        <span className="pending-alert-icon" aria-hidden="true">
+          <svg viewBox="0 0 20 20"><path d="M10 2.8a5 5 0 0 0-5 5v2.7l-1.4 2.6c-.3.5.1 1.1.7 1.1h11.4c.6 0 1-.6.7-1.1L15 10.5V7.8a5 5 0 0 0-5-5ZM8 16.2a2 2 0 0 0 4 0" /></svg>
+          {newCount > 0 && <span className="pending-alert-ping" />}
+        </span>
+        <div className="pending-alert-text">
+          <strong>{items.length} interview{items.length === 1 ? "" : "s"} waiting to be scheduled</strong>
+          <span title={companies.join(", ")}>
+            {pendingSummary(items)}
+            {!expanded && <> · {companies.slice(0, 3).join(", ")}{companies.length > 3 ? ` +${companies.length - 3} more` : ""}</>}
+          </span>
+        </div>
+        <button type="button" className="pending-alert-toggle" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
+          {expanded ? "Hide" : "Review"}
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
+        </button>
+        <button type="button" className="pending-alert-close" aria-label="Hide for this session" data-tooltip="Hide for this session" data-tooltip-hint="Comes back when a new request arrives" data-tooltip-placement="bottom" onClick={dismiss}>
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4.5 4.5 7 7m0-7-7 7" /></svg>
+        </button>
+      </div>
+      {expanded && (
+        <ul className="pending-alert-list">
+          {items.map((item) => <PendingInterviewCard key={item.email_id} item={item} isNew={!dismissed.includes(item.email_id)} timeZone={timeZone} color={mailboxColor(item.mailbox_id)} onJump={onJump} />)}
+        </ul>
+      )}
+    </section>
+  );
+}
 
 function ScheduledInterviewChart({ accounts }: { accounts: AccountInterviewCount[] }) {
   const [hoveredId, setHoveredId] = useState<number | null>(null);
@@ -1037,7 +1176,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
     void load("background");
   }, [load, refreshKey]);
   useEffect(() => {
-    const source = new EventSource(eventsUrl());
+    const source = openEvents();
     let timer = 0;
     const onChange = () => {
       window.clearTimeout(timer);
@@ -1049,6 +1188,29 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
       source.close();
     };
   }, [load]);
+  const [pendingInterviews, setPendingInterviews] = useState<PendingInterview[]>([]);
+  const loadPending = useCallback(async (signal?: AbortSignal) => {
+    try { setPendingInterviews(await fetchPendingInterviews(signal)); }
+    catch (err) { if ((err as Error).name !== "AbortError") setPendingInterviews([]); }
+  }, []);
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadPending(controller.signal);
+    return () => controller.abort();
+  }, [loadPending, refreshKey]);
+  useEffect(() => {
+    const source = openEvents();
+    let timer = 0;
+    const onChange = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => { void loadPending(); }, 600);
+    };
+    source.addEventListener("calendar.changed", onChange);
+    return () => {
+      window.clearTimeout(timer);
+      source.close();
+    };
+  }, [loadPending]);
   useEffect(() => { localStorage.setItem("calendar-view", view); }, [view]);
   useEffect(() => { try { localStorage.setItem(CALENDAR_TIME_ZONE_KEY, timeZone); } catch { /* ignore unavailable storage */ } }, [timeZone]);
   useEffect(() => () => {
@@ -1268,11 +1430,22 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
 
   return <main className={`calendar-workspace ${sidebarOpen ? "sidebar-open" : ""} ${sidebarClosing ? "sidebar-closing" : ""} ${detailsClosing ? "details-closing" : ""}`}>
     <header className="calendar-toolbar">
-      <div className="calendar-title-group"><button className="calendar-back" type="button" onClick={onClose} aria-label="Back to inbox">←</button><h1><strong>{title.primary}</strong>{title.secondary && <span>{title.secondary}</span>}</h1></div>
+      <div className="calendar-title-group"><button className="calendar-back" type="button" onClick={onClose} aria-label="Back to inbox" data-tooltip="Back to inbox" data-tooltip-placement="bottom"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5 8 12l7 7M8 12h11" /></svg></button><h1><strong>{title.primary}</strong>{title.secondary && <span>{title.secondary}</span>}</h1></div>
       <div className="calendar-nav"><button type="button" onClick={() => move(-1)} aria-label="Previous period">‹</button><button className="calendar-today" type="button" onClick={() => setAnchor(startOfDay(wallDateForInstant(new Date(), timeZone)))}>Today</button><button type="button" onClick={() => move(1)} aria-label="Next period">›</button></div>
       <div className="calendar-toolbar-actions"><CalendarTimeZonePicker value={timeZone} onChange={setTimeZone} /><CalendarViewPicker value={view} onChange={setView} /><button className="calendar-sidebar-toggle" type="button" aria-label={sidebarOpen ? "Hide calendar sidebar" : "Show calendar sidebar"} title={sidebarOpen ? "Hide sidebar" : "Show sidebar"} aria-pressed={sidebarOpen} onClick={toggleSidebar}>▥</button></div>
     </header>
     {error && <div className="calendar-state error"><span>{error}</span><button type="button" onClick={() => void load()}>Retry</button></div>}
+    {statusFilters.includes("available") && (
+      <PendingInterviewsAlert
+        items={pendingInterviews.filter((item) => !hiddenMailboxIds.includes(item.mailbox_id))}
+        timeZone={timeZone}
+        mailboxColor={mailboxColor}
+        onJump={(value) => {
+          const wall = wallDateForInstant(new Date(value), timeZone);
+          setAnchor(new Date(Date.UTC(wall.getUTCFullYear(), wall.getUTCMonth(), wall.getUTCDate())));
+        }}
+      />
+    )}
     <div className={`calendar-main ${selected ? "has-details" : ""}`}>
       <div className="calendar-board">
       {view === "month" ? (
@@ -1318,7 +1491,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
             {days.map((day, dayIndex) => { const dayEvents = dayGroups[dayIndex]?.timed ?? []; const today = sameDay(day, nowInTimeZone); const nowMinutes = nowInTimeZone.getUTCHours() * 60 + nowInTimeZone.getUTCMinutes(); return <div
                 className={`calendar-time-day ${today ? "today" : ""} ${defaultMailboxId == null ? "disabled" : ""}`}
                 key={day.toISOString()}
-                title={defaultMailboxId == null ? "Connect an email account to create events" : "Drag to create an event"}
+                title={defaultMailboxId == null ? "Connect an email account to create events" : undefined}
                 onPointerDown={(event) => beginTimeDrag(dayIndex, event)}
                 onPointerMove={(event) => updateTimeDrag(dayIndex, event)}
                 onPointerUp={(event) => finishTimeDrag(dayIndex, event)}

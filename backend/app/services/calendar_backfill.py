@@ -4,6 +4,8 @@ import asyncio
 import logging
 import threading
 
+from sqlalchemy import and_, or_
+
 from app.db import SessionLocal
 from app.models import EmailMessage
 from app.realtime.sse import publish
@@ -64,7 +66,13 @@ async def _backfill_calendar_events(
             return [
                 row[0]
                 for row in lookup.query(EmailMessage.id)
-                .filter(EmailMessage.label.in_(CALENDAR_LABELS))
+                .filter(
+                    or_(
+                        EmailMessage.label.in_(CALENDAR_LABELS),
+                        # Booked interviews misfiled under another category.
+                        and_(EmailMessage.subject.ilike("%interview%"), EmailMessage.human_corrected.is_(False)),
+                    )
+                )
                 .order_by(EmailMessage.received_at.asc(), EmailMessage.id.asc())
                 .all()
             ]

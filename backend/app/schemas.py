@@ -303,5 +303,41 @@ class CalendarEventOut(BaseModel):
     meeting_url: str | None = None
     phone_number: str | None = None
     phone_access_code: str | None = None
+    request_kind: Literal["invitation", "reschedule"] | None = None
     created_at: UtcDateTime | None = None
     updated_at: UtcDateTime | None = None
+
+
+class PendingInterviewSlotOut(BaseModel):
+    event_id: int
+    start_at: UtcDateTime
+    end_at: UtcDateTime
+
+
+class PendingInterviewOut(BaseModel):
+    email_id: int
+    mailbox_id: int
+    email_account: str
+    kind: Literal["invitation", "reschedule"]
+    company: str = ""
+    role: str = ""
+    subject: str = ""
+    received_at: UtcDateTime | None = None
+    slots: list[PendingInterviewSlotOut] = []
+
+
+class InterviewEmailAlertOut(BaseModel):
+    email_id: int
+    mailbox_id: int
+    email_account: str
+    label: Literal["interview_invitation", "interview_scheduled"]
+    interview_subtype: str | None = None
+    company: str = ""
+    role: str = ""
+    subject: str = ""
+    sender: str = ""
+    received_at: UtcDateTime | None = None
+    event_id: int | None = None
+    start_at: UtcDateTime | None = None
+    end_at: UtcDateTime | None = None
+    meeting_type: str | None = None

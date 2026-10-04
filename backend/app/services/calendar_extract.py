@@ -5,6 +5,7 @@ import html
 import json
 import logging
 import re
+from functools import lru_cache
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -755,25 +756,31 @@ def _open_role_for_employer(db: Session, email: EmailMessage, company_hint: str 
         _domain_identity_tokens(_organizer_addresses(email)) - _GENERIC_COMPANY_TOKENS
     )
     tokens = {token for token in tokens if token not in _GENERIC_COMPANY_TOKENS}
-    if received_at is None or not tokens:
+    if received_at is None or not (tokens or _company_alias_key(company_hint)):
         return None
-    candidates = (
-        db.query(EmailMessage)
-        .filter(
-            EmailMessage.mailbox_id == email.mailbox_id,
-            EmailMessage.id != email.id,
-            EmailMessage.job_role != "",
-            EmailMessage.received_at >= received_at - _ROLE_LOOKBACK,
-            EmailMessage.received_at <= received_at + timedelta(days=1),
-            or_(*[EmailMessage.company.ilike(f"%{token}%") for token in tokens]),
-        )
-        .all()
+    window = db.query(EmailMessage).filter(
+        EmailMessage.mailbox_id == email.mailbox_id,
+        EmailMessage.id != email.id,
+        EmailMessage.job_role != "",
+        EmailMessage.received_at >= received_at - _ROLE_LOOKBACK,
+        EmailMessage.received_at <= received_at + timedelta(days=1),
     )
-    matches = [
-        item
-        for item in candidates
-        if company_name_tokens(item.company).intersection(tokens) and (item.job_role or "").strip()
-    ]
+    matches: list[EmailMessage] = []
+    if tokens:
+        candidates = window.filter(or_(*[EmailMessage.company.ilike(f"%{token}%") for token in tokens])).all()
+        matches = [
+            item
+            for item in candidates
+            if company_name_tokens(item.company).intersection(tokens) and (item.job_role or "").strip()
+        ]
+    if not matches and _company_alias_key(company_hint):
+        # A sender domain stored as the company ("nucleussec", "ridewithvia.com")
+        # shares no whole word with "Nucleus Security"; compare squashed names.
+        matches = [
+            item
+            for item in window.filter(EmailMessage.company != "").all()
+            if (item.job_role or "").strip() and _company_aliases_match(company_hint, item.company)
+        ]
     rejected_roles = {
         (item.job_role or "").strip().casefold()
         for item in matches
@@ -797,12 +804,68 @@ def _open_role_for_employer(db: Session, email: EmailMessage, company_hint: str 
     latest_time = as_utc(latest.received_at)
     for other in open_rows[1:]:
         other_role = (other.job_role or "").strip()
-        if other_role.casefold() == latest_role.casefold():
+        if _same_job_family(other_role, latest_role):
             continue
         other_time = as_utc(other.received_at)
         if latest_time is not None and other_time is not None and latest_time - other_time <= timedelta(days=3):
             return "", ""
-    return latest_role, (latest.company or "").strip()
+    family = [(item.job_role or "").strip() for item in open_rows if _same_job_family(item.job_role, latest_role)]
+    return _fullest_job_title(family, [item.subject or "" for item in matches]), (latest.company or "").strip()
+
+
+_DOMAIN_SUFFIX_RE = re.compile(r"\.(?:com|io|ai|co|net|org|us|dev|tech)$", re.I)
+
+
+def _company_alias_key(company: str | None) -> str:
+    return _compact_company(_DOMAIN_SUFFIX_RE.sub("", (company or "").strip()))
+
+
+def _company_aliases_match(left: str | None, right: str | None) -> bool:
+    """ "nucleussec" is "Nucleus Security"; "ridewithvia.com" is not "Via" (too short to trust)."""
+    left_key, right_key = _company_alias_key(left), _company_alias_key(right)
+    if len(left_key) < 6 or len(right_key) < 6:
+        return False
+    return left_key == right_key or left_key.startswith(right_key) or right_key.startswith(left_key)
+
+
+def _better_company_alias(candidate: str | None, current: str | None) -> bool:
+    """ "Nucleus Security" reads better than the domain-style "nucleussec" for the same employer."""
+    candidate, current = (candidate or "").strip(), (current or "").strip()
+    if not candidate or not current or not _company_aliases_match(candidate, current):
+        return False
+    if _company_quality(candidate) != _company_quality(current):
+        return _company_quality(candidate) > _company_quality(current)
+    return " " in candidate and " " not in current
+
+
+_ROLE_SUFFIX_RE = re.compile(r"\s+(?:[-\u2013\u2014|:]|\()\s*.*$")
+
+
+def _job_base(role: str | None) -> str:
+    """The title before a team or location suffix: "Lead ML Engineer - MoneyLion" -> "lead ml engineer"."""
+    return _role_key(_ROLE_SUFFIX_RE.sub("", role or ""))
+
+
+def _same_job_family(left: str | None, right: str | None) -> bool:
+    """One opening written several ways, such as a bare title and the title with its team."""
+    if (left or "").strip().casefold() == (right or "").strip().casefold() or roles_compatible(left, right):
+        return True
+    base = _job_base(left)
+    return len(base) >= 12 and base == _job_base(right)
+
+
+def _fullest_job_title(roles: list[str], subjects: list[str]) -> str:
+    """Prefer the variant the employer wrote in a subject line, then the most specific one.
+
+    Stored titles are sometimes cut short ("... Engineer - Engine"); the subject
+    "Ryan Queen | Gen Digital - Lead Machine Learning Engineer - MoneyLion" is not.
+    """
+    unique = list(dict.fromkeys(role for role in roles if role))
+    if not unique:
+        return ""
+    folded_subjects = [subject.casefold() for subject in subjects]
+    in_subject = [role for role in unique if any(role.casefold() in subject for subject in folded_subjects)]
+    return max(in_subject or unique, key=len)
 
 
 def _fill_missing_role(db: Session, email: EmailMessage, details: InterviewDetails) -> InterviewDetails:
@@ -868,6 +931,7 @@ def _match_tokens(company: str | None) -> set[str]:
     return tokens | extra
 
 
+@lru_cache(maxsize=65536)
 def companies_match(left: str | None, right: str | None) -> bool:
     """Treat shortened and legal variants as one employer.
 
@@ -1670,7 +1734,7 @@ def refresh_calendar_event_details(db: Session, email: EmailMessage) -> bool:
         role = _known_role(messages)
     else:
         role, role_company = found_role
-        if not company and role_company:
+        if role_company and (not company or _better_company_alias(role_company, company)):
             company = role_company
     job_url = extract_job_url(combined_text)
     changed = False
@@ -1687,7 +1751,7 @@ def refresh_calendar_event_details(db: Session, email: EmailMessage) -> bool:
             event.phone_number,
             event.phone_access_code,
         )
-        if _company_quality(company) > _company_quality(event.company):
+        if _company_quality(company) > _company_quality(event.company) or _better_company_alias(company, event.company):
             event.company = company
         event.job_role = event.job_role or role
         event.interviewer = event.interviewer or interviewer
@@ -2000,6 +2064,36 @@ def message_is_booked_appointment(email: EmailMessage) -> bool:
     if _BOOKED_SUBJECT_RE.search(subject) and (_JOIN_URL_RE.search(fresh) or has_time):
         return True
     return bool(_CONFIRMED_SUBJECT_RE.search(subject) and has_time)
+
+
+_INTERVIEW_BOOKED_SUBJECT_RE = re.compile(
+    r"\binterview\b.{0,60}\b(?:confirm(?:ed|ation)?|scheduled|booked|reminder)\b"
+    r"|\b(?:confirm(?:ed|ation)?|scheduled|booked|reminder)\b.{0,60}\binterview\b",
+    re.I,
+)
+
+
+def misfiled_interview_booking(email: EmailMessage) -> bool:
+    """A booked interview the classifier filed under a non-interview category.
+
+    "Juvare Video Interview Confirmation" with "Tuesday, October 6 at 4:00 PM"
+    landed in Application Confirmation, so its appointment never reached the
+    calendar. The subject has to name a booked interview and the message has
+    to hold one upcoming appointment. Times on several different days are
+    options to pick from, not a booking.
+    """
+    if email.label in CALENDAR_LABELS or email.folder in {"sent", "spam", "trash"}:
+        return False
+    subject = email.subject or ""
+    if not _INTERVIEW_BOOKED_SUBJECT_RE.search(subject) or message_cancels_appointment(email):
+        return False
+    received = as_utc(email.received_at)
+    slots = [
+        slot
+        for slot in parse_ics_slots(_calendar_text(email)) or message_appointment_slots(email)
+        if not slot.is_availability_window and (received is None or slot.start_at >= received - timedelta(hours=1))
+    ]
+    return bool(slots) and len({slot.start_at.date() for slot in slots}) == 1
 
 
 def _replacement_times(email: EmailMessage) -> list[ExtractedSlot]:
@@ -3081,6 +3175,33 @@ async def process_calendar_email(
     *,
     force: bool = False,
     use_ai: bool = True,
+) -> bool:
+    if email.label in CALENDAR_LABELS:
+        return await _process_calendar_email(db, email, force=force, use_ai=use_ai)
+    if not misfiled_interview_booking(email):
+        return False
+    subtype = "reminder" if re.search(r"\breminder\b", email.subject or "", re.I) else "confirmation"
+    if not email.human_corrected:
+        email.label = EmailLabel.INTERVIEW_SCHEDULED.value
+        email.interview_subtype = subtype
+        return await _process_calendar_email(db, email, force=force, use_ai=use_ai)
+    # Keep the category the user chose; only the appointment goes on the calendar.
+    label, previous_subtype = email.label, email.interview_subtype
+    email.label = EmailLabel.INTERVIEW_SCHEDULED.value
+    email.interview_subtype = subtype
+    try:
+        return await _process_calendar_email(db, email, force=force, use_ai=use_ai)
+    finally:
+        email.label = label
+        email.interview_subtype = previous_subtype
+
+
+async def _process_calendar_email(
+    db: Session,
+    email: EmailMessage,
+    *,
+    force: bool,
+    use_ai: bool,
 ) -> bool:
     if email.label not in CALENDAR_LABELS:
         return False

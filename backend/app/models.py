@@ -139,6 +139,8 @@ class EmailMessage(Base):
     calendar_processed_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     calendar_processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     calendar_processing_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # The user said this unbooked interview request is handled; hide it from pending lists.
+    pending_dismissed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     folder: Mapped[str] = mapped_column(String(16), index=True, default=MailFolder.INBOX.value)
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     openai_response_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -153,6 +155,21 @@ class EmailMessage(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+
+
+EMAIL_SEARCH_COLUMNS = ("subject", "sender", "snippet", "body_text", "company", "job_role")
+
+
+def email_search_document_sql(table: str = "email_messages") -> str:
+    """Postgres expression behind the trigram search index.
+
+    The query must use this exact expression for the planner to pick the
+    index. Newlines separate fields so a single-line search term cannot match
+    across two of them.
+    """
+    prefix = f"{table}." if table else ""
+    fields = " || E'\\n' || ".join(f"coalesce({prefix}{column}, '')" for column in EMAIL_SEARCH_COLUMNS)
+    return f"lower({fields})"
 
 
 class ClassifyCorrection(Base):

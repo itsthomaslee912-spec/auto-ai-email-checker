@@ -162,6 +162,26 @@ def ensure_current_taxonomy_prompt() -> bool:
         db.close()
 
 
+def _ensure_search_index(conn) -> None:
+    """Trigram index so inbox search does not scan every message body."""
+    import logging
+
+    from sqlalchemy import text
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from app.models import email_search_document_sql
+
+    try:
+        with conn.begin_nested():
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_email_messages_search_trgm ON email_messages "
+                f"USING gin (({email_search_document_sql('')}) gin_trgm_ops)"
+            ))
+    except SQLAlchemyError as exc:
+        logging.getLogger(__name__).warning("Search index unavailable; search will scan: %s", exc)
+
+
 def init_db() -> None:
     from app import models  # noqa: F401
     from sqlalchemy import inspect, text
@@ -224,6 +244,10 @@ def init_db() -> None:
             if "calendar_processing_error" not in email_cols:
                 conn.execute(text(
                     "ALTER TABLE email_messages ADD COLUMN calendar_processing_error VARCHAR(512)"
+                ))
+            if "pending_dismissed_at" not in email_cols:
+                conn.execute(text(
+                    f"ALTER TABLE email_messages ADD COLUMN pending_dismissed_at {timestamp_type}"
                 ))
         if "calendar_events" in tables:
             calendar_cols = {c["name"] for c in inspect(conn).get_columns("calendar_events")}
@@ -487,6 +511,7 @@ def init_db() -> None:
                     "CREATE INDEX IF NOT EXISTS ix_email_messages_mailbox_unread_received "
                     "ON email_messages (mailbox_id, is_read, received_at DESC NULLS LAST, id DESC)"
                 ))
+                _ensure_search_index(conn)
 
     seed_default_classify_prompt()
     seed_admin_account()

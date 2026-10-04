@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { accountColor } from "../accountColor";
-import { eventsUrl, fetchCalendarEvents, type CalendarEvent, type Mailbox } from "../api";
+import { fetchCalendarEvents, openEvents, type CalendarEvent, type Mailbox } from "../api";
 
 const LEAD_MS = 10 * 60 * 1000;
 const GRACE_MS = 60 * 1000;
@@ -122,7 +122,7 @@ export default function InterviewAlarm({ mailboxes }: { mailboxes: Mailbox[] }) 
   useEffect(() => {
     void refresh();
     const timer = window.setInterval(() => { void refresh(); }, 20_000);
-    const source = new EventSource(eventsUrl());
+    const source = openEvents();
     const onChange = () => { void refresh(); };
     source.addEventListener("calendar.changed", onChange);
     return () => {

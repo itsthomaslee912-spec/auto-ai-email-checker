@@ -391,6 +391,7 @@ export type CalendarApplicationStatus = "active" | "passed" | "rejected" | "posi
 export type CalendarWorkModel = "remote" | "hybrid" | "on_site" | "unspecified";
 
 export interface CalendarEvent {
+  request_kind?: "invitation" | "reschedule" | null;
   id: number;
   mailbox_id: number;
   email_account: string;
@@ -444,6 +445,55 @@ export async function fetchCalendarEvents(start: string, end: string, signal?: A
   const params = new URLSearchParams({ start, end });
   const res = noteUnauthorized(await fetch(`${API_BASE}/api/calendar-events?${params}`, { signal, cache: "no-store", credentials: "include" }));
   if (!res.ok) throw new Error(await readApiError(res, "Failed to load calendar"));
+  return res.json();
+}
+
+export interface PendingInterview {
+  email_id: number;
+  mailbox_id: number;
+  email_account: string;
+  kind: "invitation" | "reschedule";
+  company: string;
+  role: string;
+  subject: string;
+  received_at: string | null;
+  slots: { event_id: number; start_at: string; end_at: string }[];
+}
+
+export async function fetchPendingInterviews(signal?: AbortSignal): Promise<PendingInterview[]> {
+  const res = noteUnauthorized(await fetch(`${API_BASE}/api/calendar-events/pending`, { signal, cache: "no-store", credentials: "include" }));
+  if (!res.ok) throw new Error(await readApiError(res, "Failed to load pending interviews"));
+  return res.json();
+}
+
+export async function setPendingInterviewDismissed(emailId: number, dismissed: boolean): Promise<void> {
+  const res = noteUnauthorized(await fetch(`${API_BASE}/api/calendar-events/pending/${emailId}/dismiss`, {
+    method: dismissed ? "POST" : "DELETE",
+    credentials: "include",
+  }));
+  if (!res.ok) throw new Error(await readApiError(res, dismissed ? "Failed to discard interview" : "Failed to restore interview"));
+}
+
+export interface InterviewEmailAlert {
+  email_id: number;
+  mailbox_id: number;
+  email_account: string;
+  label: "interview_invitation" | "interview_scheduled";
+  interview_subtype: string | null;
+  company: string;
+  role: string;
+  subject: string;
+  sender: string;
+  received_at: string | null;
+  event_id: number | null;
+  start_at: string | null;
+  end_at: string | null;
+  meeting_type: string | null;
+}
+
+export async function fetchInterviewEmailAlerts(signal?: AbortSignal): Promise<InterviewEmailAlert[]> {
+  const res = noteUnauthorized(await fetch(`${API_BASE}/api/emails/interview-alerts`, { signal, cache: "no-store", credentials: "include" }));
+  if (!res.ok) throw new Error(await readApiError(res, "Failed to load interview alerts"));
   return res.json();
 }
 
@@ -704,6 +754,46 @@ export function oauthStartUrl(
 
 export function eventsUrl(): string {
   return `${API_BASE}/api/events`;
+}
+
+export interface EventStream {
+  addEventListener(name: string, listener: EventListener): void;
+  removeEventListener(name: string, listener: EventListener): void;
+  close(): void;
+}
+
+let sharedEvents: EventSource | null = null;
+let sharedEventUsers = 0;
+
+/** Every open EventSource pins one of the browser's six HTTP/1.1 connections, so components share one. */
+export function openEvents(): EventStream {
+  if (!sharedEvents) sharedEvents = new EventSource(eventsUrl());
+  const source = sharedEvents;
+  sharedEventUsers += 1;
+  const added: Array<[string, EventListener]> = [];
+  let closed = false;
+  return {
+    addEventListener(name, listener) {
+      source.addEventListener(name, listener);
+      added.push([name, listener]);
+    },
+    removeEventListener(name, listener) {
+      source.removeEventListener(name, listener);
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      added.forEach(([name, listener]) => source.removeEventListener(name, listener));
+      sharedEventUsers -= 1;
+      // Deferred so a remount in the same tick reuses the open stream.
+      window.setTimeout(() => {
+        if (sharedEventUsers === 0 && sharedEvents === source) {
+          source.close();
+          sharedEvents = null;
+        }
+      }, 0);
+    },
+  };
 }
 
 export interface SessionUser {

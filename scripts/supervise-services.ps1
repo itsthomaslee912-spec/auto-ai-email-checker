@@ -75,11 +75,13 @@ function Start-Backend {
 }
 
 function Start-Frontend {
-    # 0.0.0.0 lets other computers on the LAN open the app; the Windows
-    # firewall rule decides which addresses may actually connect.
-    Write-SupervisorLog "Starting frontend on 0.0.0.0:5173"
+    # "::" is dual-stack: other computers on the LAN can open the app, and
+    # browsers resolving localhost to ::1 connect without a ~300 ms IPv4
+    # fallback per request. The Windows firewall rule decides which
+    # addresses may actually connect.
+    Write-SupervisorLog "Starting frontend on [::]:5173"
     return Start-Process -FilePath $Node `
-        -ArgumentList @($Vite, "--host", "0.0.0.0", "--port", "5173", "--strictPort") `
+        -ArgumentList @($Vite, "--host", "::", "--port", "5173", "--strictPort") `
         -WorkingDirectory $Frontend -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput (Join-Path $Logs "frontend.log") `
         -RedirectStandardError (Join-Path $Logs "frontend-error.log")

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 
 const TOOLTIP_TARGETS = [
   "button",
@@ -30,6 +30,7 @@ type TooltipState = {
   placement: "below" | "right" | "top";
   left: number;
   top: number;
+  arrowY?: number;
   visible: boolean;
 };
 
@@ -194,8 +195,9 @@ export default function AppTooltip() {
       const left = fitsRight ? targetRect.right + gutter : Math.max(gutter, targetRect.left - gutter - bounds.width);
       const centered = targetRect.top + targetRect.height / 2 - bounds.height / 2;
       const top = Math.max(gutter, Math.min(window.innerHeight - gutter - bounds.height, centered));
+      const arrowY = Math.max(10, Math.min(bounds.height - 10, targetRect.top + targetRect.height / 2 - top));
       setTooltip((current) => current && current.target === tooltip.target
-        ? { ...current, left, top, visible: true }
+        ? { ...current, left, top, arrowY, visible: true }
         : current);
       return;
     }
@@ -222,7 +224,7 @@ export default function AppTooltip() {
       ref={tooltipRef}
       className={`app-tooltip placement-${tooltip.placement}${tooltip.full ? " is-detailed" : ""}${tooltip.hint ? " has-hint" : ""}${tooltip.visible ? " is-visible" : ""}`}
       role="tooltip"
-      style={{ left: tooltip.left, top: tooltip.top }}
+      style={{ left: tooltip.left, top: tooltip.top, ...(tooltip.arrowY != null ? { "--tooltip-arrow-y": `${tooltip.arrowY}px` } : {}) } as CSSProperties}
     >
       {tooltip.hint ? (
         <>

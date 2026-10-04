@@ -12,7 +12,15 @@ from app.auth.session import mailbox_scope
 from app.db import get_db
 from app.models import CalendarEvent, CalendarEventEmail, EmailMessage, MailboxConnection
 from app.realtime.sse import publish
-from app.schemas import CalendarEventCreateIn, CalendarEventOut, CalendarEventUpdateIn, EmailDetailOut
+from app.schemas import (
+    CalendarEventCreateIn,
+    CalendarEventOut,
+    CalendarEventUpdateIn,
+    EmailDetailOut,
+    PendingInterviewOut,
+    PendingInterviewSlotOut,
+)
+from app.services.pending_interviews import pending_interview_requests, resolved_availability_ids
 from app.timeutil import as_utc
 
 router = APIRouter(prefix="/api/calendar-events", tags=["calendar"])
@@ -37,7 +45,23 @@ def _event_query(db: Session):
     )
 
 
-def _event_out(event: CalendarEvent, mailbox: MailboxConnection | None = None) -> CalendarEventOut:
+_RESCHEDULE_SUBTYPES = {"reschedule", "time_change"}
+
+
+def _request_kinds(db: Session, events: list[CalendarEvent]) -> dict[int, str]:
+    """Whether each unbooked availability item came from an invitation or a reschedule."""
+    sources = {event.source_email_id for event in events if event.kind == "availability" and event.source_email_id}
+    if not sources:
+        return {}
+    subtypes = dict(db.query(EmailMessage.id, EmailMessage.interview_subtype).filter(EmailMessage.id.in_(sources)).all())
+    return {
+        event.id: "reschedule" if subtypes.get(event.source_email_id) in _RESCHEDULE_SUBTYPES else "invitation"
+        for event in events
+        if event.kind == "availability"
+    }
+
+
+def _event_out(event: CalendarEvent, mailbox: MailboxConnection | None = None, request_kind: str | None = None) -> CalendarEventOut:
     box = mailbox or event.mailbox
     return CalendarEventOut(
         id=event.id,
@@ -64,6 +88,7 @@ def _event_out(event: CalendarEvent, mailbox: MailboxConnection | None = None) -
         meeting_url=event.meeting_url,
         phone_number=event.phone_number,
         phone_access_code=event.phone_access_code,
+        request_kind=request_kind,
         created_at=event.created_at,
         updated_at=event.updated_at,
     )
@@ -115,7 +140,55 @@ def list_calendar_events(
         .order_by(CalendarEvent.start_at.asc(), CalendarEvent.id.asc())
         .all()
     )
-    return [_event_out(row) for row in rows]
+    resolved = resolved_availability_ids(db, rows)
+    rows = [row for row in rows if row.id not in resolved]
+    kinds = _request_kinds(db, rows)
+    return [_event_out(row, request_kind=kinds.get(row.id)) for row in rows]
+
+
+@router.get("/pending", response_model=list[PendingInterviewOut])
+def list_pending_interviews(db: Session = Depends(get_db)) -> list[PendingInterviewOut]:
+    mailboxes = {box.id: box for box in db.query(MailboxConnection).filter(mailbox_scope()).all()}
+    items = pending_interview_requests(db, list(mailboxes))
+    return [
+        PendingInterviewOut(
+            email_id=item.email.id,
+            mailbox_id=item.email.mailbox_id,
+            email_account=mailboxes[item.email.mailbox_id].email_address,
+            kind=item.kind,
+            company=item.email.company or "",
+            role=item.email.job_role or "",
+            subject=item.email.subject or "",
+            received_at=item.email.received_at,
+            slots=[PendingInterviewSlotOut(event_id=slot.id, start_at=slot.start_at, end_at=slot.end_at) for slot in item.slots],
+        )
+        for item in items
+    ]
+
+
+async def _set_pending_dismissed(db: Session, email_id: int, dismissed: bool) -> None:
+    email = (
+        db.query(EmailMessage)
+        .join(MailboxConnection, MailboxConnection.id == EmailMessage.mailbox_id)
+        .filter(EmailMessage.id == email_id, mailbox_scope())
+        .one_or_none()
+    )
+    if email is None:
+        raise HTTPException(status_code=404, detail="Email not found")
+    email.pending_dismissed_at = datetime.now(timezone.utc) if dismissed else None
+    db.commit()
+    await publish("calendar.changed", {"action": "pending_dismissed" if dismissed else "pending_restored", "email_id": email_id, "mailbox_id": email.mailbox_id})
+
+
+@router.post("/pending/{email_id}/dismiss", status_code=204)
+async def dismiss_pending_interview(email_id: int, db: Session = Depends(get_db)) -> None:
+    """Hide an unbooked invitation or reschedule and its offered times."""
+    await _set_pending_dismissed(db, email_id, True)
+
+
+@router.delete("/pending/{email_id}/dismiss", status_code=204)
+async def restore_pending_interview(email_id: int, db: Session = Depends(get_db)) -> None:
+    await _set_pending_dismissed(db, email_id, False)
 
 
 @router.get("/{event_id}", response_model=CalendarEventOut)
@@ -123,7 +196,7 @@ def get_calendar_event(event_id: int, db: Session = Depends(get_db)) -> Calendar
     event = _event_query(db).filter(CalendarEvent.id == event_id).one_or_none()
     if event is None:
         raise HTTPException(status_code=404, detail="Calendar event not found")
-    return _event_out(event)
+    return _event_out(event, request_kind=_request_kinds(db, [event]).get(event.id))
 
 
 @router.get("/{event_id}/emails", response_model=list[EmailDetailOut])

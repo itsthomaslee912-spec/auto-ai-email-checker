@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from sqlalchemy import String, and_, cast, func, or_
+from sqlalchemy import String, and_, cast, func, literal_column, or_
 from sqlalchemy.orm import Session, load_only, sessionmaker
 
 from app.auth.oauth_google import ensure_google_access_token
@@ -34,7 +34,17 @@ from app.email.outlook import (
     outlook_send_message,
 )
 from app.email.folders import VALID_FOLDERS
-from app.models import CalendarEvent, CalendarEventEmail, ClassifyCorrection, EmailLabel, EmailMessage, MailboxConnection, MailFolder, Provider
+from app.models import (
+    CalendarEvent,
+    CalendarEventEmail,
+    ClassifyCorrection,
+    EmailLabel,
+    EmailMessage,
+    MailboxConnection,
+    MailFolder,
+    Provider,
+    email_search_document_sql,
+)
 from app.realtime.sse import publish
 from app.services.calendar_extract import CALENDAR_LABELS, process_calendar_email
 from app.schemas import (
@@ -86,12 +96,14 @@ def _from_active_mailbox(query):
     ).filter(mailbox_scope())
 
 
-def _search_filter(query: str):
+def _search_filter(query: str, dialect: str):
     term = query.strip().lower()
     if not term:
         return None
     escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     needle = f"%{escaped}%"
+    if dialect == "postgresql" and "\n" not in term:
+        return literal_column(email_search_document_sql()).like(needle, escape="\\")
     columns = (
         EmailMessage.subject,
         EmailMessage.sender,
@@ -260,8 +272,15 @@ def _thread_key():
     )
 
 
+def _bytewise(filtered, key):
+    """Thread keys only need equality, and Postgres sorts locale-collated text several times slower."""
+    if filtered.session.get_bind().dialect.name == "postgresql":
+        return key.collate("C")
+    return key
+
+
 def _conversation_ranked(filtered):
-    thread_key = _thread_key()
+    thread_key = _bytewise(filtered, _thread_key())
     partition = (EmailMessage.mailbox_id, thread_key)
     return (
         filtered.order_by(None)
@@ -290,7 +309,7 @@ def _conversation_total(filtered, key: tuple, before_id: int | None) -> int:
         cached = _conversation_total_cache.get(key)
         if cached is not None and now - cached[0] < _LIST_META_TTL_SECONDS:
             return cached[1]
-    thread_key = func.concat(cast(EmailMessage.mailbox_id, String), ":", _thread_key())
+    thread_key = _bytewise(filtered, func.concat(cast(EmailMessage.mailbox_id, String), ":", _thread_key()))
     total = int(
         filtered.order_by(None).with_entities(func.count(func.distinct(thread_key))).scalar() or 0
     )
@@ -330,7 +349,7 @@ def list_emails(
     if folder and folder != "all" and folder in VALID_FOLDERS:
         filtered = filtered.filter(EmailMessage.folder == folder)
     if q:
-        clause = _search_filter(q)
+        clause = _search_filter(q, db.get_bind().dialect.name)
         if clause is not None:
             filtered = filtered.filter(clause)
 
@@ -510,6 +529,7 @@ def list_interview_alerts(db: Session = Depends(get_db)) -> list[InterviewEmailA
             EmailMessage.is_read.is_not(True),
             EmailMessage.folder == MailFolder.INBOX.value,
             EmailMessage.label.in_(_ALERT_LABELS),
+            EmailMessage.pending_dismissed_at.is_(None),
         )
         .order_by(EmailMessage.received_at.desc(), EmailMessage.id.desc())
         .limit(50)
