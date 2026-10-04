@@ -245,6 +245,127 @@ def test_unknown_sender_invite_becomes_a_visible_calendar_item():
         assert event.meeting_url == "https://mavensecurities.zoom.us/j/93169163898"
 
 
+def test_sent_reply_proposing_a_time_becomes_an_available_calendar_slot():
+    """A candidate's own Sent reply naming a time is not an employer booking,
+
+    but it should still appear on the calendar as an offered slot awaiting
+    confirmation -- it must not be silently dropped because it lives in Sent.
+    """
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="angelica-invite",
+            thread_id="cloud-platform-thread",
+            folder="inbox",
+            subject="Cloud Platform Engineer III Interview",
+            sender="Angelica Chacon <angelica.chacon@utah.edu>",
+            received_at=datetime(2026, 9, 30, 18, 0, tzinfo=timezone.utc),
+            body_text="Are you still interested in the Cloud Platform Engineer III role? Let me know your availability.",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="University of Utah",
+            job_role="Cloud Platform Engineer III",
+        )
+        db.add(invitation)
+        db.flush()
+
+        reply = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="mark-reply",
+            thread_id="cloud-platform-thread",
+            folder="sent",
+            subject="Re: Cloud Platform Engineer III Interview",
+            sender="Mark Abraham Wei <mark.abraham.wei@gmail.com>",
+            received_at=datetime(2026, 10, 1, 17, 12, tzinfo=timezone.utc),
+            body_text=(
+                "Hi Angelica,\n\n"
+                "Thank you for reaching out. Yes, I am still very interested in the Cloud Platform "
+                "Engineer III role.\n\n"
+                "I am available on October 5th at 2:00 PM PST for the 30-minute virtual interview. "
+                "Please let me know if that time works for you.\n\n"
+                "Best regards,\nMark"
+            ),
+            label="other",
+        )
+        db.add(reply)
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, reply, use_ai=False)) is True
+        # The Sent reply keeps its own classification; only the calendar gains an entry.
+        assert reply.label == "other"
+        event = db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True)).one()
+        assert event.kind == "availability"
+        assert event.source_email_id == reply.id
+        assert event.start_at == datetime(2026, 10, 5, 21, 0, tzinfo=timezone.utc)
+
+
+def test_sent_reply_without_a_shared_thread_id_matches_by_subject():
+    """Mail sync does not always carry a thread id onto a Sent copy.
+
+    The invitation and the reply must still be linked by their (reply-stripped)
+    subject so the proposed time is not lost, matching a real production case
+    where both messages had thread_id=None.
+    """
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="angelica-invite-2",
+            thread_id=None,
+            folder="inbox",
+            subject="Cloud Platform Engineer III Interview",
+            sender="Angelica Chacon <angelica.chacon@utah.edu>",
+            received_at=datetime(2026, 9, 30, 18, 0, tzinfo=timezone.utc),
+            body_text="Are you still interested in the Cloud Platform Engineer III role?",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="University of Utah",
+            job_role="Cloud Platform Engineer III",
+        )
+        db.add(invitation)
+        db.flush()
+
+        reply = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="mark-reply-2",
+            thread_id=None,
+            folder="sent",
+            subject="Re: Cloud Platform Engineer III Interview",
+            sender="Mark Abraham Wei <mark.abraham.wei@gmail.com>",
+            received_at=datetime(2026, 10, 1, 17, 12, tzinfo=timezone.utc),
+            body_text="I am available on October 5th at 2:00 PM PST for the 30-minute virtual interview.",
+            label="other",
+        )
+        db.add(reply)
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, reply, use_ai=False)) is True
+        event = db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True)).one()
+        assert event.kind == "availability"
+        assert event.source_email_id == reply.id
+        assert event.start_at == datetime(2026, 10, 5, 21, 0, tzinfo=timezone.utc)
+
+
+def test_sent_reply_without_an_interview_thread_is_ignored():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        reply = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="unrelated-sent",
+            thread_id="unrelated-thread",
+            folder="sent",
+            subject="Re: Interview prep notes",
+            sender="Mark Abraham Wei <mark.abraham.wei@gmail.com>",
+            received_at=datetime(2026, 10, 1, 17, 12, tzinfo=timezone.utc),
+            body_text="I am available on October 5th at 2:00 PM PST, talk then.",
+            label="other",
+        )
+        db.add(reply)
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, reply, use_ai=False)) is False
+        assert db.query(CalendarEvent).count() == 0
+
+
 def test_date_glued_to_the_start_time_keeps_one_range():
     slots = parse_text_slots(
         "Friday, September 25, 2026:1:30pm - 2:15pm PT - Initial Screen",

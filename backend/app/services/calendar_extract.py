@@ -2096,6 +2096,69 @@ def misfiled_interview_booking(email: EmailMessage) -> bool:
     return bool(slots) and len({slot.start_at.date() for slot in slots}) == 1
 
 
+_REPLY_PREFIX_RE = re.compile(r"^(?:\s*(?:re|fwd?)\s*:\s*)+", re.I)
+
+
+def _normalized_subject(subject: str | None) -> str:
+    return _REPLY_PREFIX_RE.sub("", subject or "").strip().casefold()
+
+
+def candidate_proposed_availability(db: Session, email: EmailMessage) -> bool:
+    """A Sent reply where we name times we can do, in an existing interview thread.
+
+    An employer's invitation lands as interview_invitation and already reaches
+    the calendar. When we reply from Sent proposing our own times ("I am
+    available on October 5th at 2:00 PM PST"), the classifier correctly has no
+    employer-facing label for that message, so it stays "Other" and its times
+    never reach the calendar. Require an interview invitation/scheduling email
+    to already exist for the same conversation, so an unrelated Sent message
+    mentioning "interview" and a date is not mistaken for a proposal.
+
+    The mail sync does not always preserve a thread id on a Sent copy, and the
+    stored "sender" on our own Sent mail is our address, not the employer's, so
+    thread id and organizer identity cannot be trusted here. Fall back to
+    matching the employer's invitation by its reply-stripped subject.
+    """
+    if email.folder != "sent" or email.label in CALENDAR_LABELS:
+        return False
+    subject = _normalized_subject(email.subject)
+    if not subject or "interview" not in subject:
+        return False
+    if message_cancels_appointment(email):
+        return False
+    interview_labels = {EmailLabel.INTERVIEW_INVITATION.value, EmailLabel.INTERVIEW_SCHEDULED.value}
+    has_interview_thread = bool(email.thread_id) and (
+        db.query(EmailMessage.id)
+        .filter(
+            EmailMessage.mailbox_id == email.mailbox_id,
+            EmailMessage.thread_id == email.thread_id,
+            EmailMessage.id != email.id,
+            EmailMessage.label.in_(interview_labels),
+        )
+        .first()
+        is not None
+    )
+    if not has_interview_thread:
+        received = as_utc(email.received_at)
+        window_start = received - timedelta(days=120) if received else None
+        candidates = (
+            db.query(EmailMessage.subject)
+            .filter(
+                EmailMessage.mailbox_id == email.mailbox_id,
+                EmailMessage.id != email.id,
+                EmailMessage.label.in_(interview_labels),
+                *([EmailMessage.received_at >= window_start] if window_start else []),
+            )
+            .all()
+        )
+        has_interview_thread = any(_normalized_subject(row[0]) == subject for row in candidates)
+    if not has_interview_thread:
+        return False
+    fresh = _without_quoted_history(_calendar_text(email))
+    slots = [slot for slot in parse_text_slots(fresh, email.received_at) if not slot.is_availability_window]
+    return bool(slots)
+
+
 def _replacement_times(email: EmailMessage) -> list[ExtractedSlot]:
     if ics_cancels_appointment(_calendar_text(email)):
         return []
@@ -3178,22 +3241,34 @@ async def process_calendar_email(
 ) -> bool:
     if email.label in CALENDAR_LABELS:
         return await _process_calendar_email(db, email, force=force, use_ai=use_ai)
-    if not misfiled_interview_booking(email):
-        return False
-    subtype = "reminder" if re.search(r"\breminder\b", email.subject or "", re.I) else "confirmation"
-    if not email.human_corrected:
+    if misfiled_interview_booking(email):
+        subtype = "reminder" if re.search(r"\breminder\b", email.subject or "", re.I) else "confirmation"
+        if not email.human_corrected:
+            email.label = EmailLabel.INTERVIEW_SCHEDULED.value
+            email.interview_subtype = subtype
+            return await _process_calendar_email(db, email, force=force, use_ai=use_ai)
+        # Keep the category the user chose; only the appointment goes on the calendar.
+        label, previous_subtype = email.label, email.interview_subtype
         email.label = EmailLabel.INTERVIEW_SCHEDULED.value
         email.interview_subtype = subtype
-        return await _process_calendar_email(db, email, force=force, use_ai=use_ai)
-    # Keep the category the user chose; only the appointment goes on the calendar.
-    label, previous_subtype = email.label, email.interview_subtype
-    email.label = EmailLabel.INTERVIEW_SCHEDULED.value
-    email.interview_subtype = subtype
-    try:
-        return await _process_calendar_email(db, email, force=force, use_ai=use_ai)
-    finally:
-        email.label = label
-        email.interview_subtype = previous_subtype
+        try:
+            return await _process_calendar_email(db, email, force=force, use_ai=use_ai)
+        finally:
+            email.label = label
+            email.interview_subtype = previous_subtype
+    if candidate_proposed_availability(db, email):
+        # Our own Sent proposal, not yet confirmed by the employer. Process it
+        # the same way as an invitation's offered slots, without permanently
+        # relabeling a message that still correctly shows as "Other" in the inbox.
+        label, previous_subtype = email.label, email.interview_subtype
+        email.label = EmailLabel.INTERVIEW_INVITATION.value
+        email.interview_subtype = None
+        try:
+            return await _process_calendar_email(db, email, force=force, use_ai=use_ai)
+        finally:
+            email.label = label
+            email.interview_subtype = previous_subtype
+    return False
 
 
 async def _process_calendar_email(
