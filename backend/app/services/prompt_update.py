@@ -22,7 +22,7 @@ ALLOWED_SLUGS = {label.value for label in EmailLabel}
 PROMPT_UPDATE_SYSTEM = """You improve a recruiting-email classification SYSTEM prompt from human corrections.
 Return a single JSON object only: {"rules":"<concise additive classification rules>"}.
 Rules:
-- Use only these label slugs in rules: application_confirmation, application_action_required, screening, assessment, interview_invitation, interview_scheduled, interview_follow_up, offer, rejected_closed, recruitment_alert, other.
+- Use only these label slugs in rules: application_confirmation, application_action_required, screening, assessment, interview_invitation, interview_availability, interview_scheduled, interview_follow_up, offer, rejected_closed, recruitment_alert, other.
 - For interview_scheduled, keep the allowed subtypes confirmation, calendar_invite, reminder, reschedule, time_change, cancellation. Other labels use null.
 - Add or tighten category and subtype RULES so the listed mistakes would be classified correctly next time.
 - Generalize from the examples; do not paste entire email bodies into the prompt.

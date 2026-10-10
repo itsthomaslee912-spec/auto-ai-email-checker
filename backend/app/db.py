@@ -23,8 +23,9 @@ else:
     # Drop connections older than this so a restarted PostgreSQL is picked up
     # instead of leaving requests stuck on a dead socket.
     engine_kwargs["pool_recycle"] = 300
-    engine_kwargs["pool_size"] = 8
-    engine_kwargs["max_overflow"] = 8
+    engine_kwargs["pool_size"] = 12
+    engine_kwargs["max_overflow"] = 12
+    engine_kwargs["pool_timeout"] = 5
 
 engine = create_engine(database_url, connect_args=connect_args, **engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

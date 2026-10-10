@@ -33,6 +33,7 @@ EmailLabelLiteral = Literal[
     "screening",
     "assessment",
     "interview_invitation",
+    "interview_availability",
     "interview_scheduled",
     "interview_follow_up",
     "offer",
@@ -98,8 +99,13 @@ class MarkAllReadOut(BaseModel):
     marked: int = 0
 
 
-class EmailDetailOut(EmailOut):
+class EmailPreviewOut(EmailOut):
+    """Message list item. Plain text is included for status checks; HTML loads on open."""
+
     body_text: str = ""
+
+
+class EmailDetailOut(EmailPreviewOut):
     body_html: str = ""
 
 

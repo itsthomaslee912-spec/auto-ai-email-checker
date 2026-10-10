@@ -35,12 +35,17 @@ async def lifespan(app: FastAPI):
             await backfill_task
             await backfill_calendar_events(stop_event)
 
+        async def pending_reclassify_after_warmup() -> None:
+            # Let health probes and first sync settle before flooding Ollama.
+            await asyncio.sleep(15)
+            await start_all_pending_reclassify()
+
         background_tasks.extend([
             renewal_task,
             backfill_task,
             asyncio.create_task(calendar_after_outcomes()),
             asyncio.create_task(auto_sync_loop(stop_event)),
-            asyncio.create_task(start_all_pending_reclassify()),
+            asyncio.create_task(pending_reclassify_after_warmup()),
         ])
 
     # Let the server accept health checks before backfill work starts.

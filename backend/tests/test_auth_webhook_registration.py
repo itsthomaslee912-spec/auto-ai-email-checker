@@ -10,7 +10,14 @@ from app.auth.pending_oauth import PendingOAuth
 
 
 def _pending():
-    return PendingOAuth(provider="google", email="person@example.com", name="Person", created_at=0.0, user_id=1)
+    return PendingOAuth(
+        provider="google",
+        email="person@example.com",
+        name="Person",
+        created_at=0.0,
+        user_id=1,
+        return_to="http://192.168.2.10:5173",
+    )
 
 
 def test_google_callback_registers_webhook_before_starting_sync(monkeypatch):
@@ -43,7 +50,9 @@ def test_google_callback_registers_webhook_before_starting_sync(monkeypatch):
 
     register.assert_awaited_once()
     assert register.await_args.kwargs["access_token"] == "access"
-    query = parse_qs(urlparse(response.headers["location"]).query)
+    location = urlparse(response.headers["location"])
+    assert f"{location.scheme}://{location.netloc}" == "http://192.168.2.10:5173"
+    query = parse_qs(location.query)
     assert query["webhook"] == ["active"]
     assert len(tasks.tasks) == 1
     assert tasks.tasks[0].kwargs == {"register_webhook": False}

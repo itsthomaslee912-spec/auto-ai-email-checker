@@ -21,6 +21,7 @@ class EmailLabel(str, Enum):
     SCREENING = "screening"
     ASSESSMENT = "assessment"
     INTERVIEW_INVITATION = "interview_invitation"
+    INTERVIEW_AVAILABILITY = "interview_availability"
     INTERVIEW_SCHEDULED = "interview_scheduled"
     INTERVIEW_FOLLOW_UP = "interview_follow_up"
     OFFER = "offer"

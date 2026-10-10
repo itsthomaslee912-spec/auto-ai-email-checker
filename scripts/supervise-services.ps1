@@ -28,7 +28,7 @@ $backendRestartDelay = 0
 $frontendRestartDelay = 0
 # The API answers /api/health before background repair starts, so a hung
 # process should be replaced quickly instead of staying down for minutes.
-$startupGraceSeconds = 20
+$startupGraceSeconds = 90
 
 function Write-SupervisorLog([string]$Message) {
     Add-Content -LiteralPath (Join-Path $Logs "supervisor.log") `
@@ -37,7 +37,9 @@ function Write-SupervisorLog([string]$Message) {
 
 function Test-Endpoint([string]$Url) {
     try {
-        $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 3
+        # Reclassify / sync can make the API briefly busy; don't false-restart
+        # a healthy process just because one probe took longer than 3s.
+        $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 10
         return $response.StatusCode -ge 200 -and $response.StatusCode -lt 300
     } catch {
         return $false
@@ -108,7 +110,7 @@ try {
             if (((Get-Date) - $backendStartedAt).TotalSeconds -ge 30) { $backendRestartDelay = 0 }
         } elseif (((Get-Date) - $backendStartedAt).TotalSeconds -ge $startupGraceSeconds) {
             $backendFailures++
-            if ($backendFailures -ge 3) {
+            if ($backendFailures -ge 6) {
                 Write-SupervisorLog "Backend unhealthy; restarting PID $($backendProcess.Id)"
                 Stop-Process -Id $backendProcess.Id -Force -ErrorAction SilentlyContinue
                 $backendProcess = $null

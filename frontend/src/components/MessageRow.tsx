@@ -1,9 +1,9 @@
-import type { CSSProperties } from "react";
+import { memo, type CSSProperties } from "react";
 import type { EmailItem, EmailLabel, MailFolder } from "../api";
 import { CLASSIFY_LABEL_TITLES, INTERVIEW_SUBTYPE_TITLES } from "../labels";
 import type { ViewMode } from "../prefs";
 
-export default function MessageRow({
+function MessageRow({
   email,
   viewMode,
   active,
@@ -14,6 +14,7 @@ export default function MessageRow({
   folder,
   onOpen,
   onDoubleOpen,
+  onPrefetch,
 }: {
   email: EmailItem;
   viewMode: ViewMode;
@@ -25,6 +26,7 @@ export default function MessageRow({
   folder: MailFolder;
   onOpen: (id: number) => void;
   onDoubleOpen: (id: number) => void;
+  onPrefetch: (id: number) => void;
 }) {
   const itemClass = [
     "msg-item",
@@ -45,6 +47,7 @@ export default function MessageRow({
         className={`msg-table table-columns${active ? " active" : ""}${email.is_read ? "" : " unread"}`}
         onClick={() => onOpen(email.id)}
         onDoubleClick={() => onDoubleOpen(email.id)}
+        onPointerEnter={() => onPrefetch(email.id)}
         onKeyDown={(event) => {
           if (event.key === "Enter") {
             event.preventDefault();
@@ -68,7 +71,7 @@ export default function MessageRow({
             {categoryTitle}{subtypeTitle ? ` / ${subtypeTitle}` : ""}
           </span>
         </span>
-        <span className="table-cell table-folder"><span className={`folder-pill folder-${folder}`}>{folderTitle}</span></span>
+        <span className="table-cell table-folder"><span className={`folder-pill folder-${folder}`} title={`Folder: ${folderTitle}`}>{folderTitle}</span></span>
         <span className="table-cell table-status"><span className={email.is_read ? "read-pill" : "unread-pill"}>{email.is_read ? "Read" : "Unread"}</span></span>
         <time className="table-cell table-date">
           <span className="table-primary">{when.day || when.time}</span>
@@ -80,7 +83,7 @@ export default function MessageRow({
   }
 
   return (
-    <button type="button" className={itemClass} onClick={() => onOpen(email.id)}>
+    <button type="button" className={itemClass} onClick={() => onOpen(email.id)} onPointerEnter={() => onPrefetch(email.id)}>
       <span className={`avatar soft label-${email.label}`}>
         {initialsFrom(senderName(email.sender))}
       </span>
@@ -105,7 +108,7 @@ export default function MessageRow({
           <span className={`label list-label email-category-label label-${email.label}`}>
             {categoryTitle}{subtypeTitle ? ` / ${subtypeTitle}` : ""}
           </span>
-          <span className={`folder-pill folder-${folder}`}>{folderTitle}</span>
+          <span className={`folder-pill folder-${folder}`} title={`Folder: ${folderTitle}`}>{folderTitle}</span>
         </span>
         <span className="msg-snippet">{email.snippet}</span>
       </span>
@@ -113,6 +116,21 @@ export default function MessageRow({
     </button>
   );
 }
+
+function sameMessageRow(prev: Parameters<typeof MessageRow>[0], next: Parameters<typeof MessageRow>[0]): boolean {
+  return prev.email === next.email
+    && prev.viewMode === next.viewMode
+    && prev.active === next.active
+    && prev.accountAddress === next.accountAddress
+    && prev.accountTint === next.accountTint
+    && prev.folderTitle === next.folderTitle
+    && prev.folder === next.folder
+    && prev.onOpen === next.onOpen
+    && prev.onDoubleOpen === next.onDoubleOpen
+    && prev.onPrefetch === next.onPrefetch;
+}
+
+export default memo(MessageRow, sameMessageRow);
 
 function AccountChip({ address, tint }: { address: string; tint?: string }) {
   const at = address.indexOf("@");

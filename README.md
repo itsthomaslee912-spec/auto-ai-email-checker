@@ -91,9 +91,11 @@ Fill in at least:
 | `MICROSOFT_CLIENT_ID` / `MICROSOFT_CLIENT_SECRET` | Outlook OAuth |
 | `GMAIL_PUBSUB_TOPIC` | e.g. `projects/PROJECT/topics/gmail-push` |
 | `WEBHOOK_BASE_URL` | Public HTTPS URL (ngrok) for Graph + docs |
+| `BACKEND_PUBLIC_URL` | Same public backend URL; used for OAuth callbacks when redirect URIs are still localhost |
+| `GOOGLE_REDIRECT_URI` / `MICROSOFT_REDIRECT_URI` | OAuth callbacks; must be reachable from other computers (usually `{WEBHOOK_BASE_URL}/api/auth/.../callback`) |
 | `TOKEN_ENCRYPTION_KEY` | Fernet key (optional; a local fallback exists) |
 | `MICROSOFT_WEBHOOK_CLIENT_STATE` | Shared secret for Graph notifications |
-| `FRONTEND_ORIGIN` | `http://localhost:5173` |
+| `FRONTEND_ORIGIN` | Default frontend URL after OAuth (`http://localhost:5173`); remote browsers send their own origin automatically |
 
 Generate a Fernet key:
 
@@ -138,6 +140,8 @@ ngrok http 8000
 
 `run.bat` starts ngrok automatically when it is installed and on PATH. Check its public URL at `http://127.0.0.1:4040`. Set `WEBHOOK_BASE_URL` to that HTTPS URL (no trailing slash), e.g. `https://abc123.ngrok-free.app`, and restart the backend if the URL changed. The PowerShell launcher still requires starting ngrok separately.
 
+`scripts/configure-webhook-env.ps1` also sets `BACKEND_PUBLIC_URL` and the Google/Microsoft OAuth redirect URIs to that same public URL so email connect works from other computers (not only on the server machine).
+
 ---
 
 ## Google (Gmail) setup
@@ -145,7 +149,9 @@ ngrok http 8000
 1. Create a Google Cloud project.
 2. Enable **Gmail API** and **Cloud Pub/Sub API**.
 3. Configure OAuth consent screen; create **OAuth client ID** (Web application).
-4. Authorized redirect URI: `http://localhost:8000/api/auth/google/callback`
+4. Authorized redirect URIs (add both if you use local + remote):
+   - `http://localhost:8000/api/auth/google/callback`
+   - `https://YOUR_TUNNEL/api/auth/google/callback`
 5. Create a Pub/Sub topic, e.g. `gmail-push`.
 6. Grant `gmail-api-push@system.gserviceaccount.com` **Pub/Sub Publisher** on that topic.
 7. Create a **push** subscription to  
@@ -160,7 +166,7 @@ On Connect Gmail, the backend calls `users.watch` and stores `historyId`. Pub/Su
 ## Microsoft (Outlook) setup
 
 1. Register an app in [Azure Portal](https://portal.azure.com/) → Microsoft Entra ID → App registrations.
-2. Add redirect URI: `http://localhost:8000/api/auth/microsoft/callback` (Web).
+2. Add redirect URIs (Web): `http://localhost:8000/api/auth/microsoft/callback` and `https://YOUR_TUNNEL/api/auth/microsoft/callback`.
 3. Create a client secret; copy Application (client) ID and secret into `.env`.
 4. API permissions (delegated): `Mail.ReadWrite`, `User.Read`, plus OpenID (`openid`, `profile`, `email`, `offline_access`).
 5. Grant admin consent if your tenant requires it.

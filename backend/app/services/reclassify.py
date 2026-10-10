@@ -15,12 +15,33 @@ from app.services.calendar_extract import CALENDAR_LABELS, process_calendar_emai
 
 logger = logging.getLogger(__name__)
 
-CONCURRENCY = 4
+# Ollama (and most local models) serialize GPU work. Running every mailbox at
+# CONCURRENCY=4 floods the server and keeps /api/health from answering before
+# the process supervisor's probe timeout — which restarts the API and resets
+# reclassify progress to zero.
+CONCURRENCY = 1
 
 _jobs: dict[int, dict[str, Any]] = {}
 _running: set[int] = set()
 _cancel_requested: set[int] = set()
 _job_lock = asyncio.Lock()
+_ai_gate: asyncio.Semaphore | None = None
+_mailbox_gate: asyncio.Semaphore | None = None
+
+
+def _ai_gate_semaphore() -> asyncio.Semaphore:
+    global _ai_gate
+    if _ai_gate is None:
+        _ai_gate = asyncio.Semaphore(CONCURRENCY)
+    return _ai_gate
+
+
+def _mailbox_gate_semaphore() -> asyncio.Semaphore:
+    """Only one mailbox reclassifies at a time so Ollama and health stay healthy."""
+    global _mailbox_gate
+    if _mailbox_gate is None:
+        _mailbox_gate = asyncio.Semaphore(1)
+    return _mailbox_gate
 
 
 def _should_stop(mailbox_id: int) -> bool:
@@ -106,7 +127,11 @@ async def start_all_active_reclassify() -> list[dict[str, Any]]:
 
 
 async def start_all_pending_reclassify() -> list[dict[str, Any]]:
-    """Resume fast-import emails that still need an AI category."""
+    """Resume fast-import emails that still need an AI category.
+
+    Mailboxes run one after another so a local model is not flooded and the
+    API stays responsive for health checks while classification finishes.
+    """
     from app.db import SessionLocal
 
     db = SessionLocal()
@@ -125,20 +150,32 @@ async def start_all_pending_reclassify() -> list[dict[str, Any]]:
         ]
     finally:
         db.close()
-    return [await start_mailbox_reclassify(mailbox_id, pending_only=True) for mailbox_id in ids]
+    started: list[dict[str, Any]] = []
+    for mailbox_id in ids:
+        started.append(await start_mailbox_reclassify(mailbox_id, pending_only=True))
+        while mailbox_id in _running:
+            await asyncio.sleep(1)
+    return started
 
 
 async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) -> None:
     from app.db import SessionLocal
 
-    db = SessionLocal()
-    try:
-        mailbox = (
-            db.query(MailboxConnection)
-            .filter(MailboxConnection.id == mailbox_id, MailboxConnection.is_active.is_(True))
-            .one_or_none()
-        )
-        if mailbox is None:
+    async with _mailbox_gate_semaphore():
+      try:
+        def mailbox_exists() -> bool:
+            lookup = SessionLocal()
+            try:
+                return (
+                    lookup.query(MailboxConnection.id)
+                    .filter(MailboxConnection.id == mailbox_id, MailboxConnection.is_active.is_(True))
+                    .first()
+                    is not None
+                )
+            finally:
+                lookup.close()
+
+        if not await asyncio.to_thread(mailbox_exists):
             _set_job(mailbox_id, state="error", message="Mailbox not found")
             await publish("reclassify.done", get_reclassify_status(mailbox_id))
             return
@@ -162,6 +199,7 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                         EmailMessage.snippet,
                         EmailMessage.label,
                         EmailMessage.outcome_extracted,
+                        EmailMessage.folder,
                     )
                     .filter(*query_filters)
                     .order_by(EmailMessage.id.desc())
@@ -176,6 +214,7 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                         snippet=row.snippet,
                         label=row.label,
                         outcome_extracted=row.outcome_extracted,
+                        folder=row.folder,
                     )
                     for row in loaded
                 ]
@@ -184,7 +223,7 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
 
         rows = await asyncio.to_thread(load_rows)
         total = len(rows)
-        backend = get_ai_backend()
+        backend = await asyncio.to_thread(get_ai_backend)
         await _publish_progress(
             mailbox_id,
             state="running",
@@ -198,7 +237,7 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
             ),
         )
 
-        semaphore = asyncio.Semaphore(CONCURRENCY)
+        semaphore = _ai_gate_semaphore()
         updated = 0
         processed = 0
         failed = 0
@@ -232,38 +271,32 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                     logger.exception("Reclassify failed for email %s", row.id)
                     return None
 
-        for start in range(0, total, CONCURRENCY * 4):
-            if _should_stop(mailbox_id):
-                job = _set_job(
-                    mailbox_id,
-                    state="stopped",
-                    updated=updated,
-                    processed=processed,
-                    failed=failed,
-                    total=total,
-                    message=f"Reclassify stopped — updated {updated} of {total}",
-                )
-                await publish("reclassify.done", dict(job))
-                return
-            chunk = rows[start : start + CONCURRENCY * 4]
-            outcomes = await asyncio.gather(*(classify_row(row) for row in chunk))
-            for outcome in outcomes:
-                processed += 1
-                if outcome is None:
-                    failed += 1
-                    continue
-                email_id, previous_label, result, extracted, should_extract = outcome
+        def apply_outcome(
+            email_id: int,
+            previous_label: str,
+            result: Any,
+            extracted: tuple[str, str] | None,
+            should_extract: bool,
+        ) -> dict[str, Any]:
+            """Persist one classification off the event loop so health checks stay responsive."""
+            db = SessionLocal()
+            try:
                 email = db.query(EmailMessage).filter(EmailMessage.id == email_id).one_or_none()
                 if email is None:
-                    failed += 1
-                    continue
+                    return {"failed": True}
                 if email.human_corrected:
-                    continue
+                    return {"skipped": True}
                 new_subtype = (
-                    result.interview_subtype or infer_interview_subtype(email.subject, email.sender, email.body_text, email.snippet)
-                    if result.label == EmailLabel.INTERVIEW_SCHEDULED.value else None
+                    result.interview_subtype
+                    or infer_interview_subtype(email.subject, email.sender, email.body_text, email.snippet)
+                    if result.label == EmailLabel.INTERVIEW_SCHEDULED.value
+                    else None
                 )
-                label_changed = email.label != result.label or email.confidence != result.confidence or email.interview_subtype != new_subtype
+                label_changed = (
+                    email.label != result.label
+                    or email.confidence != result.confidence
+                    or email.interview_subtype != new_subtype
+                )
                 was_pending = email.classification_pending
                 if label_changed:
                     email.label = result.label
@@ -280,28 +313,91 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                     outcome_changed = True
                 if was_pending:
                     email.classification_pending = False
-                calendar_changed = False
-                if previous_label in CALENDAR_LABELS or email.label in CALENDAR_LABELS:
-                    if email.label in CALENDAR_LABELS:
-                        calendar_changed = await process_calendar_email(db, email, force=True)
-                    else:
-                        sourced = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == email.id).all()
-                        for event in sourced:
-                            event.is_visible = False
-                        calendar_changed = bool(sourced)
-                if label_changed or outcome_changed or was_pending or calendar_changed:
+                needs_calendar = previous_label in CALENDAR_LABELS or email.label in CALENDAR_LABELS or email.folder == "sent"
+                if label_changed or outcome_changed or was_pending:
                     db.commit()
-                    if label_changed:
-                        db.refresh(email)
-                        updated += 1
-                        payload = EmailOut.model_validate(email).model_dump()
-                        payload["previous_label"] = previous_label
-                        payload["updated"] = True
-                        await publish("email.classified", payload)
-                    if calendar_changed:
-                        await publish("calendar.changed", {"action": "reclassified", "mailbox_id": mailbox_id})
                 else:
                     db.rollback()
+                payload = None
+                if label_changed:
+                    db.refresh(email)
+                    payload = EmailOut.model_validate(email).model_dump()
+                    payload["previous_label"] = previous_label
+                    payload["updated"] = True
+                return {
+                    "updated": label_changed,
+                    "payload": payload,
+                    "needs_calendar": needs_calendar,
+                    "email_id": email.id,
+                    "label": email.label,
+                    "folder": email.folder,
+                    "previous_label": previous_label,
+                }
+            finally:
+                db.close()
+
+        async def maybe_update_calendar(applied: dict[str, Any]) -> bool:
+            if not applied.get("needs_calendar"):
+                return False
+            db = SessionLocal()
+            try:
+                email = db.query(EmailMessage).filter(EmailMessage.id == applied["email_id"]).one_or_none()
+                if email is None:
+                    return False
+                if email.label in CALENDAR_LABELS or email.folder == "sent":
+                    changed = await process_calendar_email(db, email, force=True)
+                else:
+                    sourced = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == email.id).all()
+                    for event in sourced:
+                        event.is_visible = False
+                    changed = bool(sourced)
+                    if changed:
+                        db.commit()
+                return bool(changed)
+            finally:
+                db.close()
+
+        # Small batches so progress moves even when the model is slow.
+        batch_size = CONCURRENCY
+        for start in range(0, total, batch_size):
+            if _should_stop(mailbox_id):
+                job = _set_job(
+                    mailbox_id,
+                    state="stopped",
+                    updated=updated,
+                    processed=processed,
+                    failed=failed,
+                    total=total,
+                    message=f"Reclassify stopped — updated {updated} of {total}",
+                )
+                await publish("reclassify.done", dict(job))
+                return
+            chunk = rows[start : start + batch_size]
+            outcomes = await asyncio.gather(*(classify_row(row) for row in chunk))
+            for outcome in outcomes:
+                processed += 1
+                if outcome is None:
+                    failed += 1
+                    continue
+                email_id, previous_label, result, extracted, should_extract = outcome
+                applied = await asyncio.to_thread(
+                    apply_outcome, email_id, previous_label, result, extracted, should_extract
+                )
+                if applied.get("failed"):
+                    failed += 1
+                    continue
+                if applied.get("skipped"):
+                    continue
+                if applied.get("updated"):
+                    updated += 1
+                    if applied.get("payload"):
+                        await publish("email.classified", applied["payload"])
+                # Pending catch-up must stay non-blocking; calendar backfill picks
+                # up newly labeled mail afterward. Full reclassify still refreshes
+                # calendar immediately.
+                if not pending_only and await maybe_update_calendar(applied):
+                    await publish("calendar.changed", {"action": "reclassified", "mailbox_id": mailbox_id})
+                await asyncio.sleep(0)
             await _publish_progress(
                 mailbox_id,
                 updated=updated,
@@ -321,11 +417,10 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
             message=f"Reclassify complete — updated {updated} of {total}",
         )
         await publish("reclassify.done", dict(job))
-    except Exception as exc:
+      except Exception as exc:
         logger.exception("Mailbox reclassify failed for %s", mailbox_id)
         job = _set_job(mailbox_id, state="error", message=str(exc)[:300])
         await publish("reclassify.done", dict(job))
-    finally:
+      finally:
         _running.discard(mailbox_id)
         _cancel_requested.discard(mailbox_id)
-        db.close()

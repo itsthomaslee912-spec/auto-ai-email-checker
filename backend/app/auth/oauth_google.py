@@ -7,6 +7,7 @@ import httpx
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from app.auth.public_urls import google_oauth_redirect_uri
 from app.auth.session import claim_mailbox_for_user
 from app.config import get_settings
 from app.crypto import decrypt_token, encrypt_token
@@ -31,7 +32,7 @@ def google_auth_url(state: str, *, login_hint: str | None = None) -> str:
         raise HTTPException(status_code=500, detail="GOOGLE_CLIENT_ID is not configured")
     params = {
         "client_id": settings.google_client_id,
-        "redirect_uri": settings.google_redirect_uri,
+        "redirect_uri": google_oauth_redirect_uri(settings),
         "response_type": "code",
         "scope": " ".join(GMAIL_SCOPES),
         "access_type": "offline",
@@ -52,7 +53,7 @@ async def exchange_google_code(code: str) -> dict:
                 "code": code,
                 "client_id": settings.google_client_id,
                 "client_secret": settings.google_client_secret,
-                "redirect_uri": settings.google_redirect_uri,
+                "redirect_uri": google_oauth_redirect_uri(settings),
                 "grant_type": "authorization_code",
             },
         )

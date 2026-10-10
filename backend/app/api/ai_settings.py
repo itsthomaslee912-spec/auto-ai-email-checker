@@ -72,7 +72,7 @@ async def read_ai_status(db: Session = Depends(get_db)) -> dict:
 
     ollama_url = settings["ollama_url"].rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=3) as client:
+        async with httpx.AsyncClient(timeout=8) as client:
             response = await client.get(f"{ollama_url}/api/tags")
             response.raise_for_status()
             models = response.json().get("models", [])

@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, or_
-from sqlalchemy.orm import Session, contains_eager
+from sqlalchemy.orm import Session, contains_eager, defer
 
 from app.auth.session import mailbox_scope
 from app.db import get_db
@@ -16,7 +16,7 @@ from app.schemas import (
     CalendarEventCreateIn,
     CalendarEventOut,
     CalendarEventUpdateIn,
-    EmailDetailOut,
+    EmailPreviewOut,
     PendingInterviewOut,
     PendingInterviewSlotOut,
 )
@@ -199,7 +199,7 @@ def get_calendar_event(event_id: int, db: Session = Depends(get_db)) -> Calendar
     return _event_out(event, request_kind=_request_kinds(db, [event]).get(event.id))
 
 
-@router.get("/{event_id}/emails", response_model=list[EmailDetailOut])
+@router.get("/{event_id}/emails", response_model=list[EmailPreviewOut])
 def list_calendar_event_emails(event_id: int, db: Session = Depends(get_db)) -> list[EmailMessage]:
     """Return every stored email linked to an event, newest first."""
     event = _event_query(db).filter(CalendarEvent.id == event_id).one_or_none()
@@ -255,6 +255,7 @@ def list_calendar_event_emails(event_id: int, db: Session = Depends(get_db)) -> 
 
     return (
         db.query(EmailMessage)
+        .options(defer(EmailMessage.body_html))
         .filter(
             EmailMessage.mailbox_id == event.mailbox_id,
             or_(*associations),

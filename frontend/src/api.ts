@@ -4,6 +4,7 @@ export type EmailLabel =
   | "screening"
   | "assessment"
   | "interview_invitation"
+  | "interview_availability"
   | "interview_scheduled"
   | "interview_follow_up"
   | "offer"
@@ -156,7 +157,8 @@ export async function updateMailboxColor(id: number, calendarColor: string): Pro
 
 async function autoSyncRequest(method: "GET" | "POST", path: string): Promise<AutoSyncStatus> {
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 5000);
+  // Sync status can stall briefly while the backend is classifying or importing mail.
+  const timeout = window.setTimeout(() => controller.abort(), 15_000);
   try {
     const res = noteUnauthorized(await fetch(`${API_BASE}${path}`, {
       method,
@@ -236,17 +238,60 @@ export async function markAllRead(mailboxId?: number | null): Promise<{ marked: 
   return res.json();
 }
 
-export async function fetchEmailConversation(id: number): Promise<EmailDetail[]> {
+export async function fetchEmailConversation(id: number): Promise<EmailItem[]> {
   const res = await apiFetch(`${API_BASE}/api/emails/${id}/conversation`);
   if (!res.ok) throw new Error(await readApiError(res, "Failed to load conversation"));
   return res.json();
 }
 
+const DETAIL_CACHE_LIMIT = 30;
+const detailCache = new Map<number, EmailDetail>();
+const detailInflight = new Map<number, Promise<EmailDetail>>();
+
+function rememberEmailDetail(detail: EmailDetail): void {
+  detailCache.delete(detail.id);
+  detailCache.set(detail.id, detail);
+  if (detailCache.size <= DETAIL_CACHE_LIMIT) return;
+  const oldest = detailCache.keys().next().value;
+  if (oldest != null) detailCache.delete(oldest);
+}
+
+export function peekEmailDetail(id: number): EmailDetail | undefined {
+  return detailCache.get(id);
+}
+
+export function peekEmailDetailRequest(id: number): Promise<EmailDetail> | undefined {
+  return detailInflight.get(id);
+}
+
+/** Warm the body cache without marking the message read. */
+export function prefetchEmailDetail(id: number): void {
+  if (detailCache.has(id) || detailInflight.has(id)) return;
+  void fetchEmailDetail(id, false).catch(() => {});
+}
+
 export async function fetchEmailDetail(id: number, markRead = true): Promise<EmailDetail> {
+  if (!markRead) {
+    const cached = detailCache.get(id);
+    if (cached) return cached;
+    const pending = detailInflight.get(id);
+    if (pending) return pending;
+  }
   const suffix = markRead ? "" : "?mark_read=false";
-  const res = await apiFetch(`${API_BASE}/api/emails/${id}${suffix}`, undefined, 4);
-  if (!res.ok) throw new Error(await readApiError(res, "Failed to load email"));
-  return res.json();
+  const request = (async () => {
+    const res = await apiFetch(`${API_BASE}/api/emails/${id}${suffix}`, undefined, markRead ? 4 : 1);
+    if (!res.ok) throw new Error(await readApiError(res, "Failed to load email"));
+    const detail = (await res.json()) as EmailDetail;
+    rememberEmailDetail(detail);
+    return detail;
+  })();
+  if (!markRead) {
+    detailInflight.set(id, request);
+    void request.finally(() => {
+      if (detailInflight.get(id) === request) detailInflight.delete(id);
+    });
+  }
+  return request;
 }
 
 export async function updateEmailLabel(
@@ -460,10 +505,18 @@ export interface PendingInterview {
   slots: { event_id: number; start_at: string; end_at: string }[];
 }
 
+let pendingInterviewCache: PendingInterview[] | null = null;
+
+export function peekPendingInterviews(): PendingInterview[] | null {
+  return pendingInterviewCache;
+}
+
 export async function fetchPendingInterviews(signal?: AbortSignal): Promise<PendingInterview[]> {
   const res = noteUnauthorized(await fetch(`${API_BASE}/api/calendar-events/pending`, { signal, cache: "no-store", credentials: "include" }));
   if (!res.ok) throw new Error(await readApiError(res, "Failed to load pending interviews"));
-  return res.json();
+  const rows = await res.json() as PendingInterview[];
+  pendingInterviewCache = rows;
+  return rows;
 }
 
 export async function setPendingInterviewDismissed(emailId: number, dismissed: boolean): Promise<void> {
@@ -747,6 +800,7 @@ export function oauthStartUrl(
 ): string {
   const qs = new URLSearchParams({
     email: opts.email.trim(),
+    return_to: window.location.origin,
   });
   if (opts.name?.trim()) qs.set("name", opts.name.trim());
   return `${API_BASE}/api/auth/${provider}/start?${qs.toString()}`;

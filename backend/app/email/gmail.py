@@ -367,11 +367,16 @@ async def gmail_get_messages(
     return [row for row in fetched if row]
 
 
-GMAIL_COMBINED_QUERY = "in:inbox OR in:spam OR in:trash OR (-in:inbox -in:spam -in:trash -in:sent -in:drafts)"
+# Sent is required: candidate replies that propose interview times only exist there.
+GMAIL_COMBINED_QUERY = (
+    "in:inbox OR in:spam OR in:trash OR in:sent OR "
+    "(-in:inbox -in:spam -in:trash -in:sent -in:drafts)"
+)
 GMAIL_FOLDER_QUERIES: tuple[tuple[str, str], ...] = (
     ("archive", "-in:inbox -in:spam -in:trash -in:sent -in:drafts"),
     ("inbox", "in:inbox"),
     ("spam", "in:spam"),
+    ("sent", "in:sent"),
     ("trash", "in:trash"),
 )
 
@@ -417,34 +422,52 @@ async def gmail_list_recent_message_ids(access_token: str, max_results: int = 10
     return ids
 
 
-def _gmail_recipient_query(query: str, recipient: str | None) -> str:
+def _gmail_mailbox_query(query: str, recipient: str | None) -> str:
+    """Scope a Gmail search to one connected account.
+
+    Incoming mail is addressed/delivered to the account. Sent mail is from the
+    account, so a recipient-only filter would drop every Sent reply (including
+    proposed interview times).
+    """
     address = (recipient or "").strip()
     if not address:
         return query
-    return f"({query}) (to:{address} OR cc:{address} OR bcc:{address} OR deliveredto:{address})"
+    incoming = (
+        f"({query}) (to:{address} OR cc:{address} OR bcc:{address} OR deliveredto:{address})"
+    )
+    if "in:sent" in query.split():
+        return f"({incoming}) OR (in:sent from:{address})"
+    return incoming
+
+
+# Older imports still call the previous name.
+_gmail_recipient_query = _gmail_mailbox_query
 
 
 async def gmail_list_inbox_message_ids(
     access_token: str, max_results: int = 10000, recipient: str | None = None,
 ) -> tuple[list[str], int]:
-    """Page through Inbox, Spam, Trash, and Archive until max_results ids (Gmail max 500 per page)."""
+    """Page through Inbox, Spam, Trash, Sent, and Archive until max_results ids (Gmail max 500 per page)."""
     async with httpx.AsyncClient(timeout=60) as client:
-        query = _gmail_recipient_query(GMAIL_COMBINED_QUERY, recipient)
+        query = _gmail_mailbox_query(GMAIL_COMBINED_QUERY, recipient)
         return await _gmail_list_ids_for_query(client, access_token, query, max_results)
 
 
 async def gmail_list_folder_id_map(
     access_token: str, max_results: int = 10000, recipient: str | None = None,
 ) -> dict[str, str]:
-    """Map message ids to inbox/spam/trash/archive. Later folders overwrite (trash wins)."""
-    mapping: dict[str, str] = {}
+    """Map message ids to inbox/spam/trash/sent/archive. Later folders overwrite (trash wins)."""
     async with httpx.AsyncClient(timeout=60) as client:
-        for folder, query in GMAIL_FOLDER_QUERIES:
-            ids, _estimate = await _gmail_list_ids_for_query(
-                client, access_token, _gmail_recipient_query(query, recipient), max_results
+        results = await asyncio.gather(
+            *(
+                _gmail_list_ids_for_query(client, access_token, _gmail_mailbox_query(query, recipient), max_results)
+                for _folder, query in GMAIL_FOLDER_QUERIES
             )
-            for mid in ids:
-                mapping[mid] = folder
+        )
+    mapping: dict[str, str] = {}
+    for (folder, _query), (ids, _estimate) in zip(GMAIL_FOLDER_QUERIES, results):
+        for mid in ids:
+            mapping[mid] = folder
     return mapping
 
 

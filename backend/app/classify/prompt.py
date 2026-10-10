@@ -15,6 +15,7 @@ CLASSIFY_TYPES: tuple[ClassifyType, ...] = (
     ClassifyType("screening", "Screening", "Initial recruiter or company evaluation: phone screen, AI chatbot questions, recruiter questionnaire, or availability questions before a formal interview."),
     ClassifyType("assessment", "Assessment", "A formal evaluation such as a coding challenge, take-home assignment, online test, or work sample."),
     ClassifyType("interview_invitation", "Interview Invitation", "An interview is offered, but its time is not confirmed; choose a slot, book a time, or use a scheduling link."),
+    ClassifyType("interview_availability", "Interview Availability", "The candidate sends, updates, or manages their own available interview times, including a proposed reschedule, before a time is booked."),
     ClassifyType("interview_scheduled", "Interview Scheduled", "An interview has a confirmed time. Includes confirmations, calendar invites, reminders, reschedules, time changes, and cancellations of that scheduled interview."),
     ClassifyType("interview_follow_up", "Interview Follow-up", "Communication after an interview: feedback request, thank-you, or next steps. A clear offer or rejection takes precedence."),
     ClassifyType("offer", "Offer", "Offer letter, compensation, negotiation, acceptance, or onboarding following an offer."),
@@ -37,7 +38,7 @@ def build_classify_prompt() -> str:
             "Rules:",
             "- Rejection or closed hiring process overrides application thank-you wording.",
             "- Administrative application steps are application_action_required; screening questions and candidate evaluation are screening or assessment.",
-            "- An invitation to book is interview_invitation. A confirmed time, calendar invite, reminder, reschedule, time change, or cancellation is interview_scheduled.",
+            "- An invitation to book is interview_invitation. The candidate's own message that sends, updates, or manages available times, including a reschedule proposal before a booking, is interview_availability. A confirmed time, calendar invite, reminder, reschedule of an already booked interview, time change, or cancellation is interview_scheduled.",
             "- A cancelled interview is interview_scheduled unless the email also says the candidacy or role is closed.",
             "- Follow-up means after the interview; an explicit offer or rejection takes precedence.",
             "- Job descriptions in bulk outreach and hypothetical interview descriptions are recruitment_alert.",
@@ -51,8 +52,13 @@ SYSTEM_PROMPT = build_classify_prompt()
 
 def with_interview_subtype_rules(prompt: str) -> str:
     """Bring older saved prompts up to the current response contract at runtime."""
-    if "interview_subtype" in prompt:
-        return prompt
-    return prompt + "\n" + "\n".join(
-        line for line in SYSTEM_PROMPT.splitlines() if "interview_subtype" in line or line.startswith("Subtype meanings:")
-    )
+    if "interview_subtype" not in prompt:
+        prompt = prompt + "\n" + "\n".join(
+            line for line in SYSTEM_PROMPT.splitlines() if "interview_subtype" in line or line.startswith("Subtype meanings:")
+        )
+    if "interview_availability" not in prompt:
+        prompt += (
+            "\n- interview_availability — Interview Availability: The candidate sends, updates, or manages their own available interview times, including a proposed reschedule, before a time is booked."
+            "\n- Use interview_availability for the candidate's own availability or pre-booking reschedule. Use interview_invitation when the employer offers a slot or scheduling link. A confirmed time stays interview_scheduled."
+        )
+    return prompt

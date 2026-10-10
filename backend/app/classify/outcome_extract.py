@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.models import EmailLabel, EmailMessage
 from app.services.ai_backend import get_ai_backend
-from app.services.calendar_extract import employer_instead_of_sender_domain
+from app.services.calendar_extract import clean_company_name, employer_instead_of_sender_domain, job_role_or_empty
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ def parse_company_role(content: str) -> tuple[str, str]:
             return "", ""
     if not isinstance(data, dict):
         return "", ""
-    return _clean_field(data.get("company")), _clean_field(data.get("role"))
+    return clean_company_name(_clean_field(data.get("company"))), job_role_or_empty(_clean_field(data.get("role")))
 
 
 async def extract_company_role(
@@ -122,9 +122,9 @@ async def apply_outcome(db: Session, email: EmailMessage, *, force: bool = False
     if extracted is None:
         return False
     company, role = extracted
-    company = employer_instead_of_sender_domain(email, company)
+    company = clean_company_name(employer_instead_of_sender_domain(email, company))
     email.company = company
-    email.job_role = role
+    email.job_role = job_role_or_empty(role)
     email.outcome_extracted = True
     db.add(email)
     return True

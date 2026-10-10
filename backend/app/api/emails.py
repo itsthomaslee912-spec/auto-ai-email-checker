@@ -9,7 +9,7 @@ from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy import String, and_, cast, func, literal_column, or_
-from sqlalchemy.orm import Session, load_only, sessionmaker
+from sqlalchemy.orm import Session, defer, load_only, sessionmaker
 
 from app.auth.oauth_google import ensure_google_access_token
 from app.auth.session import current_user_id, mailbox_scope
@@ -240,7 +240,7 @@ def _list_meta(
         )
         breakdown[cell] = breakdown.get(cell, 0) + amount
         mailbox_counts[mailbox_key] = mailbox_counts.get(mailbox_key, 0) + amount
-        if fold == MailFolder.INBOX.value and not is_read:
+        if not is_read:
             mailbox_unread_counts[mailbox_key] = mailbox_unread_counts.get(mailbox_key, 0) + amount
         if mailbox_id is not None and mid != mailbox_id:
             continue
@@ -590,6 +590,7 @@ async def get_email(
     if email is None:
         raise HTTPException(status_code=404, detail="Email not found")
 
+    changed = False
     html = (email.body_html or "").strip()
     text = (email.body_text or "").strip()
     if text and not html:
@@ -599,6 +600,7 @@ async def get_email(
             email.body_html = extracted
             html = extracted
             text = plain
+            changed = True
 
     has_body = bool(html or text)
     if not has_body:
@@ -621,6 +623,7 @@ async def get_email(
                         email.snippet = normalized["snippet"][:1000]
                     if normalized.get("folder"):
                         email.folder = normalized["folder"]
+                    changed = True
                 elif mailbox.provider == Provider.MICROSOFT.value:
                     token = await ensure_microsoft_access_token(db, mailbox)
                     raw = await outlook_get_message(token, email.provider_message_id)
@@ -634,15 +637,19 @@ async def get_email(
                         email.snippet = normalized["snippet"][:1000]
                     if normalized.get("folder"):
                         email.folder = normalized["folder"]
+                    changed = True
             except Exception as exc:
                 raise HTTPException(status_code=502, detail=f"Could not load email body: {exc}") from exc
 
     if mark_read and not email.is_read:
         email.is_read = True
+        changed = True
         background_tasks.add_task(_mark_provider_message_read, email.mailbox_id, email.provider_message_id)
     if email.label not in {item.value for item in EmailLabel}:
         email.label = EmailLabel.OTHER.value
-    db.commit()
+        changed = True
+    if changed:
+        db.commit()
     return email
 
 
@@ -749,19 +756,34 @@ async def update_email_label(
     return email
 
 
-@router.get("/{email_id}/conversation", response_model=list[EmailDetailOut])
+@router.get("/{email_id}/conversation", response_model=list[EmailOut])
 def get_email_conversation(
     email_id: int,
     db: Session = Depends(get_db),
 ) -> list[EmailMessage]:
-    """Return the stored messages associated with an email without marking them read."""
-    email = _email_from_active_mailbox(db, email_id)
+    """Return conversation headers. Bodies load when a message is opened."""
+    email = (
+        _from_active_mailbox(db.query(EmailMessage))
+        .options(load_only(EmailMessage.id, EmailMessage.mailbox_id, EmailMessage.thread_id))
+        .filter(EmailMessage.id == email_id)
+        .one_or_none()
+    )
     if email is None:
         raise HTTPException(status_code=404, detail="Email not found")
+    headers = (
+        defer(EmailMessage.body_html),
+        defer(EmailMessage.body_text),
+    )
     if not email.thread_id:
-        return [email]
+        return (
+            db.query(EmailMessage)
+            .options(*headers)
+            .filter(EmailMessage.id == email.id)
+            .all()
+        )
     return (
         _from_active_mailbox(db.query(EmailMessage))
+        .options(*headers)
         .filter(
             EmailMessage.mailbox_id == email.mailbox_id,
             EmailMessage.thread_id == email.thread_id,

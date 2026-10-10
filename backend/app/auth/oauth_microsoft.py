@@ -7,6 +7,7 @@ import httpx
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from app.auth.public_urls import microsoft_oauth_redirect_uri
 from app.auth.session import claim_mailbox_for_user
 from app.config import get_settings
 from app.crypto import decrypt_token, encrypt_token
@@ -36,7 +37,7 @@ def microsoft_auth_url(state: str, *, login_hint: str | None = None) -> str:
     params = {
         "client_id": settings.microsoft_client_id,
         "response_type": "code",
-        "redirect_uri": settings.microsoft_redirect_uri,
+        "redirect_uri": microsoft_oauth_redirect_uri(settings),
         "response_mode": "query",
         "scope": " ".join(MS_SCOPES),
         "state": state,
@@ -55,7 +56,7 @@ async def exchange_microsoft_code(code: str) -> dict:
                 "client_id": settings.microsoft_client_id,
                 "client_secret": settings.microsoft_client_secret,
                 "code": code,
-                "redirect_uri": settings.microsoft_redirect_uri,
+                "redirect_uri": microsoft_oauth_redirect_uri(settings),
                 "grant_type": "authorization_code",
                 "scope": " ".join(MS_SCOPES),
             },

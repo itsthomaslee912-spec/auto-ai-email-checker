@@ -953,6 +953,9 @@ body {
 .folder-inbox {
   color: var(--label-blue);
 }
+.folder-sent {
+  color: var(--accent);
+}
 .folder-spam {
   color: var(--warn);
 }
@@ -1115,6 +1118,7 @@ body {
   font: inherit;
   text-align: left;
   cursor: pointer;
+  contain: layout style;
 }
 
 .msg-item:hover {
@@ -1642,6 +1646,8 @@ body {
   border-radius: 10px;
   background: var(--bg-card);
   border: 1px solid var(--line);
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .email-body-scroll.plain-scroll {
@@ -1681,12 +1687,128 @@ body {
   background: var(--bg-card);
 }
 
+.application-action-bar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  margin: 0 0 0.75rem;
+  padding: 0.15rem 0 0.75rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--ink) 8%, transparent);
+}
+
+.application-action-hint {
+  margin: 0;
+  margin-right: auto;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.application-action-copies {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.45rem;
+  margin: 0;
+}
+
+.application-action-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  min-height: 2.35rem;
+  max-width: min(16rem, 100%);
+  padding: 0.3rem 0.85rem 0.3rem 0.35rem;
+  border: 1px solid color-mix(in srgb, var(--ink) 10%, var(--line));
+  border-radius: 12px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--bg-elev) 88%, white 12%), var(--bg-card));
+  color: var(--ink);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--ink) 6%, transparent);
+  cursor: pointer;
+  font: inherit;
+  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+}
+
+.application-action-copy:hover {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--line));
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-card));
+  box-shadow: 0 6px 16px color-mix(in srgb, var(--accent) 12%, transparent);
+  transform: translateY(-1px);
+}
+
+.application-action-copy.is-copied {
+  border-color: color-mix(in srgb, var(--accent) 48%, var(--line));
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-card));
+}
+
+.application-action-copy-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 1.7rem;
+  height: 1.7rem;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+}
+
+.application-action-copy-icon svg {
+  width: 0.92rem;
+  height: 0.92rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.85;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.application-action-copy-meta {
+  min-width: 0;
+  display: grid;
+  gap: 0.05rem;
+  text-align: left;
+}
+
+.application-action-copy-kind {
+  color: var(--muted);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.application-action-copy-value {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-family: ui-monospace, "Cascadia Code", "Segoe UI Mono", Consolas, monospace;
+  font-size: 0.86rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.application-action-copy.is-copied .application-action-copy-icon {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--accent);
+}
+
+.application-action-copy.is-copied .application-action-copy-kind {
+  color: var(--accent);
+}
+
 .reader-body.plain {
   margin: 0 auto;
   max-width: 680px;
   white-space: pre-wrap;
   word-break: break-word;
   font: inherit;
+  user-select: text;
+  -webkit-user-select: text;
   font-size: 1.02rem;
   line-height: 1.7;
   color: var(--ink);
@@ -1735,6 +1857,7 @@ body {
   --label-color: var(--label-blue);
   color: var(--label-color);
 }
+.label-interview_availability { --label-color: var(--label-cyan); color: var(--label-color); }
 .label-interview_follow_up { --label-color: var(--label-cyan); color: var(--label-color); }
 .label-assessment {
   --label-color: var(--warn);
@@ -1767,6 +1890,7 @@ body {
 }
 
 .avatar.soft.label-interview_invitation,
+.avatar.soft.label-interview_availability,
 .avatar.soft.label-interview_scheduled,
 .avatar.soft.label-interview_follow_up,
 .avatar.soft.label-assessment,
@@ -2099,6 +2223,7 @@ body {
 .msg-table {
   width: 100%;
   min-height: 72px;
+  contain: layout style;
   padding: 0.55rem 0.9rem;
   border: none;
   border-bottom: 1px solid var(--line);
@@ -2138,9 +2263,8 @@ body {
 
 @container (max-width: 800px) {
   .table-columns {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1.7fr) minmax(0, 1.4fr) 95px;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.7fr) minmax(0, 1.4fr) 76px 95px;
   }
-  .table-folder,
   .table-status { display: none; }
 }
 
@@ -3692,8 +3816,7 @@ button:active:not(:disabled) {
 .msg-table {
   border: 1px solid transparent;
   border-radius: var(--radius-md);
-  transition: border-color 160ms ease, background-color 160ms ease, box-shadow 160ms ease,
-    transform 160ms ease;
+  transition: border-color 160ms ease, background-color 160ms ease, box-shadow 160ms ease;
 }
 
 .msg-item:hover,
@@ -4454,6 +4577,8 @@ button:active:not(:disabled) {
 
 /* Calendar workspace */
 .app-shell.page-calendar { grid-template-columns: var(--accounts-w) var(--accounts-gap, 6px) minmax(0, 1fr); }
+.calendar-page-host { width: 100%; min-width: 0; min-height: 0; height: 100%; display: flex; flex-direction: column; }
+.calendar-page-host.is-hidden { display: none !important; }
 .calendar-workspace { --calendar-canvas: var(--bg); --calendar-panel: var(--bg-elev); --calendar-control: var(--bg-card); --calendar-hover: var(--bg-hover); --calendar-input: var(--bg); --calendar-border: color-mix(in srgb, var(--ink) 14%, transparent); --calendar-border-soft: color-mix(in srgb, var(--ink) 8%, transparent); --calendar-outside: color-mix(in srgb, var(--bg-card) 72%, var(--bg-pane)); --calendar-today: color-mix(in srgb, var(--accent) 12%, var(--bg)); container: calendar / inline-size; width: 100%; min-width: 0; min-height: 0; height: 100%; display: flex; flex-direction: column; overflow: hidden; color: var(--ink); background: var(--calendar-canvas); }
 .calendar-toolbar { position: relative; z-index: 30; min-height: 4.6rem; display: grid; grid-template-columns: minmax(0,1fr) auto auto; align-items: center; gap: 1rem; padding: .75rem 1rem; border-bottom: 1px solid var(--calendar-border); background: var(--calendar-panel); }
 .calendar-title-group, .calendar-nav { display: flex; align-items: center; gap: .55rem; }
@@ -4692,6 +4817,8 @@ html[data-theme="light"] .calendar-event-hover-card .calendar-hover-status.statu
 .calendar-now-line { position: absolute; z-index: 4; left: 0; right: 0; height: 2px; background: #ef4444; pointer-events: none; }
 .calendar-now-line::before { content: ""; position: absolute; left: -4px; top: -3px; width: 8px; height: 8px; border-radius: 50%; background: #ef4444; }
 .calendar-loading { position: absolute; inset: 0; z-index: 6; display: grid; place-items: center; padding: 1.2rem; background: color-mix(in srgb, var(--calendar-canvas) 78%, transparent); pointer-events: none; }
+.calendar-loading.is-soft { align-items: start; justify-items: end; padding: .7rem .85rem; background: transparent; }
+.calendar-loading.is-soft .calendar-loading-card { width: auto; min-width: 7.5rem; gap: .4rem; padding: .45rem .65rem; box-shadow: 0 8px 20px color-mix(in srgb, #000 18%, transparent); }
 .calendar-loading-card { width: min(16rem, 100%); display: grid; gap: .62rem; padding: .9rem .95rem .8rem; border: 1px solid var(--calendar-border); border-radius: 14px; background: color-mix(in srgb, var(--calendar-panel) 94%, transparent); box-shadow: 0 16px 36px color-mix(in srgb, #000 28%, transparent); }
 .calendar-loading-bar { display: block; height: .28rem; overflow: hidden; border-radius: 99px; background: color-mix(in srgb, var(--accent) 16%, var(--calendar-control)); }
 .calendar-loading-bar span { display: block; width: 42%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 15%, transparent), var(--accent)); animation: calendar-loading-slide 1.15s cubic-bezier(.4,0,.2,1) infinite; }
@@ -6419,16 +6546,10 @@ button:disabled {
 
 .msg-item,
 .msg-table {
-  transition: transform var(--motion-base) var(--ease-standard),
-    border-color var(--motion-fast) ease,
+  transition: border-color var(--motion-fast) ease,
     background-color var(--motion-fast) ease,
-    box-shadow var(--motion-base) ease,
-    filter var(--motion-fast) ease;
+    box-shadow var(--motion-base) ease;
 }
-.msg-item:hover,
-.msg-table:hover { transform: translateY(-1px); }
-.msg-item:active,
-.msg-table:active { transform: translateY(0) scale(.997); }
 .msg-item .avatar,
 .msg-item .label,
 .msg-item .folder-pill,
@@ -6464,7 +6585,6 @@ button:disabled {
   line-height: 1.2;
   pointer-events: none;
   box-shadow: 0 2px 6px color-mix(in srgb, var(--new-badge) 35%, transparent);
-  animation: badge-pop-in 240ms var(--ease-emphasized) both;
 }
 .msg-item.unread .msg-meta { padding-right: 2.3rem; }
 
@@ -7344,6 +7464,8 @@ html[data-theme="light"] .system-alert-backdrop {
 .signin-subtitle { margin: -.4rem 0 .2rem; color: var(--muted); font-size: .84rem; line-height: 1.45; }
 .signin-notice, .signin-error, .signin-form-ok, .signin-form-error { margin: 0; padding: .55rem .7rem; border-radius: var(--radius-sm); font-size: .8rem; line-height: 1.4; }
 .signin-notice, .signin-form-ok { border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line)); background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--ink); }
+.session-timeout-card { display: grid; gap: .75rem; text-align: center; }
+.session-timeout-card h1 { margin: 0; }
 .signin-error, .signin-form-error { border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--line)); background: color-mix(in srgb, var(--danger) 9%, transparent); color: var(--danger); }
 .signin-form-ok, .signin-form-error { margin-top: .8rem; }
 .signin-field { display: grid; gap: .35rem; color: var(--muted); font-size: .78rem; font-weight: 700; }
@@ -7686,8 +7808,13 @@ html[data-theme="light"] .system-alert-backdrop {
   backdrop-filter: blur(14px) saturate(140%);
   box-shadow: -10px 14px 34px -14px color-mix(in srgb, #000 55%, transparent), -2px 0 0 0 color-mix(in srgb, var(--launcher-tone) 18%, transparent);
   transform: translateY(-50%);
-  transition: max-width 260ms cubic-bezier(.2,.9,.25,1), background-color 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
-  animation: interview-launcher-in 360ms cubic-bezier(.2,.9,.25,1.1) both;
+  transition:
+    max-width 110ms cubic-bezier(.2, .9, .3, 1),
+    background-color 90ms ease,
+    border-color 90ms ease,
+    box-shadow 110ms ease,
+    transform 110ms cubic-bezier(.2, .9, .3, 1);
+  animation: interview-launcher-in 220ms cubic-bezier(.2, .9, .25, 1.1) both;
 }
 .interview-launcher.is-urgent { --launcher-tone: var(--warn); }
 .interview-launcher:hover,
@@ -7696,9 +7823,11 @@ html[data-theme="light"] .system-alert-backdrop {
   background: var(--bg-elev);
   border-color: color-mix(in srgb, var(--launcher-tone) 55%, var(--line));
   box-shadow: -14px 18px 40px -14px color-mix(in srgb, #000 60%, transparent), -3px 0 0 0 var(--launcher-tone);
+  transform: translate(-4px, -50%);
 }
 .interview-launcher:focus-visible { outline: none; box-shadow: var(--focus-ring), -14px 18px 40px -14px color-mix(in srgb, #000 60%, transparent); }
-.interview-launcher:active .interview-launcher-icon { transform: scale(.94); }
+.interview-launcher:active { transform: translate(-2px, -50%) scale(.98); }
+.interview-launcher:active .interview-launcher-icon { transform: scale(.92); }
 .interview-launcher-icon {
   position: relative;
   width: 2.5rem;
@@ -7710,7 +7839,12 @@ html[data-theme="light"] .system-alert-backdrop {
   background: linear-gradient(140deg, var(--accent), color-mix(in srgb, var(--accent) 55%, var(--accent-2)));
   color: #fff;
   box-shadow: 0 8px 18px -8px color-mix(in srgb, var(--accent) 85%, transparent);
-  transition: transform 140ms ease;
+  transition: transform 90ms cubic-bezier(.2, .9, .3, 1), box-shadow 90ms ease;
+}
+.interview-launcher:hover .interview-launcher-icon,
+.interview-launcher:focus-visible .interview-launcher-icon {
+  transform: scale(1.06);
+  box-shadow: 0 10px 20px -8px color-mix(in srgb, var(--accent) 90%, transparent);
 }
 .interview-launcher.is-urgent .interview-launcher-icon::after {
   content: "";
@@ -7738,21 +7872,32 @@ html[data-theme="light"] .system-alert-backdrop {
   font-weight: 800;
   line-height: 1;
   box-shadow: 0 0 0 2.5px var(--bg-elev);
+  transition: transform 90ms cubic-bezier(.2, .9, .3, 1);
 }
-.interview-launcher-text { display: grid; gap: .1rem; min-width: 0; opacity: 0; transform: translateX(6px); transition: opacity 180ms ease 60ms, transform 220ms ease 60ms; }
+.interview-launcher-text { display: grid; gap: .1rem; min-width: 0; opacity: 0; transform: translateX(8px); transition: opacity 70ms ease, transform 90ms cubic-bezier(.2, .9, .3, 1); }
 .interview-launcher:hover .interview-launcher-text,
 .interview-launcher:focus-visible .interview-launcher-text { opacity: 1; transform: none; }
+.interview-launcher:hover .interview-launcher-count,
+.interview-launcher:focus-visible .interview-launcher-count { transform: scale(1.12); }
 .interview-launcher-text strong { font-size: .82rem; font-weight: 750; }
 .interview-launcher-text small { color: var(--muted); font-size: .7rem; font-weight: 600; }
 .interview-launcher.is-urgent .interview-launcher-text small { color: var(--warn); }
 @keyframes interview-launcher-in { from { opacity: 0; transform: translate(100%, -50%); } to { opacity: 1; transform: translate(0, -50%); } }
 @keyframes interview-launcher-ring { 0% { opacity: .9; transform: scale(.92); } 70%, 100% { opacity: 0; transform: scale(1.22); } }
 @media (prefers-reduced-motion: reduce) {
-  .interview-launcher, .interview-launcher-text { animation: none; transition: none; }
+  .interview-launcher,
+  .interview-launcher-text,
+  .interview-launcher-icon,
+  .interview-launcher-count { animation: none; transition: none; }
   .interview-launcher.is-urgent .interview-launcher-icon::after { animation: none; opacity: .6; }
+  .interview-launcher:hover,
+  .interview-launcher:focus-visible { transform: translateY(-50%); }
 }
 @media (max-width: 640px) {
   .interview-launcher { top: auto; bottom: 5.5rem; transform: none; animation: none; }
+  .interview-launcher:hover,
+  .interview-launcher:focus-visible { transform: translateX(-4px); }
+  .interview-launcher:active { transform: translateX(-2px) scale(.98); }
 }
 
 .mail-alert-backdrop {

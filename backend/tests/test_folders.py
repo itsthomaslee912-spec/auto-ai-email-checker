@@ -15,7 +15,7 @@ from app.email.folders import (
     folder_from_outlook_well_known,
     normalize_folder,
 )
-from app.email.gmail import normalize_gmail_message
+from app.email.gmail import GMAIL_COMBINED_QUERY, _gmail_mailbox_query, normalize_gmail_message
 from app.email.outlook import normalize_outlook_message
 from app.models import EmailLabel, EmailMessage, MailboxConnection, MailFolder, Provider, User
 
@@ -36,6 +36,8 @@ def test_outlook_well_known_names():
     assert folder_from_outlook_well_known("deleteditems") == MailFolder.TRASH.value
     assert folder_from_outlook_well_known("Deleted Items") == MailFolder.TRASH.value
     assert folder_from_outlook_well_known("archive") == MailFolder.ARCHIVE.value
+    assert folder_from_outlook_well_known("sentitems") == MailFolder.SENT.value
+    assert folder_from_outlook_well_known("Sent Items") == MailFolder.SENT.value
     assert folder_from_outlook_well_known("unknown") == MailFolder.INBOX.value
 
 
@@ -54,6 +56,22 @@ def test_normalize_gmail_message_stamps_folder():
         "payload": {"headers": [{"name": "Subject", "value": "Hi"}]},
     }
     assert normalize_gmail_message(raw)["folder"] == MailFolder.SPAM.value
+    sent = {
+        "id": "g-sent",
+        "labelIds": ["SENT"],
+        "snippet": "available Tuesday",
+        "payload": {"headers": [{"name": "Subject", "value": "Re: Interview"}]},
+    }
+    assert normalize_gmail_message(sent)["folder"] == MailFolder.SENT.value
+
+
+def test_gmail_mailbox_query_keeps_sent_from_account():
+    assert "in:sent" in GMAIL_COMBINED_QUERY
+    query = _gmail_mailbox_query(GMAIL_COMBINED_QUERY, "jordan@example.com")
+    assert "in:sent from:jordan@example.com" in query
+    assert "to:jordan@example.com" in query
+    inbox_only = _gmail_mailbox_query("in:inbox", "jordan@example.com")
+    assert "in:sent from:" not in inbox_only
 
 
 def test_normalize_gmail_message_keeps_unread_state():
@@ -177,13 +195,13 @@ def test_list_emails_filters_folder():
     assert body["folder_counts"]["inbox"] == 1
     assert body["folder_counts"]["spam"] == 1
     assert body["folder_counts"]["trash"] == 1
-    # Sidebar unread badges include only unread messages currently in Inbox.
-    assert body["mailbox_unread_counts"] == {str(mailbox_id): 1}
+    # Sidebar unread badges count every folder, matching the all-mail list.
+    assert body["mailbox_unread_counts"] == {str(mailbox_id): 4}
 
     mixed = client.get("/api/emails")
     assert mixed.status_code == 200
     assert mixed.json()["total"] == 4
-    assert mixed.json()["mailbox_unread_counts"] == {str(mailbox_id): 1}
+    assert mixed.json()["mailbox_unread_counts"] == {str(mailbox_id): 4}
 
 
 def test_conversation_view_keeps_the_newest_message_in_each_thread():

@@ -13,6 +13,8 @@ OUTLOOK_WELL_KNOWN = {
     "deleted": MailFolder.TRASH.value,
     "trash": MailFolder.TRASH.value,
     "archive": MailFolder.ARCHIVE.value,
+    "sentitems": MailFolder.SENT.value,
+    "sent": MailFolder.SENT.value,
 }
 
 

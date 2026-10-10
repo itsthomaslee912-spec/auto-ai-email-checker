@@ -21,6 +21,9 @@ async def subscribe() -> AsyncIterator[str]:
 
 
 async def publish(event: str, data: dict[str, Any]) -> None:
+    if event == "calendar.changed":
+        from app.services.pending_interviews import invalidate_calendar_read_cache
+        invalidate_calendar_read_cache()
     payload = json.dumps({"event": event, "data": data}, default=str)
     dead: list[asyncio.Queue[str]] = []
     for queue in list(_subscribers):

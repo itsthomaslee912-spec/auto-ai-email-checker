@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 FETCH_CHUNK = 80
 GMAIL_CONCURRENCY = 16
 GMAIL_CALENDAR_REFRESH_CONCURRENCY = 2
-OUTLOOK_FOLDERS = ("inbox", "junkemail", "deleteditems", "archive")
+OUTLOOK_FOLDERS = ("inbox", "junkemail", "deleteditems", "archive", "sentitems")
 
 _jobs: dict[int, dict[str, Any]] = {}
 _running: set[int] = set()
@@ -82,12 +82,26 @@ def _message_sender_is_excluded(mailbox: MailboxConnection, normalized: dict) ->
 
 
 def _gmail_message_belongs_to_mailbox(mailbox: MailboxConnection, raw: dict) -> bool:
-    """Accept only mail addressed or delivered to this connected Gmail account."""
+    """Accept mail for this connected Gmail account (incoming To/Cc or Sent From)."""
     headers = (raw.get("payload") or {}).get("headers") or []
     if not headers:
         # Gmail full-message responses contain headers. This fallback keeps
         # partial provider/test payloads processable until a full fetch occurs.
         return True
+    mailbox_addr = mailbox.email_address.strip().casefold()
+    labels = {str(value).upper() for value in raw.get("labelIds") or []}
+    if "SENT" in labels:
+        from_values = [
+            str(header.get("value") or "")
+            for header in headers
+            if str(header.get("name") or "").strip().casefold() == "from"
+        ]
+        senders = {
+            address.strip().casefold()
+            for _name, address in getaddresses(from_values)
+            if address
+        }
+        return mailbox_addr in senders
     recipient_headers = {
         "to", "cc", "bcc", "delivered-to", "x-original-to",
         "x-forwarded-to", "envelope-to",
@@ -98,7 +112,7 @@ def _gmail_message_belongs_to_mailbox(mailbox: MailboxConnection, raw: dict) -> 
         if str(header.get("name") or "").strip().casefold() in recipient_headers
     ]
     recipients = {address.strip().casefold() for _name, address in getaddresses(values) if address}
-    return mailbox.email_address.strip().casefold() in recipients
+    return mailbox_addr in recipients
 
 
 def _should_stop(mailbox_id: int) -> bool:
@@ -207,6 +221,12 @@ async def _run_sync_job(
                 message=f"Synced {imported} new messages",
             )
         await publish("sync.done", dict(job))
+        # Full/incremental sync downloads without classifying. Sent proposals
+        # need that follow-up pass so availability reaches the calendar.
+        if imported and not _should_stop(mailbox_id):
+            from app.services.reclassify import start_mailbox_reclassify
+
+            await start_mailbox_reclassify(mailbox_id, pending_only=True)
     except Exception as exc:
         logger.exception("Mailbox sync failed for %s", mailbox_id)
         db.rollback()
@@ -233,7 +253,11 @@ async def bootstrap_mailbox(
     limit = get_settings().mail_sync_max if force_full or not mailbox.full_sync_completed else (initial_sync or get_settings().mail_sync_max)
     # Register first. A full initial import can take minutes or hours for a large
     # mailbox, and webhook delivery must not wait for that import to finish.
-    if register_webhook and not _webhook_is_active(mailbox):
+    # Gmail watches are re-posted even when active so label-filter changes
+    # (e.g. including Sent) take effect without waiting for expiry.
+    if register_webhook and (
+        not _webhook_is_active(mailbox) or mailbox.provider == Provider.GOOGLE.value
+    ):
         try:
             await register_mailbox_webhook(db, mailbox)
         except Exception:
@@ -400,7 +424,7 @@ async def _incremental_gmail(db: Session, mailbox: MailboxConnection) -> None:
                 continue
             raw = fetched[mid]
             labels = {str(value).upper() for value in raw.get("labelIds") or []}
-            if labels & {"SENT", "DRAFT"}:
+            if "DRAFT" in labels:
                 continue
             if not _gmail_message_belongs_to_mailbox(mailbox, raw):
                 continue
@@ -424,7 +448,9 @@ async def _incremental_gmail(db: Session, mailbox: MailboxConnection) -> None:
 
 async def _sync_gmail(db: Session, mailbox: MailboxConnection, limit: int) -> None:
     token = await ensure_google_access_token(db, mailbox)
-    await _publish_progress(mailbox.id, state="running", message="Listing Inbox, Spam, Trash, and Archive...")
+    await _publish_progress(
+        mailbox.id, state="running", message="Listing Inbox, Spam, Trash, Sent, and Archive...",
+    )
     ids, estimate = await gmail_list_inbox_message_ids(
         token, max_results=limit, recipient=mailbox.email_address
     )
@@ -718,7 +744,7 @@ async def _process_gmail_notification_for(
                         continue
                     raise
                 labels = {str(value).upper() for value in raw.get("labelIds") or []}
-                if labels & {"SENT", "DRAFT"}:
+                if "DRAFT" in labels:
                     continue
                 if not _gmail_message_belongs_to_mailbox(mailbox, raw):
                     continue

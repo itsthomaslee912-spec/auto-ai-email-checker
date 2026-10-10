@@ -1,5 +1,6 @@
 import { CSSProperties, Dispatch, DragEvent, FormEvent, KeyboardEvent, PointerEvent, SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import ApplicationActionCopies from "./components/ApplicationActionCopies";
 import EmailBody from "./components/EmailBody";
 import CompactSelect from "./components/CompactSelect";
 import ModernDateTimePicker from "./components/ModernDateTimePicker";
@@ -9,7 +10,7 @@ import SystemAlert, { type SystemIssue } from "./components/SystemAlert";
 import InterviewAlarm from "./components/InterviewAlarm";
 import InterviewEmailAlert from "./components/InterviewEmailAlert";
 import SettingsPage, { type SettingsSection } from "./pages/SettingsPage";
-import CalendarPage from "./pages/CalendarPage";
+import CalendarPage, { warmCalendarCache } from "./pages/CalendarPage";
 import {
   disconnectMailbox,
   openEvents,
@@ -19,6 +20,9 @@ import {
   fetchEmailConversation,
   fetchEmailDetail,
   fetchEmails,
+  peekEmailDetail,
+  peekEmailDetailRequest,
+  prefetchEmailDetail,
   createAiReply,
   fetchReclassifyStatus,
   sendEmail,
@@ -108,22 +112,6 @@ const MAIL_FOLDER_TITLES: Record<MailFolder, string> = {
   trash: "Trash",
   archive: "Archive",
 };
-const EMPTY_FOLDER_COUNTS: Record<MailFolder, number> = {
-  inbox: 0,
-  sent: 0,
-  spam: 0,
-  trash: 0,
-  archive: 0,
-};
-
-function parseFolderCounts(raw: Record<string, number> | undefined): Record<MailFolder, number> {
-  const counts = { ...EMPTY_FOLDER_COUNTS };
-  for (const key of MAIL_FOLDERS) {
-    counts[key] = raw?.[key] ?? 0;
-  }
-  return counts;
-}
-
 type CountCell = { mailbox_id: number; label: string; folder: string; unread: boolean; count: number };
 type CountTally = { total: number; unread: number };
 
@@ -317,6 +305,7 @@ function SidebarIcon({ name }: { name: SidebarIconName }) {
 
 export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUser; onSignOut: () => void }) {
   const [activePage, setActivePage] = useState<"inbox" | "calendar">("inbox");
+  const [calendarMounted, setCalendarMounted] = useState(false);
   const [mailboxes, setMailboxes] = useState<Mailbox[]>([]);
   const [accountOrder, setAccountOrder] = useState<number[]>(() => {
     try { return JSON.parse(localStorage.getItem(ACCOUNTS_ORDER_KEY) ?? "[]"); } catch { return []; }
@@ -338,13 +327,14 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   const [nextIsRead, setNextIsRead] = useState<boolean | null>(null);
   const [labelCounts, setLabelCounts] = useState<Record<EmailLabel, number>>(EMPTY_LABEL_COUNTS);
   const [mailboxUnreadCounts, setMailboxUnreadCounts] = useState<Record<number, number>>({});
-  const [folderCounts, setFolderCounts] = useState<Record<MailFolder, number>>(EMPTY_FOLDER_COUNTS);
   const [countCells, setCountCells] = useState<CountCell[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [aiStatus, setAiStatus] = useState<AiStatus | null>(null);
   const [aiStatusOffline, setAiStatusOffline] = useState(false);
   const [autoSyncStatus, setAutoSyncStatus] = useState<AutoSyncStatus | null>(null);
   const [autoSyncOffline, setAutoSyncOffline] = useState(false);
+  const aiStatusFailCountRef = useRef(0);
+  const autoSyncFailCountRef = useRef(0);
   const [banner, setBanner] = useState<string | null>(null);
   const [stableIssueKey, setStableIssueKey] = useState("");
   const [dismissedIssueKey, setDismissedIssueKey] = useState(
@@ -400,7 +390,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   const [fontSize, setFontSize] = useState<FontSize>(() => loadFontSize());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("appearance");
-  const [sidebarSections, setSidebarSections] = useState({ inbox: true, categories: true, sent: false, spam: false, trash: false, archive: false });
+  const [sidebarSections, setSidebarSections] = useState({ inbox: true, categories: true });
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try { return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1"; } catch { return false; }
   });
@@ -500,11 +490,40 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     setNextIsRead(page.next_is_read ?? null);
     setLabelCounts(parseLabelCounts(page.label_counts));
     setMailboxUnreadCounts(parseMailboxCounts(page.mailbox_unread_counts ?? {}));
-    setFolderCounts(parseFolderCounts(page.folder_counts));
     if (page.count_breakdown) {
       setCountCells(page.count_breakdown.map(([mailbox_id, label, folder, unread, count]) => ({ mailbox_id, label, folder, unread, count })));
     }
   }, []);
+
+  const countRefreshTimer = useRef(0);
+  const refreshCountsRef = useRef<() => void>(() => {});
+  refreshCountsRef.current = () => {
+    window.clearTimeout(countRefreshTimer.current);
+    countRefreshTimer.current = window.setTimeout(() => {
+      const {
+        mailboxId,
+        label: currentLabel,
+        interviewSubtype: currentSubtype,
+        query,
+        inboxType: currentInboxType,
+      } = filterRef.current;
+      void fetchEmails({
+        mailboxId,
+        label: currentLabel,
+        interviewSubtype: currentSubtype === "all" ? null : currentSubtype,
+        folder: "all",
+        query,
+        inboxType: currentInboxType,
+        limit: 1,
+      }).then((page) => {
+        setLabelCounts(parseLabelCounts(page.label_counts));
+        setMailboxUnreadCounts(parseMailboxCounts(page.mailbox_unread_counts ?? {}));
+        if (page.count_breakdown) {
+          setCountCells(page.count_breakdown.map(([mailbox_id, label, folder, unread, count]) => ({ mailbox_id, label, folder, unread, count })));
+        }
+      }).catch(() => {});
+    }, 800);
+  };
 
   const loadFirstPage = useCallback(async () => {
     const gen = ++fetchGen.current;
@@ -512,7 +531,6 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
       mailboxId,
       label: currentLabel,
       interviewSubtype: currentSubtype,
-      folder: currentFolder,
       query,
       inboxType: currentInboxType,
       conversationView: currentConversation,
@@ -531,7 +549,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         mailboxId,
         label: currentLabel,
         interviewSubtype: currentSubtype === "all" ? null : currentSubtype,
-        folder: currentFolder,
+        folder: "all",
         query,
         inboxType: currentInboxType,
         conversation: currentConversation,
@@ -559,7 +577,6 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
       mailboxId,
       label: currentLabel,
       interviewSubtype: currentSubtype,
-      folder: currentFolder,
       query,
       inboxType: currentInboxType,
       conversationView: currentConversation,
@@ -569,7 +586,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         mailboxId,
         label: currentLabel,
         interviewSubtype: currentSubtype === "all" ? null : currentSubtype,
-        folder: currentFolder,
+        folder: "all",
         query,
         inboxType: currentInboxType,
         conversation: currentConversation,
@@ -670,12 +687,21 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     void load();
   }, [load]);
 
+  useEffect(() => {
+    if (!mailboxIdsKey) return;
+    const handle = window.setTimeout(() => warmCalendarCache(), 700);
+    return () => window.clearTimeout(handle);
+  }, [mailboxIdsKey]);
+
   const refreshAiStatus = useCallback(async () => {
     try {
       setAiStatus(await fetchAiStatus());
+      aiStatusFailCountRef.current = 0;
       setAiStatusOffline(false);
     } catch {
-      setAiStatusOffline(true);
+      aiStatusFailCountRef.current += 1;
+      // One blip while classifying mail is normal; only mark offline after repeats.
+      if (aiStatusFailCountRef.current >= 2) setAiStatusOffline(true);
     }
   }, []);
 
@@ -688,9 +714,11 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   const refreshAutoSyncStatus = useCallback(async () => {
     try {
       setAutoSyncStatus(await fetchAutoSyncStatus());
+      autoSyncFailCountRef.current = 0;
       setAutoSyncOffline(false);
     } catch {
-      setAutoSyncOffline(true);
+      autoSyncFailCountRef.current += 1;
+      if (autoSyncFailCountRef.current >= 2) setAutoSyncOffline(true);
     }
   }, []);
 
@@ -705,6 +733,16 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     const timer = window.setInterval(() => void refreshReclassifyStatuses(), 20_000);
     return () => window.clearInterval(timer);
   }, [refreshReclassifyStatuses]);
+
+  useEffect(() => {
+    refreshCountsRef.current();
+  }, []);
+
+  useEffect(() => {
+    if (filterRef.current.folder === "all") return;
+    filterRef.current = { ...filterRef.current, folder: "all" };
+    setFolder("all");
+  }, []);
 
   useEffect(() => {
     if (!didMountFilters.current) {
@@ -747,12 +785,11 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
           previous_label?: EmailLabel;
           updated?: boolean;
         };
-        const { mailboxId, label: currentLabel, interviewSubtype: currentSubtype, folder: currentFolder, query } = filterRef.current;
+        const { mailboxId, label: currentLabel, interviewSubtype: currentSubtype, query } = filterRef.current;
         const matchesMailbox = mailboxId == null || item.mailbox_id === mailboxId;
         const matchesLabel = currentLabel === "all" || item.label === currentLabel;
         const matchesSubtype = currentSubtype === "all" || item.interview_subtype === currentSubtype;
         const itemFolder = mailFolderOf(item);
-        const matchesFolder = currentFolder === "all" || itemFolder === currentFolder;
         const needle = query.trim().toLowerCase();
         const matchesQuery =
           !needle ||
@@ -762,7 +799,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         setEmails((prev) => {
           const inbox = filterRef.current.inboxType;
           const conversation = filterRef.current.conversationView;
-          const matches = matchesMailbox && matchesLabel && matchesSubtype && matchesFolder && matchesQuery;
+          const matches = matchesMailbox && matchesLabel && matchesSubtype && matchesQuery;
           const threadIdx = conversation && item.thread_id
             ? prev.findIndex((email) => email.mailbox_id === item.mailbox_id && email.thread_id === item.thread_id)
             : -1;
@@ -817,24 +854,19 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
           }
           if (item.previous_label && item.previous_label !== item.label) {
             const fromLabel = item.previous_label;
-            setCountCells((prev) => {
-              const preferUnread = item.is_read == null ? undefined : !item.is_read;
-              const unread = preferUnread ?? !prev.some((cell) =>
-                cell.mailbox_id === item.mailbox_id && cell.label === fromLabel && cell.folder === itemFolder && !cell.unread && cell.count > 0,
-              );
-              return adjustCountCell(
-                adjustCountCell(prev, { mailbox_id: item.mailbox_id, label: fromLabel, folder: itemFolder, unread }, -1),
-                { mailbox_id: item.mailbox_id, label: item.label, folder: itemFolder, unread },
-                1,
-              );
-            });
+            const unread = item.is_read === false;
+            setCountCells((prev) => adjustCountCell(
+              adjustCountCell(prev, { mailbox_id: item.mailbox_id, label: fromLabel, folder: itemFolder, unread }, -1),
+              { mailbox_id: item.mailbox_id, label: item.label, folder: itemFolder, unread },
+              1,
+            ));
           }
           return;
         }
 
-        setCountCells((prev) => adjustCountCell(prev, { mailbox_id: item.mailbox_id, label: item.label, folder: itemFolder, unread: !item.is_read }, 1));
+        setCountCells((prev) => adjustCountCell(prev, { mailbox_id: item.mailbox_id, label: item.label, folder: itemFolder, unread: item.is_read === false }, 1));
 
-        if (!item.is_read) {
+        if (item.is_read === false) {
           setMailboxUnreadCounts((prev) => ({
             ...prev,
             [item.mailbox_id]: (prev[item.mailbox_id] ?? 0) + 1,
@@ -845,11 +877,8 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
             ...prev,
             [item.label]: (prev[item.label] ?? 0) + 1,
           }));
-          setFolderCounts((prev) => ({
-            ...prev,
-            [itemFolder]: (prev[itemFolder] ?? 0) + 1,
-          }));
         }
+        refreshCountsRef.current();
       } catch {
         /* ignore */
       }
@@ -1111,7 +1140,8 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   }
 
   function openSettings(section: SettingsSection = "appearance") {
-    setSettingsSection(section);
+    const adminOnly = section === "ai" || section === "training" || section === "statistics";
+    setSettingsSection(adminOnly && !sessionUser.is_admin ? "appearance" : section);
     setSettingsOpen(true);
   }
 
@@ -1172,19 +1202,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     [labelTallies]
   );
 
-  const folderTally = (scope: MailFolder, mailboxId?: number): CountTally =>
-    countCells.length
-      ? tallyCounts(countCells, (cell) => cell.folder === scope && (mailboxId == null || cell.mailbox_id === mailboxId))
-      : { total: mailboxId == null ? folderCounts[scope] ?? 0 : 0, unread: 0 };
-
-  const renderCountBadge = (tally: CountTally, className: string, showZero = false) => {
-    if (tally.unread > 0) {
-      return <span className={`${className} is-unread`} aria-label={`${tally.unread} unread`}>+{tally.unread}</span>;
-    }
-    if (tally.total > 0 || showZero) {
-      return <span className={`${className} is-total`} aria-label={`${tally.total} total`}>{tally.total}</span>;
-    }
-    return null;
+  const renderCountBadge = (tally: CountTally, className: string) => {
+    if (tally.unread <= 0) return null;
+    return <span className={`${className} is-unread`} aria-label={`${tally.unread} unread`}>+{tally.unread}</span>;
   };
 
   const dateGroups = useMemo(() => groupEmailsByDate(emails), [emails]);
@@ -1259,6 +1279,15 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   listRowsRef.current = listRows;
   const viewModeRef = useRef(viewMode);
   viewModeRef.current = viewMode;
+  const readingPaneRef = useRef(readingPane);
+  readingPaneRef.current = readingPane;
+  const selectedIdRef = useRef(selectedId);
+  selectedIdRef.current = selectedId;
+  const openEmailRef = useRef<(id: number) => void>(() => {});
+  const selectTableEmailRef = useRef<(id: number) => void>(() => {});
+  const openTableEmailRef = useRef<(id: number) => void>(() => {});
+  const prefetchTimerRef = useRef<number | null>(null);
+  const threadBodyRequests = useRef(new Set<number>());
 
   const listVirtualizer = useVirtualizer({
     count: loading ? 0 : listRows.length,
@@ -1274,6 +1303,29 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
       return row.kind === "group" ? `g-${row.key}` : `e-${row.email.id}`;
     },
   });
+
+  const openMessage = useCallback((id: number) => {
+    if (readingPaneRef.current === "no_split") {
+      if (viewModeRef.current === "table") selectTableEmailRef.current(id);
+      else openTableEmailRef.current(id);
+    } else {
+      void openEmailRef.current(id);
+    }
+  }, []);
+
+  const openMessageDirect = useCallback((id: number) => {
+    if (readingPaneRef.current === "no_split") openTableEmailRef.current(id);
+    else void openEmailRef.current(id);
+  }, []);
+
+  const prefetchMessage = useCallback((id: number) => {
+    if (prefetchTimerRef.current != null) window.clearTimeout(prefetchTimerRef.current);
+    prefetchTimerRef.current = window.setTimeout(() => {
+      prefetchTimerRef.current = null;
+      if (selectedIdRef.current === id) return;
+      prefetchEmailDetail(id);
+    }, 90);
+  }, []);
 
   const virtualItems = listVirtualizer.getVirtualItems();
   const lastVirtualIndex = virtualItems.length ? virtualItems[virtualItems.length - 1].index : -1;
@@ -1389,9 +1441,14 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     await Promise.all(activeMailboxes.map((mailbox) => onSync(mailbox.id, false)));
   }
 
+  function openCalendar() {
+    setCalendarMounted(true);
+    setActivePage("calendar");
+  }
+
   function onSyncCalendar() {
     setSyncMenuOpen(false);
-    setActivePage("calendar");
+    openCalendar();
     setCalendarRefreshKey((current) => current + 1);
   }
 
@@ -1464,6 +1521,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
       if (activePage !== "inbox" || settingsOpen || categoryPickerOpen || selectedId == null || savingLabel || pendingLabel) return;
       const target = event.target instanceof HTMLElement ? event.target : null;
       if (target?.closest("input, textarea, select, [contenteditable='true'], [contenteditable='']")) return;
+      if (target instanceof HTMLIFrameElement && target.classList.contains("email-body-frame")) return;
       if (document.querySelector(".dialog-backdrop, .category-picker-backdrop, .mail-alert-backdrop")) return;
       event.preventDefault();
       setCategoryPickerOpen(true);
@@ -1471,25 +1529,6 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [activePage, settingsOpen, categoryPickerOpen, selectedId, savingLabel, pendingLabel]);
-
-  useEffect(() => {
-    const releaseIframeFocus = () => {
-      const active = document.activeElement;
-      if (active instanceof HTMLIFrameElement && active.classList.contains("email-body-frame")) {
-        active.blur();
-      }
-    };
-    const onWindowBlur = () => {
-      requestAnimationFrame(releaseIframeFocus);
-    };
-    const onFocusIn = () => releaseIframeFocus();
-    window.addEventListener("blur", onWindowBlur);
-    document.addEventListener("focusin", onFocusIn, true);
-    return () => {
-      window.removeEventListener("blur", onWindowBlur);
-      document.removeEventListener("focusin", onFocusIn, true);
-    };
-  }, []);
 
   async function applyCategoryChange(useTraining: boolean) {
     if (!pendingLabel || savingLabel) return;
@@ -1552,19 +1591,34 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     setActivePage("inbox");
     const request = ++detailGen.current;
     const target = emails.find((item) => item.id === id);
+    const cached = peekEmailDetail(id) ?? null;
     setStickyUnreadId((current) => (current === id ? current : target && !target.is_read ? id : null));
     setSelectedId(id);
-    setSelected(target ? { ...target, body_text: "", body_html: "" } : null);
+    setSelected(cached ?? (target ? { ...target, body_text: "", body_html: "" } : null));
     setThreadMessages([]);
     setOpenThreadIds([]);
     setSaveTraining(false);
     setPendingLabel(null);
     setCategoryPickerOpen(false);
-    setLoadingDetail(true);
+    const cachedBody = Boolean(cached && (cached.body_html || cached.body_text));
+    setLoadingDetail(!cachedBody);
     try {
-      const detail = await fetchEmailDetail(id);
+      const pending = cached ? undefined : peekEmailDetailRequest(id);
+      let detail = cached ?? (pending ? await pending : null);
       if (request !== detailGen.current) return;
-      setSelected(detail);
+      if (detail) {
+        setSelected(detail);
+        setLoadingDetail(false);
+        if (!detail.is_read) {
+          detail = await fetchEmailDetail(id, true);
+          if (request !== detailGen.current) return;
+          setSelected(detail);
+        }
+      } else {
+        detail = await fetchEmailDetail(id, true);
+        if (request !== detailGen.current) return;
+        setSelected(detail);
+      }
       // Keep state updaters pure. React Strict Mode may invoke an updater more
       // than once in development; nesting the badge update inside setEmails
       // made a single opened unread message subtract two from its badge.
@@ -1603,6 +1657,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     setSelectedId(id);
     setSelected(null);
     setLoadingDetail(false);
+    prefetchEmailDetail(id);
   }
 
   function openTableEmail(id: number) {
@@ -1610,16 +1665,24 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     void onOpenEmail(id);
   }
 
+  openEmailRef.current = onOpenEmail;
+  selectTableEmailRef.current = selectTableEmail;
+  openTableEmailRef.current = openTableEmail;
+
   useEffect(() => {
     if (!conversationView || selectedId == null) {
       setThreadMessages([]);
       return;
     }
     let cancel = false;
+    threadBodyRequests.current.clear();
     fetchEmailConversation(selectedId)
       .then((items) => {
         if (cancel) return;
-        setThreadMessages(items);
+        setThreadMessages(items.map((item) => {
+          const cached = peekEmailDetail(item.id);
+          return { ...item, body_text: cached?.body_text ?? "", body_html: cached?.body_html ?? "" };
+        }));
         const newestId = items[items.length - 1]?.id;
         setOpenThreadIds(
           items
@@ -1637,6 +1700,25 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
       cancel = true;
     };
   }, [conversationView, selectedId]);
+
+  useEffect(() => {
+    if (!conversationView || selectedId == null) return;
+    const missing = openThreadIds.filter((id) => {
+      if (threadBodyRequests.current.has(id)) return false;
+      const message = threadMessages.find((item) => item.id === id);
+      if (!message || message.body_html || message.body_text) return false;
+      if (id === selectedId && selected && (selected.body_html || selected.body_text)) return false;
+      return true;
+    });
+    for (const id of missing) {
+      threadBodyRequests.current.add(id);
+      void fetchEmailDetail(id, false).then((detail) => {
+        setThreadMessages((prev) => prev.map((item) => item.id === id ? { ...item, ...detail } : item));
+      }).catch(() => {
+        threadBodyRequests.current.delete(id);
+      });
+    }
+  }, [conversationView, openThreadIds, selected, selectedId, threadMessages]);
 
   function closeTableDialog() {
     ++detailGen.current;
@@ -1947,6 +2029,14 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         {open && (
           <>
             {readerAccount ? <p className="thread-to">to <span className="to-address">{readerAccount}</span></p> : null}
+            {message.label === "application_action_required" ? (
+              <ApplicationActionCopies
+                subject={message.subject}
+                html={message.body_html}
+                text={message.body_text}
+                snippet={message.snippet}
+              />
+            ) : null}
             <EmailBody html={message.body_html} text={message.body_text} snippet={message.snippet} />
           </>
         )}
@@ -2068,7 +2158,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         severity: "error",
         title: "Can't check the AI model",
         detail: "New emails won't be classified until the AI service responds.",
-        actions: [{ label: "Open AI settings", onClick: () => openSettings("ai") }],
+        actions: sessionUser.is_admin
+          ? [{ label: "Open AI settings", onClick: () => openSettings("ai") }]
+          : undefined,
       });
     } else if (aiStatus && !aiStatus.ready) {
       const providerName = aiStatus.provider === "ollama" ? "Local AI (Ollama)" : aiStatus.provider === "gemini" ? "Gemini" : "OpenAI";
@@ -2078,7 +2170,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         severity: "error",
         title: `${providerName} isn't ready`,
         detail: `${aiStatus.reason ?? `The model ${aiStatus.model} can't be used right now.`} New emails won't be classified until this is fixed.`,
-        actions: [{ label: "Open AI settings", onClick: () => openSettings("ai"), primary: true }],
+        actions: sessionUser.is_admin
+          ? [{ label: "Open AI settings", onClick: () => openSettings("ai"), primary: true }]
+          : undefined,
       });
     }
   }
@@ -2206,11 +2300,11 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
       ? "Unavailable"
       : "Checking";
 
-  const renderSidebarAccounts = (scope: MailFolder, showUnread = false) => (
+  const renderSidebarAccounts = () => (
     <div className="sidebar-account-list">
       {orderedMailboxes.map((box) => {
         const unread = mailboxUnreadCounts[box.id] ?? 0;
-        const active = activePage === "inbox" && folder === scope && selectedMailboxId === box.id;
+        const active = activePage === "inbox" && selectedMailboxId === box.id;
         return <div
           className={`sidebar-account-wrap ${draggedAccountId === box.id ? "is-dragging" : ""}`}
           draggable
@@ -2218,14 +2312,12 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
           onDragOver={(event) => event.preventDefault()}
           onDrop={(event) => onAccountDrop(event, box.id)}
           onDragEnd={() => setDraggedAccountId(null)}
-          key={`${scope}-${box.id}`}
+          key={box.id}
         >
-          <button type="button" className={`sidebar-account-row ${active ? "active" : ""}`} onClick={() => selectMailboxFolder(box.id, scope)}>
+          <button type="button" className={`sidebar-account-row ${active ? "active" : ""}`} onClick={() => selectMailboxFolder(box.id, "all")}>
             <span className={`sidebar-account-avatar provider-${box.provider}`} style={{ "--account-color": accountColor(box) } as CSSProperties}>{providerMark(box.provider)}</span>
             <span className="sidebar-account-email">{box.email_address}</span>
-            {showUnread
-              ? unread > 0 && <span className="sidebar-account-count is-unread" aria-label={`${unread} unread`}>+{unread}</span>
-              : renderCountBadge(folderTally(scope, box.id), "sidebar-account-count")}
+            {unread > 0 && <span className="sidebar-account-count is-unread" aria-label={`${unread} unread`}>+{unread}</span>}
           </button>
         </div>;
       })}
@@ -2307,7 +2399,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         refreshKey={selectedId}
         suppressed={systemAlertOpen && visibleIssues.length > 0}
         onOpenEmail={(id) => void onOpenEmail(id)}
-        onOpenCalendar={() => setActivePage("calendar")}
+        onOpenCalendar={openCalendar}
       />
       <SystemAlert
         issues={visibleIssues}
@@ -2321,27 +2413,18 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         {sidebarCollapsed ? (
           <nav className="sidebar-rail" aria-label="Mailbox navigation">
             <div className="sidebar-rail-main">
-              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "all" && selectedMailboxId == null ? " active" : ""}`} aria-label="Home" data-tooltip="Home" data-tooltip-hint="All mail from every account" data-tooltip-placement="right" onClick={() => selectMailboxFolder(null, "all")}>
+              <button type="button" className="sidebar-rail-btn" aria-label="Home" data-tooltip="Home" data-tooltip-hint="All mail from every account" data-tooltip-placement="right" onClick={() => selectMailboxFolder(null, "all")}>
                 <SidebarIcon name="home" />
               </button>
-              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "inbox" && selectedMailboxId == null ? " active" : ""}`} aria-label={inboxCount > 0 ? `Inbox, ${inboxCount} unread` : "Inbox"} data-tooltip="Inbox" data-tooltip-hint={inboxCount > 0 ? `${inboxCount.toLocaleString()} unread messages` : "You're all caught up"} data-tooltip-placement="right" onClick={() => selectMailboxFolder(null, "inbox")}>
+              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && selectedMailboxId == null ? " active" : ""}`} aria-label={inboxCount > 0 ? `Emails, ${inboxCount} unread` : "Emails"} data-tooltip="Emails" data-tooltip-hint={inboxCount > 0 ? `${inboxCount.toLocaleString()} unread messages` : "All mail from every folder"} data-tooltip-placement="right" onClick={() => selectMailboxFolder(null, "all")}>
                 <SidebarIcon name="inbox" />
                 {inboxCount > 0 && <span className="sidebar-rail-badge">{inboxCount > 99 ? "+99" : `+${inboxCount}`}</span>}
               </button>
-              <button type="button" className={`sidebar-rail-btn${activePage === "calendar" ? " active" : ""}`} aria-label="Calendar" data-tooltip="Calendar" data-tooltip-hint="Interviews and meetings" data-tooltip-placement="right" onClick={() => setActivePage("calendar")}>
+              <button type="button" className={`sidebar-rail-btn${activePage === "calendar" ? " active" : ""}`} aria-label="Calendar" data-tooltip="Calendar" data-tooltip-hint="Interviews and meetings" data-tooltip-placement="right" onClick={openCalendar}>
                 <SidebarIcon name="calendar" />
               </button>
               <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && label !== "all" ? " active" : ""}`} aria-label="Categories" data-tooltip="Categories" data-tooltip-hint="Opens the sidebar to filter by category" data-tooltip-placement="right" onClick={() => { setActivePage("inbox"); setSidebarSections((current) => ({ ...current, categories: true })); setSidebarCollapsed(false); try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, "0"); } catch { /* ignore */ } }}>
                 <svg className="sidebar-nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3.5h6" /><path d="M10 3.5v5.2L7 12.2h10L14 8.7V3.5" /><path d="M12 12.2v8.3" /></svg>
-              </button>
-              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "sent" && selectedMailboxId == null ? " active" : ""}`} aria-label="Sent" data-tooltip="Sent" data-tooltip-hint="Messages you've sent" data-tooltip-placement="right" onClick={() => selectMailboxFolder(null, "sent")}>
-                <SidebarIcon name="sent" />
-              </button>
-              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "archive" && selectedMailboxId == null ? " active" : ""}`} aria-label="Archive" data-tooltip="Archive" data-tooltip-hint="Messages moved out of the inbox" data-tooltip-placement="right" onClick={() => selectMailboxFolder(null, "archive")}>
-                <svg className="sidebar-nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3.5h7.2L19 8.2V20.5H7V3.5Z" /><path d="M14 3.5v5h5" /></svg>
-              </button>
-              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && folder === "trash" && selectedMailboxId == null ? " active" : ""}`} aria-label="Trash" data-tooltip="Trash" data-tooltip-hint="Deleted messages" data-tooltip-placement="right" onClick={() => selectMailboxFolder(null, "trash")}>
-                <SidebarIcon name="trash" />
               </button>
             </div>
             <button
@@ -2349,7 +2432,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
               className="sidebar-rail-btn sidebar-rail-menu"
               aria-label="Show sidebar"
               data-tooltip="Show sidebar"
-              data-tooltip-hint="Expand accounts, folders and categories"
+              data-tooltip-hint="Expand accounts and categories"
               data-tooltip-placement="right"
               onClick={() => {
                 setSidebarCollapsed(false);
@@ -2413,13 +2496,13 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         <nav className="sidebar-tree" aria-label="Mailbox navigation">
           <section className="sidebar-tree-section">
             <div className="sidebar-section-heading">
-              <button type="button" className={`sidebar-disclosure ${sidebarSections.inbox ? "open" : ""}`} aria-label={`${sidebarSections.inbox ? "Collapse" : "Expand"} Inbox accounts`} aria-expanded={sidebarSections.inbox} onClick={() => toggleSidebarSection("inbox")}><span>›</span></button>
-              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "inbox" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, inbox: true })); selectMailboxFolder(null, "inbox"); }}><SidebarIcon name="inbox" /><span>Inbox</span>{inboxCount > 0 && <span className="sidebar-row-count is-unread" aria-label={`${inboxCount} unread`}>+{inboxCount}</span>}</button>
+              <button type="button" className={`sidebar-disclosure ${sidebarSections.inbox ? "open" : ""}`} aria-label={`${sidebarSections.inbox ? "Collapse" : "Expand"} Emails accounts`} aria-expanded={sidebarSections.inbox} onClick={() => toggleSidebarSection("inbox")}><span>›</span></button>
+              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, inbox: true })); selectMailboxFolder(null, "all"); }}><SidebarIcon name="inbox" /><span>Emails</span>{inboxCount > 0 && <span className="sidebar-row-count is-unread" aria-label={`${inboxCount} unread`}>+{inboxCount}</span>}</button>
             </div>
-            {sidebarSections.inbox && renderSidebarAccounts("inbox", true)}
+            {sidebarSections.inbox && renderSidebarAccounts()}
           </section>
 
-          <button type="button" className={`sidebar-nav-row sidebar-primary-row ${activePage === "calendar" ? "active" : ""}`} onClick={() => setActivePage("calendar")}><SidebarIcon name="calendar" /><span>Calendar</span></button>
+          <button type="button" className={`sidebar-nav-row sidebar-primary-row ${activePage === "calendar" ? "active" : ""}`} onClick={openCalendar}><SidebarIcon name="calendar" /><span>Calendar</span></button>
 
           <section className="sidebar-tree-section">
             <div className="sidebar-section-heading">
@@ -2427,39 +2510,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
               <button type="button" className={`sidebar-nav-row ${label !== "all" ? "active" : ""}`} onClick={() => toggleSidebarSection("categories")}><SidebarIcon name="categories" /><span>Categories</span></button>
             </div>
             {sidebarSections.categories && <div className="sidebar-category-list">
-              <button type="button" className={`sidebar-filter-row ${label === "all" ? "active" : ""}`} onClick={() => { setActivePage("inbox"); selectLabel("all"); }}><span>All categories</span>{renderCountBadge(allCategoriesTally, "sidebar-filter-count", true)}</button>
-              {CLASSIFY_LABELS.map((item) => <button type="button" className={`sidebar-filter-row ${label === item ? "active" : ""}`} onClick={() => { setActivePage("inbox"); selectLabel(item); }} key={item}><span>{CLASSIFY_LABEL_TITLES[item]}</span>{renderCountBadge(labelTallies[item], "sidebar-filter-count", true)}</button>)}
+              <button type="button" className={`sidebar-filter-row ${label === "all" ? "active" : ""}`} onClick={() => { setActivePage("inbox"); selectLabel("all"); }}><span>All categories</span>{renderCountBadge(allCategoriesTally, "sidebar-filter-count")}</button>
+              {CLASSIFY_LABELS.map((item) => <button type="button" className={`sidebar-filter-row ${label === item ? "active" : ""}`} onClick={() => { setActivePage("inbox"); selectLabel(item); }} key={item}><span>{CLASSIFY_LABEL_TITLES[item]}</span>{renderCountBadge(labelTallies[item], "sidebar-filter-count")}</button>)}
             </div>}
-          </section>
-
-          <div className="sidebar-group-label">Folders</div>
-          <section className="sidebar-tree-section">
-            <div className="sidebar-section-heading">
-              <button type="button" className={`sidebar-disclosure ${sidebarSections.sent ? "open" : ""}`} aria-label={`${sidebarSections.sent ? "Collapse" : "Expand"} Sent accounts`} aria-expanded={sidebarSections.sent} onClick={() => toggleSidebarSection("sent")}><span>›</span></button>
-              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "sent" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, sent: true })); selectMailboxFolder(null, "sent"); }}><SidebarIcon name="sent" /><span>Sent</span>{renderCountBadge(folderTally("sent"), "sidebar-row-count")}</button>
-            </div>
-            {sidebarSections.sent && renderSidebarAccounts("sent")}
-          </section>
-          <section className="sidebar-tree-section">
-            <div className="sidebar-section-heading">
-              <button type="button" className={`sidebar-disclosure ${sidebarSections.spam ? "open" : ""}`} aria-label={`${sidebarSections.spam ? "Collapse" : "Expand"} Spam accounts`} aria-expanded={sidebarSections.spam} onClick={() => toggleSidebarSection("spam")}><span>›</span></button>
-              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "spam" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, spam: true })); selectMailboxFolder(null, "spam"); }}><SidebarIcon name="spam" /><span>Spam</span>{renderCountBadge(folderTally("spam"), "sidebar-row-count")}</button>
-            </div>
-            {sidebarSections.spam && renderSidebarAccounts("spam")}
-          </section>
-          <section className="sidebar-tree-section">
-            <div className="sidebar-section-heading">
-              <button type="button" className={`sidebar-disclosure ${sidebarSections.trash ? "open" : ""}`} aria-label={`${sidebarSections.trash ? "Collapse" : "Expand"} Trash accounts`} aria-expanded={sidebarSections.trash} onClick={() => toggleSidebarSection("trash")}><span>›</span></button>
-              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "trash" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, trash: true })); selectMailboxFolder(null, "trash"); }}><SidebarIcon name="trash" /><span>Trash</span>{renderCountBadge(folderTally("trash"), "sidebar-row-count")}</button>
-            </div>
-            {sidebarSections.trash && renderSidebarAccounts("trash")}
-          </section>
-          <section className="sidebar-tree-section">
-            <div className="sidebar-section-heading">
-              <button type="button" className={`sidebar-disclosure ${sidebarSections.archive ? "open" : ""}`} aria-label={`${sidebarSections.archive ? "Collapse" : "Expand"} Archive accounts`} aria-expanded={sidebarSections.archive} onClick={() => toggleSidebarSection("archive")}><span>›</span></button>
-              <button type="button" className={`sidebar-nav-row ${activePage === "inbox" && folder === "archive" && selectedMailboxId == null ? "active" : ""}`} onClick={() => { setSidebarSections((current) => ({ ...current, archive: true })); selectMailboxFolder(null, "archive"); }}><SidebarIcon name="archive" /><span>Archive</span>{renderCountBadge(folderTally("archive"), "sidebar-row-count")}</button>
-            </div>
-            {sidebarSections.archive && renderSidebarAccounts("archive")}
           </section>
         </nav>
 
@@ -2477,7 +2530,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                 </span>
               </span>
             </button>
-            <button type="button" className="sidebar-health-row ai-model-status" data-state={aiReady ? "active" : "error"} data-tooltip={aiTooltip} data-tooltip-full data-tooltip-placement="top" aria-label={`${aiTitle}. Open AI settings`} onClick={() => openSettings("ai")}>
+            <button type="button" className="sidebar-health-row ai-model-status" data-state={aiReady ? "active" : "error"} data-tooltip={aiTooltip} data-tooltip-full data-tooltip-placement="top" aria-label={sessionUser.is_admin ? `${aiTitle}. Open AI settings` : aiTitle} onClick={() => openSettings(sessionUser.is_admin ? "ai" : "appearance")}>
               <span className="sidebar-health-dot" aria-hidden="true" />
               <span className="sidebar-health-copy"><span className="sidebar-health-name">AI model</span><span className="sidebar-health-value">{aiModelLabel}</span></span>
               <span className="sr-only" role="status" aria-live="polite">{aiLabel}</span>
@@ -2681,15 +2734,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                       when={when}
                       folder={mailFolderOf(email)}
                       folderTitle={MAIL_FOLDER_TITLES[mailFolderOf(email)]}
-                      onOpen={(id) => {
-                        if (readingPane === "no_split") {
-                          if (viewMode === "table") selectTableEmail(id);
-                          else openTableEmail(id);
-                        } else {
-                          void onOpenEmail(id);
-                        }
-                      }}
-                      onDoubleOpen={(id) => readingPane === "no_split" ? openTableEmail(id) : void onOpenEmail(id)}
+                      onOpen={openMessage}
+                      onDoubleOpen={openMessageDirect}
+                      onPrefetch={prefetchMessage}
                     />
                   </div>
                 );
@@ -2739,13 +2786,17 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         aria-modal={activePage === "inbox" && readingPane === "no_split" && tableDialogOpen ? true : undefined}
         aria-label={activePage === "calendar" ? "Calendar" : readingPane === "no_split" && tableDialogOpen ? selected?.subject || "Email" : undefined}
       >
-        {activePage === "calendar" ? (
-          <CalendarPage
-            mailboxes={orderedMailboxes}
-            refreshKey={calendarRefreshKey}
-            onClose={() => setActivePage("inbox")}
-          />
-        ) : <>
+        {calendarMounted && (
+          <div className={`calendar-page-host${activePage === "calendar" ? "" : " is-hidden"}`} hidden={activePage !== "calendar"} aria-hidden={activePage !== "calendar"}>
+            <CalendarPage
+              mailboxes={orderedMailboxes}
+              refreshKey={calendarRefreshKey}
+              active={activePage === "calendar"}
+              onClose={() => setActivePage("inbox")}
+            />
+          </div>
+        )}
+        {activePage !== "calendar" && <>
         {readingPane === "no_split" && tableDialogOpen && (
           <div className="table-dialog-toolbar">
             <span>Email</span>
@@ -2757,8 +2808,8 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
             <p>Select a message to read</p>
           </div>
         )}
-        {loadingDetail && <div className="reader-empty"><p>Opening…</p></div>}
-        {selected && !loadingDetail && (
+        {!selected && loadingDetail && <div className="reader-empty"><p>Opening…</p></div>}
+        {selected && (
           <article className="reader-article">
             <h1 id="reader-title">{selected.subject || "(no subject)"}</h1>
             <div className={showConversation ? "reader-card is-conversation" : "reader-card"} ref={conversationScrollRef}>
@@ -2879,6 +2930,14 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                   </div>
                 </div>
               </div>
+              {selected.label === "application_action_required" ? (
+                <ApplicationActionCopies
+                  subject={selected.subject}
+                  html={selected.body_html}
+                  text={selected.body_text}
+                  snippet={selected.snippet}
+                />
+              ) : null}
               <EmailBody
                 html={selected.body_html}
                 text={selected.body_text}

@@ -21,6 +21,7 @@ from app.auth.oauth_microsoft import (
     upsert_microsoft_mailbox,
 )
 from app.auth.pending_oauth import pop_pending, put_pending
+from app.auth.public_urls import sanitize_frontend_return
 from app.auth.session import MailboxOwnedElsewhere, require_user
 from app.config import get_settings
 from app.db import get_db
@@ -35,14 +36,23 @@ logger = logging.getLogger(__name__)
 def google_start(
     email: str = Query(..., min_length=3, description="Gmail address to connect"),
     name: str | None = Query(default=None, description="Optional display name"),
+    return_to: str | None = Query(default=None, description="Frontend origin to return to after OAuth"),
     user_id: int = Depends(require_user),
 ) -> RedirectResponse:
     email_clean = email.strip().lower()
     if "@" not in email_clean:
         raise HTTPException(status_code=400, detail="Enter a valid email address")
     display_name = (name or "").strip() or email_clean.split("@", 1)[0]
+    settings = get_settings()
     state = secrets.token_urlsafe(24)
-    put_pending(state, provider="google", email=email_clean, name=display_name, user_id=user_id)
+    put_pending(
+        state,
+        provider="google",
+        email=email_clean,
+        name=display_name,
+        user_id=user_id,
+        return_to=sanitize_frontend_return(return_to, settings),
+    )
     return RedirectResponse(google_auth_url(state, login_hint=email_clean))
 
 
@@ -56,8 +66,9 @@ async def google_callback(
 ) -> RedirectResponse:
     settings = get_settings()
     pending = pop_pending(state)
+    frontend = sanitize_frontend_return(pending.return_to if pending else None, settings)
     if error:
-        return RedirectResponse(f"{settings.frontend_origin}/?oauth=error&provider=google&detail={error}")
+        return RedirectResponse(f"{frontend}/?oauth=error&provider=google&detail={error}")
     if not code:
         raise HTTPException(status_code=400, detail="Missing code")
 
@@ -76,10 +87,10 @@ async def google_callback(
                 ),
             }
         )
-        return RedirectResponse(f"{settings.frontend_origin}/?{qs}")
+        return RedirectResponse(f"{frontend}/?{qs}")
 
     if pending is None or pending.user_id is None:
-        return _connect_error(settings, "google", "The connect request expired. Start adding the account again.")
+        return _connect_error(frontend, "google", "The connect request expired. Start adding the account again.")
     try:
         mailbox = upsert_google_mailbox(
             db,
@@ -90,7 +101,7 @@ async def google_callback(
         )
     except MailboxOwnedElsewhere as exc:
         db.rollback()
-        return _connect_error(settings, "google", exc.detail)
+        return _connect_error(frontend, "google", exc.detail)
     webhook_state, webhook_detail = await _register_connected_mailbox(
         db, mailbox, token_payload.get("access_token")
     )
@@ -107,21 +118,30 @@ async def google_callback(
             "detail": webhook_detail,
         }
     )
-    return RedirectResponse(f"{settings.frontend_origin}/?{qs}")
+    return RedirectResponse(f"{frontend}/?{qs}")
 
 
 @router.get("/microsoft/start")
 def microsoft_start(
     email: str = Query(..., min_length=3),
     name: str | None = Query(default=None),
+    return_to: str | None = Query(default=None),
     user_id: int = Depends(require_user),
 ) -> RedirectResponse:
     email_clean = email.strip().lower()
     if "@" not in email_clean:
         raise HTTPException(status_code=400, detail="Enter a valid email address")
     display_name = (name or "").strip() or email_clean.split("@", 1)[0]
+    settings = get_settings()
     state = secrets.token_urlsafe(24)
-    put_pending(state, provider="microsoft", email=email_clean, name=display_name, user_id=user_id)
+    put_pending(
+        state,
+        provider="microsoft",
+        email=email_clean,
+        name=display_name,
+        user_id=user_id,
+        return_to=sanitize_frontend_return(return_to, settings),
+    )
     return RedirectResponse(microsoft_auth_url(state, login_hint=email_clean))
 
 
@@ -135,8 +155,9 @@ async def microsoft_callback(
 ) -> RedirectResponse:
     settings = get_settings()
     pending = pop_pending(state)
+    frontend = sanitize_frontend_return(pending.return_to if pending else None, settings)
     if error:
-        return RedirectResponse(f"{settings.frontend_origin}/?oauth=error&provider=microsoft&detail={error}")
+        return RedirectResponse(f"{frontend}/?oauth=error&provider=microsoft&detail={error}")
     if not code:
         raise HTTPException(status_code=400, detail="Missing code")
 
@@ -155,10 +176,10 @@ async def microsoft_callback(
                 ),
             }
         )
-        return RedirectResponse(f"{settings.frontend_origin}/?{qs}")
+        return RedirectResponse(f"{frontend}/?{qs}")
 
     if pending is None or pending.user_id is None:
-        return _connect_error(settings, "microsoft", "The connect request expired. Start adding the account again.")
+        return _connect_error(frontend, "microsoft", "The connect request expired. Start adding the account again.")
     try:
         mailbox = upsert_microsoft_mailbox(
             db,
@@ -169,7 +190,7 @@ async def microsoft_callback(
         )
     except MailboxOwnedElsewhere as exc:
         db.rollback()
-        return _connect_error(settings, "microsoft", exc.detail)
+        return _connect_error(frontend, "microsoft", exc.detail)
     webhook_state, webhook_detail = await _register_connected_mailbox(
         db, mailbox, token_payload.get("access_token")
     )
@@ -186,12 +207,12 @@ async def microsoft_callback(
             "detail": webhook_detail,
         }
     )
-    return RedirectResponse(f"{settings.frontend_origin}/?{qs}")
+    return RedirectResponse(f"{frontend}/?{qs}")
 
 
-def _connect_error(settings, provider: str, detail: str) -> RedirectResponse:
+def _connect_error(frontend: str, provider: str, detail: str) -> RedirectResponse:
     qs = urlencode({"oauth": "error", "provider": provider, "detail": detail})
-    return RedirectResponse(f"{settings.frontend_origin}/?{qs}")
+    return RedirectResponse(f"{frontend}/?{qs}")
 
 
 async def _register_connected_mailbox(

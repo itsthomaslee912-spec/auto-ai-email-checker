@@ -196,6 +196,12 @@ function buildHtmlDocument(html: string, theme: AppTheme): string {
     letter-spacing: 0.01em;
     word-break: break-word;
     overflow-wrap: anywhere;
+    user-select: text !important;
+    -webkit-user-select: text !important;
+  }
+  body * {
+    user-select: text !important;
+    -webkit-user-select: text !important;
   }
   .email-canvas {
     max-width: 680px;
@@ -254,10 +260,31 @@ export default function EmailBody({ html, text, snippet }: Props) {
     return "";
   }, [sourceHtml, sourceText]);
 
-  const framedHtml = useMemo(
-    () => (htmlToRender ? buildHtmlDocument(fitColorsToTheme(htmlToRender, theme), theme) : ""),
-    [htmlToRender, theme],
+  // Large HTML walks the whole document to fix theme colors. Paint the snippet
+  // first, then fit colors after the reader header is on screen.
+  const deferFit = htmlToRender.length >= 40_000;
+  const immediateHtml = useMemo(
+    () => (htmlToRender && !deferFit ? buildHtmlDocument(fitColorsToTheme(htmlToRender, theme), theme) : ""),
+    [deferFit, htmlToRender, theme],
   );
+  const frameKey = `${theme}\0${htmlToRender}`;
+  const [framed, setFramed] = useState<{ key: string; html: string } | null>(null);
+  useEffect(() => {
+    if (!deferFit) return;
+    let cancel = false;
+    const handle = window.setTimeout(() => {
+      if (cancel) return;
+      setFramed({
+        key: frameKey,
+        html: buildHtmlDocument(fitColorsToTheme(htmlToRender, theme), theme),
+      });
+    }, 0);
+    return () => {
+      cancel = true;
+      window.clearTimeout(handle);
+    };
+  }, [deferFit, frameKey, htmlToRender, theme]);
+  const framedHtml = immediateHtml || (framed?.key === frameKey ? framed.html : "");
 
   const plainToRender = useMemo(() => {
     if (htmlToRender) return "";
@@ -266,16 +293,23 @@ export default function EmailBody({ html, text, snippet }: Props) {
     return mixed.text || sourceText || fallback;
   }, [htmlToRender, sourceText, fallback]);
 
+  if (htmlToRender && !framedHtml) {
+    return (
+      <div className="email-body-scroll plain-scroll" aria-busy="true">
+        <div className="reader-body plain">{fallback || "Loading message…"}</div>
+      </div>
+    );
+  }
+
   if (htmlToRender) {
     return (
       <div className="email-body-scroll">
         <iframe
           className="email-body-frame"
           aria-label="Email body"
-          sandbox=""
-          tabIndex={-1}
+          sandbox="allow-same-origin"
           srcDoc={framedHtml}
-          onFocus={(event) => event.currentTarget.blur()}
+          title="Email body"
         />
       </div>
     );

@@ -11,7 +11,14 @@ router = APIRouter(tags=["health"])
 
 
 @router.get("/api/health", response_model=HealthOut)
-def health(db: Session = Depends(get_db)) -> HealthOut:
+def health() -> HealthOut:
+    # Keep this free of DB/pool work so the process supervisor does not kill
+    # the API while reclassify or sync is using every connection.
+    return HealthOut(status="ok")
+
+
+@router.get("/api/health/ready", response_model=HealthOut)
+def health_ready(db: Session = Depends(get_db)) -> HealthOut:
     db.execute(text("SELECT 1"))
     return HealthOut(status="ok")
 

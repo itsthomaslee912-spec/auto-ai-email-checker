@@ -26,7 +26,9 @@ async def start_gmail_watch(db: Session, mailbox: MailboxConnection, access_toke
             headers={"Authorization": f"Bearer {access_token}"},
             json={
                 "topicName": settings.gmail_pubsub_topic,
-                "labelIds": ["SENT", "DRAFT"],
+                # Keep drafts out. Sent must notify: proposed interview times
+                # only exist on the candidate's Sent reply.
+                "labelIds": ["DRAFT"],
                 "labelFilterAction": "exclude",
             },
         )

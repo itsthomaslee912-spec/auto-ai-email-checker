@@ -45,6 +45,7 @@ import SignInAccountsPanel from "../components/SignInAccountsPanel";
 
 export type SettingsSection = "signin" | "accounts" | "appearance" | "ai" | "training" | "statistics";
 
+const ADMIN_SETTINGS_SECTIONS = new Set<SettingsSection>(["ai", "training", "statistics"]);
 const TRAINING_PAGE_SIZE = 20;
 const DEFAULT_GEMINI_MODELS = [
   "gemini-3.8-flash",
@@ -472,10 +473,20 @@ export default function SettingsPage({
     { id: "signin", label: "Sign-in" },
     { id: "accounts", label: "Email accounts" },
     { id: "appearance", label: "Appearance" },
-    { id: "ai", label: "AI model" },
-    { id: "training", label: "Training" },
-    { id: "statistics", label: "Statistics" },
+    ...(sessionUser.is_admin
+      ? ([
+          { id: "ai", label: "AI model" },
+          { id: "training", label: "Training" },
+          { id: "statistics", label: "Statistics" },
+        ] as const)
+      : []),
   ];
+
+  useEffect(() => {
+    if (!sessionUser.is_admin && ADMIN_SETTINGS_SECTIONS.has(section)) {
+      onSectionChange("appearance");
+    }
+  }, [sessionUser.is_admin, section, onSectionChange]);
 
   return (
     <main className="settings-page" aria-labelledby="settings-title">

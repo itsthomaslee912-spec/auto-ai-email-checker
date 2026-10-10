@@ -314,6 +314,21 @@ def test_gmail_message_must_be_addressed_or_delivered_to_its_mailbox():
             {"name": "To", "value": "Recruiter <recruiter@example.com>"},
         ]}
     })
+    # Sent replies are From the connected account, not To it.
+    assert mailbox_sync._gmail_message_belongs_to_mailbox(mailbox, {
+        "labelIds": ["SENT"],
+        "payload": {"headers": [
+            {"name": "From", "value": "Ryan <ryan@example.com>"},
+            {"name": "To", "value": "Recruiter <recruiter@example.com>"},
+        ]}
+    })
+    assert not mailbox_sync._gmail_message_belongs_to_mailbox(mailbox, {
+        "labelIds": ["SENT"],
+        "payload": {"headers": [
+            {"name": "From", "value": "Thomas <thomas@example.com>"},
+            {"name": "To", "value": "Recruiter <recruiter@example.com>"},
+        ]}
+    })
     db.close()
     engine.dispose()
 

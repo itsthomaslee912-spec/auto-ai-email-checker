@@ -9,7 +9,9 @@ import {
   openEvents,
   fetchCalendarEvents,
   fetchCalendarEventEmails,
+  fetchEmailDetail,
   fetchPendingInterviews,
+  peekPendingInterviews,
   updateCalendarEvent,
   type CalendarEvent,
   type CalendarEventPayload,
@@ -33,8 +35,22 @@ const DAY_MINUTES = 24 * 60;
 const SNAP_MINUTES = 15;
 const DEFAULT_EVENT_DURATION_MINUTES = 30;
 const VISIBLE_WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+function decodeMailText(value: string) {
+  return value
+    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCodePoint(parseInt(code, 16)))
+    .replace(/&apos;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
 const CALENDAR_TIME_ZONE_KEY = "calendar-time-zone";
 const CALENDAR_STATUS_VIEW_KEY = "calendar-status-view";
+const CALENDAR_RANGE_CACHE = new Map<string, CalendarEvent[]>();
+const CALENDAR_RANGE_INFLIGHT = new Map<string, Promise<CalendarEvent[]>>();
+const CALENDAR_RANGE_CACHE_LIMIT = 12;
 const CALENDAR_STATUS_FILTERS: { value: CalendarStatusFilter; label: string }[] = [
   { value: "active", label: "Active" },
   { value: "passed", label: "Passed" },
@@ -115,6 +131,48 @@ function endExclusive(start: Date, view: ViewMode) {
   const followingMonth = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 1));
   return addDays(followingMonth, 7 - followingMonth.getUTCDay());
 }
+function rememberCalendarRange(key: string, rows: CalendarEvent[]) {
+  CALENDAR_RANGE_CACHE.set(key, rows);
+  if (CALENDAR_RANGE_CACHE.size <= CALENDAR_RANGE_CACHE_LIMIT) return;
+  const oldest = CALENDAR_RANGE_CACHE.keys().next().value;
+  if (oldest) CALENDAR_RANGE_CACHE.delete(oldest);
+}
+
+function calendarRangeKey(start: Date, end: Date, timeZone: string) {
+  return `${start.getTime()}|${end.getTime()}|${timeZone}`;
+}
+
+function fetchCalendarRange(start: Date, end: Date, timeZone: string, signal?: AbortSignal): Promise<CalendarEvent[]> {
+  const key = calendarRangeKey(start, end, timeZone);
+  const existing = CALENDAR_RANGE_INFLIGHT.get(key);
+  if (existing) return existing;
+  const promise = fetchCalendarEvents(
+    instantForWallDate(start, timeZone).toISOString(),
+    instantForWallDate(end, timeZone).toISOString(),
+    signal,
+  ).then((rows) => {
+    rememberCalendarRange(key, rows);
+    return rows;
+  }).finally(() => {
+    if (CALENDAR_RANGE_INFLIGHT.get(key) === promise) CALENDAR_RANGE_INFLIGHT.delete(key);
+  });
+  CALENDAR_RANGE_INFLIGHT.set(key, promise);
+  return promise;
+}
+
+/** Load the visible range before the calendar page opens, so the grid can paint from cache. */
+export function warmCalendarCache(): void {
+  const stored = localStorage.getItem("calendar-view");
+  const view: ViewMode = stored === "month" || stored === "day" || stored === "week" ? stored : "week";
+  const timeZone = loadCalendarTimeZone();
+  const anchor = wallDateForInstant(new Date(), timeZone);
+  const start = rangeStart(anchor, view);
+  const end = view === "month" ? addDays(start, 42) : endExclusive(start, view);
+  if (CALENDAR_RANGE_CACHE.has(calendarRangeKey(start, end, timeZone))) return;
+  void fetchCalendarRange(start, end, timeZone).catch(() => {});
+  void fetchPendingInterviews().catch(() => {});
+}
+
 function rangeStart(anchor: Date, view: ViewMode) {
   if (view === "day") return startOfDay(anchor);
   if (view === "week") return startOfWeek(anchor);
@@ -148,11 +206,13 @@ function formatInterviewTimeRange(event: CalendarEvent, timeZone: string) {
   const startParts = partsInTimeZone(startInstant, timeZone);
   const endParts = partsInTimeZone(endInstant, timeZone);
   const sameDay = startParts.year === endParts.year && startParts.month === endParts.month && startParts.day === endParts.day;
-  const start = cachedDateTime(timeZone, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }, startInstant);
-  const end = sameDay
-    ? formatClock(event.end_at, timeZone)
-    : cachedDateTime(timeZone, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }, endInstant);
-  return `${start} – ${end}`;
+  const dateOptions: Intl.DateTimeFormatOptions = { weekday: "short", month: "short", day: "numeric" };
+  const startDate = cachedDateTime(timeZone, dateOptions, startInstant);
+  const startClock = formatClock(event.start_at, timeZone);
+  const endClock = formatClock(event.end_at, timeZone);
+  if (sameDay) return `${startDate}, ${startClock} – ${endClock}`;
+  const endDate = cachedDateTime(timeZone, dateOptions, endInstant);
+  return `${startDate}, ${startClock} – ${endDate}, ${endClock}`;
 }
 function InterviewTimeRange({ event, timeZone }: { event: CalendarEvent; timeZone: string }) {
   const startInstant = new Date(event.start_at);
@@ -1041,12 +1101,12 @@ function editorFor(date: Date, mailboxId: number, timeZone: string, event?: Cale
   return { id: event?.id, mailbox_id: event?.mailbox_id ?? mailboxId, title: event?.title ?? "Interview", company: event?.company ?? "", role: event?.role ?? "", interviewer: event?.interviewer ?? "", work_model: event?.work_model ?? "unspecified", application_status: event?.application_status ?? "active", interview_status: event?.interview_status ?? "confirmation", start: localInput(start), end: localInput(end), description: event?.description ?? "", job_url: event?.job_url ?? "", meeting_type: event?.meeting_type === "phone" ? "phone" : "video", meeting_provider: event?.meeting_provider ?? "", meeting_url: event?.meeting_url ?? "", phone_number: event?.phone_number ?? "", phone_access_code: event?.phone_access_code ?? "" };
 }
 
-function CalendarLoading() {
+function CalendarLoading({ soft = false }: { soft?: boolean }) {
   return (
-    <div className="calendar-loading" role="status" aria-live="polite">
+    <div className={`calendar-loading${soft ? " is-soft" : ""}`} role="status" aria-live="polite">
       <div className="calendar-loading-card">
         <span className="calendar-loading-bar" aria-hidden="true"><span /></span>
-        <span className="calendar-loading-copy">Loading calendar</span>
+        <span className="calendar-loading-copy">{soft ? "Updating…" : "Loading calendar"}</span>
       </div>
     </div>
   );
@@ -1106,7 +1166,17 @@ const MonthDayCell = memo(function MonthDayCell({
 
 type DragSelection = { dayIndex: number; startMinutes: number; endMinutes: number };
 
-export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailboxes: Mailbox[]; refreshKey: number; onClose: () => void }) {
+export default function CalendarPage({
+  mailboxes,
+  refreshKey,
+  active = true,
+  onClose,
+}: {
+  mailboxes: Mailbox[];
+  refreshKey: number;
+  active?: boolean;
+  onClose: () => void;
+}) {
   const [view, setView] = useState<ViewMode>(() => (localStorage.getItem("calendar-view") as ViewMode) || "week");
   const [timeZone, setTimeZone] = useState(loadCalendarTimeZone);
   const [anchor, setAnchor] = useState(() => wallDateForInstant(new Date(), timeZone));
@@ -1120,7 +1190,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
       return next;
     });
   }, []);
-  const [loading, setLoading] = useState(true); const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true); const [refreshing, setRefreshing] = useState(false); const [error, setError] = useState("");
   const [selected, setSelected] = useState<CalendarEvent | null>(null);
   const [monthDay, setMonthDay] = useState<Date | null>(null);
   const [detailsClosing, setDetailsClosing] = useState(false);
@@ -1133,7 +1203,6 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
   const [dragSelection, setDragSelection] = useState<DragSelection | null>(null);
   const [hourHeight, setHourHeight] = useState(HOUR_HEIGHT);
   const refreshRef = useRef(0);
-  const rangeCacheRef = useRef(new Map<string, CalendarEvent[]>());
   const abortRef = useRef<AbortController | null>(null);
   const detailsCloseTimer = useRef<number | null>(null);
   const sidebarCloseTimer = useRef<number | null>(null);
@@ -1142,39 +1211,74 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
   const dragRef = useRef<{ dayIndex: number; anchorMinutes: number } | null>(null);
   const start = useMemo(() => rangeStart(anchor, view), [anchor, view]);
   const end = useMemo(() => view === "month" ? addDays(start, 42) : endExclusive(start, view), [start, view]);
+  const rangeKey = `${start.getTime()}|${end.getTime()}|${timeZone}`;
+
+  const prefetchRange = useCallback((rangeStartDate: Date, rangeEndDate: Date, zone: string) => {
+    const key = calendarRangeKey(rangeStartDate, rangeEndDate, zone);
+    if (CALENDAR_RANGE_CACHE.has(key)) return;
+    void fetchCalendarRange(rangeStartDate, rangeEndDate, zone).catch(() => {});
+  }, []);
 
   const load = useCallback(async (mode: "foreground" | "background" = "foreground") => {
-    abortRef.current?.abort();
-    const request = ++refreshRef.current; const controller = new AbortController();
-    abortRef.current = controller;
+    const request = ++refreshRef.current;
+    const hasCached = CALENDAR_RANGE_CACHE.has(rangeKey);
     if (mode === "foreground") {
-      setLoading(true);
       setError("");
+      if (!hasCached) setLoading(true);
+      else setRefreshing(true);
+    } else {
+      setRefreshing(true);
+    }
+    const joined = CALENDAR_RANGE_INFLIGHT.get(rangeKey);
+    if (!joined) {
+      abortRef.current?.abort();
+      abortRef.current = new AbortController();
     }
     try {
-      const rows = await fetchCalendarEvents(instantForWallDate(start, timeZone).toISOString(), instantForWallDate(end, timeZone).toISOString(), controller.signal);
+      const rows = await (joined ?? fetchCalendarRange(start, end, timeZone, abortRef.current?.signal));
       if (request === refreshRef.current) {
-        rangeCacheRef.current.set(`${start.getTime()}|${end.getTime()}|${timeZone}`, rows);
         setEvents(rows);
         setSelected((current) => current ? rows.find((event) => event.id === current.id) ?? current : null);
         setError("");
+        const spanDays = Math.max(1, Math.round((end.getTime() - start.getTime()) / 86_400_000));
+        void prefetchRange(addDays(start, -spanDays), start, timeZone);
+        void prefetchRange(end, addDays(end, spanDays), timeZone);
       }
     }
     catch (err) { if (request === refreshRef.current && (err as Error).name !== "AbortError") setError(err instanceof Error ? err.message : "Failed to load calendar"); }
-    finally { if (request === refreshRef.current) setLoading(false); }
-  }, [start.getTime(), end.getTime(), timeZone]);
+    finally {
+      if (request === refreshRef.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
+    }
+  }, [start, end, timeZone, rangeKey, prefetchRange]);
   const seenRefreshKey = useRef(refreshKey);
   useEffect(() => {
-    const cached = rangeCacheRef.current.get(`${start.getTime()}|${end.getTime()}|${timeZone}`);
-    if (cached) setEvents(cached);
+    const cached = CALENDAR_RANGE_CACHE.get(rangeKey);
+    if (cached) {
+      setEvents(cached);
+      setLoading(false);
+    }
     void load(cached ? "background" : "foreground");
     return () => abortRef.current?.abort();
-  }, [load]);
+  }, [load, rangeKey]);
   useEffect(() => {
     if (seenRefreshKey.current === refreshKey) return;
     seenRefreshKey.current = refreshKey;
     void load("background");
   }, [load, refreshKey]);
+  const skipReopenLoad = useRef(true);
+  useEffect(() => {
+    if (!active) return;
+    if (skipReopenLoad.current) {
+      skipReopenLoad.current = false;
+      return;
+    }
+    const cached = CALENDAR_RANGE_CACHE.get(rangeKey);
+    if (cached) setEvents(cached);
+    void load(cached ? "background" : "foreground");
+  }, [active]); // eslint-disable-line react-hooks/exhaustive-deps -- reopen should paint cache then refresh quietly
   useEffect(() => {
     const source = openEvents();
     let timer = 0;
@@ -1190,6 +1294,8 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
   }, [load]);
   const [pendingInterviews, setPendingInterviews] = useState<PendingInterview[]>([]);
   const loadPending = useCallback(async (signal?: AbortSignal) => {
+    const cached = peekPendingInterviews();
+    if (cached) setPendingInterviews(cached);
     try { setPendingInterviews(await fetchPendingInterviews(signal)); }
     catch (err) { if ((err as Error).name !== "AbortError") setPendingInterviews([]); }
   }, []);
@@ -1218,7 +1324,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
     if (sidebarCloseTimer.current != null) window.clearTimeout(sidebarCloseTimer.current);
   }, []);
   useLayoutEffect(() => {
-    if (view === "month") return;
+    if (!active || view === "month") return;
     const timeline = timelineRef.current;
     const header = timelineHeaderRef.current;
     if (!timeline || !header) return;
@@ -1234,7 +1340,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
     observer.observe(timeline);
     observer.observe(header);
     return () => observer.disconnect();
-  }, [view]);
+  }, [view, active]);
   useEffect(() => {
     if (view !== "month" && timelineRef.current) timelineRef.current.scrollTop = 7 * hourHeight;
     setDragSelection(null); dragRef.current = null;
@@ -1450,7 +1556,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
       <div className="calendar-board">
       {view === "month" ? (
         <>
-        <section className="calendar-grid month" aria-busy={loading}>
+        <section className="calendar-grid month" aria-busy={loading || refreshing}>
           {VISIBLE_WEEKDAYS.map((day) => <div className="calendar-weekday" key={day}>{day}</div>)}
         {days.map((day, dayIndex) => <MonthDayCell
             key={day.toISOString()}
@@ -1478,7 +1584,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
         />}
         </>
       ) : (
-        <section ref={timelineRef} className={`calendar-time-grid ${view}`} aria-busy={loading} aria-label={`${view} calendar. Drag on a time range to create an event.`} style={{ "--day-count": days.length, "--hour-height": `${hourHeight}px`, "--day-height": `${hourHeight * HOURS.length}px` } as React.CSSProperties}>
+        <section ref={timelineRef} className={`calendar-time-grid ${view}`} aria-busy={loading || refreshing} aria-label={`${view} calendar. Drag on a time range to create an event.`} style={{ "--day-count": days.length, "--hour-height": `${hourHeight}px`, "--day-height": `${hourHeight * HOURS.length}px` } as React.CSSProperties}>
           <div ref={timelineHeaderRef} className="calendar-time-header">
             <div className="calendar-time-corner" />
             {days.map((day) => { const today = sameDay(day, nowInTimeZone); const weekday = new Intl.DateTimeFormat(undefined, { timeZone: "UTC", weekday: "short" }).format(day); const month = new Intl.DateTimeFormat(undefined, { timeZone: "UTC", month: "short" }).format(day); return <div className={`calendar-time-day-heading ${today ? "today" : ""}`} key={day.toISOString()}><span>{weekCrossesMonth ? `${weekday} ${month}` : weekday}</span><strong>{day.getUTCDate()}</strong></div>; })}
@@ -1507,6 +1613,7 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
         </section>
       )}
       {loading && <CalendarLoading />}
+      {!loading && refreshing && <CalendarLoading soft />}
       </div>
       {(selected || sidebarOpen || sidebarClosing) && <button className="calendar-panel-scrim" type="button" aria-label="Close calendar panel" onClick={selected ? closeEventDetails : toggleSidebar} />}
       {selected ? <aside className={`calendar-details ${detailsClosing ? "is-closing" : ""}`} aria-label="Event details" key={`details-${selected.id}`}>
@@ -1548,10 +1655,20 @@ export default function CalendarPage({ mailboxes, refreshKey, onClose }: { mailb
                 const statusMatches = messageStatus != null && selectedStatus?.key === messageStatus.key;
                 return <li key={message.id}>
                   {messageStatus && <div className="source-email-status-bar"><span className={`source-email-status ${messageStatus.className}`}>{messageStatus.label}</span>{statusMatches ? <span className="source-email-status-match">Confirmed for this interview</span> : <button type="button" disabled={statusSaving} onClick={() => void confirmInterviewStatus(messageStatus.key, messageStatus.applicationStatus)}>Confirm this status</button>}</div>}
-                  <button className="source-email-list-item" type="button" aria-expanded={expanded} onClick={() => setExpandedEmailId(expanded ? null : message.id)}>
+                  <button className="source-email-list-item" type="button" aria-expanded={expanded} onClick={() => {
+                    if (expanded) {
+                      setExpandedEmailId(null);
+                      return;
+                    }
+                    setExpandedEmailId(message.id);
+                    if (message.body_html) return;
+                    void fetchEmailDetail(message.id, false).then((detail) => {
+                      setEmailMessages((current) => current.map((item) => item.id === detail.id ? { ...item, ...detail } : item));
+                    }).catch(() => {});
+                  }}>
                     <span className="source-email-list-top"><strong>{message.subject || "(no subject)"}</strong><time dateTime={timestamp}>{formatDateTime(timestamp, timeZone)}</time></span>
                     <span className="source-email-meta">{message.sender}{message.interview_subtype && <><span>·</span>{message.interview_subtype.replaceAll("_", " ")}</>}</span>
-                    <span className="source-email-snippet">{message.snippet || message.body_text}</span>
+                    <span className="source-email-snippet">{decodeMailText(message.snippet || message.body_text)}</span>
                   </button>
                   {expanded && <div className="source-email-body"><EmailBody html={message.body_html} text={message.body_text} snippet={message.snippet} /></div>}
                 </li>;
