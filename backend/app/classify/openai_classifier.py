@@ -92,6 +92,29 @@ def _combined_text(subject: str, sender: str, body_text: str, snippet: str) -> s
     return raw.replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-")
 
 
+def _primary_message_text(subject: str, sender: str, body_text: str, snippet: str) -> str:
+    """Return the new message, excluding the quoted thread when possible.
+
+    Offer language is especially common in quoted job descriptions and older
+    thread messages.  Treating the entire thread as the sender's new intent was
+    the main source of false ``offer`` labels.
+    """
+    message = body_text or snippet or ""
+    quote_markers = (
+        r"\n\s*-{2,}\s*original message\s*-{2,}",
+        r"\n\s*on .{0,240} wrote:\s*",
+        r"\n\s*from:\s*[^\n]+\n(?:sent|date|to|subject):",
+        r"\n\s*_{5,}\s*\n",
+    )
+    cutoff = len(message)
+    for marker in quote_markers:
+        match = re.search(marker, message, flags=re.IGNORECASE)
+        if match:
+            cutoff = min(cutoff, match.start())
+    raw = f"{subject}\n{sender}\n{message[:cutoff]}".lower()
+    return raw.replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-")
+
+
 def _is_pre_interview_screen(text: str) -> bool:
     """Written screening for a named role — interview is not booked yet."""
     before_booking = any(
@@ -141,6 +164,9 @@ def _is_application_received(text: str) -> bool:
         r"\bone of our team members will get in touch\b",
         r"\bin the coming weeks to schedule an interview\b",
         r"\breview (them|applications) as quickly as possible\b",
+        r"\bthanks? for completing your application\b",
+        r"\b(?:currently |now )?reviewing your application\b",
+        r"\byour resume is now in the hands of\b",
     ]
     return any(re.search(p, text) for p in receipts)
 
@@ -160,21 +186,10 @@ def _is_hypothetical_interview(text: str) -> bool:
 
 def _is_true_interview_invite(text: str) -> bool:
     """Candidate-directed interview scheduling — not JD wording or screening Qs."""
-    if _is_pre_interview_screen(text):
-        return False
-    if _is_application_received(text):
-        return False
-    if _looks_like_cold_jd_blast(text):
-        return False
-    if _is_hypothetical_interview(text) and not re.search(
-        r"\b(confirmed for your interview|your interview (is|has been)|i('ll| will) call you)\b",
-        text,
-    ):
-        return False
     patterns = [
         r"\byou are confirmed for your interview\b",
         r"\bconfirmed for your interview\b",
-        r"\binvite[d]?\s+you\s+to\s+(an\s+)?interview\b",
+        r"\binvite[d]?\s+you\s+to\s+(?:an?\s+)?(?:in[- ]?person\s+|virtual\s+|phone\s+|video\s+)?interview\b",
         r"\bplease\s+(book|schedule)\s+(a|your)\s+(time|slot|interview)\b",
         r"\byour\s+interview\s+(is|has been|will be)\b",
         r"\binterview\s+(invitation|invite)\b",
@@ -187,8 +202,27 @@ def _is_true_interview_invite(text: str) -> bool:
         r"\b(interview|meeting)\b.{0,100}\b(scheduling link|choose a time|pick a slot)\b",
         r"\b(scheduling link|choose a time|pick a slot|book your interview)\b.{0,100}\binterview\b",
         r"\bbook your interview\b",
+        # A recruiter directly proposing a call now is offering a slot to book,
+        # not describing an asynchronous screening task or a hypothetical future
+        # stage — so these are gated more loosely than the bare nouns "phone
+        # screen"/"recruiter screen" would be (those fire on generic process
+        # descriptions like "they will contact you for a phone screen").
+        r"\bschedule\s+(?:a\s+)?(?:quick\s+|brief\s+)?(?:intro|introductory|recruiter|phone|video)?\s*call\b",
+        r"\blet'?s\s+schedule\s+a\s+(?:quick\s+)?call\b",
+        r"\bset up a\s+(?:quick|brief|preliminary)?\s*(?:call|chat)\b",
+        r"\bschedule\s+(?:a\s+)?time\s+(?:for us\s+)?to\s+(?:chat|connect|talk)\b",
+        r"\blet (?:us|me) know\s+(?:a few times|when you (?:might be|are) (?:free|available))\b",
+        r"\bcould you please suggest some times\b",
     ]
-    return any(re.search(p, text) for p in patterns)
+    if any(re.search(p, text) for p in patterns):
+        return True
+    if _is_pre_interview_screen(text):
+        return False
+    if _is_application_received(text):
+        return False
+    if _looks_like_cold_jd_blast(text):
+        return False
+    return False
 
 
 def _is_true_rejection(text: str) -> bool:
@@ -199,18 +233,17 @@ def _is_true_rejection(text: str) -> bool:
         r"\byou have reached that limit\b",
         r"\breached (the|that|our) (application )?limit\b",
         r"\bwe have decided to move forward with other candidates?\b",
-        r"\bunfortunately\b.*\b(your application|this role|this position|your candidacy)\b",
+        r"\bunfortunately\b.{0,60}\b(your application|this role|this position|your candidacy)\b",
         r"\bwe\s+have\s+decided\s+to\s+move\s+forward\b",
         r"\bwill\s+not\s+be\s+progressing\b",
         r"\bnot been selected\b",
         r"\byou have not been selected to move forward\b",
         r"\bwe(?:['’]ve|\s+have) decided to move forward\b",
         r"\b(?:have\s+)?made the decision to move forward\b",
-        r"\bmov(?:e|ing)\s+forward\s+with\s+(?:other\s+)?candidates\b",
+        r"\bmov(?:e|ed|ing)\s+forward\s+with\s+(?:other|another)\s+candidates?\b",
         r"\bexperience aligns more directly\b",
         r"\bexperience more closely aligns\b",
         r"\baligns more directly to what this (?:specific )?role needs\b",
-        r"\bunfortunately\b.{0,240}\bmove forward\b",
         r"\b(?:this )?(?:position|role|job) is not available in your (?:current )?location\b",
         r"\bnot available in your (?:current )?location\b",
         r"\bonly registered to hire\b",
@@ -219,9 +252,25 @@ def _is_true_rejection(text: str) -> bool:
         r"\bnot (?:able|eligible) to hire (?:you )?(?:in|from) your (?:current )?location\b",
         r"\bproceed with (?:other\s+)?candidates\b",
         r"\bdecided to proceed with (?:other\s+)?candidates\b",
-        r"\b(?:the|this) (?:role|position|job) (?:has been|is) filled\b",
+        r"\bdecided to pursue (?:other|another) candidates?\b",
+        r"\bpursue (?:other|another) candidates? who\b",
+        r"\b(?:the|this) (?:role|position|job) (?:has (?:now |already )?been|is(?: now)?) filled\b",
         r"\b(?:the|this) (?:role|position|job) (?:has been|is) closed\b",
         r"\bbetter align with our current hiring needs\b",
+        r"\b(?:your|the|this job) application (?:has been|was) removed\b",
+        r"\bapplication (?:has )?expired\b",
+        r"\bapplication was not completed within\b",
+        r"\b(?:unable|not able) to invite you to (?:an? )?interview\b",
+        r"\bnot to (?:move|proceed|continue) forward\b",
+        r"\b(?:won'?t|will not) be (?:moving|proceeding)(?: you)? forward\b",
+        r"\b(?:won'?t|will not) be proceeding with (?:your |the )?application\b",
+        r"\bunable to proceed with (?:your |the )?application\b",
+        r"\bdecided not to proceed with (?:your |the )?application\b",
+        r"\b(?:was|were) not selected for (?:the next step|further consideration)\b",
+        r"\b(?:won'?t|will not) be moving forward with your candidacy\b",
+        r"\bcontinue with candidates whose experience\b",
+        r"\bwill not be inviting you to the next (?:phase|stage|round)\b",
+        r"\bisn'?t the strongest match for the role\b",
     ]
     return any(re.search(p, text) for p in patterns)
 
@@ -235,11 +284,29 @@ def _is_true_screening(text: str) -> bool:
     return any(
         re.search(p, text)
         for p in [
-            r"\bphone\s+screen\b",
-            r"\brecruiter\s+screen\b",
-            r"\bscreening\s+call\b",
-            r"\bschedule\s+a\s+(quick\s+)?(intro|introductory|recruiter)\s+call\b",
-            r"\blet'?s\s+schedule\s+a\s+(quick\s+)?call\b",
+            r"\bplease (?:see|find) my (?:answers|responses) below\b",
+            r"\bmy (?:answers|responses) (?:are )?(?:below|inline)\b",
+        ]
+    )
+
+
+def _is_explicit_screening_invite(text: str) -> bool:
+    """An asynchronous screen (questionnaire/voice bot), not a request to book a call.
+
+    A request to schedule any kind of call — even one called a "phone screen" or
+    "recruiter screen" — is the candidate's next scheduling step, so it belongs to
+    interview_invitation. Only an explicit, non-call screening task stays here.
+    """
+    return any(
+        re.search(p, text)
+        for p in [
+            r"\binvited?\s+(?:you\s+)?to\s+(?:participate in\s+|complete\s+|do\s+)?(?:our\s+|a\s+|the\s+)?(?:brief\s+)?screening\b",
+            r"\byou(?:'re| are) invited to (?:our |complete |the )?(?:brief )?screening\b",
+            r"\bvoice screening agent\b",
+            r"\bai voice screener\b",
+            r"\bcomplete (?:a |the |your )?(?:required )?screening questions\b",
+            r"\b(?:invitation to complete|complete (?:your|a))\b.{0,30}\bvideo interview\b",
+            r"\bai interview to be considered\b",
         ]
     )
 
@@ -377,6 +444,10 @@ def _ics_books_one_appointment(text: str) -> bool:
 def _is_scheduled_interview(text: str) -> bool:
     if _looks_like_cold_jd_blast(text) or _is_application_received(text):
         return False
+    # A recorded/async video-interview task (myInterview, HireVue-style) has no
+    # confirmed time; a reminder to "complete" it is not a scheduled interview.
+    if re.search(r"\b(?:invitation to complete|complete (?:your|a))\b.{0,30}\bvideo interview\b", text):
+        return False
     if _ics_books_one_appointment(text):
         return True
     if re.search(r"\bbook time with me\b.{0,180}\band\b", text):
@@ -404,14 +475,36 @@ def _is_scheduled_interview(text: str) -> bool:
         r"\b(calendar invite|calendar invitation|reminder|reschedule|time change|different time|cancelled|canceled)\b.{0,120}\binterview\b",
         r"\binterview\b.{0,120}\b(calendar invite|calendar invitation|reminder|reschedule|time change|different time|cancelled|canceled)\b",
         r"\binterview(?:er)?\b.{0,100}\b(time has changed|different time|updated time)\b",
+        # Scheduling-tool confirmations ("Scheduled: X <> Y") and bare Google
+        # Calendar invites often say "meeting", not "interview" — but in this
+        # recruiting inbox a scheduled meeting chip is the same event.
+        r"\byour meeting with\b.{0,80}\b(?:has been scheduled|is confirmed)\b",
+        r"\binvitation from an unknown sender\b.{0,120}\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b",
     ))
 
 
 def _is_application_action_required(text: str) -> bool:
+    # A candidate-portal access code or identity check is inherently an
+    # administrative step on an application, even when the message itself
+    # never says "application" (e.g. a bare ADP/Workday verification code).
+    account_access_patterns = (
+        r"\bverification code\b",
+        r"\bsecurity code\b",
+        r"\baccess code\b",
+        r"\bconfirm your identity\b",
+        r"\bmultifactor authentication\b",
+        r"\b(?:enter|use|copy and paste) this code\b",
+        r"\bcandidate (?:account|home)\b",
+        r"\bconfirm your email address and complete setup for your candidate\b",
+    )
+    if any(re.search(p, text) for p in account_access_patterns):
+        return True
     if not re.search(r"\b(application|candidate|profile|resume|cv|job portal|workday)\b", text):
         return False
     return any(re.search(pattern, text) for pattern in (
-        r"\b(complete|finish|update) (your|the) (profile|application)\b",
+        # "feel free to update your profile ... as needed" is an optional
+        # courtesy mention in a closing paragraph, not a required next step.
+        r"(?<!feel free to )\b(complete|finish|update) (your|the) (profile|application)\b(?! as needed)",
         r"\b(upload|submit) (your|the|a) (resume|cv|missing (information|documents?))\b",
         r"\b(reset|set) (your|the) password\b",
         r"\b(missing information|action required|additional information required)\b",
@@ -428,32 +521,73 @@ def _is_interview_follow_up(text: str) -> bool:
 
 
 def _is_offer(text: str) -> bool:
+    """Require evidence of an actual employment offer or post-offer step.
+
+    Generic benefits/compensation language is present in many job descriptions,
+    so it must never be sufficient by itself.
+    """
     return any(re.search(pattern, text) for pattern in (
         r"\boffer letter\b",
+        r"\b(?:formal|written) (?:employment )?offer\b",
+        r"\boffer of employment\b",
+        r"\b(pleased|excited|delighted) to (?:extend|make|present)?\s*(?:you )?an? offer\b",
         r"\b(pleased|excited|delighted) to offer you\b",
-        r"\bcompensation (package|details|discussion)\b",
+        r"\bextend(?:ing)? (?:you )?an offer\b",
         r"\bnegotiat\w* (your |the )?offer\b",
+        r"\b(?:accept|decline) (?:this|the|your) offer\b",
+        r"\b(?:you|we) (?:have |just )?signed (?:the |your )?offer\b",
+        r"\bsignature requested\b.{0,100}\boffer\b",
+        r"\boffer\b.{0,100}\bsignature requested\b",
+        r"\bsign (?:the |your )?offer\b",
+        r"\b(?:you have|you've|we have) accepted (?:our|the|your) offer\b",
+        r"\baccepted (?:our|the|your) offer\b.{0,180}\b(?:background|pre-hire|onboarding|start date)\b",
+        r"\b(?:pre-hire|onboarding) (?:process|tasks?|paperwork)\b",
+        r"\bbackground (?:check|verification)\b.{0,180}\b(?:accepted|offer|new hire|start date)\b",
     ))
 
 
 def _heuristic_label(subject: str, sender: str, body_text: str, snippet: str) -> str | None:
     text = _combined_text(subject, sender, body_text, snippet)
+    primary_text = _primary_message_text(subject, sender, body_text, snippet)
 
-    if _is_true_rejection(text):
+    if _is_true_rejection(primary_text):
         return EmailLabel.REJECTED_CLOSED.value
-    if _is_offer(text):
+    if _is_offer(primary_text):
         return EmailLabel.OFFER.value
     if _is_application_action_required(text):
         return EmailLabel.APPLICATION_ACTION_REQUIRED.value
     if _is_scheduled_interview(text):
         return EmailLabel.INTERVIEW_SCHEDULED.value
+    if _is_explicit_screening_invite(text):
+        return EmailLabel.SCREENING.value
     if _is_interview_follow_up(text):
         return EmailLabel.INTERVIEW_FOLLOW_UP.value
+    # Checked before the generic application-received receipt: a recruiter's
+    # "received your application" is often immediately followed by a direct
+    # scheduling ask, which is the stronger, more actionable signal.
+    if _is_true_interview_invite(text):
+        return EmailLabel.INTERVIEW_INVITATION.value
     if _is_application_received(text):
         return EmailLabel.APPLICATION_CONFIRMATION.value
     if _looks_like_cold_jd_blast(text):
         return EmailLabel.RECRUITMENT_ALERT.value
 
+    if re.search(r"\b(?:position|job) offer\b", subject.lower()) and re.search(
+        r"\bi am interested in (?:this|the) opportunity\b", primary_text
+    ):
+        return EmailLabel.RECRUITMENT_ALERT.value
+
+    if _is_true_assessment(text):
+        return EmailLabel.ASSESSMENT.value
+    if _is_pre_interview_screen(text) or _is_true_screening(text) or re.search(
+        r"\b(recruiter questionnaire|screening questions|availability questions|chatbot questions)\b", text
+    ):
+        return EmailLabel.SCREENING.value
+
+    # Weak, generic alert wording (a stray "unsubscribe" footer, "job alert" used
+    # in passing) is checked last, only once nothing more specific matched — it
+    # was otherwise clobbering unrelated mail and even genuine application/
+    # screening/interview messages that happen to share a marketing footer.
     alert_signals = [
         "jobs that might interest you",
         "new jobs that might interest",
@@ -461,7 +595,6 @@ def _heuristic_label(subject: str, sender: str, body_text: str, snippet: str) ->
         "job notification",
         "see all opportunities",
         "view all the jobs",
-        "unsubscribe",
         "you have an interesting background",
         "fast track your application",
         "we are currently working with one of our top clients",
@@ -474,15 +607,6 @@ def _heuristic_label(subject: str, sender: str, body_text: str, snippet: str) ->
     ]
     if any(s in text for s in alert_signals):
         return EmailLabel.RECRUITMENT_ALERT.value
-
-    if _is_true_assessment(text):
-        return EmailLabel.ASSESSMENT.value
-    if _is_pre_interview_screen(text) or _is_true_screening(text) or re.search(
-        r"\b(recruiter questionnaire|screening questions|availability questions|chatbot questions)\b", text
-    ):
-        return EmailLabel.SCREENING.value
-    if _is_true_interview_invite(text):
-        return EmailLabel.INTERVIEW_INVITATION.value
     return None
 
 
@@ -537,8 +661,11 @@ async def classify_email(
         )
 
     client = backend.client() if backend.provider in {"ollama", "gemini"} else AsyncOpenAI(api_key=backend.api_key)
+    latest_message = _primary_message_text("", "", body_text, snippet).strip()
     user_content = (
-        f"From: {sender}\nSubject: {subject}\nSnippet: {snippet}\n\nBody:\n{body_text[:6000]}"
+        f"From: {sender}\nSubject: {subject}\nSnippet: {snippet}\n\n"
+        f"Latest unquoted message (primary classification evidence):\n{latest_message[:3000]}\n\n"
+        f"Full thread (context only; do not treat quoted text as the latest sender's intent):\n{body_text[:5000]}"
     )
     try:
         response = await client.chat.completions.create(
