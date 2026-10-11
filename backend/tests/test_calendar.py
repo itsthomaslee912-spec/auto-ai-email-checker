@@ -16,7 +16,7 @@ from sqlalchemy.pool import StaticPool
 from app.api import calendar_events, emails
 from app.db import Base, get_db
 from app.models import CalendarEvent, CalendarEventEmail, EmailLabel, EmailMessage, MailboxConnection, Provider, User
-from app.services.calendar_extract import InterviewDetails, MeetingAccess, _parse_ai_slot, _resolve_video_landing_page, _without_quoted_history, clean_company_name, collapse_duplicate_calendar_events, companies_match, employer_instead_of_sender_domain, explicit_hiring_employer, extract_calendar_details, extract_interviewer, extract_meeting_access, fuller_company_name, hide_open_reschedules, is_interview_stage_label, job_role_or_empty, leaves_interview_unbooked, message_appointment_slots, message_is_booked_appointment, needs_calendar_event_repair, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details, repair_availability_window_appointments, repair_interview_stage_roles, repair_meeting_join_urls, repair_phantom_availability_slots, repair_quoted_option_bookings
+from app.services.calendar_extract import InterviewDetails, MeetingAccess, _parse_ai_slot, _resolve_video_landing_page, _without_quoted_history, clean_company_name, collapse_duplicate_calendar_events, companies_match, employer_instead_of_sender_domain, explicit_hiring_employer, extract_calendar_details, extract_interviewer, extract_meeting_access, fuller_company_name, hide_open_reschedules, is_interview_stage_label, job_role_or_empty, leaves_interview_unbooked, message_appointment_slots, message_is_booked_appointment, needs_calendar_event_repair, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details, repair_availability_window_appointments, repair_interview_stage_roles, repair_meeting_join_urls, repair_meeting_landing_urls, repair_phantom_availability_slots, repair_quoted_option_bookings
 
 
 def _database():
@@ -79,6 +79,18 @@ def test_named_video_provider_is_preserved_without_a_direct_join_url():
     assert access == MeetingAccess("video", "Google Meet")
 
 
+def test_government_microsoft_teams_join_link_is_recognized():
+    url = (
+        "https://gov.teams.microsoft.us/l/meetup-join/"
+        "19%3agcch%3ameeting_9a19e26025d14a18849ea9108d09ca21%40thread.v2/0"
+        "?context=%7b%22Tid%22%3a%2277443add-4970-475d-8910-7855da11b574%22%7d"
+    )
+
+    access = extract_meeting_access(f"Microsoft Teams meeting\nJoin: {url}\\nMeeting ID: 992518179706")
+
+    assert access == MeetingAccess("video", "Microsoft Teams", url)
+
+
 def test_zoom_branding_image_is_not_used_as_the_join_link():
     from app.services.calendar_extract import is_video_join_url
 
@@ -126,7 +138,7 @@ def test_repair_replaces_zoom_branding_url_with_join_link():
             job_role="Staff Software Engineer - AI/ML Platform",
             start_at=datetime(2026, 10, 5, 17, 15, tzinfo=timezone.utc),
             end_at=datetime(2026, 10, 5, 17, 45, tzinfo=timezone.utc),
-            meeting_type="video",
+            meeting_type="unspecified",
             meeting_provider="Zoom",
             meeting_url="https://zoom.us/account/branding/p/594",
             is_visible=True,
@@ -136,6 +148,66 @@ def test_repair_replaces_zoom_branding_url_with_join_link():
         assert repair_meeting_join_urls(db) >= 1
         db.commit()
         assert event.meeting_url == "https://fanatics.zoom.us/j/91763586848?pwd=uPKCWZIARXwGitIxdu4dw3u8VGiu8N.1"
+
+
+def test_repair_uses_a_linked_invite_for_the_same_appointment():
+    factory, (mailbox_id, _) = _database()
+    start = datetime(2026, 10, 13, 16, tzinfo=timezone.utc)
+    join_url = (
+        "https://gov.teams.microsoft.us/l/meetup-join/"
+        "19%3ameeting_9a19e26025d14a18849ea9108d09ca21%40thread.v2/0"
+    )
+    with factory() as db:
+        reply = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="rivet-reply",
+            subject="RE: Next Steps with Rivet Industries",
+            sender="recruiter@rivet.us",
+            received_at=datetime(2026, 10, 5, 17, 29, tzinfo=timezone.utc),
+            body_text="Your interview was rescheduled. I sent an updated invite.",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+        )
+        invite = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="rivet-invite",
+            subject="Interview with Rivet Industries",
+            sender="recruiter@rivet.us",
+            received_at=datetime(2026, 10, 5, 17, 27, tzinfo=timezone.utc),
+            body_text=(
+                f"Join: {join_url}\nBEGIN:VCALENDAR\nBEGIN:VEVENT\n"
+                "DTSTART:20261013T160000Z\nDTEND:20261013T161500Z\n"
+                "END:VEVENT\nEND:VCALENDAR"
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+        )
+        db.add_all([reply, invite])
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=reply.id,
+            kind="confirmed",
+            origin="email",
+            title="Rivet Industries — ML Researcher",
+            company="Rivet Industries",
+            job_role="ML Researcher",
+            start_at=start,
+            end_at=start + timedelta(minutes=15),
+            meeting_type="video",
+            meeting_provider="Microsoft Teams",
+            is_visible=True,
+        )
+        db.add(event)
+        db.flush()
+        db.add_all([
+            CalendarEventEmail(event_id=event.id, email_id=reply.id),
+            CalendarEventEmail(event_id=event.id, email_id=invite.id),
+        ])
+        db.commit()
+
+        assert repair_meeting_join_urls(db, mailbox_id) == 1
+        assert event.meeting_url == join_url
+        collapse_duplicate_calendar_events(db, mailbox_id)
+        assert event.meeting_url == join_url
 
 
 def test_teamtailor_landing_page_resolves_provider_join_url(monkeypatch):
@@ -166,6 +238,114 @@ def test_teamtailor_landing_page_resolves_provider_join_url(monkeypatch):
     assert access == MeetingAccess(
         "video", "Google Meet", "https://meet.google.com/abc-defg-hij"
     )
+
+
+def test_paradox_join_link_resolves_to_provider_url(monkeypatch):
+    landing_url = "https://olivia.paradox.ai/Tu4qc3Vh"
+    teams_url = (
+        "https://teams.microsoft.com/l/meetup-join/"
+        "19%3ameeting_MDY0NTZmN2EtNWY2NC00MTI3LWI3ZjMtODQ5OWY5OTBhMjBi%40thread.v2/0"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == landing_url:
+            return httpx.Response(302, headers={"location": teams_url})
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "app.services.calendar_extract.httpx.AsyncClient",
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+
+    access = asyncio.run(
+        _resolve_video_landing_page(
+            f"Click here to join the interview by Microsoft Teams: {landing_url}"
+        )
+    )
+
+    assert access == MeetingAccess("video", "Microsoft Teams", teams_url)
+
+
+def test_paradox_short_domain_resolves_through_allow_listed_host(monkeypatch):
+    short_url = "https://oli.vi/zuAeempA"
+    landing_url = "https://olivia.paradox.ai/zuAeempA"
+    teams_url = "https://teams.microsoft.com/l/meetup-join/19%3ameeting_abcdef123456%40thread.v2/0"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == short_url:
+            return httpx.Response(308, headers={"location": landing_url})
+        if str(request.url) == landing_url:
+            return httpx.Response(302, headers={"location": teams_url})
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "app.services.calendar_extract.httpx.AsyncClient",
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+
+    access = asyncio.run(_resolve_video_landing_page(f"Join Microsoft Teams: {short_url}"))
+
+    assert access == MeetingAccess("video", "Microsoft Teams", teams_url)
+
+
+@pytest.mark.parametrize(
+    ("url", "provider"),
+    [
+        ("https://record.interview.video/7679465494990026.pPAapvUwLTthGoCb8uRkH9", "Recorded Video Interview"),
+        ("https://meet.alex.com/mitchellmartin-29142320?sessionId=abc", "Alex Video Interview"),
+        ("https://example.pinpointhq.com/candidates/interview_parts/abc123/join", "Video Interview"),
+    ],
+)
+def test_direct_interview_platform_links_are_recognized(url, provider):
+    assert extract_meeting_access(f"Join your interview: {url}") == MeetingAccess("video", provider, url)
+
+
+def test_repair_resolves_missing_trusted_landing_page(monkeypatch):
+    factory, (mailbox_id, _) = _database()
+    landing_url = "https://olivia.paradox.ai/Tu4qc3Vh"
+    teams_url = "https://teams.microsoft.com/l/meetup-join/19%3ameeting_abcdef123456%40thread.v2/0"
+
+    async def resolve(text: str):
+        assert landing_url in text
+        return MeetingAccess("video", "Microsoft Teams", teams_url)
+
+    monkeypatch.setattr("app.services.calendar_extract._resolve_video_landing_page", resolve)
+    with factory() as db:
+        email = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="pfizer-confirmed",
+            subject="Pfizer virtual interview Confirmed",
+            sender="assistant@pfizer.com",
+            body_text=f"Click here to join the interview by Microsoft Teams: {landing_url}",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+        )
+        db.add(email)
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=email.id,
+            kind="confirmed",
+            origin="email",
+            title="Pfizer — Interview",
+            company="Pfizer",
+            start_at=datetime(2026, 10, 15, 14, tzinfo=timezone.utc),
+            end_at=datetime(2026, 10, 15, 15, 30, tzinfo=timezone.utc),
+            meeting_type="video",
+            meeting_provider="Microsoft Teams",
+            is_visible=True,
+        )
+        db.add(event)
+        db.commit()
+
+        repaired = asyncio.run(repair_meeting_landing_urls(db, mailbox_id))
+
+        assert repaired == {mailbox_id}
+        assert event.meeting_type == "video"
+        assert event.meeting_url == teams_url
 
 
 def test_start_only_ics_defaults_to_thirty_minutes():
@@ -3248,6 +3428,81 @@ def test_quote_clock_availability_is_replaced_by_the_offered_window():
         assert event.is_visible is True
         assert event.start_at == datetime(2026, 10, 8, 18, tzinfo=timezone.utc)
         assert event.end_at == datetime(2026, 10, 8, 20, tzinfo=timezone.utc)
+
+
+def test_phantom_repair_does_not_append_a_duplicate_when_company_is_missing():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        email = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="companyless-offer",
+            thread_id="companyless-thread",
+            subject="",
+            sender="candidate@example.com",
+            received_at=datetime(2026, 10, 11, 14, tzinfo=timezone.utc),
+            body_text="October 13 at 10:00 a.m. Eastern works well for a phone call.",
+            label=EmailLabel.INTERVIEW_AVAILABILITY.value,
+            company="",
+            job_role="Staff Machine Learning Engineer",
+        )
+        db.add(email)
+        db.flush()
+        db.add(CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=email.id,
+            source_thread_id=email.thread_id,
+            slot_index=0,
+            kind="availability",
+            origin="email",
+            title=email.job_role,
+            company="",
+            job_role=email.job_role,
+            start_at=datetime(2026, 10, 13, 14, tzinfo=timezone.utc),
+            end_at=datetime(2026, 10, 13, 14, 30, tzinfo=timezone.utc),
+            is_visible=True,
+        ))
+        db.commit()
+
+        repair_phantom_availability_slots(db, mailbox_id)
+        db.commit()
+
+        rows = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == email.id).all()
+        assert len(rows) == 1
+        assert rows[0].is_visible is True
+
+
+def test_same_source_companyless_duplicate_chips_collapse():
+    factory, (mailbox_id, _) = _database()
+    start = datetime(2026, 10, 13, 14, tzinfo=timezone.utc)
+    with factory() as db:
+        email = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="duplicate-companyless-offer",
+            thread_id="duplicate-companyless-thread",
+            subject="",
+            sender="candidate@example.com",
+            received_at=datetime(2026, 10, 11, 14, tzinfo=timezone.utc),
+            body_text="October 13 at 10:00 a.m. Eastern works well.",
+            label=EmailLabel.INTERVIEW_AVAILABILITY.value,
+            company="",
+            job_role="Staff Machine Learning Engineer",
+        )
+        db.add(email)
+        db.flush()
+        db.add_all([
+            CalendarEvent(mailbox_id=mailbox_id, source_email_id=email.id, source_thread_id=email.thread_id, slot_index=0, kind="availability", origin="email", title=email.job_role, company="", job_role=email.job_role, start_at=start, end_at=start + timedelta(minutes=30), is_visible=True),
+            CalendarEvent(mailbox_id=mailbox_id, source_email_id=email.id, source_thread_id=email.thread_id, slot_index=1, kind="availability", origin="email", title=email.job_role, company="", job_role=email.job_role, start_at=start, end_at=start + timedelta(minutes=30), is_visible=True),
+        ])
+        db.commit()
+
+        assert collapse_duplicate_calendar_events(db, mailbox_id) is True
+        db.commit()
+
+        visible = db.query(CalendarEvent).filter(
+            CalendarEvent.source_email_id == email.id,
+            CalendarEvent.is_visible.is_(True),
+        ).all()
+        assert len(visible) == 1
 
 
 def test_bare_pacific_zone_is_the_accepted_time_not_a_quoted_option():

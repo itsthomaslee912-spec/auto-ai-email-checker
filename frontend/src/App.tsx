@@ -602,7 +602,12 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         if (!extra.length) return prev;
         return sortEmailsForInbox([...prev, ...extra], currentInboxType);
       });
-      applyPageMeta(page);
+      // Keep live badge totals from the first page and SSE/read updates. A
+      // later page can carry a cached snapshot from before a message was read.
+      setHasMore(page.has_more);
+      setNextCursor(page.next_cursor);
+      setNextReceivedAt(page.next_received_at ?? null);
+      setNextIsRead(page.next_is_read ?? null);
     } catch (err) {
       if (gen !== fetchGen.current) return;
       setError(err instanceof Error ? err.message : "Failed to load emails");
@@ -1591,6 +1596,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     setActivePage("inbox");
     const request = ++detailGen.current;
     const target = emails.find((item) => item.id === id);
+    const shouldMarkRead = Boolean(target && !target.is_read);
     const cached = peekEmailDetail(id) ?? null;
     setStickyUnreadId((current) => (current === id ? current : target && !target.is_read ? id : null));
     setSelectedId(id);
@@ -1609,13 +1615,15 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
       if (detail) {
         setSelected(detail);
         setLoadingDetail(false);
-        if (!detail.is_read) {
-          detail = await fetchEmailDetail(id, true);
+        // In conversation view the representative message can already be read
+        // while an older message in its thread is still unread.
+        if (shouldMarkRead || !detail.is_read) {
+          detail = await fetchEmailDetail(id, true, conversationView);
           if (request !== detailGen.current) return;
           setSelected(detail);
         }
       } else {
-        detail = await fetchEmailDetail(id, true);
+        detail = await fetchEmailDetail(id, true, conversationView);
         if (request !== detailGen.current) return;
         setSelected(detail);
       }

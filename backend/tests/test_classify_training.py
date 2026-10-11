@@ -26,7 +26,7 @@ from app.models import (
     Provider,
     User,
 )
-from app.services.prompt_update import PromptUpdateError, update_prompt_from_corrections
+from app.services.prompt_update import PromptUpdateError, _latest_corrections, update_prompt_from_corrections
 
 
 def _session_factory():
@@ -229,6 +229,74 @@ def test_prompt_update_receives_subtype_correction(monkeypatch):
     assert "Correct interview subtype: confirmation" in captured["content"]
     db.close()
     invalidate_prompt_cache()
+
+
+def test_training_uses_only_latest_correction_for_each_email():
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    email = _seed_email(db)
+    db.add_all([
+        ClassifyCorrection(
+            email_id=email.id,
+            previous_label=EmailLabel.RECRUITMENT_ALERT.value,
+            corrected_label=EmailLabel.OTHER.value,
+            subject="Same message",
+        ),
+        ClassifyCorrection(
+            email_id=email.id,
+            previous_label=EmailLabel.OTHER.value,
+            corrected_label=EmailLabel.RECRUITMENT_ALERT.value,
+            subject="Same message",
+        ),
+    ])
+    db.commit()
+
+    rows = _latest_corrections(db)
+    assert len(rows) == 1
+    assert rows[0].corrected_label == EmailLabel.RECRUITMENT_ALERT.value
+    db.close()
+
+
+def test_training_deduplicates_conflicting_copies_of_same_template():
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    first = _seed_email(db)
+    second = EmailMessage(
+        mailbox_id=first.mailbox_id,
+        provider_message_id="msg-template-copy",
+        subject="Thank you for applying",
+        sender="Talent <jobs@example.com>",
+        snippet="Dear Ryan, Thank you for applying. Unfortunately, we cannot proceed.",
+        body_text="Dear Ryan, Thank you for applying. Unfortunately, we cannot proceed with your application.",
+        label=EmailLabel.REJECTED_CLOSED.value,
+    )
+    db.add(second)
+    db.flush()
+    db.add_all([
+        ClassifyCorrection(
+            email_id=first.id,
+            previous_label=EmailLabel.REJECTED_CLOSED.value,
+            corrected_label=EmailLabel.APPLICATION_CONFIRMATION.value,
+            subject="Thank you for applying",
+            snippet="Dear Jordan, Thank you for applying. Unfortunately, we cannot proceed.",
+            body_text="Dear Jordan, Thank you for applying. Unfortunately, we cannot proceed with your application.",
+        ),
+        ClassifyCorrection(
+            email_id=second.id,
+            previous_label=EmailLabel.APPLICATION_CONFIRMATION.value,
+            corrected_label=EmailLabel.REJECTED_CLOSED.value,
+            subject="Thank you for applying",
+            snippet=second.snippet,
+            body_text=second.body_text,
+        ),
+    ])
+    db.commit()
+
+    rows = _latest_corrections(db)
+    assert len(rows) == 1
+    assert rows[0].email_id == second.id
+    assert rows[0].corrected_label == EmailLabel.REJECTED_CLOSED.value
+    db.close()
 
 
 def test_reclassify_query_skips_human_corrected():

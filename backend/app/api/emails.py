@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import base64
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from sqlalchemy import String, and_, cast, func, literal_column, or_
+from anyio import from_thread
+from sqlalchemy import String, and_, case, cast, func, literal_column, or_
 from sqlalchemy.orm import Session, defer, load_only, sessionmaker
 
 from app.auth.oauth_google import ensure_google_access_token
@@ -62,7 +64,7 @@ from app.schemas import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/emails", tags=["emails"])
-_label_effect_locks: dict[int, asyncio.Lock] = {}
+_label_effect_locks: dict[int, threading.Lock] = {}
 # Later pages of the same list reuse sidebar totals. The first page always recounts.
 _LIST_META_TTL_SECONDS = 30.0
 _list_meta_cache: dict[tuple, tuple[float, dict]] = {}
@@ -154,11 +156,13 @@ def _apply_unread_first_cursor(
     before_id: int,
     before_received_at: datetime | None,
     before_is_read: bool | None,
+    is_read_expr=None,
 ):
     cursor_read = bool(before_is_read) if before_is_read is not None else False
+    read_expr = is_read_expr if is_read_expr is not None else _is_unread_expr()
 
     def same_bucket_older(is_read_value: bool):
-        bucket_expr = _is_unread_expr().is_(is_read_value)
+        bucket_expr = read_expr.is_(is_read_value)
         if before_received_at is not None:
             cursor_at = _normalize_cursor_at(before_received_at)
             return or_(
@@ -185,6 +189,7 @@ def _list_meta(
     folder: str | None,
     query: str | None,
     before_id: int | None,
+    conversation: bool,
 ) -> dict:
     """Sidebar totals for the inbox list.
 
@@ -198,6 +203,7 @@ def _list_meta(
         interview_subtype or "",
         folder or "",
         (query or "").strip().lower(),
+        conversation,
     )
     now = time.monotonic()
     if before_id is not None:
@@ -206,24 +212,46 @@ def _list_meta(
             return cached[1]
 
     total = int(filtered.order_by(None).with_entities(func.count(EmailMessage.id)).scalar() or 0)
-    grouped = (
-        _from_active_mailbox(
+    if conversation:
+        all_messages = _from_active_mailbox(db.query(EmailMessage))
+        ranked = _conversation_ranked(all_messages)
+        grouped = (
             db.query(
                 EmailMessage.mailbox_id,
                 EmailMessage.label,
                 EmailMessage.folder,
-                EmailMessage.is_read,
+                ranked.c.thread_is_read,
                 func.count(EmailMessage.id),
             )
+            .join(ranked, ranked.c.rep_id == EmailMessage.id)
+            .filter(ranked.c.rn == 1)
+            .group_by(
+                EmailMessage.mailbox_id,
+                EmailMessage.label,
+                EmailMessage.folder,
+                ranked.c.thread_is_read,
+            )
+            .all()
         )
-        .group_by(
-            EmailMessage.mailbox_id,
-            EmailMessage.label,
-            EmailMessage.folder,
-            EmailMessage.is_read,
+    else:
+        grouped = (
+            _from_active_mailbox(
+                db.query(
+                    EmailMessage.mailbox_id,
+                    EmailMessage.label,
+                    EmailMessage.folder,
+                    EmailMessage.is_read,
+                    func.count(EmailMessage.id),
+                )
+            )
+            .group_by(
+                EmailMessage.mailbox_id,
+                EmailMessage.label,
+                EmailMessage.folder,
+                EmailMessage.is_read,
+            )
+            .all()
         )
-        .all()
-    )
     label_counts = {item: 0 for item in valid}
     folder_counts = {item: 0 for item in VALID_FOLDERS}
     mailbox_counts: dict[str, int] = {}
@@ -294,6 +322,9 @@ def _conversation_ranked(filtered):
                 ),
             ).label("rn"),
             func.count(EmailMessage.id).over(partition_by=partition).label("thread_count"),
+            func.min(
+                case((EmailMessage.is_read.is_(True), 1), else_=0)
+            ).over(partition_by=partition).label("thread_is_read"),
         )
         .subquery()
     )
@@ -355,10 +386,13 @@ def list_emails(
 
     unread_first = inbox_type == "unread_first"
     thread_counts: list[int] = []
+    thread_read_states: list[bool] = []
+    page_is_read = _is_unread_expr()
     if conversation:
         ranked = _conversation_ranked(filtered)
+        page_is_read = ranked.c.thread_is_read == 1
         page_q = (
-            db.query(EmailMessage, ranked.c.thread_count)
+            db.query(EmailMessage, ranked.c.thread_count, ranked.c.thread_is_read)
             .join(ranked, ranked.c.rep_id == EmailMessage.id)
             .filter(ranked.c.rn == 1)
             .options(_LIST_COLUMNS)
@@ -368,7 +402,7 @@ def list_emails(
 
     if unread_first:
         page_q = page_q.order_by(
-            _is_unread_expr().asc(),
+            page_is_read.asc(),
             EmailMessage.received_at.desc(),
             EmailMessage.id.desc(),
         )
@@ -378,7 +412,7 @@ def list_emails(
     if before_id is not None:
         if unread_first:
             page_q = _apply_unread_first_cursor(
-                page_q, before_id, before_received_at, before_is_read
+                page_q, before_id, before_received_at, before_is_read, page_is_read
             )
         else:
             page_q = _apply_default_cursor(page_q, before_id, before_received_at)
@@ -388,9 +422,10 @@ def list_emails(
         has_more = len(packed) > limit
         packed = packed[:limit]
         rows = []
-        for row, count in packed:
+        for row, count, thread_is_read in packed:
             rows.append(row)
             thread_counts.append(int(count or 1))
+            thread_read_states.append(bool(thread_is_read))
     else:
         rows = page_q.options(_LIST_COLUMNS).limit(limit + 1).all()
         has_more = len(rows) > limit
@@ -411,6 +446,7 @@ def list_emails(
         folder=folder,
         query=q,
         before_id=before_id,
+        conversation=conversation,
     )
     label_counts = meta["label_counts"]
     folder_counts = meta["folder_counts"]
@@ -435,13 +471,14 @@ def list_emails(
         item = EmailOut.model_validate(row)
         if conversation:
             item.thread_count = thread_counts[index] if index < len(thread_counts) else 1
+            item.is_read = thread_read_states[index] if index < len(thread_read_states) else bool(row.is_read)
         items.append(item)
 
     return EmailPageOut(
         items=items,
         next_cursor=rows[-1].id if rows else None,
         next_received_at=rows[-1].received_at if rows else None,
-        next_is_read=bool(rows[-1].is_read) if rows else None,
+        next_is_read=items[-1].is_read if items else None,
         has_more=has_more,
         total=total,
         label_counts=label_counts,
@@ -585,6 +622,7 @@ async def get_email(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     mark_read: bool = Query(default=True),
+    mark_thread: bool = Query(default=False),
 ) -> EmailMessage:
     email = _email_from_active_mailbox(db, email_id)
     if email is None:
@@ -641,10 +679,28 @@ async def get_email(
             except Exception as exc:
                 raise HTTPException(status_code=502, detail=f"Could not load email body: {exc}") from exc
 
-    if mark_read and not email.is_read:
-        email.is_read = True
-        changed = True
-        background_tasks.add_task(_mark_provider_message_read, email.mailbox_id, email.provider_message_id)
+    if mark_read:
+        read_targets = [email]
+        if mark_thread and email.thread_id:
+            read_targets = (
+                _from_active_mailbox(db.query(EmailMessage))
+                .filter(
+                    EmailMessage.mailbox_id == email.mailbox_id,
+                    EmailMessage.thread_id == email.thread_id,
+                    EmailMessage.is_read.is_not(True),
+                )
+                .all()
+            )
+        for target in read_targets:
+            if target.is_read:
+                continue
+            target.is_read = True
+            changed = True
+            background_tasks.add_task(
+                _mark_provider_message_read,
+                target.mailbox_id,
+                target.provider_message_id,
+            )
     if email.label not in {item.value for item in EmailLabel}:
         email.label = EmailLabel.OTHER.value
         changed = True
@@ -656,42 +712,56 @@ async def get_email(
 TRAINING_BODY_CAP = 4000
 
 
-async def _apply_label_side_effects(email_id: int, previous_label: str, new_label: str, bind) -> None:
+async def _apply_label_side_effects(email_id: int, previous_label: str, new_label: str, bind) -> int | None:
     """Extract company and role, then update the calendar, after the label is saved.
 
     The category request returns as soon as the label is stored. These steps call
     the model and rebuild that mailbox's calendar, so they must not hold the dropdown.
     """
-    lock = _label_effect_locks.setdefault(email_id, asyncio.Lock())
-    async with lock:
-        db = sessionmaker(bind=bind)()
-        try:
-            email = db.query(EmailMessage).filter(EmailMessage.id == email_id).one_or_none()
-            if email is None or email.label != new_label:
-                return
-            if previous_label != new_label and new_label in OUTCOME_LABELS:
-                if await apply_outcome(db, email, force=True):
-                    db.commit()
-            db.refresh(email)
-            if email.label != new_label:
-                return
-            calendar_changed = False
-            if previous_label in CALENDAR_LABELS or new_label in CALENDAR_LABELS:
-                if email.label in CALENDAR_LABELS:
-                    calendar_changed = await process_calendar_email(db, email, force=True)
-                else:
-                    sourced = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == email.id).all()
-                    for event in sourced:
-                        event.is_visible = False
-                    calendar_changed = bool(sourced)
+    db = sessionmaker(bind=bind)()
+    try:
+        email = db.query(EmailMessage).filter(EmailMessage.id == email_id).one_or_none()
+        if email is None or email.label != new_label:
+            return None
+        if previous_label != new_label and new_label in OUTCOME_LABELS:
+            if await apply_outcome(db, email, force=True):
                 db.commit()
-            if calendar_changed:
-                await publish("calendar.changed", {"action": "reclassified", "mailbox_id": email.mailbox_id})
-        except Exception:
-            logger.exception("Label side effects failed email_id=%s", email_id)
-            db.rollback()
-        finally:
-            db.close()
+        db.refresh(email)
+        if email.label != new_label:
+            return None
+        calendar_changed = False
+        if previous_label in CALENDAR_LABELS or new_label in CALENDAR_LABELS:
+            if email.label in CALENDAR_LABELS:
+                calendar_changed = await process_calendar_email(db, email, force=True)
+            else:
+                sourced = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == email.id).all()
+                for event in sourced:
+                    event.is_visible = False
+                calendar_changed = bool(sourced)
+            db.commit()
+        return email.mailbox_id if calendar_changed else None
+    except Exception:
+        logger.exception("Label side effects failed email_id=%s", email_id)
+        db.rollback()
+        return None
+    finally:
+        db.close()
+
+
+def _run_label_side_effects(email_id: int, previous_label: str, new_label: str, bind) -> None:
+    """Run expensive calendar/model work outside the API event-loop thread."""
+    lock = _label_effect_locks.setdefault(email_id, threading.Lock())
+    with lock:
+        mailbox_id = asyncio.run(_apply_label_side_effects(email_id, previous_label, new_label, bind))
+    if mailbox_id is not None:
+        data = {"action": "reclassified", "mailbox_id": mailbox_id}
+        try:
+            # Starlette runs this synchronous background task in an AnyIO worker.
+            # Hop back to the API loop before touching its SSE subscriber queues.
+            from_thread.run(publish, "calendar.changed", data)
+        except RuntimeError:
+            # Direct invocation in scripts/tests has no AnyIO worker token.
+            asyncio.run(publish("calendar.changed", data))
 
 
 @router.patch("/{email_id}/label", response_model=EmailOut)
@@ -742,7 +812,7 @@ async def update_email_label(
     )
     if needs_follow_up:
         background_tasks.add_task(
-            _apply_label_side_effects,
+            _run_label_side_effects,
             email.id,
             previous_label,
             new_label,

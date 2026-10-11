@@ -270,14 +270,17 @@ export function prefetchEmailDetail(id: number): void {
   void fetchEmailDetail(id, false).catch(() => {});
 }
 
-export async function fetchEmailDetail(id: number, markRead = true): Promise<EmailDetail> {
+export async function fetchEmailDetail(id: number, markRead = true, markThread = false): Promise<EmailDetail> {
   if (!markRead) {
     const cached = detailCache.get(id);
     if (cached) return cached;
     const pending = detailInflight.get(id);
     if (pending) return pending;
   }
-  const suffix = markRead ? "" : "?mark_read=false";
+  const params = new URLSearchParams();
+  if (!markRead) params.set("mark_read", "false");
+  if (markRead && markThread) params.set("mark_thread", "true");
+  const suffix = params.size ? `?${params.toString()}` : "";
   const request = (async () => {
     const res = await apiFetch(`${API_BASE}/api/emails/${id}${suffix}`, undefined, markRead ? 4 : 1);
     if (!res.ok) throw new Error(await readApiError(res, "Failed to load email"));

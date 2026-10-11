@@ -142,16 +142,18 @@ function calendarRangeKey(start: Date, end: Date, timeZone: string) {
   return `${start.getTime()}|${end.getTime()}|${timeZone}`;
 }
 
-function fetchCalendarRange(start: Date, end: Date, timeZone: string, signal?: AbortSignal): Promise<CalendarEvent[]> {
+function fetchCalendarRange(start: Date, end: Date, timeZone: string, signal?: AbortSignal, forceFresh = false): Promise<CalendarEvent[]> {
   const key = calendarRangeKey(start, end, timeZone);
   const existing = CALENDAR_RANGE_INFLIGHT.get(key);
-  if (existing) return existing;
+  if (existing && !forceFresh) return existing;
   const promise = fetchCalendarEvents(
     instantForWallDate(start, timeZone).toISOString(),
     instantForWallDate(end, timeZone).toISOString(),
     signal,
   ).then((rows) => {
-    rememberCalendarRange(key, rows);
+    // A forced refresh can replace an older request for the same range. Do
+    // not let that older response land later and put stale chips back in cache.
+    if (CALENDAR_RANGE_INFLIGHT.get(key) === promise) rememberCalendarRange(key, rows);
     return rows;
   }).finally(() => {
     if (CALENDAR_RANGE_INFLIGHT.get(key) === promise) CALENDAR_RANGE_INFLIGHT.delete(key);
@@ -676,6 +678,8 @@ const EventCard = memo(function EventCard({ event, color, timeZone, compact, tim
   const outcome = visibleApplicationStatus(event);
   const outcomeLabel = status.key === "available" ? null : status.label;
   const type = interviewType(event);
+  const primaryLabel = event.company || event.title || event.role || "Interview";
+  const showRole = status.key === "available" && Boolean(event.role) && event.role.trim().toLocaleLowerCase() !== primaryLabel.trim().toLocaleLowerCase();
   const durationMinutes = Math.max(0, (new Date(event.end_at).getTime() - new Date(event.start_at).getTime()) / 60000);
   const getHoverPosition = useCallback(() => {
     const rect = eventRef.current?.getBoundingClientRect();
@@ -757,14 +761,14 @@ const EventCard = memo(function EventCard({ event, color, timeZone, compact, tim
     role="button"
     tabIndex={0}
     aria-pressed={selected}
-    aria-label={`${interviewKindLabel(event)}, ${event.company || "Company not specified"}, ${formatInterviewTimeRange(event, timeZone)}, ${type.label}${outcomeLabel ? `, ${outcomeLabel}` : ""}${status.key === "available" ? `, ${pendingBadgeLabel(event)}` : ""}`}
+    aria-label={`${interviewKindLabel(event)}, ${primaryLabel}, ${formatInterviewTimeRange(event, timeZone)}, ${type.label}${outcomeLabel ? `, ${outcomeLabel}` : ""}${status.key === "available" ? `, ${pendingBadgeLabel(event)}` : ""}`}
     aria-describedby={hoverPosition ? hoverId : undefined}
   >
     {status.key === "available" && <span className={`calendar-event-status-icon calendar-event-pending-icon is-${event.request_kind ?? "invitation"}`} role="img" aria-label={pendingBadgeLabel(event)}><PendingRequestIcon kind={event.request_kind ?? "invitation"} /></span>}
     {status.key !== "available" && status.key !== "active" && <span className="calendar-event-status-icon" role="img" aria-label={status.label}>{status.key === "canceled" ? <CanceledStatusIcon /> : <ApplicationStatusIcon status={status.key === "rejected_closed" ? "rejected" : status.key} />}</span>}
     <span className="calendar-event-main">
-      <span className="calendar-event-company">{event.company || "Company not specified"}</span>
-      {status.key === "available" && event.role && <span className="calendar-event-role">{event.role}</span>}
+      <span className="calendar-event-company">{primaryLabel}</span>
+      {showRole && <span className="calendar-event-role">{event.role}</span>}
     </span>
     <span className={`event-type-badge meeting-${type.type}`} role="img" aria-label={type.label}><MeetingTypeIcon type={type.type} /></span>
   </div>
@@ -1219,7 +1223,7 @@ export default function CalendarPage({
     void fetchCalendarRange(rangeStartDate, rangeEndDate, zone).catch(() => {});
   }, []);
 
-  const load = useCallback(async (mode: "foreground" | "background" = "foreground") => {
+  const load = useCallback(async (mode: "foreground" | "background" = "foreground", forceFresh = false) => {
     const request = ++refreshRef.current;
     const hasCached = CALENDAR_RANGE_CACHE.has(rangeKey);
     if (mode === "foreground") {
@@ -1229,16 +1233,16 @@ export default function CalendarPage({
     } else {
       setRefreshing(true);
     }
-    const joined = CALENDAR_RANGE_INFLIGHT.get(rangeKey);
+    const joined = forceFresh ? undefined : CALENDAR_RANGE_INFLIGHT.get(rangeKey);
     if (!joined) {
       abortRef.current?.abort();
       abortRef.current = new AbortController();
     }
     try {
-      const rows = await (joined ?? fetchCalendarRange(start, end, timeZone, abortRef.current?.signal));
+      const rows = await (joined ?? fetchCalendarRange(start, end, timeZone, abortRef.current?.signal, forceFresh));
       if (request === refreshRef.current) {
         setEvents(rows);
-        setSelected((current) => current ? rows.find((event) => event.id === current.id) ?? current : null);
+        setSelected((current) => current ? rows.find((event) => event.id === current.id) ?? null : null);
         setError("");
         const spanDays = Math.max(1, Math.round((end.getTime() - start.getTime()) / 86_400_000));
         void prefetchRange(addDays(start, -spanDays), start, timeZone);
@@ -1266,7 +1270,8 @@ export default function CalendarPage({
   useEffect(() => {
     if (seenRefreshKey.current === refreshKey) return;
     seenRefreshKey.current = refreshKey;
-    void load("background");
+    CALENDAR_RANGE_CACHE.clear();
+    void load("background", true);
   }, [load, refreshKey]);
   const skipReopenLoad = useRef(true);
   useEffect(() => {
@@ -1282,16 +1287,38 @@ export default function CalendarPage({
   useEffect(() => {
     const source = openEvents();
     let timer = 0;
+    let hasOpened = false;
     const onChange = () => {
       window.clearTimeout(timer);
-      timer = window.setTimeout(() => { void load("background"); }, 400);
+      timer = window.setTimeout(() => {
+        CALENDAR_RANGE_CACHE.clear();
+        void load("background", true);
+      }, 400);
     };
+    const onOpen = () => {
+      // Re-fetch after an SSE reconnect because repairs may have completed
+      // while the backend was restarting and no change event could be sent.
+      if (hasOpened) onChange();
+      hasOpened = true;
+    };
+    source.addEventListener("open", onOpen);
     source.addEventListener("calendar.changed", onChange);
     return () => {
       window.clearTimeout(timer);
       source.close();
     };
   }, [load]);
+  const activeMailboxKey = useMemo(
+    () => mailboxes.filter((mailbox) => mailbox.is_active).map((mailbox) => mailbox.id).sort((a, b) => a - b).join(","),
+    [mailboxes],
+  );
+  const seenMailboxKey = useRef(activeMailboxKey);
+  useEffect(() => {
+    if (seenMailboxKey.current === activeMailboxKey) return;
+    seenMailboxKey.current = activeMailboxKey;
+    CALENDAR_RANGE_CACHE.clear();
+    void load("background", true);
+  }, [activeMailboxKey, load]);
   const [pendingInterviews, setPendingInterviews] = useState<PendingInterview[]>([]);
   const loadPending = useCallback(async (signal?: AbortSignal) => {
     const cached = peekPendingInterviews();
@@ -1485,7 +1512,7 @@ export default function CalendarPage({
     const startAt = instantForWallDate(wallDateFromInput(editor.start), timeZone);
     const endAt = instantForWallDate(wallDateFromInput(editor.end), timeZone);
     const payload: CalendarEventPayload = { mailbox_id: editor.mailbox_id, title: editor.title, company: editor.company, role: editor.role, interviewer: editor.interviewer, work_model: editor.work_model, start_at: startAt.toISOString(), end_at: endAt.toISOString(), source_timezone: timeZone, description: editor.description, job_url: editor.job_url || null, meeting_type: editor.meeting_type, meeting_provider: editor.meeting_provider || null, meeting_url: editor.meeting_url || null, phone_number: editor.phone_number || null, phone_access_code: editor.phone_access_code || null, interview_status: editor.interview_status ?? "confirmation", application_status: editor.application_status };
-    try { const saved = editor.id ? await updateCalendarEvent(editor.id, payload) : await createCalendarEvent(payload); setEvents((prev) => [...prev.filter((x) => x.id !== saved.id), saved]); showEventDetails(saved); setEditor(null); }
+    try { const saved = editor.id ? await updateCalendarEvent(editor.id, payload) : await createCalendarEvent(payload); CALENDAR_RANGE_CACHE.clear(); setEvents((prev) => [...prev.filter((x) => x.id !== saved.id), saved]); showEventDetails(saved); setEditor(null); }
     catch (err) { setSaveError(err instanceof Error ? err.message : "Failed to save event"); }
     finally { setSaving(false); }
   };
@@ -1502,6 +1529,7 @@ export default function CalendarPage({
         };
     try {
       const saved = await updateCalendarEvent(selected.id, payload);
+      CALENDAR_RANGE_CACHE.clear();
       setEvents((prev) => prev.map((item) => item.id === saved.id ? saved : item));
       setSelected((current) => current?.id === saved.id ? saved : current);
     } catch (err) {

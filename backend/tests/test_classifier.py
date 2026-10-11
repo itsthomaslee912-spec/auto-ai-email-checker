@@ -385,3 +385,49 @@ Please reply with your availability.
         )
         == EmailLabel.INTERVIEW_INVITATION.value
     )
+
+
+def test_offer_requires_an_actual_candidate_offer_not_job_description_boilerplate():
+    assert _heuristic_label(
+        "Incomplete job application",
+        "Workday",
+        "Your application has been removed because it was not completed within 14 days. "
+        "You may reapply. Our company offers a competitive compensation package.",
+        "",
+    ) == EmailLabel.REJECTED_CLOSED.value
+
+    assert _heuristic_label(
+        "Re: Recruiter questions",
+        "Candidate",
+        "Please see my responses below.\n\nOn Monday, Recruiter wrote:\n"
+        "The position includes a competitive compensation package.",
+        "",
+    ) == EmailLabel.SCREENING.value
+
+
+def test_offer_recognizes_offer_letter_acceptance_and_post_offer_onboarding():
+    cases = (
+        ("Your offer letter", "We are pleased to offer you the Engineer role."),
+        ("Offer to join Acme - Signature requested", "Please review and sign your offer."),
+        ("Background verification", "You have accepted our offer. Please begin the background verification."),
+        ("Welcome to Acme", "Please complete your pre-hire onboarding tasks before your start date."),
+    )
+    for subject, body in cases:
+        assert _heuristic_label(subject, "Talent", body, "") == EmailLabel.OFFER.value
+
+
+def test_quoted_offer_language_does_not_override_latest_message():
+    assert _heuristic_label(
+        "Re: Senior Engineer opportunity",
+        "Candidate",
+        "Thanks, I am interested in learning more.\n\nOn Friday, Recruiter wrote:\n"
+        "This job description includes compensation details and an offer letter process.",
+        "",
+    ) != EmailLabel.OFFER.value
+
+    assert _heuristic_label(
+        "Re: Permanent position offer for Jordan",
+        "Candidate",
+        "I am interested in this opportunity.\n\nSent with Spark\nOn Aug 31, Recruiter wrote:",
+        "",
+    ) == EmailLabel.RECRUITMENT_ALERT.value

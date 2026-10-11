@@ -84,12 +84,22 @@ _VIDEO_MEETING_LINK_RE = re.compile(
     r"https://[^\s<>\"']+/video_meetings/[a-z0-9-]+(?:[/?#][^\s<>\"']*)?",
     re.I,
 )
+_PARADOX_JOIN_RE = re.compile(
+    r"https://(?:olivia\.paradox\.ai|oli\.vi)/"
+    r"(?!(?:calendar|communication-preferences|candidate-experience)(?:[/?#]|$))"
+    r"[a-z0-9_-]{6,64}(?=[/?#\s<>\"')]|$)",
+    re.I,
+)
 
 VIDEO_HOSTS = {
     "zoom.us": "Zoom",
     "meet.google.com": "Google Meet",
     "teams.microsoft.com": "Microsoft Teams",
+    "teams.microsoft.us": "Microsoft Teams",
     "teams.live.com": "Microsoft Teams",
+    "record.interview.video": "Recorded Video Interview",
+    "meet.alex.com": "Alex Video Interview",
+    "pinpointhq.com": "Video Interview",
     "webex.com": "Webex",
     "gotomeeting.com": "GoTo Meeting",
     "whereby.com": "Whereby",
@@ -748,7 +758,7 @@ _WEBEX_JOIN_RE = re.compile(r"webex\.com/.+", re.I)
 def is_video_join_url(value: str | None) -> bool:
     """True for a conference join URL, not a branding image or scheduler page."""
     raw = (value or "").strip()
-    if not raw.lower().startswith("https://"):
+    if not raw.lower().startswith("https://") or "\\" in raw:
         return False
     try:
         parsed = urlparse(raw)
@@ -764,7 +774,7 @@ def is_video_join_url(value: str | None) -> bool:
         return bool(_ZOOM_JOIN_RE.search(path_query))
     if "meet.google.com" in host:
         return bool(_MEET_JOIN_RE.search(raw))
-    if "teams.microsoft.com" in host or "teams.live.com" in host:
+    if _provider_for_url(raw) == "Microsoft Teams":
         path = (parsed.path or "").casefold()
         # Folded ICS lines often truncate to ".../meetup-join/" with no id.
         if "/meetup-join/" in path:
@@ -773,6 +783,12 @@ def is_video_join_url(value: str | None) -> bool:
         return bool(re.search(r"/meet/[a-z0-9]{6,}", path))
     if "webex.com" in host:
         return bool(_WEBEX_JOIN_RE.search(raw)) and "meet" in path_query.casefold()
+    if host == "record.interview.video":
+        return not (parsed.path or "").casefold().endswith("/unsubscribe")
+    if host == "meet.alex.com":
+        return not (parsed.path or "").casefold().startswith("/schedule")
+    if host == "pinpointhq.com" or host.endswith(".pinpointhq.com"):
+        return bool(re.fullmatch(r"/candidates/interview_parts/[^/]+/join/?", parsed.path or "", re.I))
     if _provider_for_url(raw):
         # Other known video hosts: accept https URLs that are not obvious assets.
         return not re.search(r"\.(?:png|jpe?g|gif|svg|webp)(?:$|\?)", path_query, re.I)
@@ -819,7 +835,10 @@ def _assign_join_url(event: CalendarEvent, url: str | None) -> None:
 
 def extract_meeting_access(text: str) -> MeetingAccess:
     source = _unfold_wrapped_lines(html.unescape(text or ""))
-    urls = [raw.rstrip(".,);]") for raw in re.findall(r"https://[^\s<>\"']+", source, flags=re.I)]
+    urls = [
+        raw.split("\\n", 1)[0].split("\\r", 1)[0].rstrip(".,);]")
+        for raw in re.findall(r"https://[^\s<>\"']+", source, flags=re.I)
+    ]
     join_urls = [url for url in urls if is_video_join_url(url)]
     complete = [url for url in join_urls if join_url_is_complete(url)]
 
@@ -1981,20 +2000,39 @@ def leaves_interview_unbooked(
 
 
 async def _resolve_video_landing_page(text: str) -> MeetingAccess | None:
-    """Resolve Teamtailor's public meeting-details gateway to a join URL.
+    """Resolve allow-listed recruiting gateways to a provider join URL.
 
-    The first page must identify itself as Teamtailor and may only point to a
-    same-host ``/video_meetings/`` endpoint. Redirects are disabled; only a
-    redirect directly to a recognized video provider is accepted.
+    Redirects are disabled and only a direct redirect to a recognized video
+    provider is accepted. This prevents arbitrary links in email from turning
+    the calendar repair into an open URL fetcher.
     """
     source = html.unescape(text or "")
-    if "teamtailor" not in source.casefold():
-        return None
-    schedule_urls = [match.group(0).rstrip(".,);]") for match in _SCHEDULE_TOKEN_RE.finditer(source)]
-    if not schedule_urls:
+    paradox_urls = [match.group(0) for match in _PARADOX_JOIN_RE.finditer(source)]
+    has_teamtailor = "teamtailor" in source.casefold()
+    schedule_urls = (
+        [match.group(0).rstrip(".,);]") for match in _SCHEDULE_TOKEN_RE.finditer(source)]
+        if has_teamtailor
+        else []
+    )
+    if not paradox_urls and not schedule_urls:
         return None
     try:
         async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
+            for landing_url in paradox_urls[:3]:
+                response = await client.get(landing_url)
+                location = response.headers.get("location", "")
+                if (
+                    response.is_redirect
+                    and (urlparse(landing_url).hostname or "").lower() == "oli.vi"
+                    and (urlparse(location).hostname or "").lower() == "olivia.paradox.ai"
+                    and _PARADOX_JOIN_RE.fullmatch(location)
+                ):
+                    response = await client.get(location)
+                    location = response.headers.get("location", "")
+                provider = _provider_for_url(location)
+                safe_url = _safe_http_url(location, meeting=True)
+                if response.is_redirect and provider and safe_url:
+                    return MeetingAccess("video", provider, safe_url)
             for schedule_url in schedule_urls[:3]:
                 parsed_schedule = urlparse(schedule_url)
                 response = await client.get(schedule_url)
@@ -2126,8 +2164,11 @@ async def extract_calendar_details(
     details = InterviewDetails(company=known_company, role=known_role, interviewer=deterministic_interviewer, job_url=deterministic_job_url)
     # Google withholds the calendar file on an "unknown sender" invite, but the
     # subject still has the clock time. Creating that item must not wait on the
-    # model; a slow model scan left these appointments off the calendar.
-    if slots or not use_ai:
+    # model; a slow model scan left these appointments off the calendar. But
+    # when there's related thread context beyond this one message, still let
+    # the model fill in missing company/role/meeting details — a known time
+    # must not suppress the rest of the event metadata.
+    if (slots and len(messages) <= 1) or not use_ai:
         return slots, access, details, bool(slots)
     backend = get_ai_backend()
     if not backend.api_key:
@@ -3234,11 +3275,21 @@ def _same_scheduled_interview(left: CalendarEvent, right: CalendarEvent) -> bool
     a longer form of the same title. An identical start and end is still one
     interview when the emails name the round differently.
     """
+    same_source = (
+        left.source_email_id is not None
+        and left.source_email_id == right.source_email_id
+    )
+    same_thread_without_company = (
+        bool(left.source_thread_id)
+        and left.source_thread_id == right.source_thread_id
+        and not (left.company or "").strip()
+        and not (right.company or "").strip()
+    )
     if not (
         left.mailbox_id == right.mailbox_id
         and left.kind == "confirmed"
         and right.kind == "confirmed"
-        and companies_match(left.company, right.company)
+        and (same_source or same_thread_without_company or companies_match(left.company, right.company))
         and _starts_within_minute(left, right)
     ):
         return False
@@ -3246,11 +3297,21 @@ def _same_scheduled_interview(left: CalendarEvent, right: CalendarEvent) -> bool
 
 
 def _same_available_window(left: CalendarEvent, right: CalendarEvent) -> bool:
+    same_source = (
+        left.source_email_id is not None
+        and left.source_email_id == right.source_email_id
+    )
+    same_thread_without_company = (
+        bool(left.source_thread_id)
+        and left.source_thread_id == right.source_thread_id
+        and not (left.company or "").strip()
+        and not (right.company or "").strip()
+    )
     if not (
         left.mailbox_id == right.mailbox_id
         and left.kind == "availability"
         and right.kind == "availability"
-        and companies_match(left.company, right.company)
+        and (same_source or same_thread_without_company or companies_match(left.company, right.company))
         and roles_compatible(left.job_role, right.job_role)
         and _starts_within_minute(left, right)
     ):
@@ -3492,9 +3553,17 @@ def repair_meeting_join_urls(db: Session, mailbox_id: int | None = None) -> int:
         current = (event.meeting_url or "").strip()
         if current and join_url_is_complete(current):
             continue
-        # Only the message that created the chip. Other linked mail can belong
-        # to a different interview and must not donate its join link.
+        # Prefer the message that created the chip. A matching calendar invite
+        # linked to the same chip may carry the actual join URL while a later
+        # confirmation reply became the source message.
         email_ids = {event.source_email_id} if event.source_email_id else set()
+        linked_ids = {
+            row[0]
+            for row in db.query(CalendarEventEmail.email_id)
+            .filter(CalendarEventEmail.event_id == event.id)
+            .all()
+        }
+        email_ids.update(linked_ids)
         if not email_ids:
             if current and not is_video_join_url(current):
                 event.meeting_url = None
@@ -3503,6 +3572,14 @@ def repair_meeting_join_urls(db: Session, mailbox_id: int | None = None) -> int:
         emails = db.query(EmailMessage).filter(EmailMessage.id.in_(email_ids)).all()
         found: MeetingAccess | None = None
         for email in sorted(emails, key=lambda item: (as_utc(item.received_at) or datetime.min.replace(tzinfo=timezone.utc), item.id), reverse=True):
+            if email.id != event.source_email_id:
+                appointment_slots = [
+                    slot
+                    for slot in message_appointment_slots(email)
+                    if not slot.is_availability_window
+                ]
+                if not _slot_matches_event(event, appointment_slots):
+                    continue
             text = "\n".join(
                 [
                     email.subject or "",
@@ -3529,6 +3606,54 @@ def repair_meeting_join_urls(db: Session, mailbox_id: int | None = None) -> int:
             event.meeting_url = None
             repaired += 1
     return repaired
+
+
+async def repair_meeting_landing_urls(
+    db: Session, mailbox_id: int | None = None,
+) -> set[int]:
+    """Resolve trusted recruiter join buttons for visible video interviews."""
+    repaired_mailboxes: set[int] = set()
+    query = db.query(CalendarEvent).filter(
+        CalendarEvent.is_visible.is_(True),
+        CalendarEvent.meeting_url.is_(None),
+    )
+    if mailbox_id is not None:
+        query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
+    for event in query.all():
+        messages = _linked_messages(db, event)
+        if event.source_email_id and all(item.id != event.source_email_id for item in messages):
+            source = db.get(EmailMessage, event.source_email_id)
+            if source is not None:
+                messages.append(source)
+        eligible = []
+        for email in messages:
+            if email.id == event.source_email_id:
+                eligible.append(email)
+                continue
+            slots = [
+                slot
+                for slot in message_appointment_slots(email)
+                if not slot.is_availability_window
+            ]
+            if _slot_matches_event(event, slots):
+                eligible.append(email)
+        text = "\n".join(_calendar_text(item) for item in eligible)
+        if not (_PARADOX_JOIN_RE.search(text) or _SCHEDULE_TOKEN_RE.search(text)):
+            continue
+        access = await _resolve_video_landing_page(text)
+        if access is None or not access.url:
+            continue
+        event.meeting_url = access.url
+        event.meeting_type = "video"
+        event.meeting_provider = access.provider or event.meeting_provider
+        if access.phone_number and not event.phone_number:
+            event.phone_number = access.phone_number
+        if access.access_code and not event.phone_access_code:
+            event.phone_access_code = access.access_code
+        repaired_mailboxes.add(event.mailbox_id)
+    if repaired_mailboxes:
+        db.flush()
+    return repaired_mailboxes
 
 
 def repair_interview_stage_roles(db: Session, mailbox_id: int | None = None) -> int:
@@ -4118,7 +4243,26 @@ def repair_mixed_thread_appointments(db: Session, mailbox_id: int | None = None)
             if email.thread_id
             else []
         )
-        messages = list({item.id: item for item in (email, *related, *thread_rows)}.values())
+        linked_rows = _linked_messages(db, event)
+        matching_linked_rows = [
+            item
+            for item in linked_rows
+            if item.id == email.id
+            or _slot_matches_event(
+                event,
+                [
+                    slot
+                    for slot in message_appointment_slots(item)
+                    if not slot.is_availability_window
+                ],
+            )
+        ]
+        messages = list(
+            {
+                item.id: item
+                for item in (email, *related, *thread_rows, *matching_linked_rows)
+            }.values()
+        )
         allowed = {item.id for item in messages}
         if event.outcome_source_email_id:
             allowed.add(event.outcome_source_email_id)
@@ -4153,7 +4297,9 @@ def repair_mixed_thread_appointments(db: Session, mailbox_id: int | None = None)
         # A Teamtailor landing page is resolved to the real join link (see
         # _resolve_video_landing_page); that resolved URL never appears in the
         # thread's own text verbatim, only the schedule-page link does.
-        resolved_from_landing_page = bool(_SCHEDULE_TOKEN_RE.search(blob))
+        resolved_from_landing_page = bool(
+            _SCHEDULE_TOKEN_RE.search(blob) or _PARADOX_JOIN_RE.search(blob)
+        )
         if url and not resolved_from_landing_page and url not in blob and html.unescape(url) not in html.unescape(blob):
             event.meeting_url = None
             event.meeting_provider = None
@@ -4284,7 +4430,21 @@ def repair_phantom_availability_slots(db: Session, mailbox_id: int | None = None
                 _apply_offered_slot(event, match)
                 repaired += 1
         skip = {event.id for event in unmatched}
-        free = [slot for slot in slots if not _slot_occupied(visible, slot, events[0].company, skip)]
+        # A source with no extracted company still owns its already-created
+        # slots.  companies_match("", "") deliberately returns false, so the
+        # old global occupancy check treated every repair pass as a missing
+        # slot and appended another identical chip (hundreds in bad cases).
+        free = [
+            slot
+            for slot in slots
+            if not any(
+                event.id not in skip
+                and event.is_visible
+                and _slot_matches_event(event, [slot])
+                for event in events
+            )
+            and not _slot_occupied(visible, slot, events[0].company, skip)
+        ]
         for event in unmatched:
             quote_clock = _quote_clock_matches(event, _calendar_text(email))
             # No parsed offer and no quoted send-clock: leave the chip alone.

@@ -114,6 +114,33 @@ def test_get_email_returns_before_provider_read():
         assert len(tasks.tasks) == 1
 
 
+def test_get_email_can_mark_the_whole_conversation_read():
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    mailbox = _seed_mailbox(db, external_id="u-thread-read", email_address="thread@example.com")
+    first = _add_email(db, mailbox, "thread-unread", is_read=False)
+    second = _add_email(db, mailbox, "thread-read", is_read=True)
+    first.thread_id = second.thread_id = "same-thread"
+    db.flush()
+    second_id = second.id
+    db.commit()
+    db.close()
+
+    client = _client(SessionLocal)
+    with (
+        patch("app.api.emails.gmail_mark_read", new_callable=AsyncMock),
+        patch("app.api.emails.ensure_google_access_token", new_callable=AsyncMock, return_value="token"),
+        patch("app.api.emails.SessionLocal", SessionLocal),
+    ):
+        response = client.get(f"/api/emails/{second_id}", params={"mark_thread": "true"})
+        assert response.status_code == 200
+
+    db = SessionLocal()
+    states = [row.is_read for row in db.query(EmailMessage).filter(EmailMessage.thread_id == "same-thread").all()]
+    db.close()
+    assert states == [True, True]
+
+
 def _seed_mailbox(db, *, external_id: str, email_address: str) -> MailboxConnection:
     user = db.query(User).filter(User.external_id == external_id).one_or_none()
     if user is None:

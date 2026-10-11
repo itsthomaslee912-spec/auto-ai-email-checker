@@ -300,7 +300,7 @@ def test_label_change_returns_before_company_extraction():
         assert extract.await_count == 0
         assert len(recorded) == 1
         func, args, kwargs = recorded[0]
-        asyncio.run(func(*args, **kwargs))
+        func(*args, **kwargs)
 
     assert extract.await_count == 1
     db = SessionLocal()
