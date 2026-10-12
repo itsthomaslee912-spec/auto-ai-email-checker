@@ -321,9 +321,63 @@ def test_outlook_mark_read_many_batches_in_groups_of_twenty(monkeypatch):
     message_ids = [f"msg-{i}" for i in range(45)]
     asyncio.run(outlook_module.outlook_mark_read_many("token", message_ids))
 
-    assert len(calls) == 3
-    assert [len(chunk) for chunk in calls] == [20, 20, 5]
-    assert [mid for chunk in calls for mid in chunk] == message_ids
+    # Batches now run concurrently (up to 4 at once), so only size and total
+    # coverage are guaranteed, not call order.
+    assert sorted(len(chunk) for chunk in calls) == [5, 20, 20]
+    assert sorted(mid for chunk in calls for mid in chunk) == sorted(message_ids)
+
+
+def test_outlook_mark_read_many_caps_concurrency_at_four(monkeypatch):
+    """Graph's documented limit is 4 concurrent requests per mailbox per app."""
+    from app.email import outlook as outlook_module
+
+    in_flight = 0
+    max_in_flight = 0
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, _url, *, headers, json):
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+            return SimpleNamespace(status_code=200, json=lambda: {"responses": []}, text="")
+
+    monkeypatch.setattr(outlook_module.httpx, "AsyncClient", lambda **_kwargs: Client())
+    message_ids = [f"msg-{i}" for i in range(200)]
+    asyncio.run(outlook_module.outlook_mark_read_many("token", message_ids))
+
+    assert max_in_flight == 4
+
+
+def test_outlook_mark_read_many_retries_on_429(monkeypatch):
+    from app.email import outlook as outlook_module
+
+    attempts: list[int] = []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, _url, *, headers, json):
+            attempts.append(1)
+            if len(attempts) == 1:
+                return SimpleNamespace(status_code=429, headers={"Retry-After": "0"}, text="throttled")
+            return SimpleNamespace(status_code=200, json=lambda: {"responses": []}, text="")
+
+    monkeypatch.setattr(outlook_module.httpx, "AsyncClient", lambda **_kwargs: Client())
+    asyncio.run(outlook_module.outlook_mark_read_many("token", ["msg-1"]))
+
+    assert len(attempts) == 2
 
 
 def test_get_email_still_marks_local_read_when_provider_fails():

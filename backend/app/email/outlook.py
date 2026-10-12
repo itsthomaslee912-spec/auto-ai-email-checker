@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 import httpx
@@ -192,37 +193,58 @@ async def outlook_mark_read(access_token: str, message_id: str) -> None:
             raise HTTPException(status_code=400, detail=f"Outlook mark read failed: {resp.text}")
 
 
+async def _mark_read_batch(client: httpx.AsyncClient, access_token: str, chunk: list[str]) -> None:
+    payload = {
+        "requests": [
+            {
+                "id": str(index),
+                "method": "PATCH",
+                "url": f"/me/messages/{message_id}",
+                "headers": {"Content-Type": "application/json"},
+                "body": {"isRead": True},
+            }
+            for index, message_id in enumerate(chunk)
+        ]
+    }
+    # Graph's documented cap is 4 concurrent requests per mailbox per app; a
+    # burst can still trip "MailboxConcurrency limit" (429) even within that,
+    # so retry with the server's Retry-After instead of failing the batch.
+    for attempt in range(4):
+        resp = await client.post(
+            f"{GRAPH}/$batch",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json=payload,
+        )
+        if resp.status_code == 429 and attempt < 3:
+            delay = float(resp.headers.get("Retry-After") or 2 * (attempt + 1))
+            await asyncio.sleep(delay)
+            continue
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=400, detail=f"Outlook batch mark read failed: {resp.text}")
+        return
+
+
 async def outlook_mark_read_many(access_token: str, message_ids: list[str]) -> None:
     """Mark many messages read via Graph's $batch endpoint (max 20 sub-requests per call).
 
     Marking them one PATCH at a time — a fresh TCP/TLS connection and a full
     round trip per message — is what made "mark all read" slow for Outlook
-    while Gmail's batchModify handled the same action in one request.
+    while Gmail's batchModify handled the same action in one request. Batches
+    of 20 cut an N-message mark-all-read to ceil(N/20) requests; running up
+    to 4 of those batches at once (Graph's per-mailbox concurrency cap) cuts
+    the remaining wall-clock time by roughly another 4x.
     """
     if not message_ids:
         return
+    chunks = [message_ids[start : start + 20] for start in range(0, len(message_ids), 20)]
+    gate = asyncio.Semaphore(4)
+
+    async def run_one(chunk: list[str]) -> None:
+        async with gate:
+            await _mark_read_batch(client, access_token, chunk)
+
     async with httpx.AsyncClient(timeout=30) as client:
-        for start in range(0, len(message_ids), 20):
-            chunk = message_ids[start : start + 20]
-            payload = {
-                "requests": [
-                    {
-                        "id": str(index),
-                        "method": "PATCH",
-                        "url": f"/me/messages/{message_id}",
-                        "headers": {"Content-Type": "application/json"},
-                        "body": {"isRead": True},
-                    }
-                    for index, message_id in enumerate(chunk)
-                ]
-            }
-            resp = await client.post(
-                f"{GRAPH}/$batch",
-                headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-                json=payload,
-            )
-            if resp.status_code >= 400:
-                raise HTTPException(status_code=400, detail=f"Outlook batch mark read failed: {resp.text}")
+        await asyncio.gather(*(run_one(chunk) for chunk in chunks))
 
 
 async def outlook_reply_message(
