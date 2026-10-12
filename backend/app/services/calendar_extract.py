@@ -934,6 +934,12 @@ _COMPANY_SENTENCE_TAIL_RE = re.compile(
     r"Unfortunately|After|Looking|Excited|Hope|Let|This|The|Our|My)\b.*$",
     re.I,
 )
+# "Picogrid" + "This meeting..." / "GovSignals" + "Join Google Meet" — a
+# display:none span glued directly against the next visible word with no
+# whitespace or punctuation in the source markup at all.
+_COMPANY_GLUED_SPILL_RE = re.compile(
+    r"(?<=[a-z])(?:This|The|Join|Click|Please|Thank|Thanks|We|I|They|You|Meeting)\b.*$"
+)
 
 
 _COMPANY_ABBREV_RE = re.compile(
@@ -951,6 +957,7 @@ def clean_company_name(value: object, limit: int = 255) -> str:
         return ""
     text = text.splitlines()[0]
     text = _COMPANY_SENTENCE_TAIL_RE.sub("", text)
+    text = _COMPANY_GLUED_SPILL_RE.sub("", text)
     text = text.strip(" ,;:!?\"'\t")
     if text.endswith(".") and not _COMPANY_ABBREV_RE.search(text):
         text = text[:-1].rstrip(" ,;:!?\"'\t")
@@ -1432,6 +1439,22 @@ _INTERVIEW_STAGE_RE = re.compile(
     $
     """
 )
+
+
+_GENERIC_ROLE_SUFFIX_RE = re.compile(r"^\s*(?:the\s+)?(.*?)\s+role\s*$", re.I)
+
+
+def is_generic_company_role(role: str | None, company: str | None) -> bool:
+    """True for placeholder titles like "TinyFish role" lifted verbatim from
+    "...candidate interview ... for the TinyFish role" scheduling-page
+    boilerplate, which names the employer but not an actual job title."""
+    match = _GENERIC_ROLE_SUFFIX_RE.match((role or "").strip())
+    if not match:
+        return False
+    name = match.group(1).strip()
+    if not name:
+        return True
+    return companies_match(name, company or "")
 
 
 def is_interview_stage_label(role: str | None) -> bool:
@@ -2028,6 +2051,17 @@ skip_landing_page_resolution: ContextVar[bool] = ContextVar(
     "skip_landing_page_resolution", default=False
 )
 
+#: Set while a bulk backfill pass is running so its loop doesn't re-run the
+#: whole-mailbox duplicate-collapse pass (~15 repair scans over every stored
+#: event, observed at ~17s for a 161-event mailbox) after every single email.
+#: It is a mailbox-level operation, not a per-email one, so the backfill loop
+#: runs it once per batch instead via collapse_duplicate_calendar_events.
+#: Live single-message processing (webhooks, manual reclassify) leaves this
+#: at its default and still collapses duplicates immediately.
+defer_duplicate_collapse: ContextVar[bool] = ContextVar(
+    "defer_duplicate_collapse", default=False
+)
+
 
 async def _resolve_video_landing_page(text: str) -> MeetingAccess | None:
     """Resolve allow-listed recruiting gateways to a provider join URL.
@@ -2524,6 +2558,14 @@ def _identity_events(db: Session, email: EmailMessage, *, kind: str | None = Non
     return query.order_by(CalendarEvent.start_at.desc(), CalendarEvent.id.desc()).all()
 
 
+# A reply that updates a booking without repeating its exact clock (e.g. "see
+# you then!") still means the same appointment. Three days covers a normal
+# last-minute reschedule without reaching into the next interview round of a
+# multi-stage thread (phone screen, onsite, final), which is typically at
+# least several days to weeks later.
+_SAME_APPOINTMENT_WINDOW_SECONDS = 3 * 24 * 3600
+
+
 def _confirmed_for_slots(db: Session, email: EmailMessage, slots: list[ExtractedSlot]) -> CalendarEvent | None:
     sourced = (
         db.query(CalendarEvent)
@@ -2560,10 +2602,22 @@ def _confirmed_for_slots(db: Session, email: EmailMessage, slots: list[Extracted
             .all()
         )
     if not candidates:
-        threaded = _thread_events(db, email, kind="confirmed")
         if sourced:
             return sourced[0]
-        return threaded[0] if threaded else None
+        # A same-thread confirmed event close in time to this slot is the same
+        # appointment being updated (e.g. a reply that didn't repeat the exact
+        # clock). One far away in time is a later interview round in the same
+        # ongoing thread (phone screen, then onsite, then final) and must get
+        # its own chip rather than overwrite the earlier round's date.
+        threaded = _thread_events(db, email, kind="confirmed")
+        for event in threaded:
+            event_start = as_utc(event.start_at)
+            if event_start and any(
+                abs((event_start - slot.start_at).total_seconds()) <= _SAME_APPOINTMENT_WINDOW_SECONDS
+                for slot in slots
+            ):
+                return event
+        return None
     company = (email.company or "").strip()
     if company:
         same_company = [item for item in candidates if companies_match(item.company, company)]
@@ -2797,6 +2851,19 @@ def _matching_interview_invitation(db: Session, email: EmailMessage) -> EmailMes
     return None
 
 
+_UNCONFIRMED_CANDIDATE_PROPOSAL_RE = re.compile(
+    r"\b(?:"
+    r"please\s+let\s+me\s+know\s+(?:if|what|which|whether)"
+    r"|let\s+me\s+know\s+(?:if|what|which|whether)"
+    r"|would\b.{0,80}\bwork\s+for\s+you"
+    r"|could\b.{0,80}\b(?:schedule|reschedule)"
+    r"|please\b.{0,50}\bsend\b.{0,40}\bcalendar\s+invitation"
+    r"|if\s+(?:so|that\s+works)\b"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
 def candidate_proposed_availability(db: Session, email: EmailMessage) -> bool:
     """A Sent reply where we name times we can do, in an existing interview thread.
 
@@ -2813,7 +2880,17 @@ def candidate_proposed_availability(db: Session, email: EmailMessage) -> bool:
     thread id and organizer identity cannot be trusted here. Fall back to
     matching the employer's invitation by its reply-stripped subject.
     """
-    if email.human_corrected or email.folder != "sent" or email.label in CALENDAR_LABELS:
+    if email.human_corrected or email.folder != "sent":
+        return False
+    # A classifier can mistake the candidate's own suggested times for a
+    # confirmation. Correct only clear, unconfirmed proposals; other calendar
+    # labels and real calendar/reminder/cancellation mail remain authoritative.
+    scheduled_misclassification = email.label == EmailLabel.INTERVIEW_SCHEDULED.value
+    if email.label in CALENDAR_LABELS and not scheduled_misclassification:
+        return False
+    if scheduled_misclassification and email.interview_subtype in {"calendar_invite", "reminder", "cancellation"}:
+        return False
+    if scheduled_misclassification and parse_ics_slots(_calendar_text(email)):
         return False
     if not _normalized_subject(email.subject):
         return False
@@ -2823,7 +2900,15 @@ def candidate_proposed_availability(db: Session, email: EmailMessage) -> bool:
         return False
     fresh = _without_quoted_history(_calendar_text(email))
     # Candidate replies often offer a window ("between 9 and 3") rather than one slot.
-    return bool(parse_text_slots(fresh, email.received_at))
+    slots = parse_text_slots(fresh, email.received_at)
+    if not slots:
+        return False
+    if not scheduled_misclassification:
+        return True
+    # Multiple alternatives cannot be a booked appointment. A single time is
+    # also still only an offer when the candidate explicitly asks the employer
+    # to confirm it or send the calendar invitation.
+    return len(slots) > 1 or bool(_UNCONFIRMED_CANDIDATE_PROPOSAL_RE.search(fresh))
 
 
 def _replacement_times(email: EmailMessage) -> list[ExtractedSlot]:
@@ -3694,7 +3779,11 @@ def repair_interview_stage_roles(db: Session, mailbox_id: int | None = None) -> 
     email_query = db.query(EmailMessage).filter(EmailMessage.job_role != "")
     if mailbox_id is not None:
         email_query = email_query.filter(EmailMessage.mailbox_id == mailbox_id)
-    stage_emails = [email for email in email_query.all() if is_interview_stage_label(email.job_role)]
+    stage_emails = [
+        email
+        for email in email_query.all()
+        if is_interview_stage_label(email.job_role) or is_generic_company_role(email.job_role, email.company)
+    ]
     for email in stage_emails:
         email.job_role = ""
         found = _open_role_for_employer(db, email, email.company or "")
@@ -3712,7 +3801,7 @@ def repair_interview_stage_roles(db: Session, mailbox_id: int | None = None) -> 
         event_query = event_query.filter(CalendarEvent.mailbox_id == mailbox_id)
     refresh_ids: set[int] = set()
     for event in event_query.all():
-        if not is_interview_stage_label(event.job_role):
+        if not (is_interview_stage_label(event.job_role) or is_generic_company_role(event.job_role, event.company)):
             continue
         event.job_role = ""
         email = db.get(EmailMessage, event.source_email_id) if event.source_email_id else None
@@ -4797,6 +4886,22 @@ async def process_calendar_email(
     force: bool = False,
     use_ai: bool = True,
 ) -> bool:
+    if candidate_proposed_availability(db, email):
+        # Our own Sent proposal, not yet confirmed. Keep it as Interview
+        # Availability so the offered or reschedule times stay on the calendar
+        # until a booking replaces them. Run this before trusting an existing
+        # calendar label because classifiers can call a proposal "scheduled".
+        invitation = _matching_interview_invitation(db, email)
+        email.label = EmailLabel.INTERVIEW_AVAILABILITY.value
+        email.interview_subtype = None
+        if invitation is not None:
+            if not email.thread_id and invitation.thread_id:
+                email.thread_id = invitation.thread_id
+            if not (email.company or "").strip() and invitation.company:
+                email.company = invitation.company
+            if not job_role_or_empty(email.job_role) and job_role_or_empty(invitation.job_role):
+                email.job_role = job_role_or_empty(invitation.job_role)
+        return await _process_calendar_email(db, email, force=force, use_ai=use_ai)
     if email.label in CALENDAR_LABELS:
         return await _process_calendar_email(db, email, force=force, use_ai=use_ai)
     if misfiled_interview_booking(email):
@@ -4814,21 +4919,6 @@ async def process_calendar_email(
         finally:
             email.label = label
             email.interview_subtype = previous_subtype
-    if candidate_proposed_availability(db, email):
-        # Our own Sent proposal, not yet confirmed. Keep it as Interview
-        # Availability so the offered or reschedule times stay on the calendar
-        # until a booking replaces them.
-        invitation = _matching_interview_invitation(db, email)
-        email.label = EmailLabel.INTERVIEW_AVAILABILITY.value
-        email.interview_subtype = None
-        if invitation is not None:
-            if not email.thread_id and invitation.thread_id:
-                email.thread_id = invitation.thread_id
-            if not (email.company or "").strip() and invitation.company:
-                email.company = invitation.company
-            if not job_role_or_empty(email.job_role) and job_role_or_empty(invitation.job_role):
-                email.job_role = job_role_or_empty(invitation.job_role)
-        return await _process_calendar_email(db, email, force=force, use_ai=use_ai)
     return False
 
 
@@ -4865,7 +4955,7 @@ async def _process_calendar_email(
             target.outcome_at = as_utc(email.received_at) or datetime.now(timezone.utc)
             _link_event_email(db, target, email.id)
             changed = True
-        if collapse_duplicate_calendar_events(db, email.mailbox_id):
+        if not defer_duplicate_collapse.get() and collapse_duplicate_calendar_events(db, email.mailbox_id):
             changed = True
         email.calendar_processed_hash = digest
         email.calendar_processed_at = datetime.now(timezone.utc)
@@ -5042,7 +5132,7 @@ async def _process_calendar_email(
                 if _hide_prior_bookings_replaced_by(db, email, event):
                     changed = True
 
-    if collapse_duplicate_calendar_events(db, email.mailbox_id):
+    if not defer_duplicate_collapse.get() and collapse_duplicate_calendar_events(db, email.mailbox_id):
         changed = True
 
     email.calendar_processed_hash = digest

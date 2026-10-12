@@ -578,6 +578,98 @@ def test_sent_reply_proposing_a_time_becomes_an_available_calendar_slot():
         assert event.start_at == datetime(2026, 10, 5, 21, 0, tzinfo=timezone.utc)
 
 
+def test_sent_reply_with_two_options_overrides_scheduled_misclassification():
+    """A candidate offering alternatives is not booked just because the
+    classifier called the sent message an interview confirmation."""
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="swift-invite",
+            thread_id="swift-thread",
+            folder="inbox",
+            subject="RE: FW: Swift: Job Opportunity",
+            sender="Richard <richard@swift.com>",
+            received_at=datetime(2026, 10, 7, 19, 51, tzinfo=timezone.utc),
+            body_text="Can you please provide me with your availability this week?",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="Swift",
+            job_role="Senior Storage DevOps",
+        )
+        reply = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="swift-options",
+            thread_id="swift-thread",
+            folder="sent",
+            subject="RE: FW: Swift: Job Opportunity",
+            sender="candidate@example.com",
+            received_at=datetime(2026, 10, 7, 19, 55, tzinfo=timezone.utc),
+            body_text=(
+                "I'd be glad to speak with the hiring manager. I'm available "
+                "October 8 at 9:00 AM (CDT) or October 9 at 2:00 PM (CDT)."
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+            company="Swift",
+            job_role="Senior Storage DevOps",
+        )
+        db.add_all([invitation, reply])
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, reply, use_ai=False)) is True
+        assert reply.label == EmailLabel.INTERVIEW_AVAILABILITY.value
+        assert reply.interview_subtype is None
+        events = db.query(CalendarEvent).filter(
+            CalendarEvent.source_email_id == reply.id,
+            CalendarEvent.is_visible.is_(True),
+        ).order_by(CalendarEvent.start_at).all()
+        assert [event.kind for event in events] == ["availability", "availability"]
+        assert [event.start_at for event in events] == [
+            datetime(2026, 10, 8, 14, 0, tzinfo=timezone.utc),
+            datetime(2026, 10, 9, 19, 0, tzinfo=timezone.utc),
+        ]
+
+
+def test_sent_acceptance_of_one_time_can_remain_scheduled():
+    """A clear acceptance of one employer-proposed time is not demoted."""
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="single-time-invite",
+            thread_id="single-time-thread",
+            folder="inbox",
+            subject="Cloud Platform Engineer Interview",
+            sender="recruiter@example.com",
+            received_at=datetime(2026, 10, 7, 18, 0, tzinfo=timezone.utc),
+            body_text="Can you meet October 8 at 2:00 PM PST?",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="Example Co",
+            job_role="Cloud Platform Engineer",
+        )
+        reply = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="single-time-acceptance",
+            thread_id="single-time-thread",
+            folder="sent",
+            subject="Re: Cloud Platform Engineer Interview",
+            sender="candidate@example.com",
+            received_at=datetime(2026, 10, 7, 18, 5, tzinfo=timezone.utc),
+            body_text="October 8 at 2:00 PM PST works well for me. I look forward to speaking with you.",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+            company="Example Co",
+            job_role="Cloud Platform Engineer",
+        )
+        db.add_all([invitation, reply])
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, reply, use_ai=False)) is True
+        assert reply.label == EmailLabel.INTERVIEW_SCHEDULED.value
+        event = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == reply.id).one()
+        assert event.kind == "confirmed"
+
+
 def test_sent_reply_without_a_shared_thread_id_matches_by_subject():
     """Mail sync does not always carry a thread id onto a Sent copy.
 

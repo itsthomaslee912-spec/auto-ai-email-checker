@@ -10,7 +10,7 @@ from sqlalchemy import and_, or_
 from app.db import SessionLocal
 from app.models import EmailMessage
 from app.realtime.sse import publish
-from app.services.calendar_extract import CALENDAR_LABELS, email_calendar_hash, needs_calendar_event_repair, process_calendar_email, refresh_calendar_event_details, repair_meeting_landing_urls, skip_landing_page_resolution
+from app.services.calendar_extract import CALENDAR_LABELS, collapse_duplicate_calendar_events, defer_duplicate_collapse, email_calendar_hash, needs_calendar_event_repair, process_calendar_email, refresh_calendar_event_details, repair_meeting_landing_urls, skip_landing_page_resolution
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +137,13 @@ async def _backfill_calendar_events(
         # visible progress. Bulk backfill skips it; live single-message
         # processing (webhooks, manual reclassify) is unaffected.
         skip_token = skip_landing_page_resolution.set(True)
+        # The duplicate-collapse pass re-scans every stored event for a
+        # mailbox (observed ~17s for 161 events) and is a mailbox-level
+        # operation, not a per-email one. Running it after each of 50 emails
+        # in a batch made the backlog's effective cost quadratic; deferring
+        # it to once per touched mailbox per batch below keeps it linear.
+        collapse_token = defer_duplicate_collapse.set(True)
+        touched_mailboxes: set[int] = set()
         try:
             for index, email_id in enumerate(email_ids):
                 if stop_event.is_set():
@@ -144,6 +151,7 @@ async def _backfill_calendar_events(
                 email = db.get(EmailMessage, email_id)
                 if email is None:
                     continue
+                touched_mailboxes.add(email.mailbox_id)
                 try:
                     if email.calendar_processed_hash == email_calendar_hash(email):
                         if needs_calendar_event_repair(db, email):
@@ -180,7 +188,19 @@ async def _backfill_calendar_events(
                 if index % 5 == 0:
                     publish_pending()
                     await asyncio.sleep(0)
+            for mailbox_id in touched_mailboxes:
+                if stop_event.is_set():
+                    break
+                try:
+                    if collapse_duplicate_calendar_events(db, mailbox_id):
+                        pending_mailboxes.add(mailbox_id)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    logger.exception("Calendar backfill collapse failed mailbox_id=%s", mailbox_id)
+                await asyncio.sleep(0)
         finally:
+            defer_duplicate_collapse.reset(collapse_token)
             skip_landing_page_resolution.reset(skip_token)
             db.close()
         publish_pending()
