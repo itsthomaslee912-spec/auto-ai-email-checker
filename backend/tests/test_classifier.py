@@ -416,6 +416,48 @@ def test_offer_recognizes_offer_letter_acceptance_and_post_offer_onboarding():
         assert _heuristic_label(subject, "Talent", body, "") == EmailLabel.OFFER.value
 
 
+def test_offer_ignores_negated_eeo_disclaimer_boilerplate():
+    """"This email is not an offer of employment" is standard EEO boilerplate
+    appended to plain application receipts — it must not force the offer label."""
+    cases = (
+        (
+            "Wells Fargo Careers: Thank you for applying",
+            "Dear Thomas, thank you for your interest in Wells Fargo. We have received "
+            "your application for the following position: R-574194 Lead Infrastructure Engineer. "
+            "Note: this email is not an offer of employment.",
+        ),
+        (
+            "You're invited to Specific Specialists on Slack",
+            "Hi Thomas, thanks for applying for the role through our marketplace. "
+            "Join the Slack workspace. Joining the workspace does not constitute an offer "
+            "of employment or a contractor engagement.",
+        ),
+    )
+    for subject, body in cases:
+        assert _heuristic_label(subject, "Talent", body, "") != EmailLabel.OFFER.value
+
+
+def test_offer_requires_job_context_for_excited_to_offer_you():
+    """"We're excited to offer you X% off" is marketing, not a job offer."""
+    assert _heuristic_label(
+        "Thanks for being a valued member",
+        "LinkedIn",
+        "Hi Thomas, we're excited to offer you an exclusive free trial and then "
+        "25% off your premium career subscription - for life.",
+        "",
+    ) != EmailLabel.OFFER.value
+
+
+def test_offer_requires_start_date_for_standalone_onboarding_mention():
+    """A standalone onboarding-tasks mention with no job context is not an offer."""
+    assert _heuristic_label(
+        "Your Slack onboarding tasks are waiting",
+        "Slack",
+        "Get set up and ready to collaborate with your team.",
+        "",
+    ) != EmailLabel.OFFER.value
+
+
 def test_quoted_offer_language_does_not_override_latest_message():
     assert _heuristic_label(
         "Re: Senior Engineer opportunity",

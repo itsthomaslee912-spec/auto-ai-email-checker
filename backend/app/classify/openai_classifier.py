@@ -520,18 +520,22 @@ def _is_interview_follow_up(text: str) -> bool:
     ))
 
 
+_OFFER_NEGATION_RE = re.compile(r"\b(?:not|n't|never|without|no)\b", re.I)
+
+
 def _is_offer(text: str) -> bool:
     """Require evidence of an actual employment offer or post-offer step.
 
     Generic benefits/compensation language is present in many job descriptions,
     so it must never be sufficient by itself.
     """
-    return any(re.search(pattern, text) for pattern in (
+    if any(re.search(pattern, text) for pattern in (
         r"\boffer letter\b",
         r"\b(?:formal|written) (?:employment )?offer\b",
-        r"\boffer of employment\b",
         r"\b(pleased|excited|delighted) to (?:extend|make|present)?\s*(?:you )?an? offer\b",
-        r"\b(pleased|excited|delighted) to offer you\b",
+        # Generic "we're excited to offer you X% off" marketing matches the
+        # bare phrase below too easily; require it to actually be about a job.
+        r"\b(pleased|excited|delighted) to offer you\b.{0,40}\b(?:the position|a position|the role|this role|employment|to join (?:us|our team)|the job)\b",
         r"\bextend(?:ing)? (?:you )?an offer\b",
         r"\bnegotiat\w* (your |the )?offer\b",
         r"\b(?:accept|decline) (?:this|the|your) offer\b",
@@ -541,9 +545,24 @@ def _is_offer(text: str) -> bool:
         r"\bsign (?:the |your )?offer\b",
         r"\b(?:you have|you've|we have) accepted (?:our|the|your) offer\b",
         r"\baccepted (?:our|the|your) offer\b.{0,180}\b(?:background|pre-hire|onboarding|start date)\b",
-        r"\b(?:pre-hire|onboarding) (?:process|tasks?|paperwork)\b",
         r"\bbackground (?:check|verification)\b.{0,180}\b(?:accepted|offer|new hire|start date)\b",
-    ))
+        # A standalone onboarding-tasks mention is common in unrelated
+        # non-job emails (e.g. "Your Slack onboarding tasks are waiting");
+        # require it alongside a job-specific "start date" to count as
+        # post-offer onboarding.
+        r"\b(?:pre-hire|onboarding) (?:process|tasks?|paperwork)\b.{0,120}\bstart\s+date\b",
+        r"\bstart\s+date\b.{0,120}\b(?:pre-hire|onboarding) (?:process|tasks?|paperwork)\b",
+    )):
+        return True
+    # "offer of employment" is almost always inside a negated EEO/legal
+    # disclaimer ("this is not an offer of employment", "does not constitute
+    # an offer of employment") in a plain application receipt, so only count
+    # it when nothing nearby actually negates it.
+    for match in re.finditer(r"\boffer of employment\b", text):
+        preceding = text[max(0, match.start() - 40) : match.start()]
+        if not _OFFER_NEGATION_RE.search(preceding):
+            return True
+    return False
 
 
 def _heuristic_label(subject: str, sender: str, body_text: str, snippet: str) -> str | None:
