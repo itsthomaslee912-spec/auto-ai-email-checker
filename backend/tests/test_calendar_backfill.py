@@ -98,6 +98,68 @@ def test_backfill_loop_processes_batch_then_idles_without_ai(monkeypatch):
     assert ai_calls == []
 
 
+def test_backfill_loop_skips_real_landing_page_http_calls(monkeypatch):
+    """A Paradox/Teamtailor scheduling link would normally cost a real HTTP
+    round trip (up to ~8s, several candidate URLs) per message — left on, a
+    handful of these in one batch stalls the whole loop with no error and no
+    visible progress. The bulk pass must skip it entirely."""
+    factory, mailbox_id = _database()
+    with factory() as db:
+        db.add(EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="msg-paradox",
+            subject="Interview scheduling",
+            sender="recruiter@example.com",
+            body_text=(
+                _ics_body(datetime(2026, 10, 20, 15, 0, tzinfo=timezone.utc))
+                + "\nhttps://olivia.paradox.ai/abcdef123456"
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+        ))
+        db.commit()
+
+    monkeypatch.setattr(calendar_backfill, "SessionLocal", factory)
+    monkeypatch.setattr(calendar_backfill, "BACKFILL_IDLE_SECONDS", 0)
+
+    from app.services import calendar_extract
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("httpx should never be reached — the skip flag was not honored")
+
+    real_client = calendar_extract.httpx.AsyncClient
+    monkeypatch.setattr(calendar_extract.httpx, "AsyncClient", lambda **_kw: type(
+        "FailingClient", (), {
+            "__aenter__": fail_if_called,
+            "__aexit__": fail_if_called,
+        },
+    )())
+
+    async def run():
+        stop_event = threading.Event()
+        task = asyncio.ensure_future(
+            calendar_backfill._backfill_calendar_events(stop_event, asyncio.get_event_loop())
+        )
+        for _ in range(50):
+            await asyncio.sleep(0.02)
+            with factory() as db:
+                remaining = (
+                    db.query(EmailMessage)
+                    .filter(EmailMessage.calendar_processed_hash.is_(None))
+                    .count()
+                )
+            if remaining == 0:
+                break
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(run())
+    monkeypatch.setattr(calendar_extract.httpx, "AsyncClient", real_client)
+
+    with factory() as db:
+        email = db.query(EmailMessage).filter(EmailMessage.provider_message_id == "msg-paradox").one()
+        assert email.calendar_processed_hash is not None
+
+
 def test_backfill_loop_exits_promptly_on_stop_event(monkeypatch):
     factory, _mailbox_id = _database()
     monkeypatch.setattr(calendar_backfill, "SessionLocal", factory)

@@ -9,7 +9,7 @@ from sqlalchemy import and_, or_
 from app.db import SessionLocal
 from app.models import EmailMessage
 from app.realtime.sse import publish
-from app.services.calendar_extract import CALENDAR_LABELS, email_calendar_hash, needs_calendar_event_repair, process_calendar_email, refresh_calendar_event_details, repair_meeting_landing_urls
+from app.services.calendar_extract import CALENDAR_LABELS, email_calendar_hash, needs_calendar_event_repair, process_calendar_email, refresh_calendar_event_details, repair_meeting_landing_urls, skip_landing_page_resolution
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +129,13 @@ async def _backfill_calendar_events(
             continue
 
         db = SessionLocal()
+        # Resolving a recruiter landing page is a real HTTP round trip (up to
+        # ~8s, up to several candidate URLs per message) and isn't gated by
+        # use_ai=False — left on, a handful of Paradox/Teamtailor links in one
+        # batch of 50 can stall this loop for minutes with no error and no
+        # visible progress. Bulk backfill skips it; live single-message
+        # processing (webhooks, manual reclassify) is unaffected.
+        skip_token = skip_landing_page_resolution.set(True)
         try:
             for index, email_id in enumerate(email_ids):
                 if stop_event.is_set():
@@ -162,5 +169,6 @@ async def _backfill_calendar_events(
                     publish_pending()
                     await asyncio.sleep(0)
         finally:
+            skip_landing_page_resolution.reset(skip_token)
             db.close()
         publish_pending()

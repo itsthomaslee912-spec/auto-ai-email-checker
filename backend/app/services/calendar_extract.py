@@ -5,6 +5,7 @@ import html
 import json
 import logging
 import re
+from contextvars import ContextVar
 from functools import lru_cache
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -1999,6 +2000,16 @@ def leaves_interview_unbooked(
     return True
 
 
+#: Set while a bulk backfill pass is running so its loop never blocks on a
+#: real HTTP round trip (up to ~8s per candidate URL, several candidates per
+#: message) for every one of a large backlog. Live single-message processing
+#: (webhooks, manual reclassify) leaves this at its default and still
+#: resolves these links.
+skip_landing_page_resolution: ContextVar[bool] = ContextVar(
+    "skip_landing_page_resolution", default=False
+)
+
+
 async def _resolve_video_landing_page(text: str) -> MeetingAccess | None:
     """Resolve allow-listed recruiting gateways to a provider join URL.
 
@@ -2006,6 +2017,8 @@ async def _resolve_video_landing_page(text: str) -> MeetingAccess | None:
     provider is accepted. This prevents arbitrary links in email from turning
     the calendar repair into an open URL fetcher.
     """
+    if skip_landing_page_resolution.get():
+        return None
     source = html.unescape(text or "")
     paradox_urls = [match.group(0) for match in _PARADOX_JOIN_RE.finditer(source)]
     has_teamtailor = "teamtailor" in source.casefold()
