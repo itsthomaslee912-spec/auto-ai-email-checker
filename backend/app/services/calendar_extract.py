@@ -147,6 +147,10 @@ TIME_ZONE_ALIASES = {
     # Windows TZ names must beat the bare "GMT" → UTC alias below.
     "GMT STANDARD TIME": "Europe/London",
     "GREENWICH STANDARD TIME": "Atlantic/Reykjavik",
+    "BRITISH SUMMER TIME": "Europe/London",
+    # "Europe/London" observes BST automatically for the date in question, so
+    # this stays correct whether or not daylight time is actually in effect.
+    "BST": "Europe/London",
     "UTC": "UTC",
     "GMT": "UTC",
 }
@@ -399,13 +403,19 @@ def _zone_from_nearby_text(value: str) -> tuple[timezone | ZoneInfo, str] | None
             named.append((iana.start(), ZoneInfo(iana.group(0)), iana.group(0)))
         except ZoneInfoNotFoundError:
             pass
-    offset = re.search(r"\b(?:GMT|UTC)\s*([+-])(\d{1,2}):?(\d{2})\b", nearby, re.I)
+    # Minutes are commonly omitted ("GMT-7"), not just present ("GMT-07:00").
+    # Making that group mandatory meant "GMT-7" never matched here at all and
+    # fell through to the bare "GMT" alias below instead — which maps to UTC
+    # outright, silently discarding the "-7" and misreading the time by
+    # whatever the offset was.
+    offset = re.search(r"\b(?:GMT|UTC)\s*([+-])(\d{1,2})(?::?(\d{2}))?\b", nearby, re.I)
     if offset:
-        minutes = int(offset.group(2)) * 60 + int(offset.group(3))
+        offset_minutes = int(offset.group(3)) if offset.group(3) else 0
+        minutes = int(offset.group(2)) * 60 + offset_minutes
         if offset.group(1) == "-":
             minutes *= -1
         if -14 * 60 <= minutes <= 14 * 60:
-            label = f"UTC{offset.group(1)}{int(offset.group(2)):02d}:{int(offset.group(3)):02d}"
+            label = f"UTC{offset.group(1)}{int(offset.group(2)):02d}:{offset_minutes:02d}"
             offsets.append((offset.start(), timezone(timedelta(minutes=minutes)), label))
     upper = nearby.upper()
     for alias in sorted(TIME_ZONE_ALIASES, key=len, reverse=True):
@@ -617,8 +627,17 @@ def parse_text_slots(text: str, received_at: datetime | None = None) -> list[Ext
             weekday = WEEKDAY_NUMBERS.get((match.group("weekday") or "").lower())
             if weekday is None:
                 continue
-            # "Tuesday, October 6" is already covered by the month/day patterns.
-            if re.match(rf"\s*,?\s*(?:{_MONTH_PATTERN})\b", source[match.end() : match.end() + 24], re.I):
+            # "Tuesday, October 6" and the day-before-month order used outside
+            # the US ("Wednesday 14 Oct 2026") are both already covered by the
+            # month/day patterns. Missing the second order meant a bare
+            # "Wednesday" resolved to the next Wednesday on/after the
+            # message's own received_at — which is the same day when that
+            # message happened to arrive on a Wednesday too — producing a
+            # bogus duplicate slot alongside the correct explicit date.
+            after_weekday = source[match.end() : match.end() + 24]
+            if re.match(rf"\s*,?\s*(?:{_MONTH_PATTERN})\b", after_weekday, re.I) or re.match(
+                rf"\s*,?\s*\d{{1,2}}(?:st|nd|rd|th)?\s+(?:{_MONTH_PATTERN})\b", after_weekday, re.I
+            ):
                 continue
             # Skip class schedules like "Mon, Wed & Thurs from 7:30PM".
             if re.match(r"\s*[,&/]", source[match.end() : match.end() + 8]):

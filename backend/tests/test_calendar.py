@@ -2365,6 +2365,54 @@ def test_named_eastern_zone_beats_a_standard_offset_during_daylight_time():
     assert clean_company_name("empty") == ""
 
 
+def test_gmt_offset_without_minutes_is_not_misread_as_plain_utc():
+    """"(GMT-7)" (no minutes) failed to match the offset regex, which required
+    them, and fell through to the bare "GMT" alias — mapping straight to UTC
+    and silently discarding the "-7". Confirmed on a real Google Calendar
+    invite subject: "Tue Oct 13, 2026 1pm - 1:30pm (GMT-7)" was stored as
+    1pm UTC instead of 1pm Pacific (8pm UTC), seven hours off."""
+    received = datetime(2026, 10, 6, 4, 12, tzinfo=timezone.utc)
+    slots = parse_text_slots(
+        "Invitation: Interview with Picogrid @ Tue Oct 13, 2026 1pm - 1:30pm (GMT-7)",
+        received,
+    )
+    assert slots
+    assert slots[0].start_at == datetime(2026, 10, 13, 20, 0, tzinfo=timezone.utc)
+    assert slots[0].end_at == datetime(2026, 10, 13, 20, 30, tzinfo=timezone.utc)
+    assert slots[0].source_timezone == "UTC-07:00"
+
+
+def test_bst_abbreviation_is_recognized():
+    """"BST" (British Summer Time) was entirely missing from the alias map,
+    so a subject naming only that abbreviation produced zero deterministic
+    slots and silently deferred to AI — which never runs in the fast bulk
+    backfill pass, leaving the interview with no calendar chip at all."""
+    received = datetime(2026, 10, 7, 18, 19, tzinfo=timezone.utc)
+    slots = parse_text_slots(
+        "Invitation: Thomas Lee and Christian Wood @ Wed 14 Oct 2026 2pm - 2:30pm (BST)",
+        received,
+    )
+    assert slots
+    assert slots[0].start_at == datetime(2026, 10, 14, 13, 0, tzinfo=timezone.utc)
+    assert slots[0].source_timezone == "Europe/London"
+
+
+def test_day_before_month_date_does_not_also_match_as_a_bare_weekday():
+    """"Wednesday 14 Oct 2026" (day-before-month order) left the bare-weekday
+    skip only recognizing the US "Wednesday, October 14" order, so the
+    weekday word matched a second time on its own and resolved to the next
+    Wednesday on/after the message's received_at — the same day when the
+    message itself happened to arrive on a Wednesday, producing a bogus
+    duplicate slot next to the correct explicit date."""
+    received = datetime(2026, 10, 7, 18, 19, tzinfo=timezone.utc)  # also a Wednesday
+    slots = parse_text_slots(
+        "Invitation: Thomas Lee and Christian Wood @ Wed 14 Oct 2026 2pm - 2:30pm (BST)",
+        received,
+    )
+    assert len(slots) == 1
+    assert slots[0].start_at == datetime(2026, 10, 14, 13, 0, tzinfo=timezone.utc)
+
+
 def test_reminder_joins_the_booking_instead_of_opening_a_second_chip():
     factory, (mailbox_id, _) = _database()
     booking = """BEGIN:VCALENDAR
