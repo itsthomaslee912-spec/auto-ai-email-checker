@@ -13,6 +13,10 @@ from app.models import MailboxConnection, Provider, WebhookSubscription
 GRAPH = "https://graph.microsoft.com/v1.0"
 
 OUTLOOK_LIVE_FOLDERS = ("Inbox", "JunkEmail", "DeletedItems", "Archive")
+# Graph's documented ceiling for message/event/contact subscriptions is 10,080
+# minutes (just under 7 days); a request at or above that is rejected. Stay a
+# few hours under it rather than retry-on-rejection.
+_SUBSCRIPTION_LIFETIME = timedelta(hours=165)
 
 
 def parse_outlook_subscription_ids(raw: str | None) -> list[str]:
@@ -64,7 +68,7 @@ async def create_outlook_subscription(
 ) -> WebhookSubscription:
     settings = get_settings()
     notification_url = f"{settings.webhook_base_url.rstrip('/')}/api/webhooks/outlook"
-    expiration = datetime.now(timezone.utc) + timedelta(hours=70)
+    expiration = datetime.now(timezone.utc) + _SUBSCRIPTION_LIFETIME
 
     webhook = mailbox.webhook
     existing_ids = parse_outlook_subscription_ids(webhook.external_id if webhook else None)
@@ -118,7 +122,7 @@ async def create_outlook_subscription(
 
 
 async def renew_outlook_subscription(access_token: str, subscription_id: str) -> dict:
-    expiration = datetime.now(timezone.utc) + timedelta(hours=70)
+    expiration = datetime.now(timezone.utc) + _SUBSCRIPTION_LIFETIME
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.patch(
             f"{GRAPH}/subscriptions/{subscription_id}",
