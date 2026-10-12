@@ -98,6 +98,56 @@ def test_backfill_loop_processes_batch_then_idles_without_ai(monkeypatch):
     assert ai_calls == []
 
 
+def test_backfill_loop_does_not_refetch_mail_process_calendar_email_no_ops_on(monkeypatch):
+    """process_calendar_email legitimately returns False without touching
+    calendar_processed_hash for mail that only matched the batch query's
+    "subject mentions interview" fallback but isn't actually a misfiled
+    booking (e.g. a cold recruiter email with "Interview Process" in a
+    footer). Confirmed live: this stranded the whole loop — it kept
+    re-fetching the same stuck subset every batch, net zero progress,
+    even once the real network-call bug above was also fixed."""
+    factory, mailbox_id = _database()
+    with factory() as db:
+        db.add(EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="msg-not-a-booking",
+            subject="Our Interview Process at Acme",
+            sender="recruiter@example.com",
+            body_text="We're excited you applied! Here's an overview of our interview process...",
+            label=EmailLabel.OTHER.value,
+            human_corrected=False,
+        ))
+        db.commit()
+
+    monkeypatch.setattr(calendar_backfill, "SessionLocal", factory)
+    monkeypatch.setattr(calendar_backfill, "BACKFILL_IDLE_SECONDS", 0)
+
+    async def run():
+        stop_event = threading.Event()
+        task = asyncio.ensure_future(
+            calendar_backfill._backfill_calendar_events(stop_event, asyncio.get_event_loop())
+        )
+        for _ in range(50):
+            await asyncio.sleep(0.02)
+            with factory() as db:
+                remaining = (
+                    db.query(EmailMessage)
+                    .filter(EmailMessage.calendar_processed_hash.is_(None))
+                    .count()
+                )
+            if remaining == 0:
+                break
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(run())
+
+    with factory() as db:
+        email = db.query(EmailMessage).filter(EmailMessage.provider_message_id == "msg-not-a-booking").one()
+        assert email.calendar_processed_hash is not None
+        assert email.label == EmailLabel.OTHER.value
+
+
 def test_backfill_loop_skips_real_landing_page_http_calls(monkeypatch):
     """A Paradox/Teamtailor scheduling link would normally cost a real HTTP
     round trip (up to ~8s, several candidate URLs) per message — left on, a

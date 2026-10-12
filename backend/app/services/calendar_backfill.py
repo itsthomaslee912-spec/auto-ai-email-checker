@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from datetime import datetime, timezone
 
 from sqlalchemy import and_, or_
 
@@ -161,6 +162,17 @@ async def _backfill_calendar_events(
                     # progress behind the lock it holds while waiting on it.
                     if await process_calendar_email(db, email, use_ai=False):
                         pending_mailboxes.add(email.mailbox_id)
+                    if email.calendar_processed_hash is None:
+                        # The "subject mentions interview" fallback in the
+                        # batch query below catches real misfiled bookings,
+                        # but also ordinary mail that just happens to say
+                        # "interview" — process_calendar_email legitimately
+                        # no-ops on those without ever touching this column.
+                        # Mark them looked-at anyway, or this exact subset
+                        # matches the query again next batch forever and the
+                        # backlog never shrinks past it.
+                        email.calendar_processed_hash = email_calendar_hash(email)
+                        email.calendar_processed_at = datetime.now(timezone.utc)
                     db.commit()
                 except Exception:
                     db.rollback()
