@@ -65,6 +65,58 @@ def test_gmail_history_reads_all_pages_and_preserves_expired_signal(monkeypatch)
         asyncio.run(gmail.gmail_list_history("token", "100"))
 
 
+def test_gmail_history_retries_a_dropped_connection(monkeypatch):
+    """A keep-alive connection the server closes mid-race must not abort the sync.
+
+    httpx raises RemoteProtocolError ("Server disconnected without sending a
+    response") with no Response to inspect, unlike a quota/5xx reply. Before
+    this was handled, one dropped connection during webhook notification
+    processing flipped the account's webhook to "failed" and fell back to
+    polling.
+    """
+    calls = []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _url, *, params, **_kwargs):
+            calls.append(params)
+            if len(calls) == 1:
+                raise gmail.httpx.RemoteProtocolError("Server disconnected without sending a response")
+            return SimpleNamespace(
+                status_code=200,
+                json=lambda: {"history": [{"id": "101"}], "historyId": "200"},
+                text="",
+            )
+
+    monkeypatch.setattr(gmail.httpx, "AsyncClient", lambda **_kwargs: Client())
+    monkeypatch.setattr(gmail.asyncio, "sleep", AsyncMock())
+    result = asyncio.run(gmail.gmail_list_history("token", "100"))
+    assert len(calls) == 2
+    assert [row["id"] for row in result["history"]] == ["101"]
+
+
+def test_gmail_history_reraises_after_exhausting_retries_on_dropped_connections(monkeypatch):
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _url, *, params, **_kwargs):
+            raise gmail.httpx.RemoteProtocolError("Server disconnected without sending a response")
+
+    monkeypatch.setattr(gmail.httpx, "AsyncClient", lambda **_kwargs: Client())
+    monkeypatch.setattr(gmail.asyncio, "sleep", AsyncMock())
+    with pytest.raises(gmail.httpx.RemoteProtocolError):
+        asyncio.run(gmail.gmail_list_history("token", "100"))
+
+
 def test_gmail_incremental_advances_cursor_only_after_fetch_and_ingest(monkeypatch):
     engine, db, mailbox = _mailbox(Provider.GOOGLE)
     mailbox.sync_cursor = "100"

@@ -245,11 +245,31 @@ async def _gmail_get_with_backoff(
     params: dict,
     what: str,
 ) -> httpx.Response:
-    """Retry a Gmail read when the per-user minute quota, or a server error, clears shortly."""
+    """Retry a Gmail read when the per-user minute quota, a server error, or a
+    dropped connection clears shortly.
+
+    httpx can race a pooled keep-alive connection against the server closing
+    it, surfacing as RemoteProtocolError ("Server disconnected without
+    sending a response") with no HTTP response to inspect. Left unretried,
+    one of these during webhook-triggered notification processing aborts the
+    whole fetch and flips the account's webhook to "failed", falling back to
+    polling until the next successful sync.
+    """
     response: httpx.Response | None = None
+    last_attempt = len(_QUOTA_RETRY_DELAYS) - 1
     for attempt, delay in enumerate(_QUOTA_RETRY_DELAYS):
-        response = await client.get(url, headers=headers, params=params)
-        if not _should_retry_gmail(response) or attempt == len(_QUOTA_RETRY_DELAYS) - 1:
+        try:
+            response = await client.get(url, headers=headers, params=params)
+        except (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError, httpx.PoolTimeout) as exc:
+            if attempt == last_attempt:
+                raise
+            logger.warning(
+                "%s hit %s, waiting %ss (attempt %s)",
+                what, type(exc).__name__, delay, attempt + 1,
+            )
+            await asyncio.sleep(delay)
+            continue
+        if not _should_retry_gmail(response) or attempt == last_attempt:
             return response
         logger.warning(
             "%s hit %s, waiting %ss (attempt %s)",
