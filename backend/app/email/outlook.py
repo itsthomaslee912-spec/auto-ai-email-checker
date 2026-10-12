@@ -1,29 +1,121 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 
 import httpx
 from fastapi import HTTPException
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 
+# Tags whose own text content must never surface: stylesheet/script bodies,
+# and document metadata. The old naive "<...>"-only stripper kept this text
+# verbatim, which is why many Outlook emails' body_text started with a wall
+# of raw CSS ("body, table { font-family: ... }").
+_SKIP_CONTENT_TAGS = {"script", "style", "head", "title"}
+# Block-level tags get a newline so adjacent elements don't run together.
+_BLOCK_TAGS = {
+    "p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+    "table", "ul", "ol", "blockquote", "section", "article", "header",
+    "footer", "hr",
+}
+
+
+class _HtmlTextExtractor(HTMLParser):
+    """Converts HTML to plain text without the usual email-HTML failure modes.
+
+    Calendar invites and similar templated mail often include a visually
+    hidden span (style="display:none") carrying structured-data text right
+    before the real visible content, with no whitespace between them in the
+    markup — e.g. Google Calendar's
+    '<span style="display:none">Interview with Picogrid</span>This meeting
+    will take place...'. A tag-only stripper keeps that hidden text and
+    glues it straight onto what follows ("Interview with PicogridThis
+    meeting..."), corrupting whatever later reads the company name out of
+    it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.chunks: list[str] = []
+        self._tag_stack: list[str] = []
+        self._skip_stack: list[bool] = []
+        self._hidden_stack: list[bool] = []
+
+    def _is_skipping(self) -> bool:
+        return any(self._skip_stack) or any(self._hidden_stack)
+
+    def _push(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_dict = {key.lower(): (value or "") for key, value in attrs}
+        style = attrs_dict.get("style", "").lower().replace(" ", "")
+        is_hidden = (
+            "display:none" in style
+            or "visibility:hidden" in style
+            or "hidden" in attrs_dict
+            or attrs_dict.get("aria-hidden", "").lower() == "true"
+        )
+        self._tag_stack.append(tag)
+        self._skip_stack.append(tag in _SKIP_CONTENT_TAGS)
+        self._hidden_stack.append(is_hidden)
+        if tag in _BLOCK_TAGS and not self._is_skipping():
+            self.chunks.append("\n")
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._push(tag, attrs)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._push(tag, attrs)
+        self._pop(tag)
+
+    def _pop(self, tag: str) -> None:
+        # Email HTML is often malformed; search from the end for the nearest
+        # matching open tag instead of assuming a clean stack discipline.
+        for index in range(len(self._tag_stack) - 1, -1, -1):
+            if self._tag_stack[index] == tag:
+                del self._tag_stack[index]
+                del self._skip_stack[index]
+                del self._hidden_stack[index]
+                break
+        if tag in _BLOCK_TAGS:
+            self.chunks.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        self._pop(tag)
+
+    def handle_data(self, data: str) -> None:
+        if not self._is_skipping():
+            self.chunks.append(data)
+
 
 def _strip_html(html: str) -> str:
-    # Lightweight strip without extra deps
-    out: list[str] = []
-    in_tag = False
-    for ch in html:
-        if ch == "<":
-            in_tag = True
-            continue
-        if ch == ">":
-            in_tag = False
-            continue
-        if not in_tag:
-            out.append(ch)
-    return "".join(out)
+    parser = _HtmlTextExtractor()
+    try:
+        parser.feed(html or "")
+        parser.close()
+    except Exception:
+        # HTMLParser is lenient and rarely raises; fall back to the old
+        # tag-only strip for whatever markup still manages to break it,
+        # rather than losing the message body entirely.
+        out: list[str] = []
+        in_tag = False
+        for ch in html or "":
+            if ch == "<":
+                in_tag = True
+                continue
+            if ch == ">":
+                in_tag = False
+                continue
+            if not in_tag:
+                out.append(ch)
+        return "".join(out)
+    text = "".join(parser.chunks)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"[ \t]*\n[ \t]*", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 class OutlookDeltaExpired(Exception):
