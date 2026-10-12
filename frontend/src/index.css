@@ -2006,6 +2006,12 @@ body {
   gap: 0.55rem;
 }
 
+.loading-bar { display: block; height: .28rem; overflow: hidden; border-radius: 99px; background: color-mix(in srgb, var(--accent) 16%, var(--bg-card)); margin-top: .7rem; }
+.loading-bar span { display: block; width: 42%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 15%, transparent), var(--accent)); animation: calendar-loading-slide 1.15s cubic-bezier(.4,0,.2,1) infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .loading-bar span { animation: none; width: 68%; transform: none; }
+}
+
 .dialog-actions .primary-btn {
   width: auto;
   padding: 0.45rem 1rem;

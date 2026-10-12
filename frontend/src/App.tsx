@@ -3022,6 +3022,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                   ? `Mark ${scopeUnread} new message${scopeUnread === 1 ? "" : "s"} as read for ${selectedMailbox.email_address}?`
                   : `Mark ${scopeUnread} new message${scopeUnread === 1 ? "" : "s"} as read for all accounts?`}
               </p>
+              {markingAllRead && (
+                <span className="loading-bar" aria-hidden="true"><span /></span>
+              )}
               <div className="dialog-actions">
                 <button
                   type="button"
@@ -3037,7 +3040,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                   disabled={markingAllRead}
                   onClick={() => void confirmMarkAllRead()}
                 >
-                  Yes
+                  {markingAllRead ? "Marking…" : "Yes"}
                 </button>
               </div>
             </div>
