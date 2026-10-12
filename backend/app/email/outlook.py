@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 
 import httpx
@@ -224,7 +225,12 @@ async def _mark_read_batch(client: httpx.AsyncClient, access_token: str, chunk: 
         return
 
 
-async def outlook_mark_read_many(access_token: str, message_ids: list[str]) -> None:
+async def outlook_mark_read_many(
+    access_token: str,
+    message_ids: list[str],
+    *,
+    on_progress: Callable[[int], Awaitable[None]] | None = None,
+) -> None:
     """Mark many messages read via Graph's $batch endpoint (max 20 sub-requests per call).
 
     Marking them one PATCH at a time — a fresh TCP/TLS connection and a full
@@ -242,6 +248,8 @@ async def outlook_mark_read_many(access_token: str, message_ids: list[str]) -> N
     async def run_one(chunk: list[str]) -> None:
         async with gate:
             await _mark_read_batch(client, access_token, chunk)
+            if on_progress:
+                await on_progress(len(chunk))
 
     async with httpx.AsyncClient(timeout=30) as client:
         await asyncio.gather(*(run_one(chunk) for chunk in chunks))

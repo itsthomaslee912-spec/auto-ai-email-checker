@@ -4,6 +4,7 @@ import asyncio
 import base64
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
@@ -552,7 +553,12 @@ async def gmail_mark_read(access_token: str, message_id: str) -> None:
             raise HTTPException(status_code=400, detail=f"Gmail mark read failed: {resp.text}")
 
 
-async def gmail_mark_read_many(access_token: str, message_ids: list[str]) -> None:
+async def gmail_mark_read_many(
+    access_token: str,
+    message_ids: list[str],
+    *,
+    on_progress: Callable[[int], Awaitable[None]] | None = None,
+) -> None:
     if not message_ids:
         return
     async with httpx.AsyncClient(timeout=30) as client:
@@ -565,6 +571,8 @@ async def gmail_mark_read_many(access_token: str, message_ids: list[str]) -> Non
             )
             if resp.status_code >= 400:
                 raise HTTPException(status_code=400, detail=f"Gmail mark read failed: {resp.text}")
+            if on_progress:
+                await on_progress(len(chunk))
 
 
 async def gmail_reply_headers(access_token: str, message_id: str) -> tuple[str | None, str | None]:

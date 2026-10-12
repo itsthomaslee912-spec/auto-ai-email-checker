@@ -511,6 +511,18 @@ async def mark_all_read(
     for row in unread:
         grouped.setdefault(row.mailbox_id, []).append(row.provider_message_id)
 
+    total = len(unread)
+    marked_so_far = 0
+    await publish("mark_all_read.progress", {"mailbox_id": mailbox_id, "marked": 0, "total": total})
+
+    async def report(count: int) -> None:
+        nonlocal marked_so_far
+        marked_so_far += count
+        await publish(
+            "mark_all_read.progress",
+            {"mailbox_id": mailbox_id, "marked": marked_so_far, "total": total},
+        )
+
     for mid, message_ids in grouped.items():
         mailbox = mailboxes.get(mid)
         if mailbox is None:
@@ -518,10 +530,10 @@ async def mark_all_read(
         try:
             if mailbox.provider == Provider.GOOGLE.value:
                 token = await ensure_google_access_token(db, mailbox)
-                await gmail_mark_read_many(token, message_ids)
+                await gmail_mark_read_many(token, message_ids, on_progress=report)
             elif mailbox.provider == Provider.MICROSOFT.value:
                 token = await ensure_microsoft_access_token(db, mailbox)
-                await outlook_mark_read_many(token, message_ids)
+                await outlook_mark_read_many(token, message_ids, on_progress=report)
         except Exception:
             logger.exception(
                 "Failed to mark provider messages read mailbox_id=%s count=%s",
@@ -532,6 +544,7 @@ async def mark_all_read(
     for row in unread:
         row.is_read = True
     db.commit()
+    await publish("mark_all_read.done", {"mailbox_id": mailbox_id, "marked": len(unread), "total": total})
     return MarkAllReadOut(marked=len(unread))
 
 

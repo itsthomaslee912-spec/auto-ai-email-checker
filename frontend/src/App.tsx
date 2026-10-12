@@ -366,6 +366,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   const [stickyUnreadId, setStickyUnreadId] = useState<number | null>(null);
   const [markAllOpen, setMarkAllOpen] = useState(false);
   const [markingAllRead, setMarkingAllRead] = useState(false);
+  const [markAllReadProgress, setMarkAllReadProgress] = useState<{ marked: number; total: number } | null>(null);
 
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [selected, setSelected] = useState<EmailDetail | null>(null);
@@ -932,6 +933,17 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
       } catch {
         /* ignore */
       }
+    });
+    source.addEventListener("mark_all_read.progress", (evt) => {
+      try {
+        const data = JSON.parse((evt as MessageEvent).data) as { marked?: number; total?: number };
+        setMarkAllReadProgress({ marked: data.marked ?? 0, total: data.total ?? 0 });
+      } catch {
+        /* ignore */
+      }
+    });
+    source.addEventListener("mark_all_read.done", () => {
+      setMarkAllReadProgress(null);
     });
     source.addEventListener("reclassify.done", (evt) => {
       try {
@@ -1954,6 +1966,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   async function confirmMarkAllRead() {
     const scopeId = selectedMailboxId;
     setMarkingAllRead(true);
+    setMarkAllReadProgress({ marked: 0, total: scopeUnread });
     try {
       await markAllRead(scopeId);
       setEmails((prev) =>
@@ -1988,6 +2001,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
       setBanner(err instanceof Error ? err.message : "Could not mark messages read");
     } finally {
       setMarkingAllRead(false);
+      setMarkAllReadProgress(null);
     }
   }
   const readerMailbox = selected != null ? mailboxById.get(selected.mailbox_id) : undefined;
@@ -3023,7 +3037,24 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                   : `Mark ${scopeUnread} new message${scopeUnread === 1 ? "" : "s"} as read for all accounts?`}
               </p>
               {markingAllRead && (
-                <span className="loading-bar" aria-hidden="true"><span /></span>
+                <>
+                  {markAllReadProgress && markAllReadProgress.total > 0 ? (
+                    <>
+                      <span
+                        className="loading-bar is-determinate"
+                        aria-hidden="true"
+                        style={{ "--loading-bar-pct": `${Math.min(100, (markAllReadProgress.marked / markAllReadProgress.total) * 100)}%` } as CSSProperties}
+                      >
+                        <span />
+                      </span>
+                      <span className="loading-bar-count">
+                        {markAllReadProgress.marked.toLocaleString()} / {markAllReadProgress.total.toLocaleString()}
+                      </span>
+                    </>
+                  ) : (
+                    <span className="loading-bar" aria-hidden="true"><span /></span>
+                  )}
+                </>
               )}
               <div className="dialog-actions">
                 <button

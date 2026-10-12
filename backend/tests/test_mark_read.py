@@ -232,7 +232,8 @@ def test_mark_all_read_limits_to_one_mailbox():
         res = client.post("/api/emails/mark-all-read", params={"mailbox_id": mailbox_id})
         assert res.status_code == 200
         assert res.json()["marked"] == 1
-        mark_many.assert_awaited_once_with("token", ["a-unread"])
+        mark_many.assert_awaited_once()
+        assert mark_many.await_args.args == ("token", ["a-unread"])
 
     db = SessionLocal()
     rows = {row.provider_message_id: row.is_read for row in db.query(EmailMessage).all()}
@@ -299,6 +300,41 @@ def test_mark_all_read_batches_outlook_messages_instead_of_one_at_a_time():
     mark_many.assert_awaited_once()
     assert set(mark_many.await_args.args[1]) == {f"msg-{i}" for i in range(25)}
     mark_one.assert_not_awaited()
+
+
+def test_mark_all_read_publishes_progress_events():
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    mailbox = _seed_mailbox(db, external_id="u-progress", email_address="a@example.com")
+    for i in range(3):
+        _add_email(db, mailbox, f"msg-{i}", is_read=False)
+    db.commit()
+    db.close()
+
+    client = _client(SessionLocal)
+    published: list[tuple[str, dict]] = []
+
+    async def fake_mark_many(_token, message_ids, *, on_progress=None):
+        for message_id in message_ids:
+            if on_progress:
+                await on_progress(1)
+
+    async def fake_publish(event, data):
+        published.append((event, dict(data)))
+
+    with (
+        patch("app.api.emails.gmail_mark_read_many", fake_mark_many),
+        patch("app.api.emails.ensure_google_access_token", new_callable=AsyncMock, return_value="token"),
+        patch("app.api.emails.publish", fake_publish),
+    ):
+        res = client.post("/api/emails/mark-all-read")
+        assert res.status_code == 200
+
+    events = [event for event, _ in published]
+    assert events == ["mark_all_read.progress"] * 4 + ["mark_all_read.done"]
+    assert [data["marked"] for event, data in published if event == "mark_all_read.progress"] == [0, 1, 2, 3]
+    assert all(data["total"] == 3 for _, data in published)
+    assert published[-1][1]["marked"] == 3
 
 
 def test_outlook_mark_read_many_batches_in_groups_of_twenty(monkeypatch):
