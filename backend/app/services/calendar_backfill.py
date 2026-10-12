@@ -14,12 +14,18 @@ from app.services.calendar_extract import CALENDAR_LABELS, email_calendar_hash, 
 logger = logging.getLogger(__name__)
 
 
+BACKFILL_IDLE_SECONDS = 60
+
+
 async def backfill_calendar_events(stop_event: asyncio.Event) -> None:
     """Repair stored calendar mail without freezing the API.
 
     The repair holds database locks and does synchronous work. Running it on
     the request loop makes health checks, webhooks, and the calendar wait
-    behind it, so the work runs on its own thread and loop.
+    behind it, so the work runs on its own thread and loop. This runs until
+    stop_event is set — a one-shot pass used to silently strand a large
+    backlog (e.g. right after a mailbox's initial import) if the process
+    restarted before it finished; nothing ever resumed it.
     """
     stop_flag = threading.Event()
     main_loop = asyncio.get_running_loop()
@@ -57,30 +63,34 @@ def _publish_from_backfill(
         logger.debug("Skipped calendar backfill event; API loop is closed")
 
 
+_BATCH_SIZE = 50
+
+
+def _load_email_id_batch() -> list[int]:
+    lookup = SessionLocal()
+    try:
+        return [
+            row[0]
+            for row in lookup.query(EmailMessage.id)
+            .filter(
+                or_(
+                    EmailMessage.label.in_(CALENDAR_LABELS),
+                    # Booked interviews misfiled under another category.
+                    and_(EmailMessage.subject.ilike("%interview%"), EmailMessage.human_corrected.is_(False)),
+                ),
+                EmailMessage.calendar_processed_hash.is_(None),
+            )
+            .order_by(EmailMessage.received_at.asc(), EmailMessage.id.asc())
+            .limit(_BATCH_SIZE)
+            .all()
+        ]
+    finally:
+        lookup.close()
+
+
 async def _backfill_calendar_events(
     stop_event: threading.Event, main_loop: asyncio.AbstractEventLoop,
 ) -> None:
-    def load_email_ids() -> list[int]:
-        lookup = SessionLocal()
-        try:
-            return [
-                row[0]
-                for row in lookup.query(EmailMessage.id)
-                .filter(
-                    or_(
-                        EmailMessage.label.in_(CALENDAR_LABELS),
-                        # Booked interviews misfiled under another category.
-                        and_(EmailMessage.subject.ilike("%interview%"), EmailMessage.human_corrected.is_(False)),
-                    )
-                )
-                .order_by(EmailMessage.received_at.asc(), EmailMessage.id.asc())
-                .all()
-            ]
-        finally:
-            lookup.close()
-
-    email_ids = await asyncio.to_thread(load_email_ids)
-    db = SessionLocal()
     pending_mailboxes: set[int] = set()
 
     def publish_pending() -> None:
@@ -90,38 +100,67 @@ async def _backfill_calendar_events(
             )
         pending_mailboxes.clear()
 
-    try:
-        for index, email_id in enumerate(email_ids):
-            email = db.get(EmailMessage, email_id)
-            if stop_event.is_set():
-                break
-            if email is None:
-                continue
+    while not stop_event.is_set():
+        # A fresh session and a fresh query every batch: fresh query picks up
+        # mail that arrived mid-run, and a fresh session keeps its identity
+        # map from growing across the whole backlog, which otherwise makes
+        # commit()'s autoflush dirty-check slower with every batch.
+        email_ids = await asyncio.to_thread(_load_email_id_batch)
+        if not email_ids:
+            publish_pending()
+            # Idle mailboxes never hit this repair path from the main loop
+            # above, so give it a turn whenever there's nothing new to do.
+            db = SessionLocal()
             try:
-                if email.calendar_processed_hash == email_calendar_hash(email):
-                    if needs_calendar_event_repair(db, email):
-                        if await process_calendar_email(db, email, force=True, use_ai=False):
-                            pending_mailboxes.add(email.mailbox_id)
-                        db.commit()
-                        continue
-                    if refresh_calendar_event_details(db, email):
-                        pending_mailboxes.add(email.mailbox_id)
-                        db.commit()
-                    continue
-                if await process_calendar_email(db, email):
-                    pending_mailboxes.add(email.mailbox_id)
-                db.commit()
+                repaired_mailboxes = await repair_meeting_landing_urls(db)
+                if repaired_mailboxes:
+                    pending_mailboxes.update(repaired_mailboxes)
+                    db.commit()
             except Exception:
                 db.rollback()
-                logger.exception("Calendar backfill failed email_id=%s", email.id)
-            if index % 5 == 0:
-                publish_pending()
-                await asyncio.sleep(0)
-        if not stop_event.is_set():
-            repaired_mailboxes = await repair_meeting_landing_urls(db)
-            if repaired_mailboxes:
-                pending_mailboxes.update(repaired_mailboxes)
-                db.commit()
-    finally:
-        db.close()
-    publish_pending()
+                logger.exception("Calendar landing-page repair failed")
+            finally:
+                db.close()
+            publish_pending()
+            for _ in range(BACKFILL_IDLE_SECONDS):
+                if stop_event.is_set():
+                    return
+                await asyncio.sleep(1)
+            continue
+
+        db = SessionLocal()
+        try:
+            for index, email_id in enumerate(email_ids):
+                if stop_event.is_set():
+                    break
+                email = db.get(EmailMessage, email_id)
+                if email is None:
+                    continue
+                try:
+                    if email.calendar_processed_hash == email_calendar_hash(email):
+                        if needs_calendar_event_repair(db, email):
+                            if await process_calendar_email(db, email, force=True, use_ai=False):
+                                pending_mailboxes.add(email.mailbox_id)
+                            db.commit()
+                            continue
+                        if refresh_calendar_event_details(db, email):
+                            pending_mailboxes.add(email.mailbox_id)
+                            db.commit()
+                        continue
+                    # Deterministic parsing (ICS, explicit subject times,
+                    # meeting links) covers most mail and is near-instant; a
+                    # real model call per message is what made a backlog of
+                    # thousands take hours and starve this loop's own
+                    # progress behind the lock it holds while waiting on it.
+                    if await process_calendar_email(db, email, use_ai=False):
+                        pending_mailboxes.add(email.mailbox_id)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    logger.exception("Calendar backfill failed email_id=%s", email_id)
+                if index % 5 == 0:
+                    publish_pending()
+                    await asyncio.sleep(0)
+        finally:
+            db.close()
+        publish_pending()
