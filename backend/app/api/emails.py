@@ -32,6 +32,7 @@ from app.email.outlook import (
     outlook_attach_folder,
     outlook_get_message,
     outlook_mark_read,
+    outlook_mark_read_many,
     outlook_reply_message,
     outlook_send_message,
 )
@@ -520,8 +521,7 @@ async def mark_all_read(
                 await gmail_mark_read_many(token, message_ids)
             elif mailbox.provider == Provider.MICROSOFT.value:
                 token = await ensure_microsoft_access_token(db, mailbox)
-                for message_id in message_ids:
-                    await outlook_mark_read(token, message_id)
+                await outlook_mark_read_many(token, message_ids)
         except Exception:
             logger.exception(
                 "Failed to mark provider messages read mailbox_id=%s count=%s",

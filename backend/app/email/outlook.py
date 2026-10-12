@@ -192,6 +192,39 @@ async def outlook_mark_read(access_token: str, message_id: str) -> None:
             raise HTTPException(status_code=400, detail=f"Outlook mark read failed: {resp.text}")
 
 
+async def outlook_mark_read_many(access_token: str, message_ids: list[str]) -> None:
+    """Mark many messages read via Graph's $batch endpoint (max 20 sub-requests per call).
+
+    Marking them one PATCH at a time — a fresh TCP/TLS connection and a full
+    round trip per message — is what made "mark all read" slow for Outlook
+    while Gmail's batchModify handled the same action in one request.
+    """
+    if not message_ids:
+        return
+    async with httpx.AsyncClient(timeout=30) as client:
+        for start in range(0, len(message_ids), 20):
+            chunk = message_ids[start : start + 20]
+            payload = {
+                "requests": [
+                    {
+                        "id": str(index),
+                        "method": "PATCH",
+                        "url": f"/me/messages/{message_id}",
+                        "headers": {"Content-Type": "application/json"},
+                        "body": {"isRead": True},
+                    }
+                    for index, message_id in enumerate(chunk)
+                ]
+            }
+            resp = await client.post(
+                f"{GRAPH}/$batch",
+                headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                json=payload,
+            )
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=400, detail=f"Outlook batch mark read failed: {resp.text}")
+
+
 async def outlook_reply_message(
     access_token: str,
     message_id: str,

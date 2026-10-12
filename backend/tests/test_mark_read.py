@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 import asyncio
 
@@ -141,7 +142,9 @@ def test_get_email_can_mark_the_whole_conversation_read():
     assert states == [True, True]
 
 
-def _seed_mailbox(db, *, external_id: str, email_address: str) -> MailboxConnection:
+def _seed_mailbox(
+    db, *, external_id: str, email_address: str, provider: str = Provider.GOOGLE.value,
+) -> MailboxConnection:
     user = db.query(User).filter(User.external_id == external_id).one_or_none()
     if user is None:
         user = User(external_id=external_id)
@@ -149,7 +152,7 @@ def _seed_mailbox(db, *, external_id: str, email_address: str) -> MailboxConnect
         db.flush()
     mailbox = MailboxConnection(
         user_id=user.id,
-        provider=Provider.GOOGLE.value,
+        provider=provider,
         email_address=email_address,
         access_token_enc="x",
         refresh_token_enc="",
@@ -263,6 +266,64 @@ def test_mark_all_read_keeps_local_read_when_provider_fails():
     stored = db.query(EmailMessage).filter(EmailMessage.provider_message_id == "a-unread").one()
     assert stored.is_read is True
     db.close()
+
+
+def test_mark_all_read_batches_outlook_messages_instead_of_one_at_a_time():
+    """Outlook used to PATCH each message individually — a fresh connection and a
+    full round trip per message, with no concurrency. A batched call covering all
+    of this mailbox's unread mail in one request is what fixes that slowdown."""
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    mailbox = _seed_mailbox(
+        db, external_id="u-outlook", email_address="a@outlook.com", provider=Provider.MICROSOFT.value,
+    )
+    for i in range(25):
+        _add_email(db, mailbox, f"msg-{i}", is_read=False)
+    db.commit()
+    db.close()
+
+    client = _client(SessionLocal)
+    mark_many = AsyncMock()
+    mark_one = AsyncMock()
+    ensure_token = AsyncMock(return_value="token")
+
+    with (
+        patch("app.api.emails.outlook_mark_read_many", mark_many),
+        patch("app.api.emails.outlook_mark_read", mark_one),
+        patch("app.api.emails.ensure_microsoft_access_token", ensure_token),
+    ):
+        res = client.post("/api/emails/mark-all-read")
+        assert res.status_code == 200
+        assert res.json()["marked"] == 25
+
+    mark_many.assert_awaited_once()
+    assert set(mark_many.await_args.args[1]) == {f"msg-{i}" for i in range(25)}
+    mark_one.assert_not_awaited()
+
+
+def test_outlook_mark_read_many_batches_in_groups_of_twenty(monkeypatch):
+    from app.email import outlook as outlook_module
+
+    calls: list[list[str]] = []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, _url, *, headers, json):
+            calls.append([item["url"].removeprefix("/me/messages/") for item in json["requests"]])
+            return SimpleNamespace(status_code=200, json=lambda: {"responses": []}, text="")
+
+    monkeypatch.setattr(outlook_module.httpx, "AsyncClient", lambda **_kwargs: Client())
+    message_ids = [f"msg-{i}" for i in range(45)]
+    asyncio.run(outlook_module.outlook_mark_read_many("token", message_ids))
+
+    assert len(calls) == 3
+    assert [len(chunk) for chunk in calls] == [20, 20, 5]
+    assert [mid for chunk in calls for mid in chunk] == message_ids
 
 
 def test_get_email_still_marks_local_read_when_provider_fails():
