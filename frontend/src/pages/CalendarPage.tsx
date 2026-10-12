@@ -52,7 +52,7 @@ const CALENDAR_RANGE_CACHE = new Map<string, CalendarEvent[]>();
 const CALENDAR_RANGE_INFLIGHT = new Map<string, Promise<CalendarEvent[]>>();
 const CALENDAR_RANGE_CACHE_LIMIT = 12;
 const CALENDAR_STATUS_FILTERS: { value: CalendarStatusFilter; label: string }[] = [
-  { value: "active", label: "Active" },
+  { value: "active", label: "Booked" },
   { value: "passed", label: "Passed" },
   { value: "canceled", label: "Canceled" },
   { value: "rejected_closed", label: "Rejected/Closed" },
@@ -373,7 +373,10 @@ function cardStatus(event: CalendarEvent): CardStatus {
   if (event.interview_status === "cancellation") return { key: "canceled", label: "Canceled", className: "canceled status-canceled" };
   if (event.application_status === "passed") return { key: "passed", label: "Passed", className: "status-passed" };
   if (event.application_status === "rejected" || event.application_status === "position_closed") return { key: "rejected_closed", label: "Rejected/Closed", className: "status-rejected" };
-  return { key: "active", label: "Active", className: "status-active" };
+  // "active" is the persisted application state. On the calendar, however,
+  // this row is a confirmed appointment, so calling it Active makes it look
+  // like another open availability slot. Use the booking state in UI copy.
+  return { key: "active", label: "Booked", className: "status-active" };
 }
 
 function ActiveStatusIcon() {
@@ -424,7 +427,7 @@ function emailInterviewStatus(message: EmailDetail): { key: ConfirmableStatus; l
     const passed = /\byou (?:have )?passed\b|\bsuccessfully (?:passed|cleared)\b|\b(?:move|moving|advance|advancing) (?:you )?(?:forward|to the next)\b|\b(?:invite|inviting) you to (?:the )?next (?:round|stage)\b|\b(?:pleased|happy|excited) to (?:move|invite|advance) you\b|\bcongratulations\b.{0,120}\bnext (?:round|stage)\b/i.test(text);
     return passed ? { key: "passed", label: "Passed", className: "status-passed" } : null;
   }
-  if (message.label === "interview_scheduled") return { key: "active", label: "Active", className: "status-active" };
+  if (message.label === "interview_scheduled") return { key: "active", label: "Booked", className: "status-active" };
   return null;
 }
 
@@ -789,7 +792,7 @@ const EventCard = memo(function EventCard({ event, color, timeZone, compact, tim
             <dd><MeetingTypeIcon type={type.type} /><span>{type.label}</span></dd>
           </div>
           {status.key === "available" && <div className={`calendar-hover-offer is-${event.request_kind ?? "invitation"}`}><dt>Status</dt><dd><PendingRequestIcon kind={event.request_kind ?? "invitation"} /><span>{event.request_kind === "reschedule" ? "Reschedule offered, not booked yet" : "Available time, not booked yet"}</span></dd></div>}
-          {status.key !== "available" && <div className={`calendar-hover-status ${status.className}`}><dt>Status</dt><dd>{outcome ? <VisibleApplicationStatusIcon status={outcome} /> : <ApplicationStatusIcon status="active" />}<span>{status.label}</span></dd></div>}
+          {status.key !== "available" && status.key !== "active" && <div className={`calendar-hover-status ${status.className}`}><dt>Status</dt><dd>{outcome ? <VisibleApplicationStatusIcon status={outcome} /> : <ApplicationStatusIcon status="active" />}<span>{status.label}</span></dd></div>}
         </dl>
       </div>,
       document.body,
@@ -1658,7 +1661,7 @@ export default function CalendarPage({
             <div className="details-row"><dt>Account</dt><dd>{selected.email_account}</dd></div>
             <div className="details-row"><dt>Company</dt><dd>{selected.company || "—"}</dd></div>
             <div className="details-row"><dt>Role</dt><dd>{selected.role || "—"}</dd></div>
-            {selected.kind === "confirmed" && selectedStatus && selectedStatus.key !== "available" && <div className={`details-row details-status-row ${selectedStatus.className}`}><dt>Status</dt><dd>{selectedStatus.key === "canceled" ? <CanceledStatusIcon /> : <ApplicationStatusIcon status={selectedStatus.key === "rejected_closed" ? "rejected" : selectedStatus.key === "passed" ? "passed" : "active"} />}<span>{selectedStatus.label}</span></dd></div>}
+            {selected.kind === "confirmed" && selectedStatus && selectedStatus.key !== "available" && selectedStatus.key !== "active" && <div className={`details-row details-status-row ${selectedStatus.className}`}><dt>Interview status</dt><dd>{selectedStatus.key === "canceled" ? <CanceledStatusIcon /> : <ApplicationStatusIcon status={selectedStatus.key === "rejected_closed" ? "rejected" : selectedStatus.key === "passed" ? "passed" : "active"} />}<span>{selectedStatus.label}</span></dd></div>}
             {interviewType(selected).type === "video" && <div className="details-row details-action-row"><dt>Meeting</dt><dd>{meetingProviderLabel(selected) !== "—" ? <span className="details-meeting-value">{selected.meeting_url ? <a className="details-meeting-link" href={selected.meeting_url} target="_blank" rel="noreferrer" aria-label={`Open ${meetingProviderLabel(selected)}`} title={`Open ${meetingProviderLabel(selected)}`}><span className="details-meeting-icon"><MeetingTypeIcon type="video" /></span><span>{meetingProviderLabel(selected)}</span><svg className="details-meeting-arrow" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3h7v7M13 3 5 11" /></svg></a> : <span className="details-meeting-label"><span className="details-meeting-icon"><MeetingTypeIcon type="video" /></span><span>{meetingProviderLabel(selected)}</span></span>}{selected.meeting_url && <button className="details-copy-link details-copy-icon" type="button" onClick={() => void copyMeetingLink(selected)} aria-label={copiedMeetingEventId === selected.id ? "Meeting link copied" : `Copy ${meetingProviderLabel(selected)} meeting link`} title={copiedMeetingEventId === selected.id ? "Copied" : "Copy meeting link"}>{copiedMeetingEventId === selected.id ? <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.2 3 3 6-6.4" /></svg> : <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="2.25" width="8.5" height="8.5" rx="1.5" /><path d="M10.75 10.75v1.5a1.5 1.5 0 0 1-1.5 1.5h-5.5a1.5 1.5 0 0 1-1.5-1.5v-5.5a1.5 1.5 0 0 1 1.5-1.5h1.5" /></svg>}</button>}</span> : "—"}</dd></div>}
           </dl>
           {statusError && <p className="error-text">{statusError}</p>}
@@ -1682,7 +1685,7 @@ export default function CalendarPage({
                 const messageStatus = selected.kind === "confirmed" ? emailInterviewStatus(message) : null;
                 const statusMatches = messageStatus != null && selectedStatus?.key === messageStatus.key;
                 return <li key={message.id}>
-                  {messageStatus && <div className="source-email-status-bar"><span className={`source-email-status ${messageStatus.className}`}>{messageStatus.label}</span>{statusMatches ? <span className="source-email-status-match">Confirmed for this interview</span> : <button type="button" disabled={statusSaving} onClick={() => void confirmInterviewStatus(messageStatus.key, messageStatus.applicationStatus)}>Confirm this status</button>}</div>}
+                  {messageStatus && !(messageStatus.key === "active" && statusMatches) && <div className="source-email-status-bar"><span className={`source-email-status ${messageStatus.className}`}>{messageStatus.label}</span>{statusMatches ? <span className="source-email-status-match">Confirmed for this interview</span> : <button type="button" disabled={statusSaving} onClick={() => void confirmInterviewStatus(messageStatus.key, messageStatus.applicationStatus)}>Confirm this status</button>}</div>}
                   <button className="source-email-list-item" type="button" aria-expanded={expanded} onClick={() => {
                     if (expanded) {
                       setExpandedEmailId(null);
