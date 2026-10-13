@@ -5,6 +5,7 @@ import html
 import json
 import logging
 import re
+import time
 from contextvars import ContextVar
 from functools import lru_cache
 from collections.abc import Iterable
@@ -2092,6 +2093,43 @@ defer_duplicate_collapse: ContextVar[bool] = ContextVar(
 )
 
 
+#: Hostname -> time.monotonic() of its last failed connection. A broken DNS
+#: resolver or an unreachable gateway otherwise gets retried, at up to 8s per
+#: candidate URL, on every single event checked — in the bulk backfill's idle
+#: repair pass that is every visible event missing a meeting_url (211 at once
+#: observed live), run again every ~60s once the backlog drains. That alone
+#: was enough to stall the process past the health-check window repeatedly
+#: and get it killed and restarted in a loop.
+_LANDING_PAGE_FAILURE_CACHE: dict[str, float] = {}
+_LANDING_PAGE_FAILURE_COOLDOWN_SECONDS = 300.0
+
+
+def _landing_host_recently_failed(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    if not host:
+        return False
+    failed_at = _LANDING_PAGE_FAILURE_CACHE.get(host)
+    return failed_at is not None and time.monotonic() - failed_at < _LANDING_PAGE_FAILURE_COOLDOWN_SECONDS
+
+
+def _remember_landing_host_failure(url: str) -> None:
+    host = (urlparse(url).hostname or "").lower()
+    if host:
+        _LANDING_PAGE_FAILURE_CACHE[host] = time.monotonic()
+
+
+async def _get_landing_page(client: httpx.AsyncClient, url: str) -> httpx.Response | None:
+    """A single candidate request, isolated so one bad host doesn't abort the rest."""
+    if _landing_host_recently_failed(url):
+        return None
+    try:
+        return await client.get(url)
+    except httpx.HTTPError:
+        logger.info("Could not resolve calendar meeting landing page host", exc_info=True)
+        _remember_landing_host_failure(url)
+        return None
+
+
 async def _resolve_video_landing_page(text: str) -> MeetingAccess | None:
     """Resolve allow-listed recruiting gateways to a provider join URL.
 
@@ -2111,45 +2149,48 @@ async def _resolve_video_landing_page(text: str) -> MeetingAccess | None:
     )
     if not paradox_urls and not schedule_urls:
         return None
-    try:
-        async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
-            for landing_url in paradox_urls[:3]:
-                response = await client.get(landing_url)
+    async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
+        for landing_url in paradox_urls[:3]:
+            response = await _get_landing_page(client, landing_url)
+            if response is None:
+                continue
+            location = response.headers.get("location", "")
+            if (
+                response.is_redirect
+                and (urlparse(landing_url).hostname or "").lower() == "oli.vi"
+                and (urlparse(location).hostname or "").lower() == "olivia.paradox.ai"
+                and _PARADOX_JOIN_RE.fullmatch(location)
+            ):
+                response = await _get_landing_page(client, location)
+                if response is None:
+                    continue
                 location = response.headers.get("location", "")
+            provider = _provider_for_url(location)
+            safe_url = _safe_http_url(location, meeting=True)
+            if response.is_redirect and provider and safe_url:
+                return MeetingAccess("video", provider, safe_url)
+        for schedule_url in schedule_urls[:3]:
+            parsed_schedule = urlparse(schedule_url)
+            response = await _get_landing_page(client, schedule_url)
+            if response is None or response.status_code != 200 or "teamtailor" not in response.text.casefold():
+                continue
+            meeting_links = _VIDEO_MEETING_LINK_RE.findall(html.unescape(response.text))
+            for meeting_link in meeting_links[:3]:
+                parsed_meeting = urlparse(meeting_link)
                 if (
-                    response.is_redirect
-                    and (urlparse(landing_url).hostname or "").lower() == "oli.vi"
-                    and (urlparse(location).hostname or "").lower() == "olivia.paradox.ai"
-                    and _PARADOX_JOIN_RE.fullmatch(location)
+                    parsed_meeting.scheme != "https"
+                    or parsed_meeting.hostname != parsed_schedule.hostname
+                    or not parsed_meeting.path.startswith("/video_meetings/")
                 ):
-                    response = await client.get(location)
-                    location = response.headers.get("location", "")
+                    continue
+                gateway = await _get_landing_page(client, meeting_link)
+                if gateway is None:
+                    continue
+                location = gateway.headers.get("location", "")
                 provider = _provider_for_url(location)
                 safe_url = _safe_http_url(location, meeting=True)
-                if response.is_redirect and provider and safe_url:
+                if gateway.is_redirect and provider and safe_url:
                     return MeetingAccess("video", provider, safe_url)
-            for schedule_url in schedule_urls[:3]:
-                parsed_schedule = urlparse(schedule_url)
-                response = await client.get(schedule_url)
-                if response.status_code != 200 or "teamtailor" not in response.text.casefold():
-                    continue
-                meeting_links = _VIDEO_MEETING_LINK_RE.findall(html.unescape(response.text))
-                for meeting_link in meeting_links[:3]:
-                    parsed_meeting = urlparse(meeting_link)
-                    if (
-                        parsed_meeting.scheme != "https"
-                        or parsed_meeting.hostname != parsed_schedule.hostname
-                        or not parsed_meeting.path.startswith("/video_meetings/")
-                    ):
-                        continue
-                    gateway = await client.get(meeting_link)
-                    location = gateway.headers.get("location", "")
-                    provider = _provider_for_url(location)
-                    safe_url = _safe_http_url(location, meeting=True)
-                    if gateway.is_redirect and provider and safe_url:
-                        return MeetingAccess("video", provider, safe_url)
-    except httpx.HTTPError:
-        logger.info("Could not resolve calendar meeting landing page", exc_info=True)
     return None
 
 
@@ -3757,7 +3798,16 @@ def repair_meeting_join_urls(db: Session, mailbox_id: int | None = None) -> int:
 async def repair_meeting_landing_urls(
     db: Session, mailbox_id: int | None = None,
 ) -> set[int]:
-    """Resolve trusted recruiter join buttons for visible video interviews."""
+    """Resolve trusted recruiter join buttons for visible video interviews.
+
+    Runs every idle cycle of the bulk backfill loop once its queue is empty —
+    which is most of the time in steady state — so it is capped per call.
+    Without a cap, a mailbox with many still-unresolved Paradox/Teamtailor
+    links reprocesses all of them, at up to 5s per candidate URL, every ~60s
+    forever; a negative-cache in _resolve_video_landing_page covers a host
+    that is actually down, but a legitimate backlog of distinct hosts could
+    still add up to minutes per cycle without this limit.
+    """
     repaired_mailboxes: set[int] = set()
     query = db.query(CalendarEvent).filter(
         CalendarEvent.is_visible.is_(True),
@@ -3765,7 +3815,7 @@ async def repair_meeting_landing_urls(
     )
     if mailbox_id is not None:
         query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
-    for event in query.all():
+    for event in query.limit(20).all():
         messages = _linked_messages(db, event)
         if event.source_email_id and all(item.id != event.source_email_id for item in messages):
             source = db.get(EmailMessage, event.source_email_id)
