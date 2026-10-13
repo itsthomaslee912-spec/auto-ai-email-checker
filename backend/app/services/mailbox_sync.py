@@ -549,7 +549,9 @@ async def _sync_gmail(db: Session, mailbox: MailboxConnection, limit: int) -> No
 async def _sync_outlook(db: Session, mailbox: MailboxConnection, limit: int) -> None:
     token = await ensure_microsoft_access_token(db, mailbox)
     await _publish_progress(mailbox.id, state="running", message="Listing Inbox, Junk, Deleted Items, and Archive...")
-    messages = await outlook_list_recent(token, top=limit)
+    messages = await outlook_list_recent(
+        token, top=limit, get_token=lambda: ensure_microsoft_access_token(db, mailbox),
+    )
     existing = await _existing_ids(db, mailbox.id)
     _stamp_listed_outlook_folders(db, mailbox.id, messages)
     new_messages = [raw for raw in messages if (raw.get("id") or "") not in existing]

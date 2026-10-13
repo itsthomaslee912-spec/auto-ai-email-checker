@@ -163,8 +163,21 @@ async def outlook_get_message(access_token: str, message_id: str) -> dict:
         return resp.json()
 
 
-async def outlook_list_recent(access_token: str, top: int = 500) -> list[dict]:
-    """List Inbox, Junk Email, Deleted Items, and Archive, then keep the newest `top` overall."""
+async def outlook_list_recent(
+    access_token: str,
+    top: int = 500,
+    *,
+    get_token: Callable[[], Awaitable[str]] | None = None,
+) -> list[dict]:
+    """List Inbox, Junk Email, Deleted Items, and Archive, then keep the newest `top` overall.
+
+    `access_token` is fetched once by the caller before this starts, but
+    listing four folders with pagination can take long enough for it to
+    expire partway through — observed as inbox/junk/deleted succeeding and
+    only the last folder (archive) failing with InvalidAuthenticationToken.
+    `get_token`, when given, is called before every request so a token about
+    to expire gets refreshed instead of reused until it fails.
+    """
     folders = ("inbox", "junkemail", "deleteditems", "archive")
     collected: dict[str, dict] = {}
     per_folder = max(1, top)
@@ -179,6 +192,8 @@ async def outlook_list_recent(access_token: str, top: int = 500) -> list[dict]:
                 "$select": select,
             }
             while len(messages) < per_folder:
+                if get_token is not None:
+                    access_token = await get_token()
                 resp = await client.get(
                     url,
                     headers={"Authorization": f"Bearer {access_token}"},

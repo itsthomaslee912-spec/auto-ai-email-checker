@@ -1,0 +1,92 @@
+from __future__ import annotations
+
+import asyncio
+
+import httpx
+
+from app.email.outlook import outlook_list_recent
+
+
+def _folder_response(folder: str) -> dict:
+    return {
+        "value": [
+            {
+                "id": f"{folder}-1",
+                "subject": f"Message in {folder}",
+                "from": {"emailAddress": {"address": "sender@example.com"}},
+                "receivedDateTime": "2026-10-13T12:00:00Z",
+                "bodyPreview": "",
+                "body": {"content": "", "contentType": "text"},
+                "conversationId": "conv-1",
+            }
+        ]
+    }
+
+
+def _patched_async_client(transport: httpx.MockTransport):
+    real_async_client = httpx.AsyncClient
+
+    def patched(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    return patched
+
+
+def test_outlook_list_recent_calls_get_token_before_every_request():
+    """A token fetched once before listing four folders with pagination can
+    expire partway through — observed live as inbox/junk/deleted succeeding
+    and only the last folder (archive) failing with
+    InvalidAuthenticationToken. get_token must be called before each
+    request, not just once up front, so a near-expiry token gets refreshed
+    in time instead of reused until it fails."""
+    call_count = {"n": 0}
+
+    async def get_token() -> str:
+        call_count["n"] += 1
+        return f"token-{call_count['n']}"
+
+    seen_tokens: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_tokens.append(request.headers["authorization"])
+        folder = request.url.path.split("/")[-2]
+        return httpx.Response(200, json=_folder_response(folder))
+
+    import app.email.outlook as outlook_module
+
+    original = outlook_module.httpx.AsyncClient
+    outlook_module.httpx.AsyncClient = _patched_async_client(httpx.MockTransport(handler))
+    try:
+        asyncio.run(outlook_list_recent("stale-token", top=4, get_token=get_token))
+    finally:
+        outlook_module.httpx.AsyncClient = original
+
+    # One call per folder (inbox, junkemail, deleteditems, archive); every
+    # request used a token fetched fresh via get_token, never the stale one
+    # passed in up front.
+    assert call_count["n"] == 4
+    assert seen_tokens == ["Bearer token-1", "Bearer token-2", "Bearer token-3", "Bearer token-4"]
+    assert "Bearer stale-token" not in seen_tokens
+
+
+def test_outlook_list_recent_without_get_token_reuses_static_token():
+    """Backward compatibility: omitting get_token keeps the old behavior of
+    reusing the single access_token passed in."""
+    seen_tokens: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_tokens.append(request.headers["authorization"])
+        folder = request.url.path.split("/")[-2]
+        return httpx.Response(200, json=_folder_response(folder))
+
+    import app.email.outlook as outlook_module
+
+    original = outlook_module.httpx.AsyncClient
+    outlook_module.httpx.AsyncClient = _patched_async_client(httpx.MockTransport(handler))
+    try:
+        asyncio.run(outlook_list_recent("fixed-token", top=4))
+    finally:
+        outlook_module.httpx.AsyncClient = original
+
+    assert seen_tokens == ["Bearer fixed-token"] * 4
