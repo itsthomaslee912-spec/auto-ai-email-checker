@@ -276,8 +276,11 @@ export default function InterviewEmailAlert({ mailboxes, refreshKey, suppressed,
   const discard = useCallback((row: Row) => {
     setDiscardError(null);
     setLeaving((current) => new Set(current).add(row.emailId));
-    // Let the row slide out before the list closes the gap.
-    window.setTimeout(() => {
+    // Let the row slide out before the list closes the gap. Cancelled below
+    // if the API call fails first — otherwise this still fires afterward
+    // and re-hides a row the catch handler just restored, so a failed
+    // discard looked like it had silently succeeded.
+    const hideTimer = window.setTimeout(() => {
       setHiddenIds((current) => new Set(current).add(row.emailId));
       setLeaving((current) => { const next = new Set(current); next.delete(row.emailId); return next; });
     }, 220);
@@ -285,6 +288,8 @@ export default function InterviewEmailAlert({ mailboxes, refreshKey, suppressed,
     setUndo({ emailId: row.emailId, name: row.company || row.subject || "Interview" });
     undoTimer.current = window.setTimeout(() => { undoTimer.current = null; setUndo(null); }, UNDO_MS);
     setPendingInterviewDismissed(row.emailId, true).catch((err: unknown) => {
+      window.clearTimeout(hideTimer);
+      setLeaving((current) => { const next = new Set(current); next.delete(row.emailId); return next; });
       setHiddenIds((current) => { const next = new Set(current); next.delete(row.emailId); return next; });
       clearUndo();
       setDiscardError(err instanceof Error ? err.message : "Could not discard. Try again.");

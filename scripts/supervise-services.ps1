@@ -67,6 +67,18 @@ function Get-RestartDelay([int]$Current, [datetime]$StartedAt) {
     return [Math]::Min(30, $Current * 2)
 }
 
+# A process we force-kill for being unhealthy has, by construction, already
+# run past $startupGraceSeconds (90s) by the time $backendFailures/
+# $frontendFailures reaches its threshold. Get-RestartDelay's own "ran >= 30s
+# means it was fine, reset to 0" rule fires unconditionally in that case, so
+# calling it here always discarded the backoff and let a hung-but-never-
+# exiting process get force-killed and immediately respawned forever. This
+# grows the delay directly instead, with no uptime check.
+function Get-GrownDelay([int]$Current) {
+    if ($Current -lt 3) { return 3 }
+    return [Math]::Min(30, $Current * 2)
+}
+
 function Start-Backend {
     Write-SupervisorLog "Starting backend on 127.0.0.1:8000"
     return Start-Process -FilePath $Python `
@@ -115,7 +127,7 @@ try {
                 Stop-Process -Id $backendProcess.Id -Force -ErrorAction SilentlyContinue
                 $backendProcess = $null
                 $backendFailures = 0
-                $backendRestartDelay = Get-RestartDelay $(if ($backendRestartDelay -lt 3) { 3 } else { $backendRestartDelay }) $backendStartedAt
+                $backendRestartDelay = Get-GrownDelay $backendRestartDelay
             }
         }
 
@@ -147,7 +159,7 @@ try {
                 Stop-Process -Id $frontendProcess.Id -Force -ErrorAction SilentlyContinue
                 $frontendProcess = $null
                 $frontendFailures = 0
-                $frontendRestartDelay = Get-RestartDelay $(if ($frontendRestartDelay -lt 3) { 3 } else { $frontendRestartDelay }) $frontendStartedAt
+                $frontendRestartDelay = Get-GrownDelay $frontendRestartDelay
             }
         }
         Start-Sleep -Seconds 5

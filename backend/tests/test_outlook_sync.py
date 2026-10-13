@@ -58,15 +58,15 @@ def test_outlook_list_recent_calls_get_token_before_every_request():
     original = outlook_module.httpx.AsyncClient
     outlook_module.httpx.AsyncClient = _patched_async_client(httpx.MockTransport(handler))
     try:
-        asyncio.run(outlook_list_recent("stale-token", top=4, get_token=get_token))
+        asyncio.run(outlook_list_recent("stale-token", top=5, get_token=get_token))
     finally:
         outlook_module.httpx.AsyncClient = original
 
-    # One call per folder (inbox, junkemail, deleteditems, archive); every
-    # request used a token fetched fresh via get_token, never the stale one
-    # passed in up front.
-    assert call_count["n"] == 4
-    assert seen_tokens == ["Bearer token-1", "Bearer token-2", "Bearer token-3", "Bearer token-4"]
+    # One call per folder (inbox, junkemail, deleteditems, archive, sentitems);
+    # every request used a token fetched fresh via get_token, never the stale
+    # one passed in up front.
+    assert call_count["n"] == 5
+    assert seen_tokens == [f"Bearer token-{i}" for i in range(1, 6)]
     assert "Bearer stale-token" not in seen_tokens
 
 
@@ -85,8 +85,8 @@ def test_outlook_list_recent_without_get_token_reuses_static_token():
     original = outlook_module.httpx.AsyncClient
     outlook_module.httpx.AsyncClient = _patched_async_client(httpx.MockTransport(handler))
     try:
-        asyncio.run(outlook_list_recent("fixed-token", top=4))
+        asyncio.run(outlook_list_recent("fixed-token", top=5))
     finally:
         outlook_module.httpx.AsyncClient = original
 
-    assert seen_tokens == ["Bearer fixed-token"] * 4
+    assert seen_tokens == ["Bearer fixed-token"] * 5

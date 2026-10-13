@@ -178,7 +178,12 @@ async def outlook_list_recent(
     `get_token`, when given, is called before every request so a token about
     to expire gets refreshed instead of reused until it fails.
     """
-    folders = ("inbox", "junkemail", "deleteditems", "archive")
+    # Must match mailbox_sync.OUTLOOK_FOLDERS. Sent Items was missing here
+    # for a while — the later unbounded delta pass in the same full-sync
+    # call backfills it under normal conditions, but a sync interrupted
+    # between the two (a crash or restart) left Sent mail unimported with
+    # no bounded-listing fallback.
+    folders = ("inbox", "junkemail", "deleteditems", "archive", "sentitems")
     collected: dict[str, dict] = {}
     per_folder = max(1, top)
     select = "id,subject,from,receivedDateTime,bodyPreview,body,conversationId"

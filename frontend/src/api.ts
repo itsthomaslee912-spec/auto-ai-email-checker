@@ -125,15 +125,25 @@ function noteUnauthorized(res: Response): Response {
   return res;
 }
 
+const IDEMPOTENT_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
 async function apiFetch(url: string, init?: RequestInit, attempts = 3): Promise<Response> {
+  const method = (init?.method || "GET").toUpperCase();
+  // A network error means we don't know whether the request reached the
+  // server. Retrying a GET is harmless; retrying a POST/PATCH/DELETE risks
+  // a duplicate write (e.g. a second calendar event) if the first attempt
+  // was actually received and processed before the connection dropped.
+  const maxAttempts = IDEMPOTENT_METHODS.has(method) ? attempts : 1;
   let lastError: unknown = null;
-  for (let i = 0; i < attempts; i += 1) {
+  for (let i = 0; i < maxAttempts; i += 1) {
     try {
       const res = await fetch(url, { credentials: "include", ...init });
       return noteUnauthorized(res);
     } catch (err) {
       lastError = err;
-      await new Promise((resolve) => window.setTimeout(resolve, 350 * (i + 1)));
+      if (i < maxAttempts - 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 350 * (i + 1)));
+      }
     }
   }
   throw friendlyNetworkError(lastError, "Cannot reach the API");

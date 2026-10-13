@@ -548,7 +548,7 @@ async def _sync_gmail(db: Session, mailbox: MailboxConnection, limit: int) -> No
 
 async def _sync_outlook(db: Session, mailbox: MailboxConnection, limit: int) -> None:
     token = await ensure_microsoft_access_token(db, mailbox)
-    await _publish_progress(mailbox.id, state="running", message="Listing Inbox, Junk, Deleted Items, and Archive...")
+    await _publish_progress(mailbox.id, state="running", message="Listing Inbox, Junk, Deleted Items, Archive, and Sent...")
     messages = await outlook_list_recent(
         token, top=limit, get_token=lambda: ensure_microsoft_access_token(db, mailbox),
     )
