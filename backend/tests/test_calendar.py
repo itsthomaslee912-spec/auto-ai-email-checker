@@ -2283,6 +2283,35 @@ def test_company_name_drops_sentence_spill_after_the_employer():
         "Thank you for your interest in the Senior Forward Deployed Engineer, AI Agents role at CoreWeave. I would like to set up a time."
     ) == "CoreWeave"
 
+
+def test_explicit_hiring_employer_skips_interviewer_name_with_title():
+    # "Interview with <Name>" names the interviewer, not the employer, when a
+    # parenthetical title follows — this must not surface "Adrien Lana" (nor
+    # a backtracked fragment like "Adrien") as the employer.
+    assert explicit_hiring_employer(
+        "You're all set — Interview for Senior Machine Learning Engineer I is confirmed with "
+        "Adrien Lana (Technical Recruiter II) at Axon!"
+    ) == ""
+    assert explicit_hiring_employer(
+        "This is a great interview with Sam (https://example.com/press), our CEO and Co-Founder"
+    ) == ""
+    # The employer named elsewhere in the message still wins when it matches
+    # the trigger pattern directly.
+    assert explicit_hiring_employer(
+        "You're all set — Interview for Senior Machine Learning Engineer I is confirmed with "
+        "Adrien Lana (Technical Recruiter II). Position with Axon."
+    ) == "Axon"
+
+
+def test_explicit_hiring_employer_skips_generic_team_phrases():
+    assert explicit_hiring_employer(
+        "Initial interview with Talent Acquisition Team member"
+    ) == ""
+    assert explicit_hiring_employer(
+        "3. Interview with Company Stakeholders. Cultural interview with main company stakeholders."
+    ) == ""
+
+
 def test_confirmation_and_domain_invite_collapse_to_one_chip():
     factory, (mailbox_id, _) = _database()
     start = datetime(2026, 10, 8, 16, 30, tzinfo=timezone.utc)

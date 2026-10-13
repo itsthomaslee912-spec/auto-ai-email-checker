@@ -11,7 +11,7 @@ from app.models import CalendarEvent, EmailLabel, EmailMessage, MailboxConnectio
 from app.realtime.sse import publish
 from app.schemas import EmailOut
 from app.services.ai_backend import get_ai_backend
-from app.services.calendar_extract import CALENDAR_LABELS, process_calendar_email
+from app.services.calendar_extract import CALENDAR_LABELS, clean_company_name, employer_instead_of_sender_domain, process_calendar_email
 
 logger = logging.getLogger(__name__)
 
@@ -305,7 +305,12 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                     email.openai_response_id = result.response_id
                 outcome_changed = False
                 if should_extract and extracted is not None and email.label in OUTCOME_LABELS:
-                    email.company, email.job_role = extracted
+                    company, role = extracted
+                    # A recruiter at gkrouse@google.com hiring for Tapestry is not a
+                    # Google interview — without this, a reclassify can leave the
+                    # recruiting agency's own domain stored as the employer.
+                    email.company = clean_company_name(employer_instead_of_sender_domain(email, company))
+                    email.job_role = role
                     email.outcome_extracted = True
                     outcome_changed = True
                 elif should_extract and label_changed and email.label in OUTCOME_LABELS:

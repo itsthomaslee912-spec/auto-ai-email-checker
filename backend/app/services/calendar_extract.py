@@ -1693,14 +1693,43 @@ _HIRING_EMPLOYER_RE = re.compile(
     r"([A-Z][A-Za-z0-9&']*(?:[ \t]+[A-Z][A-Za-z0-9&']*){0,3})",
 )
 
+_HIRING_EMPLOYER_STOPWORDS = {
+    "google meet",
+    "microsoft teams",
+    "talent acquisition team",
+    "recruiting team",
+    "recruitment team",
+    "hr team",
+    "people team",
+    "hiring team",
+    "company stakeholders",
+}
+
 
 def explicit_hiring_employer(text: str) -> str:
-    """The employer a message names, as in 'position with Tapestry'."""
-    names = [
-        clean_company_name(match.group(1))
-        for match in _HIRING_EMPLOYER_RE.finditer(html.unescape(text or ""))
-    ]
-    names = [name for name in names if name and name.casefold() not in {"google meet", "microsoft teams"}]
+    """The employer a message names, as in 'position with Tapestry'.
+
+    "Interview with <Name>" is ambiguous: it names the employer about as
+    often as it names the interviewer or recruiting team ("Interview with
+    Crystal Barbieri", "Initial interview with Talent Acquisition Team
+    member"). The parenthetical-title and stopword filters below catch the
+    cases with a syntactic tell; a bare two-word interviewer name with
+    neither stays a known, unresolved false positive.
+    """
+    unescaped = html.unescape(text or "")
+    names = []
+    for match in _HIRING_EMPLOYER_RE.finditer(unescaped):
+        # A parenthetical right after the name is a title, as in "Adrien
+        # Lana (Technical Recruiter II)" — that names the interviewer, not
+        # the employer. Checked post-match (not as a regex lookahead) so the
+        # engine can't dodge it by backtracking into a shorter capture
+        # ("Adrien Lana" -> "Adrien").
+        if re.match(r"[ \t]*\(", unescaped[match.end() : match.end() + 4]):
+            continue
+        name = clean_company_name(match.group(1))
+        if name:
+            names.append(name)
+    names = [name for name in names if name.casefold() not in _HIRING_EMPLOYER_STOPWORDS]
     if not names:
         return ""
     return max(set(names), key=lambda name: (names.count(name), len(name)))
