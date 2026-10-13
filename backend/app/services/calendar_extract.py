@@ -645,7 +645,8 @@ def parse_text_slots(text: str, received_at: datetime | None = None) -> list[Ext
                 continue
             context = source[max(0, match.start() - 48) : match.end() + 140]
             if not re.search(
-                r"\b(?:available|availability|works?(?:\s+well)?|free|call|meet|connect|slot|interview|book|propose|speaking|confirmed|scheduled)\b",
+                r"\b(?:available|availability|works?(?:\s+well)?|free|call|meet|connect|slot|interview|book|propose|"
+                r"speaking|confirmed|scheduled|invite[ds]?|invitation)\b",
                 context,
                 re.I,
             ):

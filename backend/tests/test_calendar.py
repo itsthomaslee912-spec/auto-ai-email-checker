@@ -2518,6 +2518,23 @@ def test_bst_abbreviation_is_recognized():
     assert slots[0].source_timezone == "Europe/London"
 
 
+def test_bare_weekday_recognized_after_invite_not_just_the_older_trigger_words():
+    """"I just sent you an invite for Friday at 9am PST" named a real, explicit
+    appointment, but the bare-weekday context gate required one of a fixed
+    list of trigger words nearby (available/call/meet/book/...) and "invite"
+    was not among them. Deterministic parsing silently found nothing, and
+    live (AI) extraction then landed on a different, wrong date for the same
+    interview — producing a second, duplicate-looking calendar chip next to
+    the correctly ICS-sourced one for the real date."""
+    received = datetime(2026, 10, 13, 12, 53, 44, tzinfo=timezone.utc)  # a Tuesday
+    slots = parse_text_slots(
+        "Thank you! I just sent you an invite for Friday at 9am PST.",
+        received,
+    )
+    assert slots
+    assert slots[0].start_at == datetime(2026, 10, 16, 16, 0, tzinfo=timezone.utc)
+
+
 def test_day_before_month_date_does_not_also_match_as_a_bare_weekday():
     """"Wednesday 14 Oct 2026" (day-before-month order) left the bare-weekday
     skip only recognizing the US "Wednesday, October 14" order, so the
