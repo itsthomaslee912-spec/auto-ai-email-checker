@@ -5016,6 +5016,8 @@ html[data-theme="light"] .calendar-event-hover-card .calendar-hover-status.statu
 .interview-time-range { display: grid; gap: .12rem; }
 .interview-time-range > span { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .interview-time-range > span + span { font-weight: 640; opacity: .88; }
+.details-type-row dd { display: inline-flex; align-items: center; justify-self: start; gap: .38rem; }
+.details-type-row dd svg { width: .86rem; height: .86rem; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; color: var(--accent); }
 .details-status-row { min-height: 3rem; align-items: center; }
 .details-status-row { --details-status-color: var(--accent); }
 .details-status-row.status-active { --details-status-color: #38bdf8; }

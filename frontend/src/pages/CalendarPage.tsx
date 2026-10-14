@@ -432,16 +432,26 @@ function emailInterviewStatus(message: EmailDetail): { key: ConfirmableStatus; l
 }
 
 function interviewType(event: CalendarEvent): { type: CalendarEvent["meeting_type"]; label: string } {
-  const provider = event.meeting_provider?.trim().toLowerCase();
-  const hasVideoPlatform = Boolean(event.meeting_url || (provider && !provider.includes("phone") && !provider.includes("in person")));
-  if (event.meeting_type === "video" || hasVideoPlatform) return { type: "video", label: "Video call" };
-  if (event.meeting_type === "phone" || event.phone_number) return { type: "phone", label: "Phone call" };
+  // The explicit type is authoritative. Supporting fields are fallbacks for
+  // legacy rows; a placeholder provider must never turn a phone call into a
+  // video chip.
+  if (event.meeting_type === "video") return { type: "video", label: "Video call" };
+  if (event.meeting_type === "phone") return { type: "phone", label: "Phone call" };
   if (event.meeting_type === "in_person") return { type: "in_person", label: "In-person interview" };
+  if (event.phone_number) return { type: "phone", label: "Phone call" };
+  if (event.meeting_url || normalizedMeetingProvider(event.meeting_provider)) return { type: "video", label: "Video call" };
   return { type: "unspecified", label: "Not specified" };
 }
 
+const MEETING_PROVIDER_PLACEHOLDERS = new Set(["empty", "n/a", "na", "none", "not available", "not provided", "not specified", "null", "tba", "tbc", "tbd", "unknown", "unspecified", "-"]);
+
+function normalizedMeetingProvider(value: string | null | undefined): string | null {
+  const provider = value?.trim() ?? "";
+  return provider && !MEETING_PROVIDER_PLACEHOLDERS.has(provider.toLowerCase()) ? provider : null;
+}
+
 function meetingProviderLabel(event: CalendarEvent): string {
-  const provider = event.meeting_provider?.trim();
+  const provider = normalizedMeetingProvider(event.meeting_provider);
   if (provider) {
     const normalized = provider.toLowerCase();
     if (normalized.includes("google") || normalized === "meet") return "Google Meet";
@@ -1101,11 +1111,11 @@ function ScheduledInterviewChart({ accounts }: { accounts: AccountInterviewCount
   </section>;
 }
 
-type Editor = { id?: number; mailbox_id: number; title: string; company: string; role: string; interviewer: string; work_model: CalendarEvent["work_model"]; application_status: CalendarEvent["application_status"]; interview_status: CalendarEvent["interview_status"]; start: string; end: string; description: string; job_url: string; meeting_type: "video" | "phone"; meeting_provider: string; meeting_url: string; phone_number: string; phone_access_code: string };
+type Editor = { id?: number; mailbox_id: number; title: string; company: string; role: string; interviewer: string; work_model: CalendarEvent["work_model"]; application_status: CalendarEvent["application_status"]; interview_status: CalendarEvent["interview_status"]; start: string; end: string; description: string; job_url: string; meeting_type: CalendarEvent["meeting_type"]; meeting_provider: string; meeting_url: string; phone_number: string; phone_access_code: string };
 function editorFor(date: Date, mailboxId: number, timeZone: string, event?: CalendarEvent, selectedEnd?: Date): Editor {
   const start = event ? wallDateForInstant(new Date(event.start_at), timeZone) : selectedEnd ? new Date(date) : new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 9));
   const end = event ? wallDateForInstant(new Date(event.end_at), timeZone) : selectedEnd ?? new Date(start.getTime() + DEFAULT_EVENT_DURATION_MINUTES * 60_000);
-  return { id: event?.id, mailbox_id: event?.mailbox_id ?? mailboxId, title: event?.title ?? "Interview", company: event?.company ?? "", role: event?.role ?? "", interviewer: event?.interviewer ?? "", work_model: event?.work_model ?? "unspecified", application_status: event?.application_status ?? "active", interview_status: event?.interview_status ?? "confirmation", start: localInput(start), end: localInput(end), description: event?.description ?? "", job_url: event?.job_url ?? "", meeting_type: event?.meeting_type === "phone" ? "phone" : "video", meeting_provider: event?.meeting_provider ?? "", meeting_url: event?.meeting_url ?? "", phone_number: event?.phone_number ?? "", phone_access_code: event?.phone_access_code ?? "" };
+  return { id: event?.id, mailbox_id: event?.mailbox_id ?? mailboxId, title: event?.title ?? "Interview", company: event?.company ?? "", role: event?.role ?? "", interviewer: event?.interviewer ?? "", work_model: event?.work_model ?? "unspecified", application_status: event?.application_status ?? "active", interview_status: event?.interview_status ?? "confirmation", start: localInput(start), end: localInput(end), description: event?.description ?? "", job_url: event?.job_url ?? "", meeting_type: event?.meeting_type ?? "unspecified", meeting_provider: normalizedMeetingProvider(event?.meeting_provider) ?? "", meeting_url: event?.meeting_url ?? "", phone_number: event?.phone_number ?? "", phone_access_code: event?.phone_access_code ?? "" };
 }
 
 function CalendarLoading({ soft = false }: { soft?: boolean }) {
@@ -1661,6 +1671,7 @@ export default function CalendarPage({
             <div className="details-row"><dt>Account</dt><dd>{selected.email_account}</dd></div>
             <div className="details-row"><dt>Company</dt><dd>{selected.company || "—"}</dd></div>
             <div className="details-row"><dt>Role</dt><dd>{selected.role || "—"}</dd></div>
+            <div className={`details-row details-type-row meeting-${interviewType(selected).type}`}><dt>Interview type</dt><dd><MeetingTypeIcon type={interviewType(selected).type} /><span>{interviewType(selected).label}</span></dd></div>
             {selected.kind === "confirmed" && selectedStatus && selectedStatus.key !== "available" && selectedStatus.key !== "active" && <div className={`details-row details-status-row ${selectedStatus.className}`}><dt>Interview status</dt><dd>{selectedStatus.key === "canceled" ? <CanceledStatusIcon /> : <ApplicationStatusIcon status={selectedStatus.key === "rejected_closed" ? "rejected" : selectedStatus.key === "passed" ? "passed" : "active"} />}<span>{selectedStatus.label}</span></dd></div>}
             {interviewType(selected).type === "video" && <div className="details-row details-action-row"><dt>Meeting</dt><dd>{meetingProviderLabel(selected) !== "—" ? <span className="details-meeting-value">{selected.meeting_url ? <a className="details-meeting-link" href={selected.meeting_url} target="_blank" rel="noreferrer" aria-label={`Open ${meetingProviderLabel(selected)}`} title={`Open ${meetingProviderLabel(selected)}`}><span className="details-meeting-icon"><MeetingTypeIcon type="video" /></span><span>{meetingProviderLabel(selected)}</span><svg className="details-meeting-arrow" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3h7v7M13 3 5 11" /></svg></a> : <span className="details-meeting-label"><span className="details-meeting-icon"><MeetingTypeIcon type="video" /></span><span>{meetingProviderLabel(selected)}</span></span>}{selected.meeting_url && <button className="details-copy-link details-copy-icon" type="button" onClick={() => void copyMeetingLink(selected)} aria-label={copiedMeetingEventId === selected.id ? "Meeting link copied" : `Copy ${meetingProviderLabel(selected)} meeting link`} title={copiedMeetingEventId === selected.id ? "Copied" : "Copy meeting link"}>{copiedMeetingEventId === selected.id ? <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.2 3 3 6-6.4" /></svg> : <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="2.25" width="8.5" height="8.5" rx="1.5" /><path d="M10.75 10.75v1.5a1.5 1.5 0 0 1-1.5 1.5h-5.5a1.5 1.5 0 0 1-1.5-1.5v-5.5a1.5 1.5 0 0 1 1.5-1.5h1.5" /></svg>}</button>}</span> : "—"}</dd></div>}
           </dl>
@@ -1774,7 +1785,7 @@ export default function CalendarPage({
         nextEnd.setUTCMinutes(nextEnd.getUTCMinutes() + DEFAULT_EVENT_DURATION_MINUTES);
         return { ...current, start, end: localInput(nextEnd) };
       })} /><ModernDateTimePicker label="End" value={editor.end} min={editor.start} minuteStep={5} onChange={(end) => setEditor((current) => current ? { ...current, end } : current)} /></div>
-      <label>Interview type<CompactSelect value={editor.meeting_type} onChange={(e) => setEditor({ ...editor, meeting_type: e.target.value as Editor["meeting_type"] })}><option value="video">Video call</option><option value="phone">Phone call</option></CompactSelect></label>
+      <label>Interview type<CompactSelect value={editor.meeting_type} onChange={(e) => setEditor({ ...editor, meeting_type: e.target.value as Editor["meeting_type"] })}><option value="unspecified">Not specified</option><option value="video">Video call</option><option value="phone">Phone call</option><option value="in_person">In-person interview</option></CompactSelect></label>
       {editor.meeting_type === "video" && <div className="editor-row"><label>Provider<input placeholder="Zoom, Google Meet…" value={editor.meeting_provider} onChange={(e) => setEditor({ ...editor, meeting_provider: e.target.value })} /></label><label>HTTPS meeting link<input type="url" value={editor.meeting_url} onChange={(e) => setEditor({ ...editor, meeting_url: e.target.value })} /></label></div>}
       {editor.meeting_type === "phone" && <div className="editor-row"><label>Phone<input type="tel" value={editor.phone_number} onChange={(e) => setEditor({ ...editor, phone_number: e.target.value })} /></label><label>Access code<input value={editor.phone_access_code} onChange={(e) => setEditor({ ...editor, phone_access_code: e.target.value })} /></label></div>}
       <label>Job link<input type="url" value={editor.job_url} onChange={(e) => setEditor({ ...editor, job_url: e.target.value })} /></label><label>Description<textarea rows={4} value={editor.description} onChange={(e) => setEditor({ ...editor, description: e.target.value })} /></label>{saveError && <p className="error-text">{saveError}</p>}<footer><button type="button" onClick={() => setEditor(null)}>Cancel</button><button className="primary" disabled={saving}>{saving ? "Saving…" : "Save event"}</button></footer>

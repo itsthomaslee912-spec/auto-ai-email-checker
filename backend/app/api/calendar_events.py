@@ -21,6 +21,7 @@ from app.schemas import (
     PendingInterviewSlotOut,
 )
 from app.services.pending_interviews import pending_interview_requests, resolved_availability_ids
+from app.services.calendar_extract import clean_meeting_provider
 from app.timeutil import as_utc
 
 router = APIRouter(prefix="/api/calendar-events", tags=["calendar"])
@@ -84,7 +85,8 @@ def _event_out(event: CalendarEvent, mailbox: MailboxConnection | None = None, r
         interview_status=event.interview_status,
         application_status=event.application_status or "active",
         meeting_type=event.meeting_type or "unspecified",
-        meeting_provider=event.meeting_provider,
+        # Never expose old AI placeholder text as a video-platform name.
+        meeting_provider=clean_meeting_provider(event.meeting_provider),
         meeting_url=event.meeting_url,
         phone_number=event.phone_number,
         phone_access_code=event.phone_access_code,
@@ -292,7 +294,7 @@ async def create_calendar_event(
         interview_status=payload.interview_status,
         application_status=payload.application_status,
         meeting_type=payload.meeting_type,
-        meeting_provider=(payload.meeting_provider or "").strip() or None,
+        meeting_provider=clean_meeting_provider(payload.meeting_provider),
         meeting_url=_validate_url(payload.meeting_url, meeting=True),
         phone_number=_validate_phone(payload.phone_number),
         phone_access_code=(payload.phone_access_code or "").strip() or None,
@@ -338,7 +340,7 @@ async def update_calendar_event(
     if "meeting_type" in fields and payload.meeting_type is not None:
         event.meeting_type = payload.meeting_type
     if "meeting_provider" in fields:
-        event.meeting_provider = (payload.meeting_provider or "").strip() or None
+        event.meeting_provider = clean_meeting_provider(payload.meeting_provider)
     if "meeting_url" in fields:
         event.meeting_url = _validate_url(payload.meeting_url, meeting=True)
     if "phone_number" in fields:

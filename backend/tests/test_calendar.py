@@ -16,7 +16,7 @@ from sqlalchemy.pool import StaticPool
 from app.api import calendar_events, emails
 from app.db import Base, get_db
 from app.models import CalendarEvent, CalendarEventEmail, EmailLabel, EmailMessage, MailboxConnection, Provider, User
-from app.services.calendar_extract import InterviewDetails, MeetingAccess, _parse_ai_slot, _resolve_video_landing_page, _without_quoted_history, clean_company_name, collapse_duplicate_calendar_events, companies_match, employer_instead_of_sender_domain, explicit_hiring_employer, extract_calendar_details, extract_interviewer, extract_meeting_access, fuller_company_name, hide_open_reschedules, is_interview_stage_label, job_role_or_empty, leaves_interview_unbooked, message_appointment_slots, message_is_booked_appointment, needs_calendar_event_repair, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details, repair_availability_window_appointments, repair_interview_stage_roles, repair_meeting_join_urls, repair_meeting_landing_urls, repair_phantom_availability_slots, repair_quoted_option_bookings
+from app.services.calendar_extract import InterviewDetails, MeetingAccess, _parse_ai_slot, _resolve_video_landing_page, _without_quoted_history, clean_company_name, clean_meeting_provider, collapse_duplicate_calendar_events, companies_match, employer_instead_of_sender_domain, explicit_hiring_employer, extract_calendar_details, extract_interviewer, extract_meeting_access, fuller_company_name, hide_open_reschedules, is_interview_stage_label, job_role_or_empty, leaves_interview_unbooked, message_appointment_slots, message_is_booked_appointment, needs_calendar_event_repair, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details, repair_availability_window_appointments, repair_interview_stage_roles, repair_meeting_join_urls, repair_meeting_landing_urls, repair_phantom_availability_slots, repair_placeholder_calendar_fields, repair_quoted_option_bookings
 
 
 def _database():
@@ -77,6 +77,56 @@ def test_named_video_provider_is_preserved_without_a_direct_join_url():
     )
 
     assert access == MeetingAccess("video", "Google Meet")
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["unspecified", "Not specified", "unknown", "N/A", "not provided", "-"],
+)
+def test_meeting_provider_placeholders_are_not_platform_names(value):
+    assert clean_meeting_provider(value) is None
+
+
+def test_placeholder_repair_preserves_phone_type_and_infers_legacy_phone_rows():
+    factory, (mailbox_id, _) = _database()
+    start = datetime(2026, 10, 14, 14, 30, tzinfo=timezone.utc)
+    with factory() as db:
+        explicit_phone = CalendarEvent(
+            mailbox_id=mailbox_id,
+            kind="confirmed",
+            origin="email",
+            title="Rivian interview",
+            company="Rivian",
+            job_role="Staff Software Engineer",
+            start_at=start,
+            end_at=start + timedelta(minutes=30),
+            meeting_type="phone",
+            meeting_provider="unspecified",
+            phone_number="4246240728",
+        )
+        legacy_phone = CalendarEvent(
+            mailbox_id=mailbox_id,
+            kind="confirmed",
+            origin="email",
+            title="Legacy phone interview",
+            company="Example",
+            job_role="Engineer",
+            start_at=start + timedelta(hours=1),
+            end_at=start + timedelta(hours=1, minutes=30),
+            meeting_type="unspecified",
+            meeting_provider="Not specified",
+            phone_number="2125550199",
+        )
+        db.add_all([explicit_phone, legacy_phone])
+        db.commit()
+
+        assert repair_placeholder_calendar_fields(db, mailbox_id) == 2
+        db.commit()
+
+        assert explicit_phone.meeting_type == "phone"
+        assert explicit_phone.meeting_provider is None
+        assert legacy_phone.meeting_type == "phone"
+        assert legacy_phone.meeting_provider is None
 
 
 def test_government_microsoft_teams_join_link_is_recognized():
@@ -2286,13 +2336,14 @@ Recruiting powered by Teamtailor""",
 def test_manual_event_create_and_update_validates_times():
     factory, (mailbox_id, _) = _database()
     client = _client(factory)
-    payload = {"mailbox_id": mailbox_id, "title": "Manual interview", "interviewer": "Jamie Chen", "work_model": "hybrid", "job_url": "https://example.com/jobs/123", "start_at": "2026-10-05T14:00:00Z", "end_at": "2026-10-05T15:00:00Z", "meeting_type": "video", "meeting_url": "https://zoom.us/j/123"}
+    payload = {"mailbox_id": mailbox_id, "title": "Manual interview", "interviewer": "Jamie Chen", "work_model": "hybrid", "job_url": "https://example.com/jobs/123", "start_at": "2026-10-05T14:00:00Z", "end_at": "2026-10-05T15:00:00Z", "meeting_type": "video", "meeting_provider": "unspecified", "meeting_url": "https://zoom.us/j/123"}
     created = client.post("/api/calendar-events", json=payload)
     assert created.status_code == 201
     assert created.json()["origin"] == "manual"
     assert created.json()["interviewer"] == "Jamie Chen"
     assert created.json()["work_model"] == "hybrid"
     assert created.json()["job_url"] == "https://example.com/jobs/123"
+    assert created.json()["meeting_provider"] is None
     updated = client.patch(f"/api/calendar-events/{created.json()['id']}", json={"title": "Updated interview", "interviewer": "Morgan Lee", "work_model": "remote", "application_status": "position_closed"})
     assert updated.status_code == 200
     assert updated.json()["title"] == "Updated interview"

@@ -908,7 +908,22 @@ def extract_job_url(text: str) -> str | None:
     return None
 
 
-_PLACEHOLDER_VALUES = {"empty", "none", "n/a", "na", "null", "unknown", "tbd", "-"}
+_PLACEHOLDER_VALUES = {
+    "empty",
+    "none",
+    "n/a",
+    "na",
+    "not available",
+    "not provided",
+    "not specified",
+    "null",
+    "unknown",
+    "unspecified",
+    "tba",
+    "tbc",
+    "tbd",
+    "-",
+}
 
 
 def _clean_text(value: object, limit: int = 255) -> str:
@@ -916,6 +931,11 @@ def _clean_text(value: object, limit: int = 255) -> str:
         return ""
     text = " ".join(value.split())[:limit]
     return "" if text.casefold() in _PLACEHOLDER_VALUES else text
+
+
+def clean_meeting_provider(value: object) -> str | None:
+    """Return a real meeting platform name, never an AI placeholder literal."""
+    return _clean_text(value, 64) or None
 
 
 _ICS_FIELD_RE = re.compile(
@@ -2339,7 +2359,7 @@ async def extract_calendar_details(
         if ai_url and any(term in ai_url.lower() for term in ("unsubscribe", "calendar.google", "calendly", "schedule")):
             ai_url = None
         ai_provider = _provider_for_url(ai_url) if ai_url else None
-        ai_provider = ai_provider or (_clean_text(data.get("meeting_provider"), 64) or None)
+        ai_provider = ai_provider or clean_meeting_provider(data.get("meeting_provider"))
         ai_phone = _clean_text(data.get("phone_number"), 64) or None
         ai_code = _clean_text(data.get("access_code"), 64) or None
         ai_meeting_type = _clean_text(data.get("meeting_type"), 24).lower()
@@ -2401,7 +2421,7 @@ def _apply_details(event: CalendarEvent, email: EmailMessage, access: MeetingAcc
     event.source_received_at = as_utc(email.received_at)
     if access.meeting_type != "unspecified":
         event.meeting_type = access.meeting_type
-    event.meeting_provider = access.provider or event.meeting_provider
+    event.meeting_provider = clean_meeting_provider(access.provider or event.meeting_provider)
     _assign_join_url(event, access.url)
     event.phone_number = access.phone_number or event.phone_number
     event.phone_access_code = access.access_code or event.phone_access_code
@@ -2510,7 +2530,7 @@ def refresh_calendar_event_details(db: Session, email: EmailMessage) -> bool:
         event.job_url = event.job_url or job_url
         if not event.meeting_type or event.meeting_type == "unspecified":
             event.meeting_type = access.meeting_type
-        event.meeting_provider = event.meeting_provider or access.provider
+        event.meeting_provider = clean_meeting_provider(event.meeting_provider) or clean_meeting_provider(access.provider)
         _assign_join_url(event, access.url)
         event.phone_number = event.phone_number or access.phone_number
         event.phone_access_code = event.phone_access_code or access.access_code
@@ -3551,13 +3571,14 @@ def _absorb_calendar_event(db: Session, survivor: CalendarEvent, duplicate: Cale
         survivor.meeting_url = duplicate.meeting_url
     elif is_video_join_url(duplicate.meeting_url) and not is_video_join_url(survivor.meeting_url):
         survivor.meeting_url = duplicate.meeting_url
-    if not survivor.meeting_provider and duplicate.meeting_provider:
-        survivor.meeting_provider = duplicate.meeting_provider
+    survivor.meeting_provider = clean_meeting_provider(survivor.meeting_provider)
+    if not survivor.meeting_provider:
+        survivor.meeting_provider = clean_meeting_provider(duplicate.meeting_provider)
     if (not survivor.meeting_type or survivor.meeting_type == "unspecified") and duplicate.meeting_type:
         survivor.meeting_type = duplicate.meeting_type
     if is_video_join_url(survivor.meeting_url) and (not survivor.meeting_type or survivor.meeting_type == "unspecified"):
         survivor.meeting_type = "video"
-        survivor.meeting_provider = survivor.meeting_provider or _provider_for_url(survivor.meeting_url)
+        survivor.meeting_provider = clean_meeting_provider(survivor.meeting_provider) or _provider_for_url(survivor.meeting_url)
     if survivor.company and survivor.job_role:
         survivor.title = f"{survivor.company} — {survivor.job_role}"
     elif survivor.company:
@@ -3782,7 +3803,7 @@ def repair_meeting_join_urls(db: Session, mailbox_id: int | None = None) -> int:
                 break
         if found and found.url:
             event.meeting_url = found.url
-            event.meeting_provider = found.provider or event.meeting_provider
+            event.meeting_provider = clean_meeting_provider(found.provider or event.meeting_provider)
             if not event.meeting_type or event.meeting_type == "unspecified":
                 event.meeting_type = found.meeting_type
             if found.phone_number and not event.phone_number:
@@ -3842,7 +3863,7 @@ async def repair_meeting_landing_urls(
             continue
         event.meeting_url = access.url
         event.meeting_type = "video"
-        event.meeting_provider = access.provider or event.meeting_provider
+        event.meeting_provider = clean_meeting_provider(access.provider or event.meeting_provider)
         if access.phone_number and not event.phone_number:
             event.phone_number = access.phone_number
         if access.access_code and not event.phone_access_code:
@@ -4785,7 +4806,7 @@ def repair_phantom_availability_slots(db: Session, mailbox_id: int | None = None
                 source_timezone=normalize_time_zone_name(slot.source_timezone) or slot.source_timezone,
                 application_status=template.application_status or "active",
                 meeting_type=template.meeting_type or "unspecified",
-                meeting_provider=template.meeting_provider,
+                meeting_provider=clean_meeting_provider(template.meeting_provider),
                 meeting_url=template.meeting_url,
                 phone_number=template.phone_number,
                 phone_access_code=template.phone_access_code,
@@ -4829,7 +4850,7 @@ def repair_phantom_availability_slots(db: Session, mailbox_id: int | None = None
 
 
 def repair_placeholder_calendar_fields(db: Session, mailbox_id: int | None = None) -> int:
-    """Drop the literal word "empty" stored as a company or job title."""
+    """Drop placeholder literals stored in user-visible calendar fields."""
     query = db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True))
     if mailbox_id is not None:
         query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
@@ -4837,10 +4858,24 @@ def repair_placeholder_calendar_fields(db: Session, mailbox_id: int | None = Non
     for event in query.all():
         company = clean_company_name(event.company)
         role = job_role_or_empty(event.job_role)
-        if company == (event.company or "").strip() and role == (event.job_role or "").strip():
+        provider = clean_meeting_provider(event.meeting_provider)
+        meeting_type = event.meeting_type or "unspecified"
+        if meeting_type == "unspecified":
+            if event.phone_number:
+                meeting_type = "phone"
+            elif event.meeting_url or provider:
+                meeting_type = "video"
+        if (
+            company == (event.company or "").strip()
+            and role == (event.job_role or "").strip()
+            and provider == event.meeting_provider
+            and meeting_type == event.meeting_type
+        ):
             continue
         event.company = company
         event.job_role = role
+        event.meeting_provider = provider
+        event.meeting_type = meeting_type
         if event.company and event.job_role:
             event.title = f"{event.company} — {event.job_role}"
         else:
