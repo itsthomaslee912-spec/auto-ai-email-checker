@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from email.utils import getaddresses, parseaddr
 from typing import Any
 
+import httpx
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
@@ -616,43 +617,47 @@ async def _sync_outlook_delta(db: Session, mailbox: MailboxConnection) -> None:
     cursors = _outlook_cursors(mailbox)
     imported = int(_jobs.get(mailbox.id, {}).get("imported", 0))
     listed = int(_jobs.get(mailbox.id, {}).get("listed", 0))
-    for folder in OUTLOOK_FOLDERS:
-        cursor = cursors.get(folder)
-        while True:
-            if _should_stop(mailbox.id):
-                return
-            token = await ensure_microsoft_access_token(db, mailbox)
-            page = await outlook_list_delta(token, folder, cursor)
-            for item in page.get("value") or []:
+    # Reuse one connection pool for all changed messages. Creating a fresh
+    # AsyncClient per item repeatedly negotiates TCP/TLS and was both slow and
+    # prone to ConnectTimeout during large Outlook delta pages.
+    async with httpx.AsyncClient(timeout=30) as graph_client:
+        for folder in OUTLOOK_FOLDERS:
+            cursor = cursors.get(folder)
+            while True:
                 if _should_stop(mailbox.id):
                     return
-                mid = item.get("id")
-                if not mid or item.get("@removed"):
-                    continue
-                listed += 1
-                try:
-                    raw = await outlook_get_message(token, str(mid))
-                except HTTPException as exc:
-                    if exc.status_code == 404:
+                token = await ensure_microsoft_access_token(db, mailbox)
+                page = await outlook_list_delta(token, folder, cursor)
+                for item in page.get("value") or []:
+                    if _should_stop(mailbox.id):
+                        return
+                    mid = item.get("id")
+                    if not mid or item.get("@removed"):
                         continue
-                    raise
-                raw["_mail_folder"] = folder
-                email = await ingest_normalized_message(db, mailbox, normalize_outlook_message(raw), download_only=True)
-                if email:
-                    imported += 1
-            next_cursor = page.get("@odata.nextLink") or page.get("@odata.deltaLink")
-            if not next_cursor:
-                raise RuntimeError(f"Outlook delta did not return a cursor for {folder}")
-            cursors[folder] = str(next_cursor)
-            mailbox.sync_cursor = json.dumps(cursors)
-            db.commit()
-            await _publish_progress(
-                mailbox.id, listed=listed, imported=imported, total=listed,
-                message=f"Checked {listed} Outlook changes across folders",
-            )
-            if page.get("@odata.deltaLink"):
-                break
-            cursor = str(next_cursor)
+                    listed += 1
+                    try:
+                        raw = await outlook_get_message(token, str(mid), client=graph_client)
+                    except HTTPException as exc:
+                        if exc.status_code == 404:
+                            continue
+                        raise
+                    raw["_mail_folder"] = folder
+                    email = await ingest_normalized_message(db, mailbox, normalize_outlook_message(raw), download_only=True)
+                    if email:
+                        imported += 1
+                next_cursor = page.get("@odata.nextLink") or page.get("@odata.deltaLink")
+                if not next_cursor:
+                    raise RuntimeError(f"Outlook delta did not return a cursor for {folder}")
+                cursors[folder] = str(next_cursor)
+                mailbox.sync_cursor = json.dumps(cursors)
+                db.commit()
+                await _publish_progress(
+                    mailbox.id, listed=listed, imported=imported, total=listed,
+                    message=f"Checked {listed} Outlook changes across folders",
+                )
+                if page.get("@odata.deltaLink"):
+                    break
+                cursor = str(next_cursor)
 
 
 async def _full_outlook(db: Session, mailbox: MailboxConnection, limit: int) -> None:

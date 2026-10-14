@@ -1732,6 +1732,134 @@ def test_reschedule_to_a_new_day_hides_the_prior_booking():
         assert old.superseded_by_event_id == new.id
 
 
+def test_later_interview_round_does_not_supersede_prior_round_and_can_be_canceled():
+    factory, (mailbox_id, _) = _database()
+    old_url = "https://teams.microsoft.com/l/meetup-join/old-rivet-round"
+    new_url = "https://teams.microsoft.com/l/meetup-join/new-rivet-round"
+    old_ics = f"""BEGIN:VCALENDAR
+METHOD:REQUEST
+BEGIN:VEVENT
+UID:rivet-intro-round
+DTSTART:20261013T160000Z
+DTEND:20261013T161500Z
+LOCATION:{old_url}
+END:VEVENT
+END:VCALENDAR
+{old_url}
+"""
+    new_ics = f"""BEGIN:VCALENDAR
+METHOD:REQUEST
+BEGIN:VEVENT
+UID:rivet-team-round
+DTSTART:20261023T170000Z
+DTEND:20261023T173000Z
+LOCATION:{new_url}
+END:VEVENT
+END:VCALENDAR
+{new_url}
+"""
+    cancel_ics = new_ics.replace("METHOD:REQUEST", "METHOD:CANCEL").replace(
+        "END:VEVENT", "STATUS:CANCELLED\nEND:VEVENT"
+    )
+    with factory() as db:
+        first = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="rivet-intro",
+            thread_id="rivet-intro-thread",
+            subject="Interview with Rivet Industries",
+            sender="Manuela <manuela@rivet.us>",
+            received_at=datetime(2026, 10, 5, 17, 27, tzinfo=timezone.utc),
+            body_text=old_ics,
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="Rivet Industries",
+            job_role="ML Researcher",
+        )
+        next_round = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="rivet-team",
+            thread_id="rivet-team-thread",
+            subject="Interview with Rivet Industries",
+            sender="Manuela <manuela@rivet.us>",
+            received_at=datetime(2026, 10, 13, 18, 50, tzinfo=timezone.utc),
+            body_text=new_ics,
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="Rivet Industries",
+            job_role="ML Researcher",
+        )
+        canceled = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="rivet-team-cancel",
+            thread_id="rivet-team-cancel-thread",
+            subject="Canceled: Interview with Rivet Industries",
+            sender="Manuela <manuela@rivet.us>",
+            received_at=datetime(2026, 10, 13, 20, 7, tzinfo=timezone.utc),
+            body_text=cancel_ics,
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="cancellation",
+            company="Rivet Industries",
+            job_role="ML Researcher",
+        )
+        db.add_all([first, next_round, canceled])
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, first, use_ai=False)) is True
+        assert asyncio.run(process_calendar_email(db, next_round, use_ai=False)) is True
+        assert asyncio.run(process_calendar_email(db, canceled, use_ai=False)) is True
+        db.flush()
+
+        visible = db.query(CalendarEvent).filter(
+            CalendarEvent.kind == "confirmed",
+            CalendarEvent.is_visible.is_(True),
+        ).order_by(CalendarEvent.start_at).all()
+        assert [(event.start_at, event.interview_status) for event in visible] == [
+            (datetime(2026, 10, 13, 16, 0, tzinfo=timezone.utc), "calendar_invite"),
+            (datetime(2026, 10, 23, 17, 0, tzinfo=timezone.utc), "cancellation"),
+        ]
+
+
+def test_cleanup_restores_distinct_provider_meeting_hidden_by_legacy_merge():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        old = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_thread_id="rivet-intro-thread",
+            kind="confirmed",
+            origin="email",
+            company="Rivet Industries",
+            job_role="ML Researcher",
+            start_at=datetime(2026, 10, 13, 16, tzinfo=timezone.utc),
+            end_at=datetime(2026, 10, 13, 16, 15, tzinfo=timezone.utc),
+            meeting_url="https://teams.microsoft.com/l/meetup-join/old-rivet-round",
+            interview_status="reschedule",
+            is_visible=False,
+        )
+        canceled = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_thread_id="rivet-team-thread",
+            kind="confirmed",
+            origin="email",
+            company="Rivet Industries",
+            job_role="ML Researcher",
+            start_at=datetime(2026, 10, 23, 17, tzinfo=timezone.utc),
+            end_at=datetime(2026, 10, 23, 17, 30, tzinfo=timezone.utc),
+            meeting_url="https://teams.microsoft.com/l/meetup-join/new-rivet-round",
+            interview_status="cancellation",
+            is_visible=True,
+        )
+        db.add_all([old, canceled])
+        db.flush()
+        old.superseded_by_event_id = canceled.id
+        db.commit()
+
+        assert collapse_duplicate_calendar_events(db, mailbox_id) is True
+        db.commit()
+        assert db.get(CalendarEvent, old.id).is_visible is True
+        assert db.get(CalendarEvent, old.id).superseded_by_event_id is None
+        assert db.get(CalendarEvent, canceled.id).is_visible is True
+
+
 def test_calendar_invite_fills_company_and_role_from_the_same_employer():
     factory, (mailbox_id, _) = _database()
     with factory() as db:

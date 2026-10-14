@@ -185,6 +185,17 @@ async def _backfill_calendar_events(
                 except Exception:
                     db.rollback()
                     logger.exception("Calendar backfill failed email_id=%s", email_id)
+                    # Do not let one permanently malformed legacy message
+                    # monopolize the first page of this ordered backlog on
+                    # every pass. Preserve the failure for diagnostics and
+                    # mark this exact content as inspected; changed content
+                    # is processed again by normal ingestion.
+                    failed = db.get(EmailMessage, email_id)
+                    if failed is not None:
+                        failed.calendar_processed_hash = email_calendar_hash(failed)
+                        failed.calendar_processed_at = datetime.now(timezone.utc)
+                        failed.calendar_processing_error = "Calendar backfill failed; see backend log"
+                        db.commit()
                 if index % 5 == 0:
                     publish_pending()
                     await asyncio.sleep(0)

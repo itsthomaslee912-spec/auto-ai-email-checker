@@ -4271,6 +4271,91 @@ def _event_has_reschedule_signal(db: Session, event: CalendarEvent) -> bool:
     return bool(source and (source.interview_subtype or "").casefold() in _RESCHEDULE_STATUSES)
 
 
+def _same_provider_appointment(
+    db: Session,
+    left: CalendarEvent,
+    right: CalendarEvent,
+    right_email: EmailMessage | None = None,
+) -> bool:
+    """Whether two rows identify the same provider calendar appointment.
+
+    Company and job role identify an application, not an interview round.  A
+    calendar UID or an unchanged join URL is appointment-level evidence and
+    is safe to use when an updated invite moves the clock.
+    """
+    left_url = (left.meeting_url or "").strip()
+    right_url = (right.meeting_url or "").strip()
+    if left_url and right_url and left_url == right_url:
+        return True
+
+    def source_uid(event: CalendarEvent, supplied: EmailMessage | None = None) -> str:
+        source = supplied
+        if source is None and event.source_email_id:
+            source = db.get(EmailMessage, event.source_email_id)
+        return _ics_uid(_calendar_text(source)) if source is not None else ""
+
+    left_uid = source_uid(left)
+    right_uid = source_uid(right, right_email)
+    return bool(left_uid and right_uid and left_uid == right_uid)
+
+
+def _same_reschedule_context(
+    db: Session,
+    older: CalendarEvent,
+    newer: CalendarEvent,
+) -> bool:
+    """Require appointment evidence before one clock supersedes another."""
+    def thread_id(event: CalendarEvent) -> str:
+        if event.source_thread_id:
+            return event.source_thread_id
+        source = db.get(EmailMessage, event.source_email_id) if event.source_email_id else None
+        return source.thread_id if source is not None and source.thread_id else ""
+
+    older_thread = thread_id(older)
+    newer_thread = thread_id(newer)
+    same_thread = bool(
+        older_thread
+        and newer_thread
+        and older_thread == newer_thread
+    )
+    return same_thread or _same_provider_appointment(db, older, newer)
+
+
+def restore_distinct_superseded_bookings(db: Session, mailbox_id: int | None = None) -> int:
+    """Restore a real earlier round that was merged into a different appointment.
+
+    Older versions treated matching company/role as the same interview.  Two
+    different provider meeting URLs, without a shared thread, prove that the
+    rows are separate rounds and both belong on the calendar.
+    """
+    query = db.query(CalendarEvent).filter(
+        CalendarEvent.kind == "confirmed",
+        CalendarEvent.is_visible.is_(False),
+        CalendarEvent.superseded_by_event_id.is_not(None),
+    )
+    if mailbox_id is not None:
+        query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
+    restored = 0
+    for event in query.all():
+        survivor = db.get(CalendarEvent, event.superseded_by_event_id)
+        if survivor is None or survivor.kind != "confirmed" or not survivor.is_visible:
+            continue
+        if _starts_within_minute(event, survivor):
+            continue
+        left_url = (event.meeting_url or "").strip()
+        right_url = (survivor.meeting_url or "").strip()
+        if not left_url or not right_url or left_url == right_url:
+            continue
+        if _same_reschedule_context(db, event, survivor):
+            continue
+        event.is_visible = True
+        event.superseded_by_event_id = None
+        restored += 1
+    if restored:
+        db.flush()
+    return restored
+
+
 def hide_superseded_identity_bookings(db: Session, mailbox_id: int | None = None) -> int:
     """Hide an older chip when the same interview was rebooked at a new time.
 
@@ -4298,17 +4383,17 @@ def hide_superseded_identity_bookings(db: Session, mailbox_id: int | None = None
                 continue
             if not roles_compatible(left.job_role, right.job_role):
                 continue
-            left_signal = _event_has_reschedule_signal(db, left)
-            right_signal = _event_has_reschedule_signal(db, right)
-            # Require an explicit reschedule/time-change. Shared thread links
-            # alone can belong to a multi-round loop on different days.
-            if not (left_signal or right_signal):
-                continue
-            if left_signal != right_signal:
-                fresher = left if left_signal else right
-            else:
-                fresher = left if _event_freshness(db, left) >= _event_freshness(db, right) else right
+            left_freshness = _event_freshness(db, left)
+            right_freshness = _event_freshness(db, right)
+            fresher = left if left_freshness >= right_freshness else right
             older = right if fresher.id == left.id else left
+            # The newer appointment itself must carry the reschedule signal.
+            # An older round that happened to be rescheduled in the past must
+            # never consume a later round for the same application.
+            if not _event_has_reschedule_signal(db, fresher):
+                continue
+            if not _same_reschedule_context(db, older, fresher):
+                continue
             if older.is_visible and fresher.id != older.id:
                 _absorb_calendar_event(db, fresher, older)
                 hidden += 1
@@ -4330,10 +4415,6 @@ def _hide_prior_bookings_replaced_by(
     message_at = as_utc(email.received_at)
     subtype = (email.interview_subtype or "").casefold()
     force_replace = subtype in _RESCHEDULE_STATUSES or (replacement.interview_status or "").casefold() in _RESCHEDULE_STATUSES
-    replacement_links = {item.id for item in _linked_messages(db, replacement)}
-    replacement_links.add(email.id)
-    if replacement.source_email_id:
-        replacement_links.add(replacement.source_email_id)
     changed = False
     rows = (
         db.query(CalendarEvent)
@@ -4356,10 +4437,10 @@ def _hide_prior_bookings_replaced_by(
         booked_at = as_utc(event.source_received_at) or _event_received_at(event)
         if message_at is not None and booked_at is not None and booked_at > message_at:
             continue
-        prior_links = {item.id for item in _linked_messages(db, event)}
-        if event.source_email_id:
-            prior_links.add(event.source_email_id)
-        related = force_replace or bool(prior_links & replacement_links)
+        # Fuzzy context links help extract company/role details, but are not
+        # proof that two clocks are the same appointment.  Only an explicit
+        # reschedule or provider identity may retire an existing booking.
+        related = force_replace or _same_provider_appointment(db, event, replacement, email)
         if not related:
             continue
         # A "I just sent the invite" follow-up must not displace the ICS booking.
@@ -4901,6 +4982,8 @@ def collapse_duplicate_calendar_events(db: Session, mailbox_id: int | None = Non
     if hide_quote_clock_events(db, mailbox_id):
         changed = True
     if hide_replaced_bookings(db, mailbox_id):
+        changed = True
+    if restore_distinct_superseded_bookings(db, mailbox_id):
         changed = True
     if hide_superseded_identity_bookings(db, mailbox_id):
         changed = True

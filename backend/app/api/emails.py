@@ -66,9 +66,10 @@ from app.schemas import (
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/emails", tags=["emails"])
 _label_effect_locks: dict[int, threading.Lock] = {}
-# Later pages of the same list reuse sidebar totals. The first page always recounts.
+# Sidebar totals are shared by every mailbox/category view for a short period.
 _LIST_META_TTL_SECONDS = 30.0
 _list_meta_cache: dict[tuple, tuple[float, dict]] = {}
+_list_meta_cache_lock = threading.Lock()
 _LIST_COLUMNS = load_only(
     EmailMessage.id,
     EmailMessage.mailbox_id,
@@ -181,116 +182,103 @@ def _apply_unread_first_cursor(
 
 def _list_meta(
     db: Session,
-    filtered,
     valid: set[str],
     *,
-    mailbox_id: int | None,
-    label: str | None,
-    interview_subtype: str | None,
-    folder: str | None,
-    query: str | None,
-    before_id: int | None,
     conversation: bool,
 ) -> dict:
     """Sidebar totals for the inbox list.
 
-    The first page scans once. Scrolling reuses that result so each extra page
-    does not recount every message.
+    These totals describe all active mail, not the selected list filter. Cache
+    them per user/view so switching accounts or categories does not repeatedly
+    scan every message.  The lock also prevents a burst of clicks from starting
+    the same expensive conversation aggregation in several request workers.
     """
     key = (
+        id(db.get_bind()),
         current_user_id.get(),
-        mailbox_id,
-        label or "",
-        interview_subtype or "",
-        folder or "",
-        (query or "").strip().lower(),
         conversation,
     )
-    now = time.monotonic()
-    if before_id is not None:
+    with _list_meta_cache_lock:
+        now = time.monotonic()
         cached = _list_meta_cache.get(key)
         if cached is not None and now - cached[0] < _LIST_META_TTL_SECONDS:
             return cached[1]
 
-    total = int(filtered.order_by(None).with_entities(func.count(EmailMessage.id)).scalar() or 0)
-    if conversation:
-        all_messages = _from_active_mailbox(db.query(EmailMessage))
-        ranked = _conversation_ranked(all_messages)
-        grouped = (
-            db.query(
-                EmailMessage.mailbox_id,
-                EmailMessage.label,
-                EmailMessage.folder,
-                ranked.c.thread_is_read,
-                func.count(EmailMessage.id),
-            )
-            .join(ranked, ranked.c.rep_id == EmailMessage.id)
-            .filter(ranked.c.rn == 1)
-            .group_by(
-                EmailMessage.mailbox_id,
-                EmailMessage.label,
-                EmailMessage.folder,
-                ranked.c.thread_is_read,
-            )
-            .all()
-        )
-    else:
-        grouped = (
-            _from_active_mailbox(
+        if conversation:
+            all_messages = _from_active_mailbox(db.query(EmailMessage))
+            ranked = _conversation_ranked(all_messages)
+            grouped = (
                 db.query(
                     EmailMessage.mailbox_id,
                     EmailMessage.label,
                     EmailMessage.folder,
-                    EmailMessage.is_read,
+                    ranked.c.thread_is_read,
                     func.count(EmailMessage.id),
                 )
+                .join(ranked, ranked.c.rep_id == EmailMessage.id)
+                .filter(ranked.c.rn == 1)
+                .group_by(
+                    EmailMessage.mailbox_id,
+                    EmailMessage.label,
+                    EmailMessage.folder,
+                    ranked.c.thread_is_read,
+                )
+                .all()
             )
-            .group_by(
-                EmailMessage.mailbox_id,
-                EmailMessage.label,
-                EmailMessage.folder,
-                EmailMessage.is_read,
+        else:
+            grouped = (
+                _from_active_mailbox(
+                    db.query(
+                        EmailMessage.mailbox_id,
+                        EmailMessage.label,
+                        EmailMessage.folder,
+                        EmailMessage.is_read,
+                        func.count(EmailMessage.id),
+                    )
+                )
+                .group_by(
+                    EmailMessage.mailbox_id,
+                    EmailMessage.label,
+                    EmailMessage.folder,
+                    EmailMessage.is_read,
+                )
+                .all()
             )
-            .all()
-        )
-    label_counts = {item: 0 for item in valid}
-    folder_counts = {item: 0 for item in VALID_FOLDERS}
-    mailbox_counts: dict[str, int] = {}
-    mailbox_unread_counts: dict[str, int] = {}
-    breakdown: dict[tuple[int, str, str, bool], int] = {}
-    for mid, lab, fold, is_read, count in grouped:
-        amount = int(count)
-        mailbox_key = str(mid)
-        cell = (
-            int(mid),
-            lab if lab in valid else EmailLabel.OTHER.value,
-            fold if fold in VALID_FOLDERS else MailFolder.INBOX.value,
-            not is_read,
-        )
-        breakdown[cell] = breakdown.get(cell, 0) + amount
-        mailbox_counts[mailbox_key] = mailbox_counts.get(mailbox_key, 0) + amount
-        if not is_read:
-            mailbox_unread_counts[mailbox_key] = mailbox_unread_counts.get(mailbox_key, 0) + amount
-        if mailbox_id is not None and mid != mailbox_id:
-            continue
-        label_key = lab if lab in valid else EmailLabel.OTHER.value
-        label_counts[label_key] = label_counts.get(label_key, 0) + amount
-        folder_key = fold if fold in VALID_FOLDERS else MailFolder.INBOX.value
-        folder_counts[folder_key] = folder_counts.get(folder_key, 0) + amount
+        label_counts = {item: 0 for item in valid}
+        folder_counts = {item: 0 for item in VALID_FOLDERS}
+        mailbox_counts: dict[str, int] = {}
+        mailbox_unread_counts: dict[str, int] = {}
+        breakdown: dict[tuple[int, str, str, bool], int] = {}
+        for mid, lab, fold, is_read, count in grouped:
+            amount = int(count)
+            mailbox_key = str(mid)
+            cell = (
+                int(mid),
+                lab if lab in valid else EmailLabel.OTHER.value,
+                fold if fold in VALID_FOLDERS else MailFolder.INBOX.value,
+                not is_read,
+            )
+            breakdown[cell] = breakdown.get(cell, 0) + amount
+            mailbox_counts[mailbox_key] = mailbox_counts.get(mailbox_key, 0) + amount
+            if not is_read:
+                mailbox_unread_counts[mailbox_key] = mailbox_unread_counts.get(mailbox_key, 0) + amount
+            label_key = lab if lab in valid else EmailLabel.OTHER.value
+            label_counts[label_key] = label_counts.get(label_key, 0) + amount
+            folder_key = fold if fold in VALID_FOLDERS else MailFolder.INBOX.value
+            folder_counts[folder_key] = folder_counts.get(folder_key, 0) + amount
 
-    meta = {
-        "total": total,
-        "label_counts": label_counts,
-        "folder_counts": folder_counts,
-        "mailbox_counts": mailbox_counts,
-        "mailbox_unread_counts": mailbox_unread_counts,
-        "count_breakdown": [[*cell, amount] for cell, amount in breakdown.items()],
-    }
-    _list_meta_cache[key] = (now, meta)
-    if len(_list_meta_cache) > 32:
-        oldest = min(_list_meta_cache, key=lambda item: _list_meta_cache[item][0])
-        _list_meta_cache.pop(oldest, None)
-    return meta
+        meta = {
+            "label_counts": label_counts,
+            "folder_counts": folder_counts,
+            "mailbox_counts": mailbox_counts,
+            "mailbox_unread_counts": mailbox_unread_counts,
+            "count_breakdown": [[*cell, amount] for cell, amount in breakdown.items()],
+        }
+        _list_meta_cache[key] = (now, meta)
+        if len(_list_meta_cache) > 32:
+            oldest = min(_list_meta_cache, key=lambda item: _list_meta_cache[item][0])
+            _list_meta_cache.pop(oldest, None)
+        return meta
 
 
 def _thread_key():
@@ -334,22 +322,29 @@ def _conversation_ranked(filtered):
 _conversation_total_cache: dict[tuple, tuple[float, int]] = {}
 
 
+def invalidate_email_list_caches() -> None:
+    """Discard list metadata after mail, labels, folders, or read state change."""
+    with _list_meta_cache_lock:
+        _list_meta_cache.clear()
+        _conversation_total_cache.clear()
+
+
 def _conversation_total(filtered, key: tuple, before_id: int | None) -> int:
-    key = (current_user_id.get(), *key)
-    now = time.monotonic()
-    if before_id is not None:
+    key = (id(filtered.session.get_bind()), current_user_id.get(), *key)
+    with _list_meta_cache_lock:
+        now = time.monotonic()
         cached = _conversation_total_cache.get(key)
         if cached is not None and now - cached[0] < _LIST_META_TTL_SECONDS:
             return cached[1]
-    thread_key = _bytewise(filtered, func.concat(cast(EmailMessage.mailbox_id, String), ":", _thread_key()))
-    total = int(
-        filtered.order_by(None).with_entities(func.count(func.distinct(thread_key))).scalar() or 0
-    )
-    _conversation_total_cache[key] = (now, total)
-    if len(_conversation_total_cache) > 32:
-        oldest = min(_conversation_total_cache, key=lambda item: _conversation_total_cache[item][0])
-        _conversation_total_cache.pop(oldest, None)
-    return total
+        thread_key = _bytewise(filtered, func.concat(cast(EmailMessage.mailbox_id, String), ":", _thread_key()))
+        total = int(
+            filtered.order_by(None).with_entities(func.count(func.distinct(thread_key))).scalar() or 0
+        )
+        _conversation_total_cache[key] = (now, total)
+        if len(_conversation_total_cache) > 32:
+            oldest = min(_conversation_total_cache, key=lambda item: _conversation_total_cache[item][0])
+            _conversation_total_cache.pop(oldest, None)
+        return total
 
 
 @router.get("", response_model=EmailPageOut)
@@ -439,21 +434,21 @@ def list_emails(
 
     meta = _list_meta(
         db,
-        filtered,
         valid,
-        mailbox_id=mailbox_id,
-        label=label,
-        interview_subtype=interview_subtype,
-        folder=folder,
-        query=q,
-        before_id=before_id,
         conversation=conversation,
     )
     label_counts = meta["label_counts"]
     folder_counts = meta["folder_counts"]
     mailbox_counts = meta["mailbox_counts"]
     mailbox_unread_counts = meta["mailbox_unread_counts"]
-    total = meta["total"]
+    if mailbox_id is not None:
+        label_counts = {item: 0 for item in valid}
+        folder_counts = {item: 0 for item in VALID_FOLDERS}
+        for mid, lab, fold, _unread, amount in meta["count_breakdown"]:
+            if mid != mailbox_id:
+                continue
+            label_counts[lab] = label_counts.get(lab, 0) + amount
+            folder_counts[fold] = folder_counts.get(fold, 0) + amount
     if conversation:
         total = _conversation_total(
             filtered,
@@ -466,6 +461,8 @@ def list_emails(
             ),
             before_id,
         )
+    else:
+        total = int(filtered.order_by(None).with_entities(func.count(EmailMessage.id)).scalar() or 0)
 
     items = []
     for index, row in enumerate(rows):
@@ -544,6 +541,7 @@ async def mark_all_read(
     for row in unread:
         row.is_read = True
     db.commit()
+    invalidate_email_list_caches()
     await publish("mark_all_read.done", {"mailbox_id": mailbox_id, "marked": len(unread), "total": total})
     return MarkAllReadOut(marked=len(unread))
 
@@ -719,6 +717,7 @@ async def get_email(
         changed = True
     if changed:
         db.commit()
+        invalidate_email_list_caches()
     return email
 
 
@@ -818,6 +817,7 @@ async def update_email_label(
     if previous_label != new_label and new_label in OUTCOME_LABELS:
         email.outcome_extracted = False
     db.commit()
+    invalidate_email_list_caches()
     db.refresh(email)
 
     needs_follow_up = (previous_label != new_label and new_label in OUTCOME_LABELS) or (
@@ -965,6 +965,7 @@ async def send_email(payload: SendEmailIn, db: Session = Depends(get_db)) -> Sen
     )
     db.add(sent)
     db.commit()
+    invalidate_email_list_caches()
     return SendEmailOut(ok=True, provider_message_id=provider_message_id)
 
 

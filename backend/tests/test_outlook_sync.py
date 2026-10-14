@@ -4,7 +4,7 @@ import asyncio
 
 import httpx
 
-from app.email.outlook import outlook_list_recent
+from app.email.outlook import outlook_get_message, outlook_list_recent
 
 
 def _folder_response(folder: str) -> dict:
@@ -90,3 +90,54 @@ def test_outlook_list_recent_without_get_token_reuses_static_token():
         outlook_module.httpx.AsyncClient = original
 
     assert seen_tokens == ["Bearer fixed-token"] * 5
+
+
+def test_outlook_message_queries_request_read_state():
+    selects: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        selects.append(request.url.params.get("$select", ""))
+        if "/mailFolders/" in request.url.path:
+            folder = request.url.path.split("/")[-2]
+            return httpx.Response(200, json=_folder_response(folder))
+        return httpx.Response(200, json={"id": "message-1", "isRead": True})
+
+    import app.email.outlook as outlook_module
+
+    original = outlook_module.httpx.AsyncClient
+    outlook_module.httpx.AsyncClient = _patched_async_client(httpx.MockTransport(handler))
+    try:
+        asyncio.run(outlook_get_message("token", "message-1"))
+        asyncio.run(outlook_list_recent("token", top=1))
+    finally:
+        outlook_module.httpx.AsyncClient = original
+
+    assert len(selects) == 6
+    assert all("isRead" in select.split(",") for select in selects)
+
+
+def test_outlook_get_message_retries_transient_connection_failure(monkeypatch):
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ConnectTimeout("temporary TLS timeout", request=request)
+        return httpx.Response(200, json={"id": "message-1", "isRead": True})
+
+    async def no_delay(_seconds: float) -> None:
+        return None
+
+    import app.email.outlook as outlook_module
+
+    monkeypatch.setattr(outlook_module.asyncio, "sleep", no_delay)
+    original = outlook_module.httpx.AsyncClient
+    outlook_module.httpx.AsyncClient = _patched_async_client(httpx.MockTransport(handler))
+    try:
+        result = asyncio.run(outlook_get_message("token", "message-1"))
+    finally:
+        outlook_module.httpx.AsyncClient = original
+
+    assert result["id"] == "message-1"
+    assert attempts == 2

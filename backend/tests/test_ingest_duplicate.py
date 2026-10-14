@@ -132,6 +132,87 @@ def test_existing_message_refreshes_calendar_attachment_content(tmp_path, monkey
     engine.dispose()
 
 
+def test_existing_message_sync_never_resets_local_read_state(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'read-state.db'}", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    with Session() as db:
+        user = User(external_id="read-state-sync")
+        db.add(user)
+        db.flush()
+        mailbox = MailboxConnection(
+            user_id=user.id,
+            provider=Provider.MICROSOFT.value,
+            email_address="read@example.com",
+            access_token_enc="x",
+            is_active=True,
+        )
+        db.add(mailbox)
+        db.flush()
+        email = EmailMessage(
+            mailbox_id=mailbox.id,
+            provider_message_id="already-read",
+            subject="Interview",
+            sender="recruiter@example.com",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            is_read=True,
+        )
+        db.add(email)
+        db.commit()
+
+        monkeypatch.setattr("app.services.ingest.process_calendar_email", lambda *_args, **_kwargs: None)
+        asyncio.run(ingest_normalized_message(db, mailbox, {
+            "provider_message_id": "already-read",
+            "subject": "Interview",
+            "sender": "recruiter@example.com",
+            "is_read": False,
+        }, download_only=True))
+
+        db.refresh(email)
+        assert email.is_read is True
+    engine.dispose()
+
+
+def test_existing_message_sync_can_promote_unread_to_read(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'provider-read.db'}", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    with Session() as db:
+        user = User(external_id="provider-read-sync")
+        db.add(user)
+        db.flush()
+        mailbox = MailboxConnection(
+            user_id=user.id,
+            provider=Provider.GOOGLE.value,
+            email_address="provider-read@example.com",
+            access_token_enc="x",
+            is_active=True,
+        )
+        db.add(mailbox)
+        db.flush()
+        email = EmailMessage(
+            mailbox_id=mailbox.id,
+            provider_message_id="provider-read",
+            subject="Update",
+            sender="sender@example.com",
+            label=EmailLabel.OTHER.value,
+            is_read=False,
+        )
+        db.add(email)
+        db.commit()
+
+        asyncio.run(ingest_normalized_message(db, mailbox, {
+            "provider_message_id": "provider-read",
+            "subject": "Update",
+            "sender": "sender@example.com",
+            "is_read": True,
+        }, download_only=True))
+
+        db.refresh(email)
+        assert email.is_read is True
+    engine.dispose()
+
+
 def test_existing_message_keeps_provider_refresh_when_calendar_repair_fails(tmp_path, monkeypatch):
     engine = create_engine(f"sqlite:///{tmp_path / 'failed-repair.db'}", connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)

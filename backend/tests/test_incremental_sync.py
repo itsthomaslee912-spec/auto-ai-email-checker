@@ -405,12 +405,15 @@ def test_outlook_delta_tracks_each_folder_and_keeps_cursor_on_failure(monkeypatc
         return pages[folder].pop(0)
 
     monkeypatch.setattr(mailbox_sync, "outlook_list_delta", delta)
-    monkeypatch.setattr(mailbox_sync, "outlook_get_message", AsyncMock(return_value={"id": "new"}))
+    get_message = AsyncMock(return_value={"id": "new"})
+    monkeypatch.setattr(mailbox_sync, "outlook_get_message", get_message)
     monkeypatch.setattr(mailbox_sync, "normalize_outlook_message", lambda raw: raw)
     ingest = AsyncMock(return_value=object())
     monkeypatch.setattr(mailbox_sync, "ingest_normalized_message", ingest)
     asyncio.run(mailbox_sync._incremental_outlook(db, mailbox))
     assert ingest.await_count == 1
+    assert get_message.await_count == 1
+    assert get_message.await_args.kwargs.get("client") is not None
     assert set(json.loads(mailbox.sync_cursor)) == set(mailbox_sync.OUTLOOK_FOLDERS)
     assert json.loads(mailbox.sync_cursor)["inbox"].endswith("/done")
 

@@ -365,6 +365,9 @@ async def disconnect_mailbox_record(db: Session, mailbox: MailboxConnection) -> 
     deleted_emails = delete_emails_for_mailbox(db, mailbox_id)
     mailbox.is_active = False
     db.commit()
+    from app.api.emails import invalidate_email_list_caches
+
+    invalidate_email_list_caches()
     await publish("mailbox.disconnected", {"mailbox_id": mailbox_id, "deleted_emails": deleted_emails})
     return deleted_emails
 

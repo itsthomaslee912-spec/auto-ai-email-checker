@@ -141,6 +141,9 @@ async function apiFetch(url: string, init?: RequestInit, attempts = 3): Promise<
       return noteUnauthorized(res);
     } catch (err) {
       lastError = err;
+      if (init?.signal?.aborted || (err instanceof DOMException && err.name === "AbortError")) {
+        throw err;
+      }
       if (i < maxAttempts - 1) {
         await new Promise((resolve) => window.setTimeout(resolve, 350 * (i + 1)));
       }
@@ -218,6 +221,7 @@ export async function fetchEmails(opts?: {
   beforeId?: number | null;
   beforeReceivedAt?: string | null;
   beforeIsRead?: boolean | null;
+  signal?: AbortSignal;
 }): Promise<EmailPage> {
   const params = new URLSearchParams();
   if (opts?.label && opts.label !== "all") params.set("label", opts.label);
@@ -232,7 +236,9 @@ export async function fetchEmails(opts?: {
   if (opts?.beforeReceivedAt) params.set("before_received_at", opts.beforeReceivedAt);
   if (opts?.beforeIsRead != null) params.set("before_is_read", String(opts.beforeIsRead));
   const qs = params.toString();
-  const res = await apiFetch(`${API_BASE}/api/emails${qs ? `?${qs}` : ""}`);
+  const res = await apiFetch(`${API_BASE}/api/emails${qs ? `?${qs}` : ""}`, {
+    signal: opts?.signal,
+  });
   if (!res.ok) throw new Error(await readApiError(res, "Failed to load emails"));
   return res.json();
 }

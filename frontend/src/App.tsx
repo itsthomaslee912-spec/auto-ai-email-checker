@@ -424,6 +424,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     conversationView,
   };
   const fetchGen = useRef(0);
+  const firstPageAbortRef = useRef<AbortController | null>(null);
   const detailGen = useRef(0);
   const loadingMoreRef = useRef(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -527,6 +528,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   };
 
   const loadFirstPage = useCallback(async () => {
+    firstPageAbortRef.current?.abort();
+    const controller = new AbortController();
+    firstPageAbortRef.current = controller;
     const gen = ++fetchGen.current;
     const {
       mailboxId,
@@ -555,19 +559,24 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         inboxType: currentInboxType,
         conversation: currentConversation,
         limit: PAGE_SIZE,
+        signal: controller.signal,
       });
       if (gen !== fetchGen.current) return;
       setEmails(sortEmailsForInbox(page.items, currentInboxType));
       applyPageMeta(page);
     } catch (err) {
+      if (controller.signal.aborted) return;
       if (gen !== fetchGen.current) return;
       setError(err instanceof Error ? err.message : "Failed to load emails");
       setEmails([]);
       setFilteredTotal(0);
     } finally {
       if (gen === fetchGen.current) setLoading(false);
+      if (firstPageAbortRef.current === controller) firstPageAbortRef.current = null;
     }
   }, [applyPageMeta]);
+
+  useEffect(() => () => firstPageAbortRef.current?.abort(), []);
 
   const loadMore = useCallback(async () => {
     if (loadingMoreRef.current || !hasMore || nextCursor == null) return;

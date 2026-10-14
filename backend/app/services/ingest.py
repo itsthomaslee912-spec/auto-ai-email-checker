@@ -45,11 +45,13 @@ async def ingest_normalized_message(
         if new_received is not None and existing.received_at != new_received:
             existing.received_at = new_received
             changed = True
-        # Provider sync is the source of truth for unread state. This also
-        # repairs records imported before read state was persisted.
-        new_is_read = bool(normalized.get("is_read", False))
-        if existing.is_read != new_is_read:
-            existing.is_read = new_is_read
+        # Reading in the app is persisted locally before the provider update
+        # finishes. A sync can race that update (and older Outlook fetches did
+        # not request isRead at all), so provider refreshes may promote unread
+        # to read but must never reset an already-read local message.
+        provider_is_read = normalized.get("is_read")
+        if provider_is_read is True and not existing.is_read:
+            existing.is_read = True
             changed = True
         # A provider can return a richer version of an existing message later
         # (most importantly after fetching a detached text/calendar part).
@@ -81,6 +83,9 @@ async def ingest_normalized_message(
                 except Exception:
                     logger.exception("Calendar refresh failed during existing-message ingest email_id=%s", existing.id)
             db.commit()
+            from app.api.emails import invalidate_email_list_caches
+
+            invalidate_email_list_caches()
         return None
 
     classification = None
@@ -141,6 +146,9 @@ async def ingest_normalized_message(
             except Exception:
                 logger.exception("Calendar extraction failed during ingest email_id=%s", email.id)
         db.commit()
+        from app.api.emails import invalidate_email_list_caches
+
+        invalidate_email_list_caches()
     except IntegrityError:
         db.rollback()
         # A webhook and the periodic sync can discover the same message while

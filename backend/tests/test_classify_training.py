@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from unittest.mock import AsyncMock, patch
@@ -20,6 +21,7 @@ from app.db import Base, get_db
 from app.models import (
     ClassifyCorrection,
     ClassifyPromptVersion,
+    CalendarEvent,
     EmailLabel,
     EmailMessage,
     MailboxConnection,
@@ -327,6 +329,53 @@ def test_reclassify_query_skips_human_corrected():
     assert unlocked.id in ids
     assert locked.id not in ids
     db.close()
+
+
+def test_reclassify_commits_calendar_changes_before_worker_session_closes(monkeypatch):
+    from app.services import reclassify
+
+    SessionLocal = _session_factory()
+    with SessionLocal() as db:
+        email = _seed_email(db, label=EmailLabel.OTHER.value)
+        email.subject = "Interview confirmed for October 20 at 2 PM"
+        email.body_text = "Your interview is confirmed for October 20 at 2 PM."
+        db.commit()
+        mailbox_id = email.mailbox_id
+
+    async def classify_as_interview(**_kwargs):
+        return SimpleNamespace(
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+            confidence=1.0,
+            response_id="test-response",
+        )
+
+    async def create_calendar_event(db, email, *, force=False):
+        start = datetime(2026, 10, 20, 18, tzinfo=timezone.utc)
+        db.add(CalendarEvent(
+            mailbox_id=email.mailbox_id,
+            source_email_id=email.id,
+            kind="confirmed",
+            origin="email",
+            title="Interview",
+            start_at=start,
+            end_at=start + timedelta(minutes=30),
+            is_visible=True,
+        ))
+        return True
+
+    monkeypatch.setattr("app.db.SessionLocal", SessionLocal)
+    monkeypatch.setattr(reclassify, "classify_email", classify_as_interview)
+    monkeypatch.setattr(reclassify, "process_calendar_email", create_calendar_event)
+    monkeypatch.setattr(reclassify, "get_ai_backend", lambda: SimpleNamespace(provider="test"))
+    monkeypatch.setattr(reclassify, "publish", AsyncMock())
+    reclassify._ai_gate = None
+    reclassify._mailbox_gate = None
+
+    asyncio.run(reclassify._run_reclassify_job(mailbox_id, pending_only=False))
+
+    with SessionLocal() as db:
+        assert db.query(CalendarEvent).filter(CalendarEvent.mailbox_id == mailbox_id).count() == 1
 
 
 def test_prompt_loader_falls_back_to_seed(monkeypatch):

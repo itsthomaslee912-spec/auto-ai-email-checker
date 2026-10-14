@@ -351,6 +351,11 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                     return False
                 if email.label in CALENDAR_LABELS or email.folder == "sent":
                     changed = await process_calendar_email(db, email, force=True)
+                    # Calendar extraction mutates events and the email's
+                    # processed hash but does not own the transaction. Without
+                    # this commit, closing the short-lived worker session rolls
+                    # the calendar update back even though the UI is notified.
+                    db.commit()
                 else:
                     sourced = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == email.id).all()
                     for event in sourced:

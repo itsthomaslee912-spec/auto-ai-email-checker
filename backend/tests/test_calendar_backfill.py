@@ -225,3 +225,66 @@ def test_backfill_loop_exits_promptly_on_stop_event(monkeypatch):
         await asyncio.wait_for(task, timeout=2)
 
     asyncio.run(run())
+
+
+def test_backfill_failure_is_recorded_without_starving_later_mail(monkeypatch):
+    factory, mailbox_id = _database()
+    with factory() as db:
+        db.add_all([
+            EmailMessage(
+                mailbox_id=mailbox_id,
+                provider_message_id="broken",
+                subject="Interview broken",
+                sender="recruiter@example.com",
+                label=EmailLabel.INTERVIEW_SCHEDULED.value,
+                received_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
+            ),
+            EmailMessage(
+                mailbox_id=mailbox_id,
+                provider_message_id="later",
+                subject="Interview later",
+                sender="recruiter@example.com",
+                label=EmailLabel.INTERVIEW_SCHEDULED.value,
+                received_at=datetime(2026, 10, 2, tzinfo=timezone.utc),
+            ),
+        ])
+        db.commit()
+
+    monkeypatch.setattr(calendar_backfill, "SessionLocal", factory)
+    monkeypatch.setattr(calendar_backfill, "BACKFILL_IDLE_SECONDS", 0)
+
+    async def process(_db, email, **_kwargs):
+        if email.provider_message_id == "broken":
+            raise ValueError("malformed calendar payload")
+        email.calendar_processed_hash = calendar_backfill.email_calendar_hash(email)
+        email.calendar_processed_at = datetime.now(timezone.utc)
+        return False
+
+    monkeypatch.setattr(calendar_backfill, "process_calendar_email", process)
+
+    async def run():
+        stop_event = threading.Event()
+        task = asyncio.ensure_future(
+            calendar_backfill._backfill_calendar_events(stop_event, asyncio.get_event_loop())
+        )
+        for _ in range(50):
+            await asyncio.sleep(0.02)
+            with factory() as db:
+                remaining = db.query(EmailMessage).filter(
+                    EmailMessage.calendar_processed_hash.is_(None)
+                ).count()
+            if remaining == 0:
+                break
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(run())
+
+    with factory() as db:
+        rows = {
+            row.provider_message_id: row
+            for row in db.query(EmailMessage).order_by(EmailMessage.id).all()
+        }
+        assert rows["broken"].calendar_processed_hash is not None
+        assert rows["broken"].calendar_processing_error
+        assert rows["later"].calendar_processed_hash is not None

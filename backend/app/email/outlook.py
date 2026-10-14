@@ -10,6 +10,42 @@ import httpx
 from fastapi import HTTPException
 
 GRAPH = "https://graph.microsoft.com/v1.0"
+_TRANSIENT_GRAPH_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _graph_retry_delay(response: httpx.Response | None, attempt: int) -> float:
+    if response is not None:
+        try:
+            return max(0.0, min(float(response.headers.get("Retry-After", "")), 10.0))
+        except (TypeError, ValueError):
+            pass
+    return 0.5 * (2 ** attempt)
+
+
+async def _graph_request_with_retry(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    **kwargs,
+) -> httpx.Response:
+    """Retry transient Graph transport, throttling, and server failures.
+
+    A single TLS/connect timeout used to abort the whole mailbox delta pass.
+    Keep retries bounded so a real outage is still reported promptly.
+    """
+    for attempt in range(3):
+        response: httpx.Response | None = None
+        try:
+            call = getattr(client, method.lower())
+            response = await call(url, **kwargs)
+        except httpx.TransportError:
+            if attempt == 2:
+                raise
+        else:
+            if response.status_code not in _TRANSIENT_GRAPH_STATUSES or attempt == 2:
+                return response
+        await asyncio.sleep(_graph_retry_delay(response, attempt))
+    raise RuntimeError("Microsoft Graph retry loop ended unexpectedly")
 
 # Tags whose own text content must never surface: stylesheet/script bodies,
 # and document metadata. The old naive "<...>"-only stripper kept this text
@@ -135,7 +171,9 @@ async def outlook_list_delta(
             "$top": "50",
         }
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
+        resp = await _graph_request_with_retry(
+            client,
+            "GET",
             url,
             headers={"Authorization": f"Bearer {access_token}"},
             params=params,
@@ -147,20 +185,34 @@ async def outlook_list_delta(
         return resp.json()
 
 
-async def outlook_get_message(access_token: str, message_id: str) -> dict:
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
+async def outlook_get_message(
+    access_token: str,
+    message_id: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> dict:
+    async def fetch(active_client: httpx.AsyncClient) -> httpx.Response:
+        return await _graph_request_with_retry(
+            active_client,
+            "GET",
             f"{GRAPH}/me/messages/{message_id}",
             headers={"Authorization": f"Bearer {access_token}"},
             params={
-                "$select": "id,subject,from,receivedDateTime,bodyPreview,body,conversationId,parentFolderId",
+                "$select": "id,subject,from,receivedDateTime,bodyPreview,body,conversationId,parentFolderId,isRead",
             },
         )
-        if resp.status_code == 404:
-            raise HTTPException(status_code=404, detail="Outlook message no longer exists")
-        if resp.status_code >= 400:
-            raise HTTPException(status_code=400, detail=f"Outlook get message failed: {resp.text}")
-        return resp.json()
+
+    if client is None:
+        async with httpx.AsyncClient(timeout=30) as owned_client:
+            resp = await fetch(owned_client)
+    else:
+        resp = await fetch(client)
+
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail="Outlook message no longer exists")
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=400, detail=f"Outlook get message failed: {resp.text}")
+    return resp.json()
 
 
 async def outlook_list_recent(
@@ -186,7 +238,7 @@ async def outlook_list_recent(
     folders = ("inbox", "junkemail", "deleteditems", "archive", "sentitems")
     collected: dict[str, dict] = {}
     per_folder = max(1, top)
-    select = "id,subject,from,receivedDateTime,bodyPreview,body,conversationId"
+    select = "id,subject,from,receivedDateTime,bodyPreview,body,conversationId,isRead"
     async with httpx.AsyncClient(timeout=60) as client:
         for folder in folders:
             messages: list[dict] = []
@@ -199,7 +251,9 @@ async def outlook_list_recent(
             while len(messages) < per_folder:
                 if get_token is not None:
                     access_token = await get_token()
-                resp = await client.get(
+                resp = await _graph_request_with_retry(
+                    client,
+                    "GET",
                     url,
                     headers={"Authorization": f"Bearer {access_token}"},
                     params=params if url.endswith("/messages") else None,
@@ -239,7 +293,9 @@ async def outlook_attach_folder(access_token: str, raw: dict) -> dict:
     if not parent:
         return raw
     async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.get(
+        resp = await _graph_request_with_retry(
+            client,
+            "GET",
             f"{GRAPH}/me/mailFolders/{parent}",
             headers={"Authorization": f"Bearer {access_token}"},
             params={"$select": "wellKnownName,displayName"},
