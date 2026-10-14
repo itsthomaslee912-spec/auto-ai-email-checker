@@ -377,6 +377,16 @@ Please reply with your availability.
     )
     assert (
         apply_label_guards(
+            EmailLabel.REJECTED_CLOSED.value,
+            subject="Declined: Kenneth and Tremayne Matthews",
+            sender="kchung121@outlook.com",
+            body_text="",
+            snippet="",
+        )
+        == EmailLabel.INTERVIEW_INVITATION.value
+    )
+    assert (
+        apply_label_guards(
             EmailLabel.INTERVIEW_INVITATION.value,
             subject="Interview invitation: Principal AI Engineer",
             sender="noreply@taleri.es",

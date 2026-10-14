@@ -16,7 +16,7 @@ from sqlalchemy.pool import StaticPool
 from app.api import calendar_events, emails
 from app.db import Base, get_db
 from app.models import CalendarEvent, CalendarEventEmail, EmailLabel, EmailMessage, MailboxConnection, Provider, User
-from app.services.calendar_extract import InterviewDetails, MeetingAccess, _parse_ai_slot, _resolve_video_landing_page, _without_quoted_history, clean_company_name, clean_meeting_provider, collapse_duplicate_calendar_events, companies_match, employer_instead_of_sender_domain, explicit_hiring_employer, extract_calendar_details, extract_interviewer, extract_meeting_access, fuller_company_name, hide_open_reschedules, is_interview_stage_label, job_role_or_empty, leaves_interview_unbooked, message_appointment_slots, message_is_booked_appointment, needs_calendar_event_repair, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details, repair_availability_window_appointments, repair_conflicting_calendar_roles, repair_interview_stage_roles, repair_meeting_join_urls, repair_meeting_landing_urls, repair_phantom_availability_slots, repair_placeholder_calendar_fields, repair_quoted_option_bookings
+from app.services.calendar_extract import InterviewDetails, MeetingAccess, _parse_ai_slot, _resolve_video_landing_page, _without_quoted_history, clean_company_name, clean_meeting_provider, collapse_duplicate_calendar_events, companies_match, employer_instead_of_sender_domain, explicit_hiring_employer, extract_calendar_details, extract_interviewer, extract_meeting_access, fuller_company_name, hide_open_reschedules, is_interview_stage_label, job_role_or_empty, leaves_interview_unbooked, message_appointment_slots, message_is_booked_appointment, needs_calendar_event_repair, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details, repair_availability_window_appointments, repair_calendar_attendee_response_labels, repair_conflicting_calendar_roles, repair_interview_stage_roles, repair_meeting_join_urls, repair_meeting_landing_urls, repair_phantom_availability_slots, repair_placeholder_calendar_fields, repair_quoted_option_bookings
 
 
 def _database():
@@ -127,6 +127,66 @@ def test_placeholder_repair_preserves_phone_type_and_infers_legacy_phone_rows():
         assert explicit_phone.meeting_provider is None
         assert legacy_phone.meeting_type == "phone"
         assert legacy_phone.meeting_provider is None
+
+
+def test_bodyless_calendar_decline_is_not_an_application_rejection():
+    factory, (mailbox_id, _) = _database()
+    start = datetime(2026, 10, 14, 19, 0, tzinfo=timezone.utc)
+    with factory() as db:
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="garner-calendar-invite",
+            thread_id="garner-calendar-thread",
+            subject="Invitation: Kenneth and Tremayne Matthews",
+            sender="tremayne.matthews@getgarner.com",
+            received_at=start - timedelta(days=7),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="Garner Health",
+            job_role="Senior Machine Learning Engineer I, AI & ML Platform",
+        )
+        declined = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="garner-attendee-declined",
+            thread_id="garner-calendar-thread",
+            subject="Declined: Kenneth and Tremayne Matthews",
+            sender="first@example.com",
+            received_at=start - timedelta(days=7) + timedelta(minutes=1),
+            label=EmailLabel.REJECTED_CLOSED.value,
+            human_corrected=False,
+            body_text="",
+            snippet="",
+        )
+        db.add_all([invitation, declined])
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=invitation.id,
+            source_thread_id=invitation.thread_id,
+            kind="confirmed",
+            origin="email",
+            title="Garner Health — Senior Machine Learning Engineer I, AI & ML Platform",
+            company="Garner Health",
+            job_role="Senior Machine Learning Engineer I, AI & ML Platform",
+            start_at=start,
+            end_at=start + timedelta(minutes=30),
+            application_status="rejected",
+            outcome_source_email_id=declined.id,
+            outcome_at=declined.received_at,
+            is_visible=True,
+        )
+        db.add(event)
+        db.flush()
+        db.add(CalendarEventEmail(event_id=event.id, email_id=declined.id))
+        db.commit()
+
+        assert repair_calendar_attendee_response_labels(db, mailbox_id) == 1
+        db.commit()
+
+        assert declined.label == EmailLabel.INTERVIEW_INVITATION.value
+        assert event.application_status == "active"
+        assert event.outcome_source_email_id is None
+        assert event.outcome_at is None
 
 
 def test_linked_role_consensus_beats_one_cross_thread_calendar_invite_typo():

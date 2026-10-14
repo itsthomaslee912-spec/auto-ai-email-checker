@@ -642,6 +642,15 @@ def apply_label_guards(
     text = _combined_text(subject, sender, body_text, snippet)
     if heuristic is not None:
         return heuristic
+    # Outlook/Google attendee responses can arrive as an otherwise-empty mail
+    # whose subject is only "Declined: <event title>" or "Tentative: ...".
+    # That is an RSVP state, never an employer rejecting the application.
+    if (
+        re.match(r"^\s*(?:declined|tentative)\s*:", subject or "", re.I)
+        and not (body_text or "").strip()
+        and not (snippet or "").strip()
+    ):
+        return EmailLabel.INTERVIEW_INVITATION.value
     if label in (EmailLabel.INTERVIEW_INVITATION.value, EmailLabel.INTERVIEW_SCHEDULED.value) and (
         _is_pre_interview_screen(text) or _is_true_screening(text)
     ):

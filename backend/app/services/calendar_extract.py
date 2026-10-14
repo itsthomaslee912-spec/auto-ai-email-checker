@@ -3596,6 +3596,44 @@ def infer_application_outcome(email: EmailMessage) -> str:
     return "position_closed" if any(pattern in text for pattern in closed_patterns) else "rejected"
 
 
+def repair_calendar_attendee_response_labels(db: Session, mailbox_id: int | None = None) -> int:
+    """Undo application rejections inferred from calendar RSVP notifications.
+
+    Outlook and Google can emit a bodyless ``Declined: <event>`` message when
+    an attendee answers an invitation. It describes that event response, not
+    the employer's decision about the candidate.
+    """
+    query = db.query(EmailMessage).filter(
+        EmailMessage.label == EmailLabel.REJECTED_CLOSED.value,
+        EmailMessage.human_corrected.is_(False),
+    )
+    if mailbox_id is not None:
+        query = query.filter(EmailMessage.mailbox_id == mailbox_id)
+    repaired = 0
+    for email in query.all():
+        if not _DECLINED_SUBJECT_RE.search(email.subject or ""):
+            continue
+        body = "\n".join((email.snippet or "", email.body_text or "", email.body_html or "")).strip()
+        if body:
+            method, _status, _events, _has_start = _first_calendar(_calendar_text(email))
+            if method != "REPLY":
+                continue
+        email.label = EmailLabel.INTERVIEW_INVITATION.value
+        email.interview_subtype = None
+        email.calendar_processed_hash = None
+        email.calendar_processing_error = None
+        outcomes = db.query(CalendarEvent).filter(CalendarEvent.outcome_source_email_id == email.id).all()
+        for event in outcomes:
+            if event.application_status in {"rejected", "position_closed"}:
+                event.application_status = "active"
+            event.outcome_source_email_id = None
+            event.outcome_at = None
+        repaired += 1
+    if repaired:
+        db.flush()
+    return repaired
+
+
 def is_passed_outcome(email: EmailMessage) -> bool:
     """Return whether a positive outcome message advances this application."""
     if email.label == EmailLabel.OFFER.value:
@@ -5205,7 +5243,9 @@ def repair_quoted_option_bookings(db: Session, mailbox_id: int | None = None) ->
 
 def collapse_duplicate_calendar_events(db: Session, mailbox_id: int | None = None) -> bool:
     """Keep one visible chip for each scheduled interview and each open window."""
-    changed = repair_mixed_thread_appointments(db, mailbox_id) > 0
+    changed = repair_calendar_attendee_response_labels(db, mailbox_id) > 0
+    if repair_mixed_thread_appointments(db, mailbox_id) > 0:
+        changed = True
     if repair_quoted_option_bookings(db, mailbox_id) > 0:
         changed = True
     if repair_placeholder_calendar_fields(db, mailbox_id) > 0:
