@@ -16,7 +16,7 @@ from sqlalchemy.pool import StaticPool
 from app.api import calendar_events, emails
 from app.db import Base, get_db
 from app.models import CalendarEvent, CalendarEventEmail, EmailLabel, EmailMessage, MailboxConnection, Provider, User
-from app.services.calendar_extract import InterviewDetails, MeetingAccess, _parse_ai_slot, _resolve_video_landing_page, _without_quoted_history, clean_company_name, clean_meeting_provider, collapse_duplicate_calendar_events, companies_match, employer_instead_of_sender_domain, explicit_hiring_employer, extract_calendar_details, extract_interviewer, extract_meeting_access, fuller_company_name, hide_open_reschedules, is_interview_stage_label, job_role_or_empty, leaves_interview_unbooked, message_appointment_slots, message_is_booked_appointment, needs_calendar_event_repair, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details, repair_availability_window_appointments, repair_interview_stage_roles, repair_meeting_join_urls, repair_meeting_landing_urls, repair_phantom_availability_slots, repair_placeholder_calendar_fields, repair_quoted_option_bookings
+from app.services.calendar_extract import InterviewDetails, MeetingAccess, _parse_ai_slot, _resolve_video_landing_page, _without_quoted_history, clean_company_name, clean_meeting_provider, collapse_duplicate_calendar_events, companies_match, employer_instead_of_sender_domain, explicit_hiring_employer, extract_calendar_details, extract_interviewer, extract_meeting_access, fuller_company_name, hide_open_reschedules, is_interview_stage_label, job_role_or_empty, leaves_interview_unbooked, message_appointment_slots, message_is_booked_appointment, needs_calendar_event_repair, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details, repair_availability_window_appointments, repair_conflicting_calendar_roles, repair_interview_stage_roles, repair_meeting_join_urls, repair_meeting_landing_urls, repair_phantom_availability_slots, repair_placeholder_calendar_fields, repair_quoted_option_bookings
 
 
 def _database():
@@ -127,6 +127,191 @@ def test_placeholder_repair_preserves_phone_type_and_infers_legacy_phone_rows():
         assert explicit_phone.meeting_provider is None
         assert legacy_phone.meeting_type == "phone"
         assert legacy_phone.meeting_provider is None
+
+
+def test_linked_role_consensus_beats_one_cross_thread_calendar_invite_typo():
+    factory, (mailbox_id, _) = _database()
+    start = datetime(2026, 10, 14, 16, 30, tzinfo=timezone.utc)
+    with factory() as db:
+        messages = [
+            EmailMessage(
+                mailbox_id=mailbox_id,
+                provider_message_id=f"carparts-role-{index}",
+                thread_id="calendar-invite" if index == 3 else "scheduling-thread",
+                subject=(
+                    "Pre-screen Jordan Meeker (Staff Software Engineer)"
+                    if index == 3
+                    else "RE: CarParts.com Career Opportunity - Sr. Software Engineer"
+                ),
+                sender="Debbie <debbie@carparts.com>",
+                received_at=start - timedelta(hours=4 - index),
+                label=EmailLabel.INTERVIEW_SCHEDULED.value,
+                company="CarParts.com",
+                job_role="Staff Software Engineer" if index == 3 else "Sr. Software Engineer",
+            )
+            for index in range(4)
+        ]
+        db.add_all(messages)
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=messages[-1].id,
+            source_thread_id=messages[-1].thread_id,
+            kind="confirmed",
+            origin="email",
+            title="CarParts.com — Staff Software Engineer",
+            company="CarParts.com",
+            job_role="Staff Software Engineer",
+            start_at=start,
+            end_at=start + timedelta(minutes=30),
+            meeting_type="video",
+        )
+        db.add(event)
+        db.flush()
+        db.add_all(CalendarEventEmail(event_id=event.id, email_id=message.id) for message in messages)
+        db.commit()
+
+        assert repair_conflicting_calendar_roles(db, mailbox_id) == 1
+        db.commit()
+
+        assert event.job_role == "Sr. Software Engineer"
+        assert event.title == "CarParts.com — Sr. Software Engineer"
+
+
+def test_linked_role_consensus_does_not_guess_from_weak_conflicting_evidence():
+    factory, (mailbox_id, _) = _database()
+    start = datetime(2026, 10, 14, 18, 0, tzinfo=timezone.utc)
+    with factory() as db:
+        messages = [
+            EmailMessage(
+                mailbox_id=mailbox_id,
+                provider_message_id=f"ambiguous-role-{index}",
+                thread_id=f"ambiguous-thread-{index}",
+                subject=role,
+                sender="Recruiter <recruiter@example.com>",
+                received_at=start - timedelta(minutes=index),
+                label=EmailLabel.INTERVIEW_SCHEDULED.value,
+                company="Example",
+                job_role=role,
+            )
+            for index, role in enumerate(("Staff Software Engineer", "Sr. Software Engineer"))
+        ]
+        db.add_all(messages)
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=messages[0].id,
+            kind="confirmed",
+            origin="email",
+            title="Example — Staff Software Engineer",
+            company="Example",
+            job_role="Staff Software Engineer",
+            start_at=start,
+            end_at=start + timedelta(minutes=30),
+        )
+        db.add(event)
+        db.flush()
+        db.add_all(CalendarEventEmail(event_id=event.id, email_id=message.id) for message in messages)
+        db.commit()
+
+        assert repair_conflicting_calendar_roles(db, mailbox_id) == 0
+        assert event.job_role == "Staff Software Engineer"
+
+
+def test_microsoft_bookings_parent_tenant_collapses_child_company_interview_and_resolves_alert():
+    from app.services.pending_interviews import invalidate_calendar_read_cache, pending_interview_requests
+
+    factory, (mailbox_id, _) = _database()
+    request_at = datetime(2026, 10, 14, 16, 42, tzinfo=timezone.utc)
+    start = datetime(2026, 10, 22, 19, 20, tzinfo=timezone.utc)
+    booking_url = (
+        "https://outlook.office365.com/owa/calendar/"
+        "GaryMillerKochRecruiting@kochind.onmicrosoft.com/bookings/"
+    )
+    with factory() as db:
+        request = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="georgia-pacific-request",
+            thread_id="georgia-pacific-thread",
+            subject="(Second Attempt) Lead Software Engineer - AI GP Atlanta, GA",
+            sender="Gary Miller <gary.miller@kochcc.com>",
+            received_at=request_at,
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="Georgia-Pacific",
+            job_role="Lead Software Engineer - AI",
+            body_text=f"Please schedule the Georgia-Pacific interview at {booking_url}",
+        )
+        calendar_invite = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="koch-calendar-invite",
+            thread_id="koch-calendar-thread",
+            subject="MS Teams Screening - Jordan Meeker",
+            sender="Gary Miller Koch Recruiting <GaryMillerKochRecruiting@kochind.onmicrosoft.com>",
+            received_at=request_at + timedelta(minutes=12),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="kochind",
+            job_role="Lead Software Engineer",
+            body_text=f"ORGANIZER:mailto:GaryMillerKochRecruiting@kochind.onmicrosoft.com\n{booking_url}",
+        )
+        confirmation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="koch-booking-confirmation",
+            thread_id="koch-confirmation-thread",
+            subject="Confirmed: MS Teams Screening",
+            sender="Gary Miller Koch Recruiting <GaryMillerKochRecruiting@kochind.onmicrosoft.com>",
+            received_at=request_at + timedelta(minutes=12, seconds=3),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+            company="Koch Industries",
+            job_role="Lead Software Engineer",
+            body_text=f"Your Booking is confirmed. {booking_url}",
+        )
+        db.add_all([request, calendar_invite, confirmation])
+        db.flush()
+        events = [
+            CalendarEvent(
+                mailbox_id=mailbox_id,
+                source_email_id=message.id,
+                source_thread_id=message.thread_id,
+                source_received_at=message.received_at,
+                kind="confirmed",
+                origin="email",
+                title=f"{company} — Lead Software Engineer",
+                company=company,
+                job_role="Lead Software Engineer",
+                start_at=start,
+                end_at=start + timedelta(minutes=30),
+                interview_status=message.interview_subtype,
+                is_visible=True,
+            )
+            for message, company in (
+                (calendar_invite, "kochind"),
+                (confirmation, "Koch Industries"),
+            )
+        ]
+        db.add_all(events)
+        db.commit()
+
+        assert collapse_duplicate_calendar_events(db, mailbox_id) is True
+        db.commit()
+        invalidate_calendar_read_cache()
+
+        visible = db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True)).all()
+        assert len(visible) == 1
+        assert visible[0].company == "Georgia-Pacific"
+        assert visible[0].job_role == "Lead Software Engineer - AI"
+        assert visible[0].title == "Georgia-Pacific — Lead Software Engineer - AI"
+        linked_ids = {
+            row.email_id
+            for row in db.query(CalendarEventEmail).filter(CalendarEventEmail.event_id == visible[0].id)
+        }
+        assert request.id in linked_ids
+        assert pending_interview_requests(
+            db,
+            [mailbox_id],
+            now=datetime(2026, 10, 14, 18, 0, tzinfo=timezone.utc),
+        ) == []
 
 
 def test_government_microsoft_teams_join_link_is_recognized():
@@ -2439,6 +2624,7 @@ def test_company_variants_match_and_keep_the_fuller_name():
     assert not companies_match("Remy", "Acme")
     assert companies_match("collectfanatics", "Fanatics Collectibles")
     assert fuller_company_name("collectfanatics", "Fanatics Collectibles") == "Fanatics Collectibles"
+    assert companies_match("kochind", "Koch Industries")
     assert not companies_match("United Health", "United Airlines")
     assert employer_instead_of_sender_domain(
         EmailMessage(

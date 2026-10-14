@@ -82,6 +82,11 @@ _SCHEDULE_TOKEN_RE = re.compile(
     r"https://[^\s<>\"']+/schedule/(?P<token>[a-z0-9-]{12,})(?=[/?.#\s<>\"']|$)",
     re.I,
 )
+_MICROSOFT_BOOKINGS_IDENTITY_RE = re.compile(
+    r"https://(?:outlook\.office(?:365)?\.com)/(?:owa/calendar|book)/"
+    r"(?P<token>[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+)",
+    re.I,
+)
 _VIDEO_MEETING_LINK_RE = re.compile(
     r"https://[^\s<>\"']+/video_meetings/[a-z0-9-]+(?:[/?#][^\s<>\"']*)?",
     re.I,
@@ -1016,7 +1021,12 @@ def _message_text(email: EmailMessage) -> str:
 
 
 def _schedule_tokens(text: str) -> set[str]:
-    return {match.group("token").casefold() for match in _SCHEDULE_TOKEN_RE.finditer(html.unescape(text or ""))}
+    decoded = html.unescape(text or "")
+    return {
+        match.group("token").casefold()
+        for pattern in (_SCHEDULE_TOKEN_RE, _MICROSOFT_BOOKINGS_IDENTITY_RE)
+        for match in pattern.finditer(decoded)
+    }
 
 
 def _normalized_address(value: str) -> str:
@@ -1241,18 +1251,49 @@ def _open_role_for_employer(db: Session, email: EmailMessage, company_hint: str 
 
 
 _DOMAIN_SUFFIX_RE = re.compile(r"\.(?:com|io|ai|co|net|org|us|dev|tech)$", re.I)
+_COMPANY_SUFFIX_ABBREVIATIONS = (
+    ("industries", "ind"),
+    ("technologies", "tech"),
+    ("technology", "tech"),
+    ("corporation", "corp"),
+)
 
 
 def _company_alias_key(company: str | None) -> str:
     return _compact_company(_DOMAIN_SUFFIX_RE.sub("", (company or "").strip()))
 
 
+def _company_compact_aliases(company: str | None) -> set[str]:
+    """Compact spellings used by corporate sender domains.
+
+    Microsoft tenants frequently abbreviate a final corporate word, for
+    example ``kochind`` for ``Koch Industries``. Keep this deliberately
+    limited to conventional suffix abbreviations so unrelated short brands do
+    not become matches.
+    """
+    key = _company_alias_key(company)
+    if not key:
+        return set()
+    aliases = {key}
+    for full, short in _COMPANY_SUFFIX_ABBREVIATIONS:
+        if key.endswith(full) and len(key) >= len(full) + 3:
+            aliases.add(f"{key[:-len(full)]}{short}")
+    return aliases
+
+
 def _company_aliases_match(left: str | None, right: str | None) -> bool:
     """ "nucleussec" is "Nucleus Security"; "ridewithvia.com" is not "Via" (too short to trust)."""
-    left_key, right_key = _company_alias_key(left), _company_alias_key(right)
-    if len(left_key) < 6 or len(right_key) < 6:
+    left_aliases = _company_compact_aliases(left)
+    right_aliases = _company_compact_aliases(right)
+    if not left_aliases or not right_aliases:
         return False
-    return left_key == right_key or left_key.startswith(right_key) or right_key.startswith(left_key)
+    return any(
+        len(left_key) >= 6
+        and len(right_key) >= 6
+        and (left_key == right_key or left_key.startswith(right_key) or right_key.startswith(left_key))
+        for left_key in left_aliases
+        for right_key in right_aliases
+    )
 
 
 def _better_company_alias(candidate: str | None, current: str | None) -> bool:
@@ -1398,6 +1439,8 @@ def companies_match(left: str | None, right: str | None) -> bool:
     left_compact = _compact_company(left)
     right_compact = _compact_company(right)
     if left_compact and left_compact == right_compact:
+        return True
+    if _company_compact_aliases(left).intersection(_company_compact_aliases(right)):
         return True
     left_tokens = _match_tokens(left)
     right_tokens = _match_tokens(right)
@@ -1691,12 +1734,11 @@ def _related_interview_emails(
             if not conflicts:
                 anchor_role = closest_role
     if anchor_role:
-        normalized_role = anchor_role.casefold()
         ordered = [
             item
             for item in ordered
             if not (item.job_role or "").strip()
-            or (item.job_role or "").strip().casefold() == normalized_role
+            or _same_job_family(item.job_role, anchor_role)
         ]
     return ordered[-12:]
 
@@ -1792,7 +1834,12 @@ def employer_instead_of_sender_domain(email: EmailMessage, company: str) -> str:
 
 
 def correct_sender_domain_employers(db: Session, mailbox_id: int | None = None) -> int:
-    """Replace a sender-domain company with the employer named in the linked mail."""
+    """Replace a sender-domain company with the employer named in linked mail.
+
+    A Microsoft Bookings confirmation can use the parent company's tenant
+    while the invitation names the actual hiring company. A shared Bookings
+    identity is strong enough to use the latest preceding invitation.
+    """
     changed = 0
     query = db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True))
     if mailbox_id is not None:
@@ -1808,7 +1855,53 @@ def correct_sender_domain_employers(db: Session, mailbox_id: int | None = None) 
             continue
         emails = db.query(EmailMessage).filter(EmailMessage.id.in_(email_ids)).all()
         corrected = ""
-        for email in emails:
+        corrected_role = ""
+        source = next((item for item in emails if item.id == event.source_email_id), None)
+        if source is not None:
+            source_tokens = _schedule_tokens(_message_text(source))
+            if not source_tokens:
+                # Outlook calendar requests can place the Bookings link past
+                # the bounded preview; a safely linked confirmation carries
+                # the same identity.
+                source_tokens = {
+                    token
+                    for item in emails
+                    for token in _schedule_tokens(_message_text(item))
+                }
+            source_brand = sender_domain_brand(source)
+            current = (event.company or source.company or "").strip()
+            source_received = as_utc(source.received_at)
+            invitations = [
+                item
+                for item in emails
+                if item.id != source.id
+                and item.label == EmailLabel.INTERVIEW_INVITATION.value
+                and (item.company or "").strip()
+                and source_tokens.intersection(_schedule_tokens(_message_text(item)))
+                and roles_compatible(event.job_role, item.job_role)
+                and (
+                    source_received is None
+                    or as_utc(item.received_at) is None
+                    or as_utc(item.received_at) <= source_received
+                )
+            ]
+            if source_brand and companies_match(current, source_brand) and invitations:
+                invitation = max(
+                    invitations,
+                    key=lambda item: (
+                        as_utc(item.received_at) or datetime.min.replace(tzinfo=timezone.utc),
+                        item.id,
+                    ),
+                )
+                corrected = (invitation.company or "").strip()
+                invitation_role = job_role_or_empty(invitation.job_role)
+                if invitation_role and roles_compatible(event.job_role, invitation_role):
+                    corrected_role = _fullest_job_title(
+                        [job_role_or_empty(event.job_role), invitation_role],
+                        [source.subject or "", invitation.subject or ""],
+                    )
+
+        for email in (() if corrected else emails):
             current = event.company or email.company or ""
             candidate = employer_instead_of_sender_domain(email, current)
             if not candidate:
@@ -1826,14 +1919,48 @@ def correct_sender_domain_employers(db: Session, mailbox_id: int | None = None) 
         if not corrected:
             continue
         event.company = corrected
+        if corrected_role:
+            event.job_role = corrected_role
         if event.origin == "email":
-            event.title = _title(emails[0], InterviewDetails(company=corrected, role=event.job_role or ""))
+            event.title = f"{corrected} — {event.job_role}" if event.job_role else corrected
         for email in emails:
             brand = sender_domain_brand(email)
             if brand and companies_match(email.company, brand) and (email.company or "").strip() != corrected:
                 email.company = corrected
         changed += 1
     return changed
+
+
+def repair_calendar_event_email_links(db: Session, mailbox_id: int | None = None) -> int:
+    """Backfill safe cross-thread Microsoft Bookings links for existing events."""
+    query = db.query(CalendarEvent).filter(
+        CalendarEvent.is_visible.is_(True),
+        CalendarEvent.kind == "confirmed",
+        CalendarEvent.source_email_id.is_not(None),
+    )
+    if mailbox_id is not None:
+        query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
+    repaired = 0
+    for event in query.all():
+        source = db.get(EmailMessage, event.source_email_id)
+        if source is None:
+            continue
+        if not _schedule_tokens(_message_text(source)) and "onmicrosoft.com" not in (source.sender or "").casefold():
+            continue
+        related = _related_interview_emails(db, source)
+        # A calendar request can put the booking URL past the bounded message
+        # preview. Its immediately-following confirmation carries the token,
+        # so one safe hop reaches the original invitation.
+        expanded = {item.id: item for item in related}
+        for item in related:
+            for nested in _related_interview_emails(db, item):
+                expanded.setdefault(nested.id, nested)
+        related_ids = list(expanded)
+        if related_ids and _link_event_emails(db, event, related_ids):
+            repaired += 1
+    if repaired:
+        db.flush()
+    return repaired
 
 
 def _known_company(messages: list[EmailMessage]) -> str:
@@ -3954,6 +4081,64 @@ def repair_interview_stage_roles(db: Session, mailbox_id: int | None = None) -> 
     return repaired
 
 
+def _consensus_linked_role(messages: list[EmailMessage]) -> str:
+    """Return a strongly supported role when one linked thread is an outlier.
+
+    Calendar providers often create a fresh thread whose generated title can
+    contain the wrong seniority (for example, ``Staff`` instead of ``Sr.``).
+    A single conflicting invite must not override a role repeated throughout
+    the scheduling conversation. Ambiguous or lightly supported conflicts are
+    deliberately left unchanged.
+    """
+    families: list[list[tuple[str, EmailMessage]]] = []
+    for message in messages:
+        role = job_role_or_empty(message.job_role)
+        if not role:
+            continue
+        family = next(
+            (items for items in families if _same_job_family(items[0][0], role)),
+            None,
+        )
+        if family is None:
+            families.append([(role, message)])
+        else:
+            family.append((role, message))
+    if not families:
+        return ""
+    families.sort(key=len, reverse=True)
+    winner = families[0]
+    if len(families) > 1:
+        runner_up_count = len(families[1])
+        if len(winner) < 3 or len(winner) < runner_up_count * 2:
+            return ""
+    return _fullest_job_title(
+        [role for role, _message in winner],
+        [message.subject or "" for _role, message in winner],
+    )
+
+
+def repair_conflicting_calendar_roles(db: Session, mailbox_id: int | None = None) -> int:
+    """Use strong linked-message consensus for every visible calendar chip."""
+    query = db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True))
+    if mailbox_id is not None:
+        query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
+    repaired = 0
+    for event in query.all():
+        role = _consensus_linked_role(_linked_messages(db, event))
+        current = job_role_or_empty(event.job_role)
+        if not role or role.casefold() == current.casefold():
+            continue
+        if current and _same_job_family(role, current) and len(role) <= len(current):
+            continue
+        event.job_role = role
+        if event.origin == "email":
+            event.title = f"{event.company} — {role}" if event.company else role
+        repaired += 1
+    if repaired:
+        db.flush()
+    return repaired
+
+
 def repair_phantom_end_slots(db: Session, mailbox_id: int | None = None) -> int:
     """Move a chip that starts at the end of the range its own email states.
 
@@ -5009,6 +5194,10 @@ def collapse_duplicate_calendar_events(db: Session, mailbox_id: int | None = Non
         changed = True
     if repair_interview_stage_roles(db, mailbox_id) > 0:
         changed = True
+    if repair_calendar_event_email_links(db, mailbox_id) > 0:
+        changed = True
+    if repair_conflicting_calendar_roles(db, mailbox_id) > 0:
+        changed = True
     if correct_sender_domain_employers(db, mailbox_id) > 0:
         changed = True
         companies_match.cache_clear()
@@ -5040,6 +5229,9 @@ def collapse_duplicate_calendar_events(db: Session, mailbox_id: int | None = Non
                 continue
             _absorb_calendar_event(db, survivor, duplicate)
             changed = True
+    # A merge can add the decisive scheduling conversation to the survivor.
+    if repair_conflicting_calendar_roles(db, mailbox_id) > 0:
+        changed = True
     confirmed = [
         event
         for event in db.query(CalendarEvent)
