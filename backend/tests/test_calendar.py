@@ -229,6 +229,28 @@ def test_microsoft_bookings_parent_tenant_collapses_child_company_interview_and_
         "GaryMillerKochRecruiting@kochind.onmicrosoft.com/bookings/"
     )
     with factory() as db:
+        molex_receipt = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="molex-application-receipt",
+            thread_id="koch-generic-application-subject",
+            subject="We received your application. See what's next!",
+            sender="Koch Careers <no-reply@careers.kochind.com>",
+            received_at=request_at - timedelta(days=1, minutes=15),
+            label=EmailLabel.APPLICATION_CONFIRMATION.value,
+            company="Molex",
+            body_text="Koch Careers. Thank you for applying at Molex. The Molex HR Team.",
+        )
+        georgia_pacific_receipt = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="georgia-pacific-application-receipt",
+            thread_id="koch-generic-application-subject",
+            subject="We received your application. See what's next!",
+            sender="Koch Careers <no-reply@careers.kochind.com>",
+            received_at=request_at - timedelta(days=1),
+            label=EmailLabel.APPLICATION_CONFIRMATION.value,
+            company="Georgia-Pacific",
+            body_text="Koch Careers. Thank you for applying at Georgia-Pacific. The Georgia-Pacific HR Team.",
+        )
         request = EmailMessage(
             mailbox_id=mailbox_id,
             provider_message_id="georgia-pacific-request",
@@ -267,7 +289,13 @@ def test_microsoft_bookings_parent_tenant_collapses_child_company_interview_and_
             job_role="Lead Software Engineer",
             body_text=f"Your Booking is confirmed. {booking_url}",
         )
-        db.add_all([request, calendar_invite, confirmation])
+        db.add_all([
+            molex_receipt,
+            georgia_pacific_receipt,
+            request,
+            calendar_invite,
+            confirmation,
+        ])
         db.flush()
         events = [
             CalendarEvent(
@@ -291,6 +319,16 @@ def test_microsoft_bookings_parent_tenant_collapses_child_company_interview_and_
             )
         ]
         db.add_all(events)
+        db.flush()
+        # Historical provider-thread association incorrectly attached both
+        # same-subject Koch subsidiary receipts.
+        for event in events:
+            db.add_all(
+                [
+                    CalendarEventEmail(event_id=event.id, email_id=molex_receipt.id),
+                    CalendarEventEmail(event_id=event.id, email_id=georgia_pacific_receipt.id),
+                ]
+            )
         db.commit()
 
         assert collapse_duplicate_calendar_events(db, mailbox_id) is True
@@ -307,6 +345,8 @@ def test_microsoft_bookings_parent_tenant_collapses_child_company_interview_and_
             for row in db.query(CalendarEventEmail).filter(CalendarEventEmail.event_id == visible[0].id)
         }
         assert request.id in linked_ids
+        assert georgia_pacific_receipt.id in linked_ids
+        assert molex_receipt.id not in linked_ids
         assert pending_interview_requests(
             db,
             [mailbox_id],

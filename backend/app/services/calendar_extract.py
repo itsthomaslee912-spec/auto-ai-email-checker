@@ -1634,6 +1634,21 @@ def _related_interview_emails(
             .limit(7)
             .all()
         )
+        # Gmail can group identical ATS subjects (for example, Koch Careers'
+        # generic application receipt) into one thread even when they are for
+        # different subsidiaries. Do not let that provider grouping join two
+        # clearly named employers.
+        rows = [
+            item
+            for item in rows
+            if not (
+                email.label == EmailLabel.APPLICATION_CONFIRMATION.value
+                and item.label == EmailLabel.APPLICATION_CONFIRMATION.value
+                and (email.company or "").strip()
+                and (item.company or "").strip()
+                and not companies_match(email.company, item.company)
+            )
+        ]
         related.update({item.id: item for item in rows})
 
     organizer_addresses = _organizer_addresses(email)
@@ -1953,10 +1968,26 @@ def repair_calendar_event_email_links(db: Session, mailbox_id: int | None = None
         # so one safe hop reaches the original invitation.
         expanded = {item.id: item for item in related}
         for item in related:
+            if item.label != EmailLabel.INTERVIEW_SCHEDULED.value:
+                continue
             for nested in _related_interview_emails(db, item):
                 expanded.setdefault(nested.id, nested)
         related_ids = list(expanded)
-        if related_ids and _link_event_emails(db, event, related_ids):
+        link_changed = bool(related_ids and _link_event_emails(db, event, related_ids))
+        allowed = {source.id, *related_ids}
+        if event.outcome_source_email_id:
+            allowed.add(event.outcome_source_email_id)
+        stale_ids = {
+            row.email_id
+            for row in db.query(CalendarEventEmail).filter(CalendarEventEmail.event_id == event.id).all()
+            if row.email_id not in allowed
+        }
+        if stale_ids:
+            db.query(CalendarEventEmail).filter(
+                CalendarEventEmail.event_id == event.id,
+                CalendarEventEmail.email_id.in_(stale_ids),
+            ).delete(synchronize_session=False)
+        if link_changed or stale_ids:
             repaired += 1
     if repaired:
         db.flush()
@@ -5201,6 +5232,11 @@ def collapse_duplicate_calendar_events(db: Session, mailbox_id: int | None = Non
     if correct_sender_domain_employers(db, mailbox_id) > 0:
         changed = True
         companies_match.cache_clear()
+    # Correcting a parent-tenant company can make the matching subsidiary's
+    # application receipt discoverable; refresh once more and remove any
+    # sibling-company receipt inherited from a provider-grouped thread.
+    if repair_calendar_event_email_links(db, mailbox_id) > 0:
+        changed = True
     if promote_booked_availability(db, mailbox_id):
         changed = True
     if hide_quote_clock_events(db, mailbox_id):
