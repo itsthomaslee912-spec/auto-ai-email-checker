@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import logging
 import re
@@ -191,9 +192,26 @@ def _infer_category_subtype(label: str, text: str) -> str | None:
     return None
 
 
+def _normalize_classifier_text(value: str) -> str:
+    """Normalize common email HTML and encoding damage before matching intent."""
+    text = html.unescape(value or "").lower()
+    text = (
+        text.replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u2212", "-")
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("â€™", "'")
+        .replace("â€˜", "'")
+        .replace("\u00a0", " ")
+        .replace("\u202f", " ")
+        .replace("\u200b", "")
+    )
+    return re.sub(r"(?<=\w)\ufffd(?=(?:t|s|re|ve|ll|d|m)\b)", "'", text)
+
+
 def _combined_text(subject: str, sender: str, body_text: str, snippet: str) -> str:
-    raw = f"{subject}\n{sender}\n{snippet}\n{body_text}".lower()
-    return raw.replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-")
+    return _normalize_classifier_text(f"{subject}\n{sender}\n{snippet}\n{body_text}")
 
 
 def _primary_message_text(subject: str, sender: str, body_text: str, snippet: str) -> str:
@@ -215,8 +233,10 @@ def _primary_message_text(subject: str, sender: str, body_text: str, snippet: st
         match = re.search(marker, message, flags=re.IGNORECASE)
         if match:
             cutoff = min(cutoff, match.start())
-    raw = f"{subject}\n{sender}\n{message[:cutoff]}".lower()
-    return raw.replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-")
+    # Keep the provider snippet as primary evidence too. Some HTML messages
+    # begin with several kilobytes of CSS, while the snippet already contains
+    # the visible current request.
+    return _normalize_classifier_text(f"{subject}\n{sender}\n{snippet}\n{message[:cutoff]}")
 
 
 def _is_pre_interview_screen(text: str) -> bool:
@@ -243,11 +263,30 @@ def _is_pre_interview_screen(text: str) -> bool:
             "questions below",
         ]
     )
+    direct_questionnaire = (
+        text.count("?") >= 2
+        and any(
+            phrase in text
+            for phrase in (
+                "could you let me know",
+                "asked me to reach out to you to get a better understanding",
+                "please explain",
+            )
+        )
+    )
     thanks_interest = bool(re.search(r"\bthanks for your interest in\b", text))
+    application_context = bool(
+        re.search(
+            r"\b(?:thank(?:s| you) for applying|after reviewing your application|moving forward in (?:our|the) hiring process)\b",
+            text,
+        )
+    )
     named_role = bool(re.search(r"\b(the\s+)?[\w /+-]+ (role|position) at\b", text))
     if before_booking and (asks_written or thanks_interest):
         return True
-    return thanks_interest and named_role and asks_written
+    return (thanks_interest and named_role and asks_written) or (
+        application_context and (asks_written or direct_questionnaire)
+    )
 
 
 def _is_application_received(text: str) -> bool:
@@ -281,6 +320,11 @@ def _is_hypothetical_interview(text: str) -> bool:
         for p in [
             r"\bif we('d| would) like to schedule\b",
             r"\bif your qualifications meet\b",
+            r"\bif\b.{0,120}\b(?:background|application|profile|qualifications?)\b.{0,80}\b(?:fit|match|align\w*)\b.{0,180}\b(?:reach out|contact|get (?:back )?in touch|schedule|set up)\b",
+            r"\bif\b.{0,140}\b(?:potential|good|strong) fit\b.{0,180}\b(?:reach out|contact|get (?:back )?in touch|schedule|set up)\b",
+            r"\bif\b.{0,100}\b(?:selected|qualified|chosen|move forward)\b.{0,180}\b(?:reach out|contact|receive (?:an )?email|get (?:back )?in touch|schedule|set up)\b",
+            r"\bshould there be (?:an |any )?interest\b.{0,160}\b(?:reach out|contact|get (?:back )?in touch|schedule|set up)\b",
+            r"\b(?:we|the hiring team) (?:will|may) review\b.{0,180}\b(?:reach out|contact|get (?:back )?in touch)\b.{0,80}\bif\b",
             r"\bin the coming weeks to schedule an interview\b",
             r"\bmode of interview\b",
             r"\bjob description\b",
@@ -290,6 +334,8 @@ def _is_hypothetical_interview(text: str) -> bool:
 
 def _is_true_interview_invite(text: str) -> bool:
     """Candidate-directed interview scheduling — not JD wording or screening Qs."""
+    if _is_hypothetical_interview(text):
+        return False
     patterns = [
         r"\byou are confirmed for your interview\b",
         r"\bconfirmed for your interview\b",
@@ -316,6 +362,10 @@ def _is_true_interview_invite(text: str) -> bool:
         r"\bset up a\s+(?:quick|brief|preliminary)?\s*(?:call|chat)\b",
         r"\bschedule\s+(?:a\s+)?time\s+(?:for us\s+)?to\s+(?:chat|connect|talk)\b",
         r"\blet (?:us|me) know\s+(?:a few times|when you (?:might be|are) (?:free|available))\b",
+        r"\b(?:provide|send) (?:me|us) (?:with )?your availability\b",
+        r"\benter your availability now\b",
+        r"\bcan i schedule (?:the|an?) interview\b",
+        r"\bschedule interview\b",
         r"\bcould you please suggest some times\b",
     ]
     if any(re.search(p, text) for p in patterns):
@@ -330,8 +380,20 @@ def _is_true_interview_invite(text: str) -> bool:
 
 
 def _is_true_rejection(text: str) -> bool:
+    # Receipts often explain what will happen *if* the role is filled or the
+    # candidate is not selected. Those future/conditional process statements
+    # are not a current rejection. Remove only the conditional clause so a
+    # separate, explicit outcome elsewhere in the message can still win.
+    outcome_text = re.sub(
+        r"\b(?:if(?:/when)?|when|once)\b[^\n.!?]{0,320}"
+        r"\b(?:decided to move forward with other candidates?|(?:position|role|job) (?:is |has been )?(?:filled|closed))\b[^\n.!?]*",
+        " ",
+        text,
+    )
     patterns = [
         r"\bnot (?:be )?(?:able to )?mov(?:e|ing) forward\b",
+        r"\bunable to mov(?:e|ing) (?:ahead|forward) with (?:your|the) (?:application|candidacy)\b",
+        r"\bnot able to move ahead with (?:your|the) (?:application|candidacy)\b",
         r"\bcannot move forward with your\b",
         r"\bregret to inform you\b",
         r"\byou have reached that limit\b",
@@ -341,6 +403,7 @@ def _is_true_rejection(text: str) -> bool:
         r"\bwe\s+have\s+decided\s+to\s+move\s+forward\b",
         r"\bwill\s+not\s+be\s+progressing\b",
         r"\bnot been selected\b",
+        r"\b(?:were|was|are|is)(?: not|n't) selected for (?:further consideration|the next (?:step|stage|round))\b",
         r"\byou have not been selected to move forward\b",
         r"\bwe(?:['’]ve|\s+have) decided to move forward\b",
         r"\b(?:have\s+)?made the decision to move forward\b",
@@ -360,6 +423,9 @@ def _is_true_rejection(text: str) -> bool:
         r"\bpursue\s+(?:other|another)\s+candidates?\s+who\b",
         r"\b(?:the|this) (?:role|position|job) (?:has (?:now |already )?been|is(?: now)?) filled\b",
         r"\b(?:the|this) (?:role|position|job) (?:has been|is) closed\b",
+        r"\b(?:we )?(?:no longer have|do not have|don't have) any openings? for\b",
+        r"\bdecided to pause (?:this|the) (?:search|role|position|hiring process)\b",
+        r"\bat this time, the client is only considering candidates? who (?:are )?currently local\b",
         r"\bbetter align with our current hiring needs\b",
         r"\b(?:your|the|this job) application (?:has been|was) removed\b",
         r"\bapplication (?:has )?expired\b",
@@ -376,7 +442,7 @@ def _is_true_rejection(text: str) -> bool:
         r"\bwill not be inviting you to the next (?:phase|stage|round)\b",
         r"\bisn'?t the strongest match for the role\b",
     ]
-    return any(re.search(p, text) for p in patterns)
+    return any(re.search(p, outcome_text) for p in patterns)
 
 
 def _is_true_screening(text: str) -> bool:
@@ -411,6 +477,10 @@ def _is_explicit_screening_invite(text: str) -> bool:
             r"\bcomplete (?:a |the |your )?(?:required )?screening questions\b",
             r"\b(?:invitation to complete|complete (?:your|a))\b.{0,30}\bvideo interview\b",
             r"\bai interview to be considered\b",
+            r"\bnext step ai interview\b",
+            r"\bsubmit a short video\b.{0,180}\b(?:introduce|covers? the following|questions?)\b",
+            r"\b(?:last |final )?reminder\b.{0,100}\b(?:complete|take) (?:the |your )?ai interview\b",
+            r"\bai interview is the step that is left\b",
         ]
     )
 
@@ -552,6 +622,8 @@ def _is_scheduled_interview(text: str) -> bool:
     # confirmed time; a reminder to "complete" it is not a scheduled interview.
     if re.search(r"\b(?:invitation to complete|complete (?:your|a))\b.{0,30}\bvideo interview\b", text):
         return False
+    if re.search(r"\b(?:last |final )?reminder\b.{0,80}\b(?:complete|take|ai interview)\b", text):
+        return False
     if _ics_books_one_appointment(text):
         return True
     if re.search(r"\bbook time with me\b.{0,180}\band\b", text):
@@ -598,7 +670,6 @@ def _is_application_action_required(text: str) -> bool:
         r"\bconfirm your identity\b",
         r"\bmultifactor authentication\b",
         r"\b(?:enter|use|copy and paste) this code\b",
-        r"\bcandidate (?:account|home)\b",
         r"\bconfirm your email address and complete setup for your candidate\b",
     )
     if any(re.search(p, text) for p in account_access_patterns):
@@ -615,6 +686,17 @@ def _is_application_action_required(text: str) -> bool:
     ))
 
 
+def _is_recruitment_digest(text: str) -> bool:
+    """High-confidence automated job digest, before footer account actions."""
+    return any(re.search(pattern, text) for pattern in (
+        r"\bnew jobs? (?:posted|added|matching|that match)\b",
+        r"\bjob agent\b.{0,100}\bmatched the following jobs\b",
+        r"\btalent community\b.{0,180}\b(?:matched the following jobs|job openings become available)\b",
+        r"\byour profile matched the following jobs\b",
+        r"\bwe have \d+ new jobs? that match your profile\b",
+    ))
+
+
 def _is_interview_follow_up(text: str) -> bool:
     return any(re.search(pattern, text) for pattern in (
         r"\bthank you for (interviewing|meeting|speaking) with (us|our team)\b",
@@ -624,7 +706,7 @@ def _is_interview_follow_up(text: str) -> bool:
     ))
 
 
-_OFFER_NEGATION_RE = re.compile(r"\b(?:not|n't|never|without|no)\b", re.I)
+_OFFER_NEGATION_RE = re.compile(r"\b(?:not|n't|never|without|no|potential|possible|future)\b", re.I)
 
 
 def _is_offer(text: str) -> bool:
@@ -634,13 +716,12 @@ def _is_offer(text: str) -> bool:
     so it must never be sufficient by itself.
     """
     if any(re.search(pattern, text) for pattern in (
-        r"\boffer letter\b",
-        r"\b(?:formal|written) (?:employment )?offer\b",
         r"\b(pleased|excited|delighted) to (?:extend|make|present)?\s*(?:you )?an? offer\b",
         # Generic "we're excited to offer you X% off" marketing matches the
         # bare phrase below too easily; require it to actually be about a job.
         r"\b(pleased|excited|delighted) to offer you\b.{0,40}\b(?:the position|a position|the role|this role|employment|to join (?:us|our team)|the job)\b",
-        r"\bextend(?:ing)? (?:you )?an offer\b",
+        r"\b(pleased|excited|delighted) to offer you the\b.{0,60}\b(?:position|role|job)\b",
+        r"\bextend(?:ing)? you an offer\b",
         r"\bnegotiat\w* (your |the )?offer\b",
         r"\b(?:accept|decline) (?:this|the|your) offer\b",
         r"\b(?:you|we) (?:have |just )?signed (?:the |your )?offer\b",
@@ -684,6 +765,8 @@ def _heuristic_label(
         return EmailLabel.REJECTED_CLOSED.value
     if _is_offer(primary_text):
         return EmailLabel.OFFER.value
+    if _is_recruitment_digest(primary_text):
+        return EmailLabel.RECRUITMENT_ALERT.value
     if _is_application_action_required(primary_text):
         return EmailLabel.APPLICATION_ACTION_REQUIRED.value
     if direction == "outgoing" and not _ics_books_one_appointment(text) and re.search(
@@ -691,12 +774,16 @@ def _heuristic_label(
         primary_text,
     ):
         return EmailLabel.INTERVIEW_AVAILABILITY.value
-    if _is_scheduled_interview(text):
+    if _is_scheduled_interview(primary_text):
         return EmailLabel.INTERVIEW_SCHEDULED.value
     if _is_explicit_screening_invite(primary_text):
         return EmailLabel.SCREENING.value
     if _is_interview_follow_up(primary_text):
         return EmailLabel.INTERVIEW_FOLLOW_UP.value
+    # Direct screening questions are the current requested action even when
+    # the message begins with an application receipt.
+    if _is_pre_interview_screen(primary_text) or _is_true_screening(primary_text):
+        return EmailLabel.SCREENING.value
     # Checked before the generic application-received receipt: a recruiter's
     # "received your application" is often immediately followed by a direct
     # scheduling ask, which is the stronger, more actionable signal.
@@ -714,7 +801,7 @@ def _heuristic_label(
 
     if _is_true_assessment(primary_text):
         return EmailLabel.ASSESSMENT.value
-    if _is_pre_interview_screen(primary_text) or _is_true_screening(primary_text) or re.search(
+    if re.search(
         r"\b(recruiter questionnaire|screening questions|availability questions|chatbot questions)\b", primary_text
     ):
         return EmailLabel.SCREENING.value
@@ -763,6 +850,7 @@ def apply_label_guards(
     strong = (
         _is_true_rejection(text)
         or _is_offer(text)
+        or _is_recruitment_digest(text)
         or _is_application_action_required(text)
         or _is_explicit_screening_invite(text)
         or _is_interview_follow_up(text)

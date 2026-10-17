@@ -180,7 +180,7 @@ def test_scheduled_interview_subtype_is_metadata():
     db.close()
 
     client = _client(SessionLocal)
-    with patch("app.classify.outcome_extract.extract_company_role", new=AsyncMock(return_value=None)):
+    with patch("app.api.emails.process_calendar_email", new=AsyncMock(return_value=False)):
         response = client.patch(
             f"/api/emails/{email_id}/label",
             json={"label": "interview_scheduled", "save_training": False},
@@ -189,7 +189,7 @@ def test_scheduled_interview_subtype_is_metadata():
     assert response.json()["label"] == "interview_scheduled"
     assert response.json()["interview_subtype"] == "reminder"
 
-    with patch("app.classify.outcome_extract.extract_company_role", new=AsyncMock(return_value=None)):
+    with patch("app.api.emails.process_calendar_email", new=AsyncMock(return_value=False)):
         response = client.patch(
             f"/api/emails/{email_id}/label",
             json={"label": "interview_follow_up", "save_training": False},
@@ -208,7 +208,7 @@ def test_manual_interview_subtype_overrides_inference_and_can_be_changed():
     db.close()
 
     client = _client(SessionLocal)
-    with patch("app.classify.outcome_extract.extract_company_role", new=AsyncMock(return_value=None)):
+    with patch("app.api.emails.process_calendar_email", new=AsyncMock(return_value=False)):
         response = client.patch(
             f"/api/emails/{email_id}/label",
             json={"label": "interview_scheduled", "interview_subtype": "confirmation", "save_training": False},
@@ -216,10 +216,11 @@ def test_manual_interview_subtype_overrides_inference_and_can_be_changed():
     assert response.status_code == 200, response.text
     assert response.json()["interview_subtype"] == "confirmation"
 
-    response = client.patch(
-        f"/api/emails/{email_id}/label",
-        json={"label": "interview_scheduled", "interview_subtype": "reschedule", "save_training": True},
-    )
+    with patch("app.api.emails.process_calendar_email", new=AsyncMock(return_value=False)):
+        response = client.patch(
+            f"/api/emails/{email_id}/label",
+            json={"label": "interview_scheduled", "interview_subtype": "reschedule", "save_training": True},
+        )
     assert response.status_code == 200, response.text
     assert response.json()["interview_subtype"] == "reschedule"
     db = SessionLocal()

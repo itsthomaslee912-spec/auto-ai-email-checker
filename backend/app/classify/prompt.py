@@ -41,6 +41,7 @@ def build_classify_prompt() -> str:
             "- Rejection or closed hiring process overrides application thank-you wording.",
             "- Administrative application steps are application_action_required; screening questions and candidate evaluation are screening or assessment.",
             "- An invitation to book is interview_invitation. This includes a recruiter proposing any live call — a phone screen, recruiter screen, or intro chat — and asking the candidate to pick a time, suggest availability, or use a scheduling link; only an asynchronous task with no live call (questionnaire, chatbot, recorded video screen) is screening. The candidate's own message that sends, updates, or manages available times, including a reschedule proposal before a booking, is interview_availability. A confirmed time, calendar invite, reminder, reschedule of an already booked interview, time change, or cancellation is interview_scheduled.",
+            "- Future or conditional interview language in an application receipt is not an invitation. Phrases such as 'if your background is a fit, we will reach out to set up a call', 'qualified candidates will be contacted', or 'we plan to schedule interviews in the coming weeks' remain application_confirmation. Use interview_invitation only when this message currently invites or asks the candidate to schedule, choose, book, or provide availability.",
             "- A cancelled interview is interview_scheduled unless the email also says the candidacy or role is closed.",
             "- Follow-up means after the interview; an explicit offer or rejection takes precedence.",
             "- Use offer only for an actual candidate-specific employment offer or a clearly post-offer step. A role pitch described as an opportunity/position offer, or generic compensation and benefits language, is not an offer.",
@@ -76,5 +77,11 @@ def with_interview_subtype_rules(prompt: str) -> str:
             if 'Return one JSON object only:' in line
             or line.startswith("Allowed category_subtype values:")
             or line.startswith("Infer the independent facts first")
+        )
+    if "Future or conditional interview language" not in prompt:
+        prompt += "\n" + next(
+            line
+            for line in SYSTEM_PROMPT.splitlines()
+            if line.startswith("- Future or conditional interview language")
         )
     return prompt

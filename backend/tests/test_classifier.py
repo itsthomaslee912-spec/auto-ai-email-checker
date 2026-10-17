@@ -207,6 +207,18 @@ Databricks
 ** Please note: Do not reply to this email. This email is sent from an unattended mailbox. Replies will not be read.
 """
 
+CMT_RECEIPT = """Hi Jordan,
+
+Thank you for applying to Cambridge Mobile Telematics!
+
+Your application has been received and will be reviewed as soon as possible. If your background is a fit, we will reach out to set up a call.
+
+Best regards,
+CMT Talent Team
+"""
+
+CAMBLY_RECEIPT = """Thank you for applying. Our recruiting team is reviewing applications and plans to schedule interviews in the coming weeks. If you are qualified, a recruiter will contact you to schedule a phone call."""
+
 
 def test_motley_fool_receipt_is_applied():
     assert _heuristic_label("", "The Motley Fool", MOTLEY_FOOL, "") == EmailLabel.APPLICATION_CONFIRMATION.value
@@ -230,6 +242,51 @@ def test_databricks_receipt_is_applied():
         apply_label_guards(EmailLabel.OTHER.value, subject="", sender="", body_text=DATABRICKS, snippet="")
         == EmailLabel.APPLICATION_CONFIRMATION.value
     )
+
+
+def test_conditional_future_calls_remain_application_confirmations():
+    for body in (CMT_RECEIPT, CAMBLY_RECEIPT):
+        assert _heuristic_label("", "", body, "") == EmailLabel.APPLICATION_CONFIRMATION.value
+        assert (
+            apply_label_guards(
+                EmailLabel.INTERVIEW_INVITATION.value,
+                subject="",
+                sender="",
+                body_text=body,
+                snippet="",
+            )
+            == EmailLabel.APPLICATION_CONFIRMATION.value
+        )
+
+
+def test_application_receipt_with_direct_booking_request_is_an_invitation():
+    body = """We received your application and would like to interview you. Please use this scheduling link to choose a time for your interview."""
+    assert _heuristic_label("", "", body, "") == EmailLabel.INTERVIEW_INVITATION.value
+
+
+def test_encoded_or_damaged_contractions_do_not_hide_rejections():
+    bodies = (
+        "Thank you for applying. Unfortunately, we won&rsquo;t be moving forward with your candidacy.",
+        "Thank you for applying. Unfortunately, you weren\ufffdt selected for further consideration.",
+    )
+    for body in bodies:
+        assert _heuristic_label("", "", body, "") == EmailLabel.REJECTED_CLOSED.value
+
+
+def test_explicit_closed_or_paused_application_overrides_receipt_language():
+    bodies = (
+        "Thank you for applying. We are unable to move forward with your application at this time.",
+        "Thank you for applying. Unfortunately, we no longer have any openings for this role.",
+        "Thank you for applying. We have decided to pause this search temporarily while we reassess the role.",
+        "Thank you for applying. At this time, the client is only considering candidates who are currently local.",
+    )
+    for body in bodies:
+        assert _heuristic_label("", "", body, "") == EmailLabel.REJECTED_CLOSED.value
+
+
+def test_job_digest_footer_actions_do_not_become_application_actions():
+    body = """You joined the AGFA Talent Community. Your Job Agent matched the following jobs at careers.agfa.com. Update your preferences or reset your password to access your profile and agents."""
+    assert _heuristic_label("New jobs posted from careers.agfa.com", "", body, "") == EmailLabel.RECRUITMENT_ALERT.value
 
 
 CLOUDBEDS = """Hi Jordan,
@@ -379,6 +436,13 @@ def test_runtime_prompt_removes_legacy_static_fallback_examples():
     assert '"facts"' in upgraded
 
 
+def test_runtime_prompt_adds_conditional_interview_rule_to_saved_prompt():
+    from app.classify.prompt import with_interview_subtype_rules
+
+    upgraded = with_interview_subtype_rules("Classify recruiting email. interview_subtype facts category_subtype")
+    assert "Future or conditional interview language" in upgraded
+
+
 def test_booked_calendar_request_is_scheduled_and_a_decline_is_not():
     booked = """BEGIN:VCALENDAR
 METHOD:REQUEST
@@ -455,6 +519,80 @@ def test_offer_requires_an_actual_candidate_offer_not_job_description_boilerplat
         "The position includes a competitive compensation package.",
         "",
     ) == EmailLabel.SCREENING.value
+
+    application_receipts = (
+        "If your application is successful, your job offer letter will be sent to your account.",
+        "After the interviews, we will extend an offer to shortlisted candidates.",
+        "Never share bank details before you've received and signed any formal offer.",
+        "Learn about the process from applying through a potential offer of employment.",
+    )
+    for body in application_receipts:
+        assert _heuristic_label(
+            "Thank you for applying",
+            "Talent",
+            f"We received your application. {body}",
+            "",
+        ) == EmailLabel.APPLICATION_CONFIRMATION.value
+
+
+def test_future_rejection_process_language_does_not_close_an_application():
+    cases = (
+        "If you haven't heard from us within 30 days, it likely means we've decided to move forward with other candidates.",
+        "Once the role is filled or closed, we'll send a final update.",
+        "We will inform you if/when the position is filled.",
+    )
+    for sentence in cases:
+        body = f"Thank you for applying. We received your application. {sentence}"
+        assert _heuristic_label("Application received", "Talent", body, "") == EmailLabel.APPLICATION_CONFIRMATION.value
+
+
+def test_candidate_account_mentioned_in_receipt_is_not_action_required():
+    body = "We received your application. You may access your candidate account to view your application status."
+    assert _heuristic_label("Thank you for applying", "Talent", body, "") == EmailLabel.APPLICATION_CONFIRMATION.value
+
+
+def test_direct_recruiter_questions_override_application_thank_you():
+    cases = (
+        (
+            "Thank you for applying. Could you let me know if you would relocate? "
+            "If so, what timeframe would work best for you?"
+        ),
+        (
+            "Thank you for applying. The hiring manager has asked me to reach out to you "
+            "to get a better understanding of your experience. Have you built a local LLM? "
+            "What's your experience with local LLM? Please explain."
+        ),
+    )
+    for body in cases:
+        assert _heuristic_label("Next step", "Recruiter", body, "") == EmailLabel.SCREENING.value
+
+
+def test_async_video_screen_is_screening_not_application_confirmation():
+    body = (
+        "After reviewing your application, you're moving forward in our hiring process. "
+        "Please submit a short video to introduce yourself that covers the following questions."
+    )
+    assert _heuristic_label("Next step AI interview", "Recruiter", body, "") == EmailLabel.SCREENING.value
+
+    reminder = "Your application went through. The AI interview is the step that is left. Take your AI interview now."
+    assert _heuristic_label("Last reminder: your AI interview", "Recruiter", reminder, "") == EmailLabel.SCREENING.value
+
+
+def test_latest_availability_request_beats_quoted_old_confirmation():
+    body = """Can you provide me with your availability this week?
+
+From: Recruiter
+Sent: Friday, October 2, 2026
+Subject: Earlier confirmation
+Your video interview has been confirmed on Friday at 3:00 PM.
+"""
+    assert _heuristic_label("Re: Interview", "Recruiter", body, "") == EmailLabel.INTERVIEW_INVITATION.value
+
+
+def test_visible_snippet_beats_leading_html_css_for_async_screen():
+    body = "body { width: 600px; } " * 400
+    snippet = "Final reminder: complete your AI interview to continue your application."
+    assert _heuristic_label("Final reminder", "Recruiter", body, snippet) == EmailLabel.SCREENING.value
 
 
 def test_offer_recognizes_offer_letter_acceptance_and_post_offer_onboarding():
