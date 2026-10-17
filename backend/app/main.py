@@ -15,6 +15,7 @@ from app.realtime.renewal import renewal_loop
 from app.services.outcome_backfill import backfill_outcomes
 from app.services.calendar_backfill import backfill_calendar_events
 from app.services.auto_sync import auto_sync_loop
+from app.services.webhook_queue import webhook_queue_loop
 from app.services.reclassify import start_all_pending_reclassify
 
 logging.basicConfig(level=logging.INFO)
@@ -45,6 +46,7 @@ async def lifespan(app: FastAPI):
             backfill_task,
             asyncio.create_task(calendar_after_outcomes()),
             asyncio.create_task(auto_sync_loop(stop_event)),
+            asyncio.create_task(webhook_queue_loop(stop_event)),
             asyncio.create_task(pending_reclassify_after_warmup()),
         ])
 

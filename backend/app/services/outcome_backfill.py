@@ -10,7 +10,9 @@ from app.services.ai_backend import get_ai_backend
 
 logger = logging.getLogger(__name__)
 
-CONCURRENCY = 4
+# The same local model handles live classification. A startup repair must not
+# occupy every model slot while fresh webhook mail is waiting for a category.
+CONCURRENCY = 1
 
 
 async def backfill_outcomes(stop_event: asyncio.Event) -> None:

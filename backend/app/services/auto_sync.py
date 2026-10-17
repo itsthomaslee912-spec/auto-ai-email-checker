@@ -132,16 +132,15 @@ def _provider_delivery_status(provider: str, mailboxes: list[MailboxConnection])
 
 
 async def poll_active_mailboxes() -> int:
-    """Poll only accounts whose webhook is not delivering mail.
+    """Incrementally reconcile every account as a safety net.
 
-    A working webhook is the sync path. Polling stays off while the subscription
-    is current, the tunnel can deliver, and the webhook has succeeded without a
-    later real failure. It turns on when the webhook is missing, expired,
-    failing, has never delivered, or the tunnel is down. Silence is not a
-    failure: providers push only when new mail arrives.
+    Webhooks remain the immediate-delivery path. The periodic incremental sync
+    also runs for healthy webhooks so a provider outage, backend restart, or
+    exhausted retry window cannot leave a message missing forever. Healthy
+    Gmail watches are not re-registered on every safety pass.
     """
     ngrok = await asyncio.to_thread(get_ngrok_status)
-    mailbox_ids = []
+    mailboxes_to_sync: list[tuple[int, bool]] = []
     with SessionLocal() as db:
         for mailbox in db.query(MailboxConnection).filter(MailboxConnection.is_active.is_(True)).all():
             reason = polling_reason(mailbox, ngrok)
@@ -151,15 +150,17 @@ async def poll_active_mailboxes() -> int:
                 else:
                     logger.info("Mailbox %s is back on webhook delivery", mailbox.id)
                 _polling_reasons[mailbox.id] = reason
-            if reason and not needs_reconnect(mailbox.last_sync_error):
-                mailbox_ids.append(mailbox.id)
+            if not needs_reconnect(mailbox.last_sync_error):
+                mailboxes_to_sync.append((mailbox.id, bool(reason)))
 
     limit = max(1, get_settings().auto_sync_max_messages)
     errors = 0
-    for mailbox_id in mailbox_ids:
+    for mailbox_id, register_webhook in mailboxes_to_sync:
         try:
             await start_mailbox_sync(
-                mailbox_id, max_results=limit, register_webhook=True
+                mailbox_id,
+                max_results=limit,
+                register_webhook=register_webhook,
             )
         except Exception:
             errors += 1

@@ -250,6 +250,10 @@ def init_db() -> None:
                 conn.execute(text(
                     f"ALTER TABLE email_messages ADD COLUMN pending_dismissed_at {timestamp_type}"
                 ))
+            if "category_subtype" not in email_cols:
+                conn.execute(text(
+                    "ALTER TABLE email_messages ADD COLUMN category_subtype VARCHAR(48)"
+                ))
         if "calendar_events" in tables:
             calendar_cols = {c["name"] for c in inspect(conn).get_columns("calendar_events")}
             if "interviewer" not in calendar_cols:
@@ -280,6 +284,20 @@ def init_db() -> None:
                 conn.execute(text(
                     "ALTER TABLE mailbox_connections ADD COLUMN calendar_color VARCHAR(7)"
                 ))
+        if "classify_corrections" in tables:
+            correction_cols = {c["name"] for c in inspect(conn).get_columns("classify_corrections")}
+            if "evaluation_holdout" not in correction_cols:
+                false_default = "FALSE" if database_url.get_backend_name() == "postgresql" else "0"
+                conn.execute(text(
+                    "ALTER TABLE classify_corrections ADD COLUMN evaluation_holdout "
+                    f"BOOLEAN DEFAULT {false_default}"
+                ))
+                # Reserve a stable 20% of historical corrections. These rows are
+                # never used in prompts or retrieval.
+                conn.execute(text(
+                    "UPDATE classify_corrections SET evaluation_holdout = :held_out "
+                    "WHERE MOD(id, 5) = 0 AND used_in_prompt_version_id IS NULL"
+                ), {"held_out": True})
         if "users" in tables:
             user_cols = {c["name"] for c in inspect(conn).get_columns("users")}
             false_default = "FALSE" if database_url.get_backend_name() == "postgresql" else "0"
@@ -344,6 +362,8 @@ def init_db() -> None:
                     )
                 if "interview_subtype" not in cols:
                     conn.execute(text("ALTER TABLE email_messages ADD COLUMN interview_subtype VARCHAR(32)"))
+                if "category_subtype" not in cols:
+                    conn.execute(text("ALTER TABLE email_messages ADD COLUMN category_subtype VARCHAR(48)"))
                 from app.classify.openai_classifier import (
                     _combined_text,
                     _is_scheduled_interview,

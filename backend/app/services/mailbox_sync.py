@@ -43,8 +43,8 @@ from app.timeutil import as_utc
 
 logger = logging.getLogger(__name__)
 
-FETCH_CHUNK = 80
-GMAIL_CONCURRENCY = 16
+FETCH_CHUNK = 20
+GMAIL_CONCURRENCY = 4
 GMAIL_CALENDAR_REFRESH_CONCURRENCY = 2
 OUTLOOK_FOLDERS = ("inbox", "junkemail", "deleteditems", "archive", "sentitems")
 
@@ -53,6 +53,15 @@ _running: set[int] = set()
 _cancel_requested: set[int] = set()
 _job_lock = asyncio.Lock()
 _cursor_locks: dict[int, asyncio.Lock] = {}
+_sync_gate: asyncio.Semaphore | None = None
+
+
+def _sync_gate_semaphore() -> asyncio.Semaphore:
+    """Keep bulk account reconciliation from starving API and webhook work."""
+    global _sync_gate
+    if _sync_gate is None:
+        _sync_gate = asyncio.Semaphore(1)
+    return _sync_gate
 
 
 def _cursor_lock(mailbox_id: int) -> asyncio.Lock:
@@ -181,6 +190,20 @@ async def request_stop_sync(mailbox_id: int) -> dict[str, Any]:
 
 
 async def _run_sync_job(
+    mailbox_id: int, max_results: int | None = None,
+    register_webhook: bool = True, force_full: bool = False,
+) -> None:
+    # A full rescan can issue thousands of provider requests. Running one for
+    # every account simultaneously starves the API event loop and makes the
+    # supervisor mistake a busy backend for a dead one. Webhook jobs do not use
+    # this gate and can still import new mail immediately.
+    async with _sync_gate_semaphore():
+        await _run_sync_job_exclusive(
+            mailbox_id, max_results, register_webhook, force_full,
+        )
+
+
+async def _run_sync_job_exclusive(
     mailbox_id: int, max_results: int | None = None,
     register_webhook: bool = True, force_full: bool = False,
 ) -> None:
@@ -435,6 +458,7 @@ async def _incremental_gmail(db: Session, mailbox: MailboxConnection) -> None:
             email = await ingest_normalized_message(db, mailbox, normalized, download_only=True)
             if email:
                 imported += 1
+            await asyncio.sleep(0)
         await _publish_progress(
             mailbox.id, imported=imported, listed=len(ids), total=len(ids),
             message=f"Checked {min(start + len(chunk), len(ids))} changed Gmail messages",
@@ -536,6 +560,7 @@ async def _sync_gmail(db: Session, mailbox: MailboxConnection, limit: int) -> No
                     total=max(estimate, len(ids)),
                     message=f"Imported {imported} new and refreshed {refreshed} calendar messages",
                 )
+            await asyncio.sleep(0)
     await _publish_progress(
         mailbox.id,
         imported=imported,
@@ -591,6 +616,7 @@ async def _sync_outlook(db: Session, mailbox: MailboxConnection, limit: int) -> 
                 total=len(messages),
                 message=f"Imported {imported} of {len(new_messages)} new messages",
             )
+        await asyncio.sleep(0)
     await _publish_progress(
         mailbox.id,
         imported=imported,
@@ -645,6 +671,7 @@ async def _sync_outlook_delta(db: Session, mailbox: MailboxConnection) -> None:
                     email = await ingest_normalized_message(db, mailbox, normalize_outlook_message(raw), download_only=True)
                     if email:
                         imported += 1
+                    await asyncio.sleep(0)
                 next_cursor = page.get("@odata.nextLink") or page.get("@odata.deltaLink")
                 if not next_cursor:
                     raise RuntimeError(f"Outlook delta did not return a cursor for {folder}")

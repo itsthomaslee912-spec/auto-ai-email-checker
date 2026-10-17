@@ -1,4 +1,5 @@
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -72,3 +73,27 @@ def test_gmail_push_rejects_wrong_service_account(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         asyncio.run(webhooks._verify_gmail_push_auth(Request("Bearer signed-token")))
     assert exc.value.status_code == 403
+
+
+def test_gmail_push_reuses_verified_token_until_expiry(monkeypatch):
+    calls = []
+    webhooks._gmail_token_cache.clear()
+
+    def verify(token, _request, audience):
+        calls.append((token, audience))
+        return {
+            "email": "push@example.iam.gserviceaccount.com",
+            "exp": time.time() + 600,
+        }
+
+    monkeypatch.setattr(webhooks.id_token, "verify_oauth2_token", verify)
+    args = (
+        "signed-token",
+        "https://example.test/api/webhooks/gmail",
+        "push@example.iam.gserviceaccount.com",
+    )
+
+    assert webhooks._verify_gmail_token_cached(*args)["email"].startswith("push@")
+    assert webhooks._verify_gmail_token_cached(*args)["email"].startswith("push@")
+    assert calls == [(args[0], args[1])]
+    webhooks._gmail_token_cache.clear()

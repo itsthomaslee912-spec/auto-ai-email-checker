@@ -11,7 +11,7 @@ router = APIRouter(tags=["health"])
 
 
 @router.get("/api/health", response_model=HealthOut)
-def health() -> HealthOut:
+async def health() -> HealthOut:
     # Keep this free of DB/pool work so the process supervisor does not kill
     # the API while reclassify or sync is using every connection.
     return HealthOut(status="ok")

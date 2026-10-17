@@ -505,3 +505,30 @@ def test_outlook_notification_never_falls_back_to_another_mailbox(monkeypatch):
     get_message.assert_not_awaited()
     db.close()
     engine.dispose()
+
+
+def test_bulk_mailbox_sync_jobs_are_serialized(monkeypatch):
+    active = 0
+    peak = 0
+
+    async def fake_sync(*_args, **_kwargs):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+
+    async def run_two():
+        mailbox_sync._sync_gate = None
+        try:
+            await asyncio.gather(
+                mailbox_sync._run_sync_job(1),
+                mailbox_sync._run_sync_job(2),
+            )
+        finally:
+            mailbox_sync._sync_gate = None
+
+    monkeypatch.setattr(mailbox_sync, "_run_sync_job_exclusive", fake_sync)
+    asyncio.run(run_two())
+
+    assert peak == 1

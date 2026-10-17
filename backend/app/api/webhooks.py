@@ -4,25 +4,50 @@ import asyncio
 import base64
 import json
 import logging
+import threading
+import time
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Request, Response
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
-from sqlalchemy.orm import Session
-
 from app.config import get_settings
-from app.db import SessionLocal
-from app.services.mailbox_sync import process_gmail_notification, process_outlook_notification
 from app.services.webhook_health import (
     persist_webhook_delivery_failure,
     record_webhook_delivery_failure,
 )
+from app.services.webhook_queue import enqueue_webhook_delivery
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
-_gmail_pending: dict[str, str | None] = {}
-_gmail_tasks: dict[str, asyncio.Task[None]] = {}
-_MISSING = object()
+_gmail_token_cache: dict[tuple[str, str, str], tuple[float, dict]] = {}
+_gmail_token_cache_lock = threading.Lock()
+
+
+def _verify_gmail_token_cached(
+    token: str, audience: str, expected_email: str,
+) -> dict:
+    """Verify a Pub/Sub token once and reuse it until shortly before expiry.
+
+    Pub/Sub reuses bearer tokens across a burst. Fetching Google's certificates
+    for every notification previously made acknowledgements take about a second
+    each and amplified retry storms while the backend was recovering.
+    """
+    key = (token, audience, expected_email)
+    now = time.time()
+    with _gmail_token_cache_lock:
+        cached = _gmail_token_cache.get(key)
+        if cached is not None and cached[0] > now + 30:
+            return cached[1]
+        claims = id_token.verify_oauth2_token(
+            token, google_requests.Request(), audience
+        )
+        expires_at = float(claims.get("exp") or now)
+        if expires_at > now + 30:
+            _gmail_token_cache[key] = (expires_at, claims)
+        for cache_key, (expiry, _) in list(_gmail_token_cache.items()):
+            if expiry <= now + 30:
+                _gmail_token_cache.pop(cache_key, None)
+        return claims
 
 
 async def _verify_gmail_push_auth(request: Request) -> None:
@@ -41,10 +66,10 @@ async def _verify_gmail_push_auth(request: Request) -> None:
 
     try:
         claims = await asyncio.to_thread(
-            id_token.verify_oauth2_token,
+            _verify_gmail_token_cached,
             token.strip(),
-            google_requests.Request(),
             audience,
+            settings.gmail_pubsub_service_account.strip().casefold(),
         )
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=401, detail="Invalid Pub/Sub bearer token") from exc
@@ -80,43 +105,18 @@ async def gmail_pubsub_push(request: Request) -> dict:
     history_id = str(payload.get("historyId") or "") or None
     if not email_address:
         return {"ok": True, "skipped": True}
-    _schedule_gmail(email_address, history_id)
-    return {"ok": True}
-
-
-def _schedule_gmail(email_address: str, history_id: str | None) -> None:
-    """Coalesce Pub/Sub retries and acknowledge the HTTP request immediately."""
-    _gmail_pending[email_address] = history_id
-    task = _gmail_tasks.get(email_address)
-    if task is None or task.done():
-        _gmail_tasks[email_address] = asyncio.create_task(_drain_gmail(email_address))
-
-
-async def _drain_gmail(email_address: str) -> None:
-    try:
-        while True:
-            history_id = _gmail_pending.pop(email_address, _MISSING)
-            if history_id is _MISSING:
-                return
-            await _handle_gmail(email_address, history_id)
-    finally:
-        _gmail_tasks.pop(email_address, None)
-        if email_address in _gmail_pending:
-            _schedule_gmail(email_address, _gmail_pending[email_address])
-
-
-async def _handle_gmail(email_address: str, history_id: str | None) -> None:
-    db = SessionLocal()
-    try:
-        await process_gmail_notification(db, email_address, history_id)
-    except Exception:
-        logger.exception("Gmail notification processing failed")
-    finally:
-        db.close()
+    queued = enqueue_webhook_delivery(
+        "google",
+        {"email_address": email_address, "history_id": history_id},
+        # Gmail history is cumulative. Keep at most one queued job per account
+        # and replace its payload with the newest history id during bursts.
+        provider_id=email_address.strip().casefold(),
+    )
+    return {"ok": True, "queued": queued}
 
 
 @router.post("/outlook")
-async def outlook_graph_webhook(request: Request, background_tasks: BackgroundTasks) -> Response:
+async def outlook_graph_webhook(request: Request) -> Response:
     # Graph validation handshake
     validation_token = request.query_params.get("validationToken")
     if validation_token:
@@ -140,16 +140,10 @@ async def outlook_graph_webhook(request: Request, background_tasks: BackgroundTa
             if parts:
                 message_id = parts[-1]
         if subscription_id and message_id:
-            background_tasks.add_task(_handle_outlook, subscription_id, message_id)
+            enqueue_webhook_delivery(
+                "microsoft",
+                {"subscription_id": subscription_id, "message_id": message_id},
+                provider_id=f"{subscription_id}:{message_id}",
+            )
 
     return Response(status_code=202)
-
-
-async def _handle_outlook(subscription_id: str, message_id: str) -> None:
-    db = SessionLocal()
-    try:
-        await process_outlook_notification(db, subscription_id, message_id)
-    except Exception:
-        logger.exception("Outlook notification processing failed")
-    finally:
-        db.close()

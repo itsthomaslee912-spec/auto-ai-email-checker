@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from app.classify.openai_classifier import classify_email, infer_interview_subtype
+from app.classify.correction_retrieval import load_correction_corpus, retrieve_relevant_corrections
 from app.classify.outcome_extract import BACKFILL_LABELS, OUTCOME_LABELS, extract_company_role
 from app.models import CalendarEvent, EmailLabel, EmailMessage, MailboxConnection
 from app.realtime.sse import publish
@@ -222,6 +223,15 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                 lookup.close()
 
         rows = await asyncio.to_thread(load_rows)
+        def load_context():
+            lookup = SessionLocal()
+            try:
+                mailbox = lookup.get(MailboxConnection, mailbox_id)
+                return (mailbox.email_address if mailbox else ""), load_correction_corpus(lookup)
+            finally:
+                lookup.close()
+
+        account_email, correction_corpus = await asyncio.to_thread(load_context)
         total = len(rows)
         backend = await asyncio.to_thread(get_ai_backend)
         await _publish_progress(
@@ -247,11 +257,21 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
         ) -> tuple[int, str, Any, tuple[str, str] | None, bool] | None:
             async with semaphore:
                 try:
+                    correction_examples = retrieve_relevant_corrections(
+                        correction_corpus,
+                        subject=row.subject or "",
+                        sender=row.sender or "",
+                        body_text=row.body_text or "",
+                        snippet=row.snippet or "",
+                    )
                     result = await classify_email(
                         subject=row.subject or "",
                         sender=row.sender or "",
                         body_text=row.body_text or "",
                         snippet=row.snippet or "",
+                        folder=row.folder or "inbox",
+                        account_email=account_email,
+                        correction_examples=correction_examples,
                         force_openai=True,
                     )
                     should_extract = result.label in OUTCOME_LABELS and (
@@ -294,12 +314,14 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                 )
                 label_changed = (
                     email.label != result.label
+                    or email.category_subtype != getattr(result, "category_subtype", None)
                     or email.confidence != result.confidence
                     or email.interview_subtype != new_subtype
                 )
                 was_pending = email.classification_pending
                 if label_changed:
                     email.label = result.label
+                    email.category_subtype = getattr(result, "category_subtype", None)
                     email.interview_subtype = new_subtype
                     email.confidence = result.confidence
                     email.openai_response_id = result.response_id

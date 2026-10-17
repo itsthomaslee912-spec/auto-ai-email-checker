@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
 from app.classify.openai_classifier import classify_email, infer_interview_subtype
+from app.classify.correction_retrieval import load_correction_corpus, retrieve_relevant_corrections
 from app.classify.outcome_extract import apply_outcome
 from app.email.folders import normalize_folder
 from app.models import EmailLabel, EmailMessage, MailboxConnection
@@ -90,6 +91,14 @@ async def ingest_normalized_message(
 
     classification = None
     if not download_only:
+        corpus = load_correction_corpus(db)
+        correction_examples = retrieve_relevant_corrections(
+            corpus,
+            subject=normalized.get("subject") or "",
+            sender=normalized.get("sender") or "",
+            body_text=normalized.get("body_text") or "",
+            snippet=normalized.get("snippet") or "",
+        )
         try:
             # Live classification uses the active SQLite prompt.
             classification = await classify_email(
@@ -97,6 +106,9 @@ async def ingest_normalized_message(
                 sender=normalized.get("sender") or "",
                 body_text=normalized.get("body_text") or "",
                 snippet=normalized.get("snippet") or "",
+                folder=normalize_folder(normalized.get("folder")),
+                account_email=mailbox.email_address,
+                correction_examples=correction_examples,
                 force_openai=force_openai,
                 use_openai=use_openai,
             )
@@ -107,6 +119,9 @@ async def ingest_normalized_message(
                 sender=normalized.get("sender") or "",
                 body_text=normalized.get("body_text") or "",
                 snippet=normalized.get("snippet") or "",
+                folder=normalize_folder(normalized.get("folder")),
+                account_email=mailbox.email_address,
+                correction_examples=correction_examples,
                 use_openai=False,
             )
 
@@ -121,6 +136,7 @@ async def ingest_normalized_message(
         body_text=normalized.get("body_text") or "",
         body_html=normalized.get("body_html") or "",
         label=classification.label if classification else EmailLabel.OTHER.value,
+        category_subtype=classification.category_subtype if classification else None,
         classification_pending=download_only,
         interview_subtype=(
             classification.interview_subtype or infer_interview_subtype(

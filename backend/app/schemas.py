@@ -71,6 +71,7 @@ class EmailOut(BaseModel):
     received_at: UtcDateTime | None = None
     snippet: str
     label: str
+    category_subtype: str | None = None
     interview_subtype: str | None = None
     confidence: float | None = None
     is_read: bool = False
@@ -144,6 +145,7 @@ class HealthOut(BaseModel):
 
 class ClassificationResult(BaseModel):
     label: EmailLabelLiteral
+    category_subtype: str | None = None
     interview_subtype: Literal["confirmation", "calendar_invite", "reminder", "reschedule", "time_change", "cancellation"] | None = None
     confidence: float | None = None
     response_id: str | None = None
@@ -182,6 +184,7 @@ class ClassifyTrainingExampleOut(BaseModel):
     subject: str
     sender: str
     snippet: str
+    evaluation_holdout: bool = False
     used_in_prompt_version_id: int | None = None
     created_at: UtcDateTime | None = None
 

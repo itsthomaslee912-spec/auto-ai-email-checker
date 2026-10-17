@@ -15,6 +15,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.api import classify, emails
 from app.classify.openai_classifier import classify_email
+from app.classify.correction_retrieval import load_correction_corpus, retrieve_relevant_corrections
 from app.classify.prompt import CLASSIFY_TYPES, SYSTEM_PROMPT
 from app.classify.prompt_store import activate_prompt_text, get_active_system_prompt, invalidate_prompt_cache
 from app.db import Base, get_db
@@ -138,6 +139,36 @@ def test_patch_label_without_training_skips_correction():
     db.close()
 
 
+def test_outcome_to_outcome_label_change_reuses_existing_extraction():
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    email = _seed_email(db, label=EmailLabel.INTERVIEW_INVITATION.value)
+    email.company = "Acme"
+    email.job_role = "Software Engineer"
+    email.outcome_extracted = True
+    email.classification_pending = True
+    db.commit()
+    email_id = email.id
+    db.close()
+
+    client = _client(SessionLocal)
+    with patch("app.api.emails.apply_outcome", new=AsyncMock()) as extract:
+        response = client.patch(
+            f"/api/emails/{email_id}/label",
+            json={"label": "screening", "save_training": True},
+        )
+
+    assert response.status_code == 200, response.text
+    extract.assert_not_awaited()
+    with SessionLocal() as db:
+        stored = db.get(EmailMessage, email_id)
+        assert stored.label == EmailLabel.SCREENING.value
+        assert stored.classification_pending is False
+        assert stored.outcome_extracted is True
+        assert stored.company == "Acme"
+        assert stored.job_role == "Software Engineer"
+
+
 def test_scheduled_interview_subtype_is_metadata():
     SessionLocal = _session_factory()
     db = SessionLocal()
@@ -256,6 +287,56 @@ def test_training_uses_only_latest_correction_for_each_email():
     rows = _latest_corrections(db)
     assert len(rows) == 1
     assert rows[0].corrected_label == EmailLabel.RECRUITMENT_ALERT.value
+    db.close()
+
+
+def test_retrieval_excludes_holdout_and_finds_similar_corrections():
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    email = _seed_email(db)
+    other = EmailMessage(
+        mailbox_id=email.mailbox_id,
+        provider_message_id="assessment-copy",
+        subject="Complete your coding challenge",
+        sender="Assessments <noreply@codes.test>",
+        snippet="Please complete the coding challenge by Friday.",
+        body_text="Please complete the coding challenge by Friday.",
+        label=EmailLabel.ASSESSMENT.value,
+    )
+    db.add(other)
+    db.flush()
+    db.add_all([
+        ClassifyCorrection(
+            email_id=email.id,
+            previous_label="other",
+            corrected_label="rejected_closed",
+            subject=email.subject,
+            body_text=email.body_text,
+            evaluation_holdout=True,
+        ),
+        ClassifyCorrection(
+            email_id=other.id,
+            previous_label="screening",
+            corrected_label="assessment",
+            subject=other.subject,
+            sender=other.sender,
+            snippet=other.snippet,
+            body_text=other.body_text,
+            evaluation_holdout=False,
+        ),
+    ])
+    db.commit()
+
+    corpus = load_correction_corpus(db)
+    found = retrieve_relevant_corrections(
+        corpus,
+        subject="Reminder: complete your coding challenge",
+        sender="noreply@codes.test",
+        body_text="Your coding challenge is due Friday.",
+        snippet="",
+    )
+    assert [item.corrected_label for item in found] == ["assessment"]
+    assert all(item.corrected_label != "rejected_closed" for item in corpus)
     db.close()
 
 
@@ -457,6 +538,34 @@ def test_prompt_status_endpoint():
     res = client.get("/api/classify/prompt")
     assert res.status_code == 200, res.text
     assert res.json()["unused_count"] == 0
+
+
+def test_evaluation_endpoint_reports_only_held_out_confusion():
+    SessionLocal = _session_factory()
+    with SessionLocal() as db:
+        email = _seed_email(db)
+        db.add_all([
+            ClassifyCorrection(
+                email_id=email.id,
+                previous_label="application_confirmation",
+                corrected_label="rejected_closed",
+                evaluation_holdout=True,
+            ),
+            ClassifyCorrection(
+                email_id=email.id,
+                previous_label="other",
+                corrected_label="recruitment_alert",
+                evaluation_holdout=False,
+            ),
+        ])
+        db.commit()
+
+    body = _client(SessionLocal).get("/api/classify/evaluation").json()
+    assert body["total"] == 1
+    assert body["accuracy"] == 0
+    assert body["confusion_matrix"] == {
+        "rejected_closed": {"application_confirmation": 1},
+    }
 
 
 def test_list_training_examples_marks_used_and_unused():

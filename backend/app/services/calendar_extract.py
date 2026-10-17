@@ -97,6 +97,19 @@ _PARADOX_JOIN_RE = re.compile(
     r"[a-z0-9_-]{6,64}(?=[/?#\s<>\"')]|$)",
     re.I,
 )
+_PHONE_MEETING_MENTION_RE = re.compile(
+    r"\b(phone (?:conversation|interview|screen|call)|telephone (?:interview|call))\b", re.I
+)
+# A recruiter's "Schedule Your Interview" link to their Calendly booking page
+# (calendly.com/<user>/<event-type>), as opposed to Calendly's own
+# transactional links (invitees/, reschedulings/, ...) which name no one.
+_CALENDLY_BOOKING_LINK_RE = re.compile(
+    r"https://calendly\.com/"
+    r"(?!invitees/|reschedulings/|cancellations/|notification_subscriptions/|\?)"
+    r"[a-z0-9_-]+(?:/[a-z0-9_-]+)?",
+    re.I,
+)
+_CALENDLY_SENDER_RE = re.compile(r"@calendly\.com\b", re.I)
 
 VIDEO_HOSTS = {
     "zoom.us": "Zoom",
@@ -751,7 +764,11 @@ def extract_interviewer(text: str, sender: str = "") -> str:
         return _clean_text(match.group(1))
     for pattern in (
         r"\binterviewer\s*[:\-]\s*([^\r\n|;,]+)",
-        r"\b(?:meet|meeting|interview|conversation|call)\s+with\s+([^\r\n|;,]+)",
+        # Stop before a trailing date/time clause ("... with Todd Hilfred on
+        # Thursday, October 15" or "... with Todd Hilfred at 12:30pm") so
+        # that clause is not captured as part of the interviewer's name.
+        r"\b(?:meet|meeting|interview|conversation|call)\s+with\s+([^\r\n|;,]+?)"
+        r"(?=\s+(?:on|at)\s+(?:mon|tue|wed|thu|fri|sat|sun|\d)|[\r\n|;,]|$)",
     ):
         match = re.search(pattern, text or "", re.I)
         if match:
@@ -860,6 +877,17 @@ def _assign_join_url(event: CalendarEvent, url: str | None) -> None:
         event.meeting_url = candidate if is_video_join_url(candidate) else None
 
 
+def _normalize_meeting_access_fields(event: CalendarEvent) -> bool:
+    """Make the stored chip agree with definitive conferencing evidence."""
+    before = (event.meeting_type, event.meeting_provider)
+    event.meeting_provider = clean_meeting_provider(event.meeting_provider)
+    if is_video_join_url(event.meeting_url):
+        event.meeting_type = "video"
+        # The host is more reliable than prose or an earlier model guess.
+        event.meeting_provider = _provider_for_url(event.meeting_url) or event.meeting_provider
+    return before != (event.meeting_type, event.meeting_provider)
+
+
 def extract_meeting_access(text: str) -> MeetingAccess:
     source = _unfold_wrapped_lines(html.unescape(text or ""))
     urls = [
@@ -894,7 +922,7 @@ def extract_meeting_access(text: str) -> MeetingAccess:
     for pattern, provider in provider_phrases:
         if re.search(pattern, source, re.I):
             return MeetingAccess("video", provider, None, None, code)
-    if re.search(r"\b(phone (?:conversation|interview|screen|call)|telephone (?:interview|call))\b", source, re.I):
+    if _PHONE_MEETING_MENTION_RE.search(source):
         return MeetingAccess("phone")
     if re.search(r"\b(in person|on-site|onsite|at our office)\b", source, re.I):
         return MeetingAccess("in_person")
@@ -1609,6 +1637,40 @@ def _cross_thread_score(
     return score
 
 
+def _pending_scheduler_invitation(db: Session, email: EmailMessage) -> EmailMessage | None:
+    """The invitation whose Calendly link this anonymous confirmation answers.
+
+    A generic scheduler (Calendly, etc.) confirmation names the interviewer
+    but never the employer or role. The only link back to that context is
+    the earlier invitation email's own booking-page link, which the
+    confirmation itself never repeats. If exactly one still-open invitation
+    with such a link was sent shortly before, it is safe to borrow its
+    company and role; more than one is ambiguous and must be left blank
+    rather than guessed.
+    """
+    if not _CALENDLY_SENDER_RE.search(email.sender or ""):
+        return None
+    received_at = as_utc(email.received_at)
+    if received_at is None:
+        return None
+    candidates = (
+        db.query(EmailMessage)
+        .filter(
+            EmailMessage.mailbox_id == email.mailbox_id,
+            EmailMessage.label == EmailLabel.INTERVIEW_INVITATION.value,
+            EmailMessage.received_at >= received_at - timedelta(days=3),
+            EmailMessage.received_at <= received_at,
+        )
+        .all()
+    )
+    matches = [
+        item
+        for item in candidates
+        if _CALENDLY_BOOKING_LINK_RE.search(_message_text(item))
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _related_interview_emails(
     db: Session,
     email: EmailMessage,
@@ -1716,6 +1778,10 @@ def _related_interview_emails(
 
     for item in _employer_context_messages(db, email):
         related.setdefault(item.id, item)
+
+    invitation = _pending_scheduler_invitation(db, email)
+    if invitation is not None:
+        related.setdefault(invitation.id, invitation)
 
     ordered = sorted(
         related.values(),
@@ -2098,6 +2164,49 @@ def _prefer_specific_slots(slots: list[ExtractedSlot]) -> list[ExtractedSlot]:
     return specific or slots
 
 
+_CURRENT_RESCHEDULE_LINE_RE = re.compile(
+    r"^\s*(?:updated|new(?:\s+(?:time|date))?|rescheduled(?:\s+to)?|moved(?:\s+to)?|changed(?:\s+to)?)\s*[:\-]?\s*.+$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_CURRENT_RESCHEDULE_TO_RE = re.compile(
+    r"\b(?:rescheduled|moved|changed)\b[^\r\n]{0,160}?\bto\b\s*(?P<current>[^\r\n]+)",
+    re.IGNORECASE,
+)
+
+
+def authoritative_reschedule_slots(
+    email: EmailMessage, slots: list[ExtractedSlot] | None = None,
+) -> list[ExtractedSlot]:
+    """Return the new clock from an update that also repeats the old clock.
+
+    Calendar update mail commonly contains both the replacement time and the
+    original invitation.  Generic closest-slot matching then preserves the
+    existing (old) chip by design.  Provider calendar data wins first; next,
+    an explicit time in the update subject or an ``Updated:``/``moved to``
+    clause identifies the replacement.  Ambiguous prose keeps the complete
+    slot list instead of guessing.
+    """
+    parsed = list(slots if slots is not None else explicit_message_slots(email))
+    if (email.interview_subtype or "").casefold() not in {"reschedule", "time_change"}:
+        return parsed
+    full = _calendar_text(email)
+    ics_slots = parse_ics_slots(full)
+    if ics_slots:
+        return _prefer_specific_slots(ics_slots)
+    subject_slots = _prefer_specific_slots(parse_text_slots(email.subject or "", email.received_at))
+    if subject_slots:
+        return subject_slots
+    body = (email.body_text or "").strip() or (email.snippet or "")
+    fresh = _without_quoted_history("\n".join([email.subject or "", body]))
+    marked = "\n".join(match.group(0) for match in _CURRENT_RESCHEDULE_LINE_RE.finditer(fresh))
+    marked_slots = _prefer_specific_slots(parse_text_slots(marked, email.received_at)) if marked else []
+    if marked_slots:
+        return marked_slots
+    moved_to = "\n".join(match.group("current") for match in _CURRENT_RESCHEDULE_TO_RE.finditer(fresh))
+    moved_slots = _prefer_specific_slots(parse_text_slots(moved_to, email.received_at)) if moved_to else []
+    return moved_slots or parsed
+
+
 def _date_parts(date_match: re.Match[str], reference: datetime | None) -> tuple[int, int, int] | None:
     try:
         month = int(date_match.groupdict().get("month_num") or MONTH_NUMBERS[(date_match.group("month") or "").lower()])
@@ -2218,7 +2327,11 @@ _CLOCK_OR_DATE_RE = re.compile(
     re.IGNORECASE,
 )
 _STILL_BOOKED_RE = re.compile(
-    r"has been scheduled|invitation has been sent|calendar invitation|now confirmed|confirmed for your|out of the office|currently away",
+    r"has been scheduled|invitation has been sent|calendar invitation|now confirmed|confirmed for your|out of the office|currently away"
+    # "Sorry, I got the time mixed up" apologizes for the sender's own
+    # confusion; it does not, by itself, say the meeting is off or ask to
+    # change it, unlike "I need to reschedule" or "that no longer works".
+    r"|got (?:the |my )?(?:times?|dates?) (?:mixed up|wrong|confused)|my (?:mistake|bad)\b",
     re.IGNORECASE,
 )
 
@@ -2583,6 +2696,7 @@ def _apply_details(event: CalendarEvent, email: EmailMessage, access: MeetingAcc
     _assign_join_url(event, access.url)
     event.phone_number = access.phone_number or event.phone_number
     event.phone_access_code = access.access_code or event.phone_access_code
+    _normalize_meeting_access_fields(event)
     event.title = _title(
         email,
         InterviewDetails(company=event.company or "", role=event.job_role or ""),
@@ -2692,6 +2806,7 @@ def refresh_calendar_event_details(db: Session, email: EmailMessage) -> bool:
         _assign_join_url(event, access.url)
         event.phone_number = event.phone_number or access.phone_number
         event.phone_access_code = event.phone_access_code or access.access_code
+        _normalize_meeting_access_fields(event)
         if event.origin == "email" and (event.company or event.job_role):
             event.title = _title(
                 email,
@@ -2798,13 +2913,109 @@ def _identity_events(db: Session, email: EmailMessage, *, kind: str | None = Non
     if not (email.company or email.job_role):
         return []
     query = db.query(CalendarEvent).filter(CalendarEvent.mailbox_id == email.mailbox_id)
-    if email.company:
-        query = query.filter(CalendarEvent.company == email.company)
-    if email.job_role:
-        query = query.filter(CalendarEvent.job_role == email.job_role)
     if kind:
         query = query.filter(CalendarEvent.kind == kind)
-    return query.order_by(CalendarEvent.start_at.desc(), CalendarEvent.id.desc()).all()
+    rows = query.order_by(CalendarEvent.start_at.desc(), CalendarEvent.id.desc()).all()
+    return [
+        event
+        for event in rows
+        if (not email.company or companies_match(event.company, email.company))
+        and (not email.job_role or roles_compatible(event.job_role, email.job_role))
+    ]
+
+
+_OUTCOME_ROLE_STOPWORDS = {
+    "and", "assets", "digital", "job", "lead", "position", "role", "senior", "sr", "staff", "the",
+}
+_OUTCOME_GENERIC_COMPANIES = {
+    "hiring manager", "recruiter", "recruiting team", "recruitment team",
+    "talent acquisition", "talent acquisition team",
+}
+
+
+def _identity_words(value: str | None) -> list[str]:
+    return [
+        word
+        for word in re.findall(r"[a-z0-9]+", (value or "").casefold())
+        if len(word) > 2 and word not in _OUTCOME_ROLE_STOPWORDS
+    ]
+
+
+def _outcome_text_matches_event(
+    email: EmailMessage,
+    event: CalendarEvent,
+    normalized_text: str | None = None,
+    normalized_words: set[str] | None = None,
+) -> bool:
+    """Match a cross-thread outcome using company and role evidence in its text."""
+    if normalized_text is None or normalized_words is None:
+        raw = " ".join((email.sender or "", email.subject or "", email.snippet or "", email.body_text or ""))
+        words = re.findall(r"[a-z0-9]+", raw.casefold())
+        normalized_text = " ".join(words)
+        normalized_words = set(words)
+    company_words = _identity_words(event.company)
+    role_words = _identity_words(event.job_role)
+    company_match = (
+        bool(company_words)
+        and (event.company or "").strip().casefold() not in _OUTCOME_GENERIC_COMPANIES
+        and " ".join(company_words) in normalized_text
+    )
+    role_hits = sum(word in normalized_words for word in set(role_words))
+    role_match = not role_words or role_hits >= min(2, len(set(role_words)))
+    return company_match and role_match
+
+
+def _outcome_events(
+    db: Session,
+    email: EmailMessage,
+    *,
+    events: list[CalendarEvent] | None = None,
+    linked_event_ids: set[int] | None = None,
+) -> list[CalendarEvent]:
+    """All chips for the application affected by this outcome message."""
+    if events is None:
+        events = (
+            db.query(CalendarEvent)
+            .filter(CalendarEvent.mailbox_id == email.mailbox_id)
+            .order_by(CalendarEvent.start_at.desc(), CalendarEvent.id.desc())
+            .all()
+        )
+    if linked_event_ids is None:
+        linked_event_ids = {
+            row[0]
+            for row in db.query(CalendarEventEmail.event_id)
+            .filter(CalendarEventEmail.email_id == email.id)
+            .all()
+        }
+    direct = [
+        event
+        for event in events
+        if event.id in linked_event_ids
+        or event.source_email_id == email.id
+        or (email.thread_id and event.source_thread_id == email.thread_id)
+    ]
+    seed_company = (email.company or (direct[0].company if direct else "") or "").strip()
+    seed_role = (email.job_role or (direct[0].job_role if direct else "") or "").strip()
+    raw = " ".join((email.sender or "", email.subject or "", email.snippet or "", email.body_text or ""))
+    normalized_words_list = re.findall(r"[a-z0-9]+", raw.casefold())
+    normalized_text = " ".join(normalized_words_list)
+    normalized_words = set(normalized_words_list)
+    matches = list(direct)
+    for event in events:
+        if event in matches:
+            continue
+        structured = bool(seed_company and seed_role) and (
+            companies_match(event.company, seed_company)
+            and roles_compatible(event.job_role, seed_role)
+        )
+        if structured or _outcome_text_matches_event(email, event, normalized_text, normalized_words):
+            matches.append(event)
+    if seed_company and not seed_role:
+        company_events = [event for event in events if companies_match(event.company, seed_company)]
+        role_identities = {tuple(_identity_words(event.job_role)) for event in company_events if event.job_role}
+        if len(role_identities) <= 1:
+            matches.extend(event for event in company_events if event not in matches)
+    return matches
 
 
 # A reply that updates a booking without repeating its exact clock (e.g. "see
@@ -2853,6 +3064,9 @@ def _confirmed_for_slots(db: Session, email: EmailMessage, slots: list[Extracted
     if not candidates:
         if sourced:
             return sourced[0]
+        provider_match = _provider_appointment_for_email(db, email)
+        if provider_match is not None:
+            return provider_match
         # A same-thread confirmed event close in time to this slot is the same
         # appointment being updated (e.g. a reply that didn't repeat the exact
         # clock). One far away in time is a later interview round in the same
@@ -2883,16 +3097,16 @@ def _confirmed_for_slots(db: Session, email: EmailMessage, slots: list[Extracted
         return sourced[0] if sourced else None
     # A previous extraction of this same email may contain a hallucinated year.
     # If another message already owns the real appointment, retire the stale
-    # row before transferring the source link to the canonical event.
+    # row before transferring the source link to the canonical event. The
+    # stale row may hold better meeting details (e.g. the real join link and
+    # type) than the row it is folded into, so merge through
+    # _absorb_calendar_event rather than discarding its fields outright.
     for stale in sourced:
         if stale.id == matched.id:
             continue
         stale_source_email_id = stale.source_email_id
         stale.source_email_id = None
-        stale.is_visible = False
-        stale.superseded_by_event_id = matched.id
-        db.flush()
-        _transfer_event_email_links(db, stale, matched)
+        _absorb_calendar_event(db, matched, stale)
         _link_event_email(db, matched, stale_source_email_id)
     if sourced:
         db.flush()
@@ -2970,6 +3184,43 @@ def _ics_uid(text: str) -> str:
         elif upper == "END:VCALENDAR":
             break
     return ""
+
+
+def _event_calendar_uids(db: Session, event: CalendarEvent) -> set[str]:
+    return {
+        uid
+        for message in _linked_messages(db, event)
+        if (uid := _ics_uid(_calendar_text(message)))
+    }
+
+
+def _provider_appointment_for_email(db: Session, email: EmailMessage) -> CalendarEvent | None:
+    """Find a moved appointment across threads using provider-level identity."""
+    if (email.interview_subtype or "").casefold() not in {"reschedule", "time_change", "cancellation"}:
+        return None
+    text = _calendar_text(email)
+    incoming_uid = _ics_uid(text)
+    incoming_url = (extract_meeting_access(text).url or "").strip()
+    events = (
+        db.query(CalendarEvent)
+        .filter(
+            CalendarEvent.mailbox_id == email.mailbox_id,
+            CalendarEvent.kind == "confirmed",
+            CalendarEvent.superseded_by_event_id.is_(None),
+        )
+        .all()
+    )
+
+    if incoming_uid:
+        uid_matches = [event for event in events if incoming_uid in _event_calendar_uids(db, event)]
+        if uid_matches:
+            return max(uid_matches, key=lambda event: (bool(event.is_visible), _event_freshness(db, event), event.id))
+
+    if join_url_is_complete(incoming_url):
+        url_matches = [event for event in events if (event.meeting_url or "").strip() == incoming_url]
+        if len(url_matches) == 1:
+            return url_matches[0]
+    return None
 
 
 def ics_requests_appointment(text: str) -> bool:
@@ -3358,6 +3609,7 @@ def needs_calendar_event_repair(db: Session, email: EmailMessage) -> bool:
         return prior is not None and prior.interview_status != "cancellation"
     text = _calendar_text(email)
     slots = parse_ics_slots(text) or parse_text_slots(text, email.received_at)
+    slots = authoritative_reschedule_slots(email, slots)
     if not slots:
         return False
     sourced_rows = (
@@ -3761,20 +4013,29 @@ def _absorb_calendar_event(db: Session, survivor: CalendarEvent, duplicate: Cale
         survivor.application_status = duplicate.application_status
         survivor.outcome_source_email_id = duplicate.outcome_source_email_id or survivor.outcome_source_email_id
         survivor.outcome_at = duplicate.outcome_at or survivor.outcome_at
+    # A genuine join link the survivor lacked is strong evidence the duplicate
+    # came from the actual invite; its clock is then more trustworthy than a
+    # time the survivor may have picked up from a quoted availability offer.
+    gained_join_link = False
     if join_url_is_complete(duplicate.meeting_url) and not join_url_is_complete(survivor.meeting_url):
         survivor.meeting_url = duplicate.meeting_url
+        gained_join_link = True
     elif not survivor.meeting_url and duplicate.meeting_url:
         survivor.meeting_url = duplicate.meeting_url
+        gained_join_link = is_video_join_url(duplicate.meeting_url)
     elif is_video_join_url(duplicate.meeting_url) and not is_video_join_url(survivor.meeting_url):
         survivor.meeting_url = duplicate.meeting_url
+        gained_join_link = True
+    if gained_join_link and duplicate.start_at is not None:
+        survivor.start_at = duplicate.start_at
+        survivor.end_at = duplicate.end_at
+        survivor.source_timezone = duplicate.source_timezone or survivor.source_timezone
     survivor.meeting_provider = clean_meeting_provider(survivor.meeting_provider)
     if not survivor.meeting_provider:
         survivor.meeting_provider = clean_meeting_provider(duplicate.meeting_provider)
     if (not survivor.meeting_type or survivor.meeting_type == "unspecified") and duplicate.meeting_type:
         survivor.meeting_type = duplicate.meeting_type
-    if is_video_join_url(survivor.meeting_url) and (not survivor.meeting_type or survivor.meeting_type == "unspecified"):
-        survivor.meeting_type = "video"
-        survivor.meeting_provider = clean_meeting_provider(survivor.meeting_provider) or _provider_for_url(survivor.meeting_url)
+    _normalize_meeting_access_fields(survivor)
     if survivor.company and survivor.job_role:
         survivor.title = f"{survivor.company} — {survivor.job_role}"
     elif survivor.company:
@@ -3956,7 +4217,9 @@ def repair_meeting_join_urls(db: Session, mailbox_id: int | None = None) -> int:
         query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
     for event in query.all():
         current = (event.meeting_url or "").strip()
+        normalized = _normalize_meeting_access_fields(event)
         if current and join_url_is_complete(current):
+            repaired += int(normalized)
             continue
         # Prefer the message that created the chip. A matching calendar invite
         # linked to the same chip may carry the actual join URL while a later
@@ -4006,6 +4269,7 @@ def repair_meeting_join_urls(db: Session, mailbox_id: int | None = None) -> int:
                 event.phone_number = found.phone_number
             if found.access_code and not event.phone_access_code:
                 event.phone_access_code = found.access_code
+            _normalize_meeting_access_fields(event)
             repaired += 1
         elif current and not is_video_join_url(current):
             event.meeting_url = None
@@ -4563,15 +4827,59 @@ def _same_provider_appointment(
     if left_url and right_url and left_url == right_url:
         return True
 
-    def source_uid(event: CalendarEvent, supplied: EmailMessage | None = None) -> str:
-        source = supplied
-        if source is None and event.source_email_id:
-            source = db.get(EmailMessage, event.source_email_id)
-        return _ics_uid(_calendar_text(source)) if source is not None else ""
+    def source_email(event: CalendarEvent, supplied: EmailMessage | None = None) -> EmailMessage | None:
+        if supplied is not None:
+            return supplied
+        return db.get(EmailMessage, event.source_email_id) if event.source_email_id else None
 
-    left_uid = source_uid(left)
-    right_uid = source_uid(right, right_email)
-    return bool(left_uid and right_uid and left_uid == right_uid)
+    left_uids = _event_calendar_uids(db, left)
+    right_uids = (
+        {_ics_uid(_calendar_text(right_email))} - {""}
+        if right_email is not None
+        else _event_calendar_uids(db, right)
+    )
+    if left_uids & right_uids:
+        return True
+
+    # Calendly sends a new message/thread and can issue a new meeting URL when
+    # a booking is moved.  Company/role enrichment changes both event titles,
+    # so compare the unchanged scheduler subjects on the source messages
+    # instead.  The short delivery window keeps a later, genuinely separate
+    # interview with the same interviewer from being treated as this booking.
+    left_source = source_email(left)
+    right_source = source_email(right, right_email)
+    if (
+        left_source is not None
+        and right_source is not None
+        and _CALENDLY_SENDER_RE.search(left_source.sender or "")
+        and _CALENDLY_SENDER_RE.search(right_source.sender or "")
+        and _normalized_subject(left_source.subject)
+        and _normalized_subject(left_source.subject) == _normalized_subject(right_source.subject)
+    ):
+        left_received = as_utc(left_source.received_at)
+        right_received = as_utc(right_source.received_at)
+        if (
+            left_received is not None
+            and right_received is not None
+            and abs((left_received - right_received).total_seconds()) <= _REBOOK_WINDOW.total_seconds()
+        ):
+            return True
+
+    # A generic scheduler (Calendly, etc.) names neither a company nor a
+    # role, so the booking's own subject is the only identity signal. Two
+    # such bookings with the identical subject (e.g. "30 Minute Meeting
+    # with Todd Hilfred") are the same appointment, not two unrelated ones.
+    if (
+        not (left.company or "").strip()
+        and not (left.job_role or "").strip()
+        and not (right.company or "").strip()
+        and not (right.job_role or "").strip()
+    ):
+        left_subject = _normalized_subject(left.title)
+        right_subject = _normalized_subject(right.title)
+        if left_subject and left_subject == right_subject and left_subject != "interview":
+            return True
+    return False
 
 
 def _same_reschedule_context(
@@ -4685,7 +4993,13 @@ def _hide_prior_bookings_replaced_by(
         return False
     company = replacement.company or email.company or ""
     role = replacement.job_role or email.job_role or ""
-    if not company and not role:
+    # A generic scheduler confirmation (Calendly, etc.) often names neither a
+    # company nor a role. The booking's own subject ("30 Minute Meeting with
+    # Todd Hilfred") is then the only identity signal available, but it is
+    # still specific enough to tell one booking from another.
+    match_by_title = not company and not role
+    replacement_subject = _normalized_subject(replacement.title)
+    if match_by_title and not replacement_subject:
         return False
     message_at = as_utc(email.received_at)
     subtype = (email.interview_subtype or "").casefold()
@@ -4705,10 +5019,14 @@ def _hide_prior_bookings_replaced_by(
     for event in rows:
         if _starts_within_minute(event, replacement):
             continue
-        if company and not companies_match(event.company, company):
-            continue
-        if role and not roles_compatible(event.job_role, role):
-            continue
+        if match_by_title:
+            if _normalized_subject(event.title) != replacement_subject:
+                continue
+        else:
+            if company and not companies_match(event.company, company):
+                continue
+            if role and not roles_compatible(event.job_role, role):
+                continue
         booked_at = as_utc(event.source_received_at) or _event_received_at(event)
         if message_at is not None and booked_at is not None and booked_at > message_at:
             continue
@@ -4861,7 +5179,11 @@ def repair_mixed_thread_appointments(db: Session, mailbox_id: int | None = None)
             event.meeting_url = None
             event.meeting_provider = None
             if event.meeting_type == "video":
-                event.meeting_type = "phone" if re.search(r"\bphone\b", _without_quoted_history(_calendar_text(email)), re.I) else "unspecified"
+                event.meeting_type = (
+                    "phone"
+                    if _PHONE_MEETING_MENTION_RE.search(_without_quoted_history(_calendar_text(email)))
+                    else "unspecified"
+                )
             changed = True
         if not changed:
             continue
@@ -5114,7 +5436,10 @@ def repair_placeholder_calendar_fields(db: Session, mailbox_id: int | None = Non
         role = job_role_or_empty(event.job_role)
         provider = clean_meeting_provider(event.meeting_provider)
         meeting_type = event.meeting_type or "unspecified"
-        if meeting_type == "unspecified":
+        if is_video_join_url(event.meeting_url):
+            meeting_type = "video"
+            provider = _provider_for_url(event.meeting_url) or provider
+        elif meeting_type == "unspecified":
             if event.phone_number:
                 meeting_type = "phone"
             elif event.meeting_url or provider:
@@ -5411,15 +5736,14 @@ async def _process_calendar_email(
     elif is_passed_outcome(email):
         outcome_status = "passed"
     if email.label in {EmailLabel.REJECTED_CLOSED.value, EmailLabel.INTERVIEW_FOLLOW_UP.value, EmailLabel.OFFER.value}:
-        confirmed = _thread_events(db, email, kind="confirmed")
-        if not confirmed:
-            confirmed = _identity_events(db, email, kind="confirmed")
-        if confirmed and outcome_status:
-            target = confirmed[0]
-            target.application_status = outcome_status
-            target.outcome_source_email_id = email.id
-            target.outcome_at = as_utc(email.received_at) or datetime.now(timezone.utc)
-            _link_event_email(db, target, email.id)
+        targets = _outcome_events(db, email)
+        if targets and outcome_status:
+            outcome_at = as_utc(email.received_at) or datetime.now(timezone.utc)
+            for target in targets:
+                target.application_status = outcome_status
+                target.outcome_source_email_id = email.id
+                target.outcome_at = outcome_at
+                _link_event_email(db, target, email.id)
             changed = True
         if not defer_duplicate_collapse.get() and collapse_duplicate_calendar_events(db, email.mailbox_id):
             changed = True
@@ -5437,7 +5761,11 @@ async def _process_calendar_email(
     # below don't each run the same regex pass over this message's text. Only
     # reused when non-empty: message_appointment_slots has an extra quoted
     # clock/date fallback for the empty case that this simpler check lacks.
-    reschedule_slots = explicit_message_slots(email) if is_reschedule else None
+    reschedule_slots = (
+        authoritative_reschedule_slots(email, explicit_message_slots(email))
+        if is_reschedule
+        else None
+    )
     known_slots = reschedule_slots or None
     if is_reschedule and leaves_interview_unbooked(email, known_slots=reschedule_slots):
         # "I need to reschedule and will be in touch" does not keep the old

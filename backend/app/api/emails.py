@@ -735,7 +735,12 @@ async def _apply_label_side_effects(email_id: int, previous_label: str, new_labe
         email = db.query(EmailMessage).filter(EmailMessage.id == email_id).one_or_none()
         if email is None or email.label != new_label:
             return None
-        if previous_label != new_label and new_label in OUTCOME_LABELS:
+        needs_outcome_extraction = (
+            previous_label != new_label
+            and new_label in OUTCOME_LABELS
+            and (previous_label not in OUTCOME_LABELS or not email.outcome_extracted)
+        )
+        if needs_outcome_extraction:
             if await apply_outcome(db, email, force=True):
                 db.commit()
         db.refresh(email)
@@ -792,6 +797,7 @@ async def update_email_label(
     new_label = payload.label
     if previous_label != new_label:
         email.label = new_label
+        email.category_subtype = None
         email.interview_subtype = (
             payload.interview_subtype or infer_interview_subtype(email.subject, email.sender, email.body_text, email.snippet)
             if new_label == EmailLabel.INTERVIEW_SCHEDULED.value else None
@@ -811,10 +817,21 @@ async def update_email_label(
             sender=email.sender or "",
             snippet=email.snippet or "",
             body_text=body,
+            # A stable holdout keeps evaluation examples out of both the
+            # generated global prompt and per-message few-shot retrieval.
+            evaluation_holdout=(email.id % 5 == 0),
         ))
 
     email.human_corrected = True
-    if previous_label != new_label and new_label in OUTCOME_LABELS:
+    # A human choice is the final classification for this message. Leaving a
+    # download-only row pending makes the UI say it still needs classification
+    # even though pending reclassify correctly skips human-corrected mail.
+    email.classification_pending = False
+    if (
+        previous_label != new_label
+        and new_label in OUTCOME_LABELS
+        and (previous_label not in OUTCOME_LABELS or not email.outcome_extracted)
+    ):
         email.outcome_extracted = False
     db.commit()
     invalidate_email_list_caches()

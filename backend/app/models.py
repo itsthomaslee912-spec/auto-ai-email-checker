@@ -133,6 +133,7 @@ class EmailMessage(Base):
     body_text: Mapped[str] = mapped_column(Text, default="")
     body_html: Mapped[str] = mapped_column(Text, default="")
     label: Mapped[str] = mapped_column(String(32), index=True, default=EmailLabel.OTHER.value)
+    category_subtype: Mapped[str | None] = mapped_column(String(48), nullable=True)
     interview_subtype: Mapped[str | None] = mapped_column(String(32), nullable=True)
     company: Mapped[str | None] = mapped_column(String(255), nullable=True)
     job_role: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -184,6 +185,7 @@ class ClassifyCorrection(Base):
     corrected_label: Mapped[str] = mapped_column(String(32), index=True)
     previous_subtype: Mapped[str | None] = mapped_column(String(32), nullable=True)
     corrected_subtype: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    evaluation_holdout: Mapped[bool] = mapped_column(default=False, index=True)
     subject: Mapped[str] = mapped_column(String(998), default="")
     sender: Mapped[str] = mapped_column(String(512), default="")
     snippet: Mapped[str] = mapped_column(Text, default="")
@@ -246,6 +248,41 @@ class WebhookSubscription(Base):
     )
 
     mailbox: Mapped[MailboxConnection] = relationship(back_populates="webhook")
+
+
+class WebhookDeliveryJob(Base):
+    """A provider notification that has been durably accepted for processing.
+
+    Providers may retry the same delivery, so ``dedupe_key`` is unique while a
+    job is pending. Successful jobs are deleted; message ingestion itself is
+    also idempotent in case the process dies after ingest and before deletion.
+    """
+
+    __tablename__ = "webhook_delivery_jobs"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_webhook_delivery_jobs_dedupe"),
+        Index("ix_webhook_delivery_jobs_ready", "status", "available_at", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), index=True)
+    dedupe_key: Mapped[str] = mapped_column(String(255))
+    payload: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class CalendarEvent(Base):

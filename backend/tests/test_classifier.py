@@ -1,5 +1,34 @@
-from app.classify.openai_classifier import apply_label_guards, _heuristic_label
+from app.classify.openai_classifier import apply_label_guards, _heuristic_label, message_direction
 from app.models import EmailLabel
+
+
+def test_direction_and_latest_unquoted_text_control_classification():
+    assert message_direction("sent", "Jordan <me@example.com>", "me@example.com") == ("outgoing", True)
+    availability = "I am available Tuesday at 10 AM or Wednesday at 2 PM."
+    assert _heuristic_label("Re: Interview", "me@example.com", availability, "", direction="outgoing") == EmailLabel.INTERVIEW_AVAILABILITY.value
+
+    body = (
+        "Thanks, this is already complete.\n\n"
+        "On Monday, Recruiter wrote:\n"
+        "Action required: upload your missing resume to continue your application."
+    )
+    assert _heuristic_label("Re: Application", "me@example.com", body, "", direction="outgoing") is None
+    assert _heuristic_label(
+        "Coding challenge",
+        "Assessments <noreply@example.com>",
+        "Please complete your coding challenge by Friday.",
+        "",
+    ) == EmailLabel.ASSESSMENT.value
+    wrapped_rejection = (
+        "Thank you for taking the time to discuss the role. "
+        "The hiring leader has decided to pursue\n      other candidates for this position."
+    )
+    assert _heuristic_label(
+        "Update on your application",
+        "Recruiting Team <recruiting@example.com>",
+        wrapped_rejection,
+        "",
+    ) == EmailLabel.REJECTED_CLOSED.value
 
 BLOCKSTREAM = """Hi Thomas,
 
@@ -335,6 +364,19 @@ def test_system_prompt_lists_every_label():
     assert normalize_label("tech") == EmailLabel.ASSESSMENT.value
     assert normalize_label("unknown") == EmailLabel.OTHER.value
     assert normalize_label("not_a_label") == EmailLabel.OTHER.value
+
+
+def test_runtime_prompt_removes_legacy_static_fallback_examples():
+    from app.classify.prompt import SYSTEM_PROMPT, with_interview_subtype_rules
+
+    legacy = (
+        SYSTEM_PROMPT
+        + "\n\nAdditional rules learned from training:\n"
+        + "Human-labeled examples. Infer intent.\n- Example 1: correct label=other."
+    )
+    upgraded = with_interview_subtype_rules(legacy)
+    assert "Example 1" not in upgraded
+    assert '"facts"' in upgraded
 
 
 def test_booked_calendar_request_is_scheduled_and_a_decline_is_not():

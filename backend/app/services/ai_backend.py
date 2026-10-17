@@ -67,3 +67,18 @@ def has_saved_ai_settings() -> bool:
             return db.get(AiSettings, 1) is not None
     except OperationalError:
         return False
+
+
+def get_escalation_backend(active_provider: str) -> AiBackend | None:
+    """Return configured OpenAI as an ambiguity-only fallback for local AI."""
+    if active_provider != "ollama":
+        return None
+    defaults = get_settings()
+    try:
+        with SessionLocal() as db:
+            saved = db.get(AiSettings, 1)
+            key = decrypt_token(saved.openai_key_enc) if saved and saved.openai_key_enc else defaults.openai_api_key
+            model = saved.openai_model if saved else defaults.openai_model
+    except OperationalError:
+        key, model = defaults.openai_api_key, defaults.openai_model
+    return AiBackend("openai", model, key) if key else None

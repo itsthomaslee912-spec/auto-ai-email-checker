@@ -41,7 +41,10 @@ class PromptUpdateError(ValueError):
 def unused_corrections_query(db: Session):
     return (
         db.query(ClassifyCorrection)
-        .filter(ClassifyCorrection.used_in_prompt_version_id.is_(None))
+        .filter(
+            ClassifyCorrection.used_in_prompt_version_id.is_(None),
+            ClassifyCorrection.evaluation_holdout.is_not(True),
+        )
         .order_by(ClassifyCorrection.id.asc())
     )
 
@@ -155,7 +158,12 @@ def _correction_fingerprint(row: ClassifyCorrection) -> str:
 
 def _latest_corrections(db: Session) -> list[ClassifyCorrection]:
     """Return a recent, label-balanced set with one correction per email."""
-    rows = db.query(ClassifyCorrection).order_by(ClassifyCorrection.id.desc()).all()
+    rows = (
+        db.query(ClassifyCorrection)
+        .filter(ClassifyCorrection.evaluation_holdout.is_not(True))
+        .order_by(ClassifyCorrection.id.desc())
+        .all()
+    )
     by_label: dict[str, list[ClassifyCorrection]] = {}
     seen_email_ids: set[int] = set()
     seen_messages: set[str] = set()

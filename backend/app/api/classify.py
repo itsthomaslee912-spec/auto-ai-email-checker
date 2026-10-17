@@ -40,6 +40,32 @@ def classify_prompt_status(db: Session = Depends(get_db)) -> ClassifyPromptStatu
     return get_prompt_status(db)
 
 
+@router.get("/evaluation")
+def classification_evaluation(db: Session = Depends(get_db)) -> dict:
+    """Baseline confusion matrix for the correction holdout set.
+
+    ``previous_label`` is the classifier prediction recorded before the human
+    correction; ``corrected_label`` is the held-out truth.
+    """
+    rows = _visible_corrections(
+        db.query(ClassifyCorrection).filter(ClassifyCorrection.evaluation_holdout.is_(True))
+    ).all()
+    confusion: dict[str, dict[str, int]] = {}
+    correct = 0
+    for row in rows:
+        confusion.setdefault(row.corrected_label, {})[row.previous_label] = (
+            confusion.setdefault(row.corrected_label, {}).get(row.previous_label, 0) + 1
+        )
+        correct += int(row.previous_label == row.corrected_label)
+    total = len(rows)
+    return {
+        "total": total,
+        "accuracy": (correct / total) if total else None,
+        "confusion_matrix": confusion,
+        "note": "Held-out recorded predictions; excluded from prompt training and retrieval.",
+    }
+
+
 @router.get("/training", response_model=ClassifyTrainingPageOut)
 def list_training_examples(
     limit: int = Query(default=20, ge=1, le=100),

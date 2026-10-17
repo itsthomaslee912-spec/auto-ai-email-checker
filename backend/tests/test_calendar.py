@@ -16,7 +16,7 @@ from sqlalchemy.pool import StaticPool
 from app.api import calendar_events, emails
 from app.db import Base, get_db
 from app.models import CalendarEvent, CalendarEventEmail, EmailLabel, EmailMessage, MailboxConnection, Provider, User
-from app.services.calendar_extract import InterviewDetails, MeetingAccess, _parse_ai_slot, _resolve_video_landing_page, _without_quoted_history, clean_company_name, clean_meeting_provider, collapse_duplicate_calendar_events, companies_match, employer_instead_of_sender_domain, explicit_hiring_employer, extract_calendar_details, extract_interviewer, extract_meeting_access, fuller_company_name, hide_open_reschedules, is_interview_stage_label, job_role_or_empty, leaves_interview_unbooked, message_appointment_slots, message_is_booked_appointment, needs_calendar_event_repair, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details, repair_availability_window_appointments, repair_calendar_attendee_response_labels, repair_conflicting_calendar_roles, repair_interview_stage_roles, repair_meeting_join_urls, repair_meeting_landing_urls, repair_phantom_availability_slots, repair_placeholder_calendar_fields, repair_quoted_option_bookings
+from app.services.calendar_extract import InterviewDetails, MeetingAccess, _absorb_calendar_event, _parse_ai_slot, _resolve_video_landing_page, _without_quoted_history, clean_company_name, clean_meeting_provider, collapse_duplicate_calendar_events, companies_match, employer_instead_of_sender_domain, explicit_hiring_employer, extract_calendar_details, extract_interviewer, extract_meeting_access, fuller_company_name, hide_open_reschedules, is_interview_stage_label, job_role_or_empty, leaves_interview_unbooked, message_appointment_slots, message_is_booked_appointment, needs_calendar_event_repair, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details, repair_availability_window_appointments, repair_calendar_attendee_response_labels, repair_conflicting_calendar_roles, repair_interview_stage_roles, repair_meeting_join_urls, repair_meeting_landing_urls, repair_mixed_thread_appointments, repair_phantom_availability_slots, repair_placeholder_calendar_fields, repair_quoted_option_bookings
 
 
 def _database():
@@ -79,6 +79,55 @@ def test_named_video_provider_is_preserved_without_a_direct_join_url():
     assert access == MeetingAccess("video", "Google Meet")
 
 
+def test_absorbing_a_duplicate_with_the_real_join_link_fixes_type_and_clock():
+    """A stale "waiting for our call" row must not keep its guessed phone
+    type and borrowed time once it absorbs the row sourced from the actual
+    Google Meet invite.
+    """
+    factory, (mailbox_id, _) = _database()
+    wrong_start = datetime(2026, 10, 14, 21, 0, tzinfo=timezone.utc)
+    right_start = datetime(2026, 10, 14, 21, 30, tzinfo=timezone.utc)
+    with factory() as db:
+        survivor = CalendarEvent(
+            mailbox_id=mailbox_id,
+            kind="confirmed",
+            origin="email",
+            title="Mirendil — Member of Technical Staff",
+            company="Mirendil",
+            job_role="Member of Technical Staff",
+            start_at=wrong_start,
+            end_at=wrong_start + timedelta(hours=1),
+            meeting_type="phone",
+            is_visible=True,
+        )
+        duplicate = CalendarEvent(
+            mailbox_id=mailbox_id,
+            kind="confirmed",
+            origin="email",
+            title="Mirendil — Member of Technical Staff",
+            company="Mirendil",
+            job_role="Member of Technical Staff",
+            start_at=right_start,
+            end_at=right_start + timedelta(minutes=15),
+            meeting_type="video",
+            meeting_provider="Google Meet",
+            meeting_url="https://meet.google.com/mfq-jgmo-has",
+            is_visible=True,
+        )
+        db.add_all([survivor, duplicate])
+        db.commit()
+
+        _absorb_calendar_event(db, survivor, duplicate)
+        db.commit()
+
+        assert survivor.meeting_url == "https://meet.google.com/mfq-jgmo-has"
+        assert survivor.meeting_type == "video"
+        assert survivor.start_at == right_start
+        assert survivor.end_at == right_start + timedelta(minutes=15)
+        assert duplicate.is_visible is False
+        assert duplicate.superseded_by_event_id == survivor.id
+
+
 @pytest.mark.parametrize(
     "value",
     ["unspecified", "Not specified", "unknown", "N/A", "not provided", "-"],
@@ -127,6 +176,129 @@ def test_placeholder_repair_preserves_phone_type_and_infers_legacy_phone_rows():
         assert explicit_phone.meeting_provider is None
         assert legacy_phone.meeting_type == "phone"
         assert legacy_phone.meeting_provider is None
+
+
+def test_placeholder_repair_makes_a_teams_join_link_authoritative_over_phone():
+    factory, (mailbox_id, _) = _database()
+    start = datetime(2026, 10, 16, 16, 0, tzinfo=timezone.utc)
+    with factory() as db:
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            kind="confirmed",
+            origin="email",
+            title="Disney — Senior ML Engineer",
+            company="Disney",
+            job_role="Senior ML Engineer",
+            start_at=start,
+            end_at=start + timedelta(minutes=45),
+            meeting_type="phone",
+            meeting_provider="Microsoft Teams",
+            meeting_url="https://teams.microsoft.com/meet/12345678901234?p=AbCdEfGhIjKlMnOp",
+            phone_number="786.218.0775",
+            is_visible=True,
+        )
+        db.add(event)
+        db.commit()
+
+        assert repair_placeholder_calendar_fields(db, mailbox_id) == 1
+        db.commit()
+
+        assert event.meeting_type == "video"
+        assert event.meeting_provider == "Microsoft Teams"
+        # A dial-in or signature number may remain as secondary information,
+        # but it must never turn the primary calendar chip into a phone call.
+        assert event.phone_number == "786.218.0775"
+
+
+def test_time_change_uses_ics_uid_across_threads_to_move_existing_chip():
+    factory, (mailbox_id, _) = _database()
+    zoom_url = "https://us02web.zoom.us/j/12345678901?pwd=StuutInterview"
+    old_ics = f"""BEGIN:VCALENDAR
+METHOD:REQUEST
+BEGIN:VEVENT
+UID:v76qiav5iiafsfsdn5brv880mc@google.com
+DTSTART;TZID=America/New_York:20261016T140000
+DTEND;TZID=America/New_York:20261016T144500
+LOCATION:{zoom_url}
+END:VEVENT
+END:VCALENDAR
+Join Zoom Meeting: {zoom_url}
+"""
+    updated_ics = f"""BEGIN:VCALENDAR
+METHOD:REQUEST
+BEGIN:VEVENT
+UID:v76qiav5iiafsfsdn5brv880mc@google.com
+DTSTART;TZID=America/Chicago:20261022T090000
+DTEND;TZID=America/Chicago:20261022T094500
+LOCATION:{zoom_url}
+END:VEVENT
+END:VCALENDAR
+Join Zoom Meeting: {zoom_url}
+"""
+    with factory() as db:
+        original = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="stuut-original",
+            thread_id="stuut-old-thread",
+            subject="Invitation: Interview with Stuut",
+            sender="Stuut Interviews <interviews@stuut.co>",
+            received_at=datetime(2026, 10, 3, 20, 3, tzinfo=timezone.utc),
+            body_text=old_ics,
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="Stuut",
+            job_role="Member of the Technical Staff — AI/ML",
+        )
+        update = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="stuut-updated",
+            thread_id="stuut-new-thread",
+            subject="Updated invitation: Interview with Stuut @ Thu Oct 22, 2026 9am - 9:45am (CDT)",
+            sender="Stuut Interviews <interviews@stuut.co>",
+            received_at=datetime(2026, 10, 16, 15, 34, tzinfo=timezone.utc),
+            body_text=updated_ics,
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="time_change",
+            company="Stuut",
+            job_role="Member of the Technical Staff — AI/ML",
+        )
+        db.add_all([original, update])
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=original.id,
+            source_thread_id=original.thread_id,
+            kind="confirmed",
+            origin="email",
+            title="Stuut — Member of the Technical Staff — AI/ML",
+            company="Stuut",
+            job_role="Member of the Technical Staff — AI/ML",
+            start_at=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc),
+            end_at=datetime(2026, 10, 16, 18, 45, tzinfo=timezone.utc),
+            meeting_type="video",
+            meeting_provider="Zoom",
+            meeting_url=zoom_url,
+            interview_status="calendar_invite",
+            source_received_at=original.received_at,
+            is_visible=True,
+        )
+        db.add(event)
+        db.commit()
+        event_id, update_id = event.id, update.id
+
+        assert asyncio.run(process_calendar_email(db, update, use_ai=False)) is True
+        db.commit()
+
+        visible = db.query(CalendarEvent).filter(
+            CalendarEvent.mailbox_id == mailbox_id,
+            CalendarEvent.kind == "confirmed",
+            CalendarEvent.is_visible.is_(True),
+        ).all()
+        assert [row.id for row in visible] == [event_id]
+        assert visible[0].start_at == datetime(2026, 10, 22, 14, 0, tzinfo=timezone.utc)
+        assert visible[0].end_at == datetime(2026, 10, 22, 14, 45, tzinfo=timezone.utc)
+        assert visible[0].interview_status == "time_change"
+        assert db.query(CalendarEventEmail).filter_by(event_id=event_id, email_id=update_id).one()
 
 
 def test_bodyless_calendar_decline_is_not_an_application_rejection():
@@ -412,6 +584,56 @@ def test_microsoft_bookings_parent_tenant_collapses_child_company_interview_and_
             [mailbox_id],
             now=datetime(2026, 10, 14, 18, 0, tzinfo=timezone.utc),
         ) == []
+
+
+def test_mixed_thread_repair_does_not_demote_video_to_phone_on_stray_word():
+    """A signature's "Cell/Phone: ..." line must not flip a video interview to
+    "phone call" just because the join link could no longer be verified
+    verbatim in the thread text.
+    """
+    factory, (mailbox_id, _) = _database()
+    start = datetime(2026, 10, 14, 21, 30, tzinfo=timezone.utc)
+    with factory() as db:
+        email = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="mirendil-reminder",
+            thread_id="mirendil-thread",
+            subject="Reminder: Your Upcoming Interview with Mirendil",
+            sender="no-reply@ashbyhq.com",
+            received_at=start - timedelta(days=1),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            company="Mirendil",
+            job_role="Member of Technical Staff",
+            body_text="Thomas Lee | Cell/Phone: 555-123-4567\nSee you then.",
+        )
+        db.add(email)
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=email.id,
+            source_thread_id=email.thread_id,
+            kind="confirmed",
+            origin="email",
+            title="Mirendil — Member of Technical Staff",
+            company="Mirendil",
+            job_role="Member of Technical Staff",
+            start_at=start,
+            end_at=start + timedelta(minutes=15),
+            meeting_type="video",
+            meeting_provider="Google Meet",
+            meeting_url="https://meet.google.com/mfq-jgmo-has",
+            is_visible=True,
+        )
+        db.add(event)
+        db.flush()
+        db.add(CalendarEventEmail(event_id=event.id, email_id=email.id))
+        db.commit()
+
+        assert repair_mixed_thread_appointments(db, mailbox_id) == 1
+        db.commit()
+
+        assert event.meeting_url is None
+        assert event.meeting_type == "unspecified"
 
 
 def test_government_microsoft_teams_join_link_is_recognized():
@@ -1228,6 +1450,25 @@ def test_interviewer_falls_back_to_human_sender_but_not_notification_sender():
     assert extract_interviewer("Interview reminder", "Google Calendar <calendar-notification@google.com>") == ""
 
 
+def test_interviewer_name_does_not_swallow_the_trailing_date_or_time():
+    """A Calendly-style subject/body must yield the bare name, not "Todd
+    Hilfred on Thursday" or "Todd Hilfred at 12:30pm (...)".
+    """
+    assert (
+        extract_interviewer(
+            "Confirmed: 30 Minute Meeting with Todd Hilfred on Thursday, October 15, 2026"
+        )
+        == "Todd Hilfred"
+    )
+    assert (
+        extract_interviewer(
+            "Your 30 Minute Meeting with Todd Hilfred at 12:30pm (Eastern Time - US & Canada) "
+            "on Thursday, October 15, 2026 is scheduled."
+        )
+        == "Todd Hilfred"
+    )
+
+
 def test_existing_available_and_scheduled_events_are_enriched_without_ai():
     factory, (mailbox_id, _) = _database()
     body = """BEGIN:VCALENDAR
@@ -1295,6 +1536,315 @@ Join https://zoom.us/j/123456789"""
         assert asyncio.run(process_calendar_email(db, rejection)) is True
         db.commit()
         assert db.get(CalendarEvent, scheduled.id).application_status == "rejected"
+
+
+def test_cross_thread_rejection_text_updates_all_application_chips_without_extracted_identity():
+    factory, (mailbox_id, _) = _database()
+    start = datetime(2026, 10, 15, 20, 30, tzinfo=timezone.utc)
+    with factory() as db:
+        interview = CalendarEvent(
+            mailbox_id=mailbox_id,
+            kind="confirmed",
+            origin="email",
+            title="Early Warning — Sr Site Reliability Engineer",
+            company="Early Warning",
+            job_role="Sr Site Reliability Engineer",
+            start_at=start,
+            end_at=start + timedelta(minutes=30),
+            application_status="active",
+            is_visible=True,
+        )
+        earlier_option = CalendarEvent(
+            mailbox_id=mailbox_id,
+            kind="availability",
+            origin="email",
+            title=interview.title,
+            company=interview.company,
+            job_role=interview.job_role,
+            start_at=start + timedelta(days=1),
+            end_at=start + timedelta(days=1, minutes=30),
+            application_status="active",
+            is_visible=False,
+        )
+        rejection = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="early-warning-rejection",
+            thread_id="different-thread",
+            subject="EWS/Zelle - Update on Sr. Site Reliability Engineer - Digital Assets",
+            sender="Early Warning Recruiting Team <earlywarning@myworkday.com>",
+            received_at=datetime(2026, 10, 16, 14, 9, tzinfo=timezone.utc),
+            body_text=(
+                "Thank you for taking the time to discuss the Sr. Site Reliability Engineer role. "
+                "Our hiring leader has decided to pursue\n      other candidates for this position."
+            ),
+            label=EmailLabel.REJECTED_CLOSED.value,
+            company=None,
+            job_role=None,
+        )
+        db.add_all([interview, earlier_option, rejection])
+        db.commit()
+
+        assert asyncio.run(process_calendar_email(db, rejection, use_ai=False)) is True
+        db.commit()
+
+        assert interview.application_status == "rejected"
+        assert earlier_option.application_status == "rejected"
+        assert interview.outcome_source_email_id == rejection.id
+        assert earlier_option.outcome_source_email_id == rejection.id
+        assert db.query(CalendarEventEmail).filter_by(event_id=interview.id, email_id=rejection.id).one()
+
+
+def test_role_only_cross_thread_rejection_does_not_update_unrelated_companies():
+    factory, (mailbox_id, _) = _database()
+    start = datetime(2026, 10, 15, 20, 30, tzinfo=timezone.utc)
+    with factory() as db:
+        acme = CalendarEvent(
+            mailbox_id=mailbox_id,
+            kind="confirmed",
+            origin="email",
+            company="Acme",
+            job_role="Software Engineer",
+            start_at=start,
+            end_at=start + timedelta(minutes=30),
+            application_status="active",
+            is_visible=True,
+        )
+        beta = CalendarEvent(
+            mailbox_id=mailbox_id,
+            kind="confirmed",
+            origin="email",
+            company="Beta Labs",
+            job_role="Software Engineer",
+            start_at=start + timedelta(days=1),
+            end_at=start + timedelta(days=1, minutes=30),
+            application_status="active",
+            is_visible=True,
+        )
+        rejection = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="role-only-rejection",
+            thread_id="unrelated-thread",
+            subject="Application update for Software Engineer",
+            sender="Recruiting Team <jobs@example.test>",
+            received_at=datetime(2026, 10, 16, 14, 9, tzinfo=timezone.utc),
+            body_text="We decided to pursue other candidates for this position.",
+            label=EmailLabel.REJECTED_CLOSED.value,
+            company=None,
+            job_role="Software Engineer",
+        )
+        db.add_all([acme, beta, rejection])
+        db.commit()
+
+        assert asyncio.run(process_calendar_email(db, rejection, use_ai=False)) is False
+        db.commit()
+
+        assert acme.application_status == "active"
+        assert beta.application_status == "active"
+        assert db.query(CalendarEventEmail).filter_by(email_id=rejection.id).count() == 0
+
+
+def test_calendly_reschedule_with_no_company_replaces_the_old_time_slot():
+    """Calendly confirmations name neither a company nor a role, only the
+    interviewer and the generic "30 Minute Meeting" subject. A later
+    "Former: ... Updated: ..." reschedule email, sent from a different
+    thread with a brand new Zoom link, must retire the old booking instead
+    of leaving two separate confirmed chips on the calendar.
+    """
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        original = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="calendly-original",
+            thread_id="calendly-thread-1",
+            subject="Confirmed: 30 Minute Meeting with Todd Hilfred on Thursday, October 15, 2026",
+            sender="notifications@calendly.com",
+            received_at=datetime(2026, 10, 14, 20, 24, tzinfo=timezone.utc),
+            body_text=(
+                "Your 30 Minute Meeting with Todd Hilfred at 12:30pm (Eastern Time - US & Canada) "
+                "on Thursday, October 15, 2026 is scheduled.\n\n"
+                "This is a Zoom web conference.\n"
+                "https://us05web.zoom.us/j/85624178997?pwd=QcLKX22bEsRDk7Cdo4wcYCnyJDhBTl.1"
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+        )
+        db.add(original)
+        db.flush()
+        assert asyncio.run(process_calendar_email(db, original, use_ai=False)) is True
+        db.commit()
+
+        rescheduled = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="calendly-time-change",
+            thread_id="calendly-thread-2",
+            subject="Confirmed: 30 Minute Meeting with Todd Hilfred on Thursday, October 15, 2026",
+            sender="notifications@calendly.com",
+            received_at=datetime(2026, 10, 14, 20, 28, tzinfo=timezone.utc),
+            body_text=(
+                "Your 30 Minute Meeting with Todd Hilfred at 01:30pm (Eastern Time - US & Canada) "
+                "on Thursday, October 15, 2026 is scheduled.\n\n"
+                "This is a Zoom web conference.\n"
+                "https://us05web.zoom.us/j/89575320953?pwd=23qnpNq0aMEcUiwWUe27OkCjckNapE.1\n\n"
+                "Former: 12:30pm - Thursday, October 15, 2026 (Eastern Time - US & Canada)\n"
+                "Updated: 01:30pm - Thursday, October 15, 2026 (Eastern Time - US & Canada)"
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="time_change",
+        )
+        db.add(rescheduled)
+        db.flush()
+        assert asyncio.run(process_calendar_email(db, rescheduled, use_ai=False)) is True
+        db.commit()
+
+        visible = db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True)).all()
+        assert len(visible) == 1
+        assert visible[0].meeting_url == "https://us05web.zoom.us/j/89575320953?pwd=23qnpNq0aMEcUiwWUe27OkCjckNapE.1"
+
+
+def test_calendly_reschedule_stays_collapsed_after_company_enrichment():
+    """Borrowing NorthBridge details from the scheduling invitation must not
+    make the cleanup pass mistake the old and updated Calendly times for two
+    distinct interview rounds.
+    """
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        original = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="nb-calendly-original",
+            thread_id="nb-calendly-thread-1",
+            subject="Confirmed: 30 Minute Meeting with Todd Hilfred on Thursday, October 15, 2026",
+            sender="notifications@calendly.com",
+            received_at=datetime(2026, 10, 14, 20, 24, 6, tzinfo=timezone.utc),
+            body_text=(
+                "Your 30 Minute Meeting with Todd Hilfred at 12:30pm (Eastern Time - US & Canada) "
+                "on Thursday, October 15, 2026 is scheduled.\n"
+                "https://us05web.zoom.us/j/85624178997?pwd=old"
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+        )
+        updated = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="nb-calendly-updated",
+            thread_id="nb-calendly-thread-2",
+            subject="Confirmed: 30 Minute Meeting with Todd Hilfred on Thursday, October 15, 2026",
+            sender="notifications@calendly.com",
+            received_at=datetime(2026, 10, 14, 20, 27, 59, tzinfo=timezone.utc),
+            body_text=(
+                "Your 30 Minute Meeting with Todd Hilfred at 01:30pm (Eastern Time - US & Canada) "
+                "on Thursday, October 15, 2026 is scheduled.\n"
+                "https://us05web.zoom.us/j/89575320953?pwd=new\n"
+                "Former: 12:30pm - Thursday, October 15, 2026 (Eastern Time - US & Canada)\n"
+                "Updated: 01:30pm - Thursday, October 15, 2026 (Eastern Time - US & Canada)"
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="time_change",
+        )
+        db.add_all([original, updated])
+        db.flush()
+        old_event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=original.id,
+            source_thread_id=original.thread_id,
+            kind="confirmed",
+            origin="email",
+            title="NorthBridge Solutions — Senior Software Engineer",
+            company="NorthBridge Solutions",
+            job_role="Senior Software Engineer",
+            start_at=datetime(2026, 10, 15, 16, 30, tzinfo=timezone.utc),
+            end_at=datetime(2026, 10, 15, 17, 0, tzinfo=timezone.utc),
+            interview_status="confirmation",
+            meeting_type="video",
+            meeting_provider="Zoom",
+            meeting_url="https://us05web.zoom.us/j/85624178997?pwd=old",
+            source_received_at=original.received_at,
+            is_visible=True,
+        )
+        new_event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=updated.id,
+            source_thread_id=updated.thread_id,
+            kind="confirmed",
+            origin="email",
+            title="NorthBridge Solutions — Senior Software Engineer",
+            company="NorthBridge Solutions",
+            job_role="Senior Software Engineer",
+            start_at=datetime(2026, 10, 15, 17, 30, tzinfo=timezone.utc),
+            end_at=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc),
+            interview_status="time_change",
+            meeting_type="video",
+            meeting_provider="Zoom",
+            meeting_url="https://us05web.zoom.us/j/89575320953?pwd=new",
+            source_received_at=updated.received_at,
+            is_visible=True,
+        )
+        db.add_all([old_event, new_event])
+        db.commit()
+
+        assert collapse_duplicate_calendar_events(db, mailbox_id) is True
+        visible = db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True)).all()
+        assert len(visible) == 1
+        assert visible[0].company == "NorthBridge Solutions"
+        assert visible[0].job_role == "Senior Software Engineer"
+        assert visible[0].start_at == datetime(2026, 10, 15, 17, 30, tzinfo=timezone.utc)
+        assert visible[0].meeting_url == "https://us05web.zoom.us/j/89575320953?pwd=new"
+
+
+def test_calendly_confirmation_borrows_company_and_role_from_its_invitation():
+    """A Calendly confirmation never repeats the employer or role, and the
+    confirmation email shares no link, token, or thread with the original
+    invitation -- the only connection is that the invitation's own body
+    held a Calendly booking-page link shortly before the confirmation
+    arrived. The resulting chip must not be left blank when that invitation
+    is sitting right there in the same mailbox.
+    """
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="nb-invite",
+            thread_id="nb-thread",
+            subject="Next step: Initial Screening interview - Senior Software Engineer, NorthBridge Solutions",
+            sender="northbridgesolutions-hiringteam@mailservercloud.com",
+            received_at=datetime(2026, 10, 14, 23, 55, 59, tzinfo=timezone.utc),
+            body_text=(
+                "Please use the link below to schedule your interview: "
+                "https://calendly.com/northbridgesolutions4/30min"
+            ),
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="NorthBridge Solutions",
+            job_role="Senior Software Engineer",
+        )
+        db.add(invitation)
+        db.flush()
+        asyncio.run(process_calendar_email(db, invitation, use_ai=False))
+        db.commit()
+
+        confirmation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="calendly-confirm",
+            thread_id="calendly-thread",
+            subject="Confirmed: 30 Minute Meeting with Todd Hilfred on Thursday, October 15, 2026",
+            sender="notifications@calendly.com",
+            received_at=datetime(2026, 10, 15, 0, 24, 6, tzinfo=timezone.utc),
+            body_text=(
+                "Your 30 Minute Meeting with Todd Hilfred at 12:30pm (Eastern Time - US & Canada) "
+                "on Thursday, October 15, 2026 is scheduled.\n\n"
+                "This is a Zoom web conference.\n"
+                "https://us05web.zoom.us/j/85624178997?pwd=QcLKX22bEsRDk7Cdo4wcYCnyJDhBTl.1"
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+        )
+        db.add(confirmation)
+        db.flush()
+        assert asyncio.run(process_calendar_email(db, confirmation, use_ai=False)) is True
+        db.commit()
+
+        event = db.query(CalendarEvent).filter(CalendarEvent.kind == "confirmed").one()
+        assert event.company == "NorthBridge Solutions"
+        assert event.job_role == "Senior Software Engineer"
+        assert event.interviewer == "Todd Hilfred"
 
 
 def test_cross_thread_confirmation_hides_related_availability_and_it_stays_hidden():
@@ -1994,6 +2544,77 @@ def test_reschedule_that_names_a_new_time_or_confirms_the_booking_stays_visible(
     assert leaves_interview_unbooked(moved) is False
     assert leaves_interview_unbooked(confirmed) is False
     assert leaves_interview_unbooked(dated) is False
+
+
+def test_updated_invitation_moves_stored_chip_instead_of_reusing_old_time():
+    """An Outlook/Google update can repeat the old invitation below the new
+    time. The subject's updated time is authoritative for every calendar chip.
+    """
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        update = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="garner-updated-invite",
+            thread_id="garner-calendar-thread",
+            subject=(
+                "Updated invitation: Kenneth and Tremayne Matthews @ "
+                "Thu Oct 22, 2026 2pm - 2:30pm (CDT)"
+            ),
+            sender="tremayne.matthews@getgarner.com",
+            received_at=datetime(2026, 10, 15, 17, 45, 5, tzinfo=timezone.utc),
+            body_text=(
+                "This event has been updated. Changed: time\n"
+                "Thursday, October 22, 2026 2:00 PM - 2:30 PM CDT\n\n"
+                "Original invitation: Wednesday, October 14, 2026 2:00 PM - 2:30 PM CDT"
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="reschedule",
+            company="Garner Health",
+            job_role="Senior Machine Learning Engineer I, AI & ML Platform",
+        )
+        db.add(update)
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=update.id,
+            source_thread_id=update.thread_id,
+            kind="confirmed",
+            origin="email",
+            title="Garner Health — Senior Machine Learning Engineer I, AI & ML Platform",
+            company="Garner Health",
+            job_role="Senior Machine Learning Engineer I, AI & ML Platform",
+            start_at=datetime(2026, 10, 14, 19, 0, tzinfo=timezone.utc),
+            end_at=datetime(2026, 10, 14, 19, 30, tzinfo=timezone.utc),
+            source_timezone="America/Chicago",
+            interview_status="reschedule",
+            source_received_at=update.received_at,
+            is_visible=True,
+        )
+        db.add(event)
+        db.commit()
+
+        assert needs_calendar_event_repair(db, update) is True
+        assert asyncio.run(process_calendar_email(db, update, force=True, use_ai=False)) is True
+        db.commit()
+
+        repaired = db.get(CalendarEvent, event.id)
+        assert repaired.is_visible is True
+        assert repaired.start_at == datetime(2026, 10, 22, 19, 0, tzinfo=timezone.utc)
+        assert repaired.end_at == datetime(2026, 10, 22, 19, 30, tzinfo=timezone.utc)
+
+
+def test_apology_for_own_confusion_does_not_unbook_the_interview():
+    """"Sorry, I got the time mixed up" apologizes for the sender's own mix-up;
+    it does not say the meeting moved or is off, unlike "I need to
+    reschedule" or "that time no longer works for me".
+    """
+    mixed_up = EmailMessage(
+        subject="Re: Next Steps - Mirendil",
+        body_text="Sorry. I got the time mixed up.",
+        interview_subtype="reschedule",
+        label=EmailLabel.INTERVIEW_SCHEDULED.value,
+    )
+    assert leaves_interview_unbooked(mixed_up) is False
 
 
 def test_reschedule_to_a_new_day_hides_the_prior_booking():

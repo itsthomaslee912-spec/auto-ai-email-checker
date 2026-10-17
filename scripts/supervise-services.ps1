@@ -16,6 +16,7 @@ if (-not (Test-Path $Vite)) { throw "Frontend dependencies are missing." }
 
 $env:DISABLE_SQLALCHEMY_CEXT_RUNTIME = "1"
 $env:PSYCOPG_IMPL = "python"
+$env:PYTHONUNBUFFERED = "1"
 $env:PATH = (Join-Path $Root ".local\postgresql\bin") + ";" + $env:PATH
 
 $backendProcess = $null
@@ -29,6 +30,10 @@ $frontendRestartDelay = 0
 # The API answers /api/health before background repair starts, so a hung
 # process should be replaced quickly instead of staying down for minutes.
 $startupGraceSeconds = 90
+# Sync, calendar extraction, and local-model work can temporarily starve the
+# HTTP event loop even though useful work is still progressing. A short probe
+# outage must not create a restart/retry storm that drops provider traffic.
+$backendFailureThreshold = 30
 
 function Write-SupervisorLog([string]$Message) {
     Add-Content -LiteralPath (Join-Path $Logs "supervisor.log") `
@@ -122,7 +127,7 @@ try {
             if (((Get-Date) - $backendStartedAt).TotalSeconds -ge 30) { $backendRestartDelay = 0 }
         } elseif (((Get-Date) - $backendStartedAt).TotalSeconds -ge $startupGraceSeconds) {
             $backendFailures++
-            if ($backendFailures -ge 6) {
+            if ($backendFailures -ge $backendFailureThreshold) {
                 Write-SupervisorLog "Backend unhealthy; restarting PID $($backendProcess.Id)"
                 Stop-Process -Id $backendProcess.Id -Force -ErrorAction SilentlyContinue
                 $backendProcess = $null
