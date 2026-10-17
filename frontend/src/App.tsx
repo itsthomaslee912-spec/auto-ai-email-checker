@@ -636,6 +636,19 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     }
   }, []);
 
+  // Sync/reclassify completion only needs fresh mailbox metadata (sync
+  // status, counts). The email list itself already stays current via the
+  // email.classified SSE event; re-running loadFirstPage here would reset
+  // scroll position and flash the list on every routine background sync.
+  const refreshMailboxes = useCallback(async () => {
+    try {
+      const boxes = await fetchMailboxes();
+      setMailboxes(boxes);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
   const mailboxIdsKey = useMemo(() => mailboxes.map((mailbox) => mailbox.id).join(","), [mailboxes]);
   const refreshReclassifyStatuses = useCallback(async () => {
     if (!mailboxIdsKey) return;
@@ -975,7 +988,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
           reclassifyingIdsRef.current = next;
           setReclassifyingIds(next);
         }
-        void load();
+        void refreshMailboxes();
         setMailboxAction(
           mailboxId,
           data.state === "error" ? "error" : "success",
@@ -1005,7 +1018,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
           syncingIdsRef.current = next;
           setSyncingIds(next);
         }
-        void load();
+        void refreshMailboxes();
         setMailboxAction(
           mailboxId,
           data.state === "error" ? "error" : "success",
@@ -1021,7 +1034,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
       }
     });
     return () => source.close();
-  }, [load]);
+  }, [load, refreshMailboxes]);
 
   useEffect(() => {
     applyTheme(themePref);

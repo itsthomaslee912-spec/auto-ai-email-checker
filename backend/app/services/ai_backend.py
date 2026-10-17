@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import heapq
+import itertools
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from openai import AsyncOpenAI
@@ -11,6 +15,81 @@ from app.db import SessionLocal
 from app.models import AiSettings
 
 GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+# Ollama (and most local models) serialize GPU work, so every AI classification
+# call shares this one gate — whether it comes from live ingest, a bulk sync
+# now classifying inline, or a background reclassify pass. Without it, a full
+# mailbox import or several mailboxes syncing at once would fire concurrent
+# calls and flood the local model, which previously starved /api/health and
+# triggered supervisor restarts.
+AI_CALL_CONCURRENCY = 1
+
+_PRIORITY_TIER = {"live": 0, "background": 1}
+
+
+class _PriorityGate:
+    """A concurrency-1 gate where "live" callers jump ahead of "background" ones.
+
+    A plain semaphore serves waiters in arrival order, so a live webhook
+    email classifying right after a large bulk sync queued thousands of its
+    own AI calls would sit behind all of them and lose its real-time feel.
+    This gate instead always hands the next free slot to the
+    highest-priority waiter, live before background, FIFO within each tier.
+    """
+
+    def __init__(self, concurrency: int = 1) -> None:
+        self._concurrency = concurrency
+        self._in_use = 0
+        self._lock = asyncio.Lock()
+        self._seq = itertools.count()
+        self._waiters: list[tuple[int, int, asyncio.Event]] = []
+
+    async def _acquire(self, tier: int) -> None:
+        async with self._lock:
+            if self._in_use < self._concurrency:
+                self._in_use += 1
+                return
+            event = asyncio.Event()
+            heapq.heappush(self._waiters, (tier, next(self._seq), event))
+        await event.wait()
+
+    async def _release(self) -> None:
+        async with self._lock:
+            if self._waiters:
+                # Hand the slot directly to the next waiter; _in_use is
+                # unchanged since ownership transfers rather than freeing up.
+                _, _, event = heapq.heappop(self._waiters)
+                event.set()
+            else:
+                self._in_use -= 1
+
+
+_ai_call_gate: _PriorityGate | None = None
+
+
+def _gate() -> _PriorityGate:
+    global _ai_call_gate
+    if _ai_call_gate is None:
+        _ai_call_gate = _PriorityGate(AI_CALL_CONCURRENCY)
+    return _ai_call_gate
+
+
+@asynccontextmanager
+async def ai_call_semaphore(priority: str = "live"):
+    """Serialize AI calls behind the shared Ollama-safe gate.
+
+    priority="live" (the default) is for anything a user is waiting on right
+    now — a webhook-delivered email, a manual repair action. Pass
+    priority="background" for bulk sync and reclassify passes so they never
+    delay a live classification that arrives while they're running.
+    """
+    gate = _gate()
+    tier = _PRIORITY_TIER.get(priority, 1)
+    await gate._acquire(tier)
+    try:
+        yield
+    finally:
+        await gate._release()
 
 
 @dataclass(frozen=True)

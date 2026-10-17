@@ -1,5 +1,52 @@
-from app.classify.openai_classifier import apply_label_guards, _heuristic_label, message_direction
+from app.classify.openai_classifier import apply_label_guards, _heuristic_label, _is_scheduled_interview, _is_true_rejection, message_direction
 from app.models import EmailLabel
+
+
+def test_ada_accommodation_disclaimer_is_not_a_scheduled_interview_reminder():
+    """"As a reminder, if you need accommodation... during the interview
+    process" is a standard ADA disclaimer on application receipts, not a
+    reference to an actual booked interview. "reminder" and "interview"
+    landing within the heuristic's proximity window must not manufacture a
+    false interview_scheduled/reminder label.
+    """
+    text = (
+        "thank you for your application! we are excited that you're interested "
+        "in the position of senior software engineer at example corp.\n\n"
+        "what happens next? we'll review your application, and if there is a "
+        "match we'll reach out to learn more.\n\n"
+        "also, as a reminder, if you need accommodation, due to a disability, "
+        "during any part of the interview process, please let us know so we "
+        "can provide you with the best interview experience possible."
+    )
+    assert _is_scheduled_interview(text) is False
+    assert _heuristic_label(
+        "Interest in Example Corp!",
+        "workday example <example@myworkday.com>",
+        text,
+        "",
+    ) == EmailLabel.APPLICATION_CONFIRMATION.value
+
+
+def test_should_we_move_forward_with_other_candidates_is_not_a_rejection():
+    """"Should we decide to move forward with other candidates, we'll also let
+    you know" is a conditional future outcome in an application receipt, not
+    a present-tense rejection. Only "if/when/once" was previously recognized
+    as a conditional trigger, so "should" slipped through and this receipt
+    was misclassified as rejected_closed.
+    """
+    text = (
+        "thank you for your interest in joining press ganey. we're pleased to confirm "
+        "that we've received your application for the senior software engineer position.\n\n"
+        "if your background aligns with our needs, we'll be in touch to discuss next steps. "
+        "should we decide to move forward with other candidates, we'll also let you know."
+    )
+    assert _is_true_rejection(text) is False
+    assert _heuristic_label(
+        "Thank You For Applying - Press Ganey!",
+        "Press Ganey <pressganey@myworkday.com>",
+        text,
+        "",
+    ) == EmailLabel.APPLICATION_CONFIRMATION.value
 
 
 def test_direction_and_latest_unquoted_text_control_classification():

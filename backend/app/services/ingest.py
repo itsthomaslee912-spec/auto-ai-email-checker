@@ -12,6 +12,7 @@ from app.email.folders import normalize_folder
 from app.models import EmailLabel, EmailMessage, MailboxConnection
 from app.realtime.sse import publish
 from app.schemas import EmailOut
+from app.services.ai_backend import ai_call_semaphore
 from app.services.calendar_extract import process_calendar_email
 from app.timeutil import as_utc
 
@@ -26,6 +27,7 @@ async def ingest_normalized_message(
     force_openai: bool = False,
     use_openai: bool = True,
     download_only: bool = False,
+    priority: str = "live",
 ) -> EmailMessage | None:
     existing = (
         db.query(EmailMessage)
@@ -80,7 +82,9 @@ async def ingest_normalized_message(
                     # Keep a single malformed legacy item from invalidating the
                     # provider-content refresh or the rest of a bulk repair.
                     with db.begin_nested():
-                        await process_calendar_email(db, existing, force=True, use_ai=not download_only)
+                        await process_calendar_email(
+                            db, existing, force=True, use_ai=not download_only, priority=priority,
+                        )
                 except Exception:
                     logger.exception("Calendar refresh failed during existing-message ingest email_id=%s", existing.id)
             db.commit()
@@ -100,30 +104,35 @@ async def ingest_normalized_message(
             snippet=normalized.get("snippet") or "",
         )
         try:
-            # Live classification uses the active SQLite prompt.
-            classification = await classify_email(
-                subject=normalized.get("subject") or "",
-                sender=normalized.get("sender") or "",
-                body_text=normalized.get("body_text") or "",
-                snippet=normalized.get("snippet") or "",
-                folder=normalize_folder(normalized.get("folder")),
-                account_email=mailbox.email_address,
-                correction_examples=correction_examples,
-                force_openai=force_openai,
-                use_openai=use_openai,
-            )
+            # Live classification uses the active SQLite prompt. Every AI call
+            # — live ingest, bulk sync, or background reclassify — shares one
+            # priority-ordered gate so a full mailbox import cannot flood a
+            # local model or delay a live webhook email behind its backlog.
+            async with ai_call_semaphore(priority):
+                classification = await classify_email(
+                    subject=normalized.get("subject") or "",
+                    sender=normalized.get("sender") or "",
+                    body_text=normalized.get("body_text") or "",
+                    snippet=normalized.get("snippet") or "",
+                    folder=normalize_folder(normalized.get("folder")),
+                    account_email=mailbox.email_address,
+                    correction_examples=correction_examples,
+                    force_openai=force_openai,
+                    use_openai=use_openai,
+                )
         except Exception:
             logger.exception("Classification failed; using heuristic")
-            classification = await classify_email(
-                subject=normalized.get("subject") or "",
-                sender=normalized.get("sender") or "",
-                body_text=normalized.get("body_text") or "",
-                snippet=normalized.get("snippet") or "",
-                folder=normalize_folder(normalized.get("folder")),
-                account_email=mailbox.email_address,
-                correction_examples=correction_examples,
-                use_openai=False,
-            )
+            async with ai_call_semaphore(priority):
+                classification = await classify_email(
+                    subject=normalized.get("subject") or "",
+                    sender=normalized.get("sender") or "",
+                    body_text=normalized.get("body_text") or "",
+                    snippet=normalized.get("snippet") or "",
+                    folder=normalize_folder(normalized.get("folder")),
+                    account_email=mailbox.email_address,
+                    correction_examples=correction_examples,
+                    use_openai=False,
+                )
 
     email = EmailMessage(
         mailbox_id=mailbox.id,
@@ -155,10 +164,10 @@ async def ingest_normalized_message(
     calendar_changed = False
     try:
         if not download_only:
-            await apply_outcome(db, email)
+            await apply_outcome(db, email, priority=priority)
             db.flush()
             try:
-                calendar_changed = await process_calendar_email(db, email)
+                calendar_changed = await process_calendar_email(db, email, priority=priority)
             except Exception:
                 logger.exception("Calendar extraction failed during ingest email_id=%s", email.id)
         db.commit()

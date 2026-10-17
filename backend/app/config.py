@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     mail_sync_excluded_senders: str = "{}"
     auto_sync_interval_seconds: int = 120
     auto_sync_max_messages: int = 200
+    # A healthy, verified webhook delivers mail immediately; re-running its
+    # full incremental sync on every 120s tick only guards against an
+    # exhausted retry window or missed delivery, so it does not need the
+    # same cadence as the active polling path.
+    auto_sync_webhook_safety_net_seconds: int = 900
 
 
 @lru_cache

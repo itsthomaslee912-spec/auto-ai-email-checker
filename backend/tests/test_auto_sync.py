@@ -80,6 +80,34 @@ def test_recent_verified_webhook_gets_safety_reconciliation(monkeypatch):
     engine.dispose()
 
 
+def test_recently_synced_healthy_webhook_skips_safety_reconciliation(monkeypatch):
+    engine, session_factory = _session_factory()
+    mailbox_id = _verified_mailbox(session_factory, timedelta(minutes=5))
+    with session_factory() as db:
+        mailbox = db.get(MailboxConnection, mailbox_id)
+        mailbox.last_sync_completed_at = datetime.now(timezone.utc) - timedelta(minutes=2)
+        db.commit()
+
+    sync = _poll(monkeypatch, session_factory)
+
+    sync.assert_not_awaited()
+    engine.dispose()
+
+
+def test_stale_healthy_webhook_still_gets_safety_reconciliation(monkeypatch):
+    engine, session_factory = _session_factory()
+    mailbox_id = _verified_mailbox(session_factory, timedelta(minutes=5))
+    with session_factory() as db:
+        mailbox = db.get(MailboxConnection, mailbox_id)
+        mailbox.last_sync_completed_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+        db.commit()
+
+    sync = _poll(monkeypatch, session_factory)
+
+    sync.assert_awaited_once_with(mailbox_id, max_results=200, register_webhook=False)
+    engine.dispose()
+
+
 @pytest.mark.parametrize("state", ["offline", "mismatch"])
 def test_polling_turns_on_when_ngrok_cannot_deliver(monkeypatch, ngrok_online, state):
     engine, session_factory = _session_factory()

@@ -414,7 +414,7 @@ def test_reclassify_query_skips_human_corrected():
 
 
 def test_reclassify_commits_calendar_changes_before_worker_session_closes(monkeypatch):
-    from app.services import reclassify
+    from app.services import ai_backend, reclassify
 
     SessionLocal = _session_factory()
     with SessionLocal() as db:
@@ -432,7 +432,7 @@ def test_reclassify_commits_calendar_changes_before_worker_session_closes(monkey
             response_id="test-response",
         )
 
-    async def create_calendar_event(db, email, *, force=False):
+    async def create_calendar_event(db, email, *, force=False, priority="live"):
         start = datetime(2026, 10, 20, 18, tzinfo=timezone.utc)
         db.add(CalendarEvent(
             mailbox_id=email.mailbox_id,
@@ -451,7 +451,7 @@ def test_reclassify_commits_calendar_changes_before_worker_session_closes(monkey
     monkeypatch.setattr(reclassify, "process_calendar_email", create_calendar_event)
     monkeypatch.setattr(reclassify, "get_ai_backend", lambda: SimpleNamespace(provider="test"))
     monkeypatch.setattr(reclassify, "publish", AsyncMock())
-    reclassify._ai_gate = None
+    ai_backend._ai_call_gate = None
     reclassify._mailbox_gate = None
 
     asyncio.run(reclassify._run_reclassify_job(mailbox_id, pending_only=False))

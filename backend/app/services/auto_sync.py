@@ -132,14 +132,21 @@ def _provider_delivery_status(provider: str, mailboxes: list[MailboxConnection])
 
 
 async def poll_active_mailboxes() -> int:
-    """Incrementally reconcile every account as a safety net.
+    """Poll accounts that need it; reconcile healthy webhooks on a slower safety net.
 
-    Webhooks remain the immediate-delivery path. The periodic incremental sync
-    also runs for healthy webhooks so a provider outage, backend restart, or
-    exhausted retry window cannot leave a message missing forever. Healthy
-    Gmail watches are not re-registered on every safety pass.
+    Webhooks remain the immediate-delivery path and are polled every tick.
+    A healthy, verified webhook additionally gets a much slower periodic
+    incremental sync so a provider outage, backend restart, or exhausted
+    retry window cannot leave a message missing forever — but it does not
+    need the same 120s cadence as the active polling path, since re-running
+    it that often only adds sync/classification load without a live webhook
+    needing the help. Healthy Gmail watches are not re-registered on any
+    safety pass.
     """
     ngrok = await asyncio.to_thread(get_ngrok_status)
+    safety_net_seconds = getattr(get_settings(), "auto_sync_webhook_safety_net_seconds", 900)
+    safety_net_age = timedelta(seconds=max(60, safety_net_seconds))
+    now = datetime.now(timezone.utc)
     mailboxes_to_sync: list[tuple[int, bool]] = []
     with SessionLocal() as db:
         for mailbox in db.query(MailboxConnection).filter(MailboxConnection.is_active.is_(True)).all():
@@ -150,8 +157,14 @@ async def poll_active_mailboxes() -> int:
                 else:
                     logger.info("Mailbox %s is back on webhook delivery", mailbox.id)
                 _polling_reasons[mailbox.id] = reason
-            if not needs_reconnect(mailbox.last_sync_error):
-                mailboxes_to_sync.append((mailbox.id, bool(reason)))
+            if needs_reconnect(mailbox.last_sync_error):
+                continue
+            if reason:
+                mailboxes_to_sync.append((mailbox.id, True))
+                continue
+            last_synced = as_utc(mailbox.last_sync_completed_at)
+            if last_synced is None or now - last_synced >= safety_net_age:
+                mailboxes_to_sync.append((mailbox.id, False))
 
     limit = max(1, get_settings().auto_sync_max_messages)
     errors = 0

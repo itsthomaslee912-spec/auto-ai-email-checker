@@ -111,7 +111,7 @@ def test_existing_message_refreshes_calendar_attachment_content(tmp_path, monkey
 
         calls = []
 
-        async def process(_db, refreshed, *, force=False, use_ai=True):
+        async def process(_db, refreshed, *, force=False, use_ai=True, priority="live"):
             calls.append((refreshed.id, refreshed.body_text, force, use_ai))
             return True
 

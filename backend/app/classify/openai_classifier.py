@@ -301,6 +301,7 @@ def _is_application_received(text: str) -> bool:
     receipts = [
         r"\bthank you for (taking the time to )?apply(ing)?\b",
         r"\bthanks for (taking the time to )?apply(ing)?\b",
+        r"\bthank you for your application\b",
         r"\bthank(s| you) for submitting your application\b",
         r"\bwe have received (your application|several applications|all of your materials)\b",
         r"\breceived (all of )?your (application|materials)\b",
@@ -390,8 +391,10 @@ def _is_true_rejection(text: str) -> bool:
     # are not a current rejection. Remove only the conditional clause so a
     # separate, explicit outcome elsewhere in the message can still win.
     outcome_text = re.sub(
-        r"\b(?:if(?:/when)?|when|once)\b[^\n.!?]{0,320}"
-        r"\b(?:decided to move forward with other candidates?|(?:position|role|job) (?:is |has been )?(?:filled|closed))\b[^\n.!?]*",
+        r"\b(?:if(?:/when)?|when|once|should)\b[^\n.!?]{0,320}"
+        r"\b(?:(?:decide|decided) to move forward with other candidates?"
+        r"|mov(?:e|ing) forward with other candidates?"
+        r"|(?:position|role|job) (?:is |has been )?(?:filled|closed))\b[^\n.!?]*",
         " ",
         text,
     )
@@ -629,6 +632,16 @@ def _is_scheduled_interview(text: str) -> bool:
         return False
     if re.search(r"\b(?:last |final )?reminder\b.{0,80}\b(?:complete|take|ai interview)\b", text):
         return False
+    # The standard ADA/accommodation disclaimer ("as a reminder, if you need
+    # accommodation... during any part of the interview process") appears on
+    # nearly every application receipt and is not a reference to an actual
+    # booked interview. Strip it before the reminder/interview proximity
+    # check below can mistake it for one.
+    text = re.sub(
+        r"\bas a reminder\b[^\n.!?]{0,200}\baccommodat\w*\b[^\n.!?]*",
+        " ",
+        text,
+    )
     if _ics_books_one_appointment(text):
         return True
     if re.search(r"\bbook time with me\b.{0,180}\band\b", text):

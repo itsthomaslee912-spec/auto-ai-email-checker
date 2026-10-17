@@ -11,30 +11,16 @@ from app.classify.outcome_extract import BACKFILL_LABELS, OUTCOME_LABELS, extrac
 from app.models import CalendarEvent, EmailLabel, EmailMessage, MailboxConnection
 from app.realtime.sse import publish
 from app.schemas import EmailOut
-from app.services.ai_backend import get_ai_backend
+from app.services.ai_backend import AI_CALL_CONCURRENCY, ai_call_semaphore, get_ai_backend
 from app.services.calendar_extract import CALENDAR_LABELS, clean_company_name, employer_instead_of_sender_domain, process_calendar_email
 
 logger = logging.getLogger(__name__)
-
-# Ollama (and most local models) serialize GPU work. Running every mailbox at
-# CONCURRENCY=4 floods the server and keeps /api/health from answering before
-# the process supervisor's probe timeout — which restarts the API and resets
-# reclassify progress to zero.
-CONCURRENCY = 1
 
 _jobs: dict[int, dict[str, Any]] = {}
 _running: set[int] = set()
 _cancel_requested: set[int] = set()
 _job_lock = asyncio.Lock()
-_ai_gate: asyncio.Semaphore | None = None
 _mailbox_gate: asyncio.Semaphore | None = None
-
-
-def _ai_gate_semaphore() -> asyncio.Semaphore:
-    global _ai_gate
-    if _ai_gate is None:
-        _ai_gate = asyncio.Semaphore(CONCURRENCY)
-    return _ai_gate
 
 
 def _mailbox_gate_semaphore() -> asyncio.Semaphore:
@@ -247,7 +233,6 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
             ),
         )
 
-        semaphore = _ai_gate_semaphore()
         updated = 0
         processed = 0
         failed = 0
@@ -255,15 +240,22 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
         async def classify_row(
             row: Any,
         ) -> tuple[int, str, Any, tuple[str, str] | None, bool] | None:
-            async with semaphore:
-                try:
-                    correction_examples = retrieve_relevant_corrections(
-                        correction_corpus,
-                        subject=row.subject or "",
-                        sender=row.sender or "",
-                        body_text=row.body_text or "",
-                        snippet=row.snippet or "",
-                    )
+            try:
+                correction_examples = retrieve_relevant_corrections(
+                    correction_corpus,
+                    subject=row.subject or "",
+                    sender=row.sender or "",
+                    body_text=row.body_text or "",
+                    snippet=row.snippet or "",
+                )
+                # A fresh context manager per call: the shared gate is a
+                # priority queue, not a reusable semaphore object. A
+                # reclassify pass is always background priority so it never
+                # delays a live webhook classification arriving meanwhile.
+                # extract_company_role below acquires the same gate itself,
+                # so it must not be nested inside this one or the two would
+                # deadlock each other over the single slot.
+                async with ai_call_semaphore("background"):
                     result = await classify_email(
                         subject=row.subject or "",
                         sender=row.sender or "",
@@ -274,22 +266,23 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                         correction_examples=correction_examples,
                         force_openai=True,
                     )
-                    should_extract = result.label in OUTCOME_LABELS and (
-                        result.label != row.label
-                        or (result.label in BACKFILL_LABELS and not row.outcome_extracted)
+                should_extract = result.label in OUTCOME_LABELS and (
+                    result.label != row.label
+                    or (result.label in BACKFILL_LABELS and not row.outcome_extracted)
+                )
+                extracted: tuple[str, str] | None = None
+                if should_extract:
+                    extracted = await extract_company_role(
+                        subject=row.subject or "",
+                        sender=row.sender or "",
+                        body_text=row.body_text or "",
+                        snippet=row.snippet or "",
+                        priority="background",
                     )
-                    extracted: tuple[str, str] | None = None
-                    if should_extract:
-                        extracted = await extract_company_role(
-                            subject=row.subject or "",
-                            sender=row.sender or "",
-                            body_text=row.body_text or "",
-                            snippet=row.snippet or "",
-                        )
-                    return row.id, row.label, result, extracted, should_extract
-                except Exception:
-                    logger.exception("Reclassify failed for email %s", row.id)
-                    return None
+                return row.id, row.label, result, extracted, should_extract
+            except Exception:
+                logger.exception("Reclassify failed for email %s", row.id)
+                return None
 
         def apply_outcome(
             email_id: int,
@@ -372,7 +365,7 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                 if email is None:
                     return False
                 if email.label in CALENDAR_LABELS or email.folder == "sent":
-                    changed = await process_calendar_email(db, email, force=True)
+                    changed = await process_calendar_email(db, email, force=True, priority="background")
                     # Calendar extraction mutates events and the email's
                     # processed hash but does not own the transaction. Without
                     # this commit, closing the short-lived worker session rolls
@@ -390,7 +383,7 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                 db.close()
 
         # Small batches so progress moves even when the model is slow.
-        batch_size = CONCURRENCY
+        batch_size = AI_CALL_CONCURRENCY
         for start in range(0, total, batch_size):
             if _should_stop(mailbox_id):
                 job = _set_job(

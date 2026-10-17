@@ -20,7 +20,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.models import CalendarEvent, CalendarEventEmail, EmailLabel, EmailMessage
-from app.services.ai_backend import get_ai_backend
+from app.services.ai_backend import ai_call_semaphore, get_ai_backend
 from app.timeutil import as_utc
 
 logger = logging.getLogger(__name__)
@@ -258,6 +258,7 @@ Rules:
 - Every start must include a reliable UTC offset. Do not guess a timezone.
 - Use an empty slots array for a scheduling link with no visible times.
 - company is the hiring employer, not an ATS, scheduler, job board, or the sender's email domain. "position with Tapestry" from a google.com address is Tapestry. Google Meet, Zoom, and Teams are meeting tools, not the employer.
+- company is never a person's name. A calendar invite titled "Interview with Jordan Meeker - Role" names the interviewer, not the employer; Jordan Meeker belongs in interviewer, and company must come from elsewhere (sender domain, signature, or other context) or be left empty.
 - interviewer is the person conducting the interview; do not use a recruiter unless the email explicitly says they are the interviewer.
 - work_model describes the job arrangement, not whether the interview itself is virtual.
 - job_url must point to the job posting, not a scheduler, meeting, tracking, or unsubscribe URL.
@@ -2524,6 +2525,7 @@ async def extract_calendar_details(
     *,
     use_ai: bool = True,
     known_slots: list[ExtractedSlot] | None = None,
+    priority: str = "live",
 ) -> tuple[list[ExtractedSlot], MeetingAccess, InterviewDetails, bool]:
     messages = [*(related_emails or []), email]
     text = "\n".join(_calendar_text(item) for item in messages)
@@ -2604,18 +2606,19 @@ async def extract_calendar_details(
     if not backend.api_key:
         return slots, access, details, bool(slots)
     try:
-        response = await backend.client().chat.completions.create(
-            model=backend.model,
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": EXTRACT_PROMPT},
-                {
-                    "role": "user",
-                    "content": _email_context(messages),
-                },
-            ],
-        )
+        async with ai_call_semaphore(priority):
+            response = await backend.client().chat.completions.create(
+                model=backend.model,
+                temperature=0,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": EXTRACT_PROMPT},
+                    {
+                        "role": "user",
+                        "content": _email_context(messages),
+                    },
+                ],
+            )
         data = json.loads(response.choices[0].message.content or "{}")
         if not isinstance(data, dict):
             raise ValueError("Calendar extraction response is not an object")
@@ -2649,13 +2652,21 @@ async def extract_calendar_details(
         work_model = _clean_text(data.get("work_model"), 32).lower()
         if work_model not in {"remote", "hybrid", "on_site"}:
             work_model = "unspecified"
+        ai_company = _clean_text(data.get("company"))
+        ai_interviewer = _clean_text(data.get("interviewer")) or deterministic_interviewer
+        # A calendar invite's subject is often "Interview with <Interviewer> -
+        # <Role>" with little other body text. A model can then mistake the
+        # interviewer's own name for the employer; never let an extracted
+        # company that is really the interviewer override a known one.
+        if ai_company and ai_interviewer and companies_match(ai_company, ai_interviewer):
+            ai_company = ""
         details = InterviewDetails(
             company=clean_company_name(
-                employer_instead_of_sender_domain(email, _clean_text(data.get("company")) or known_company)
+                employer_instead_of_sender_domain(email, ai_company or known_company)
             )
             or clean_company_name(known_company),
             role=job_role_or_empty(_clean_text(data.get("role"))) or known_role,
-            interviewer=_clean_text(data.get("interviewer")) or deterministic_interviewer,
+            interviewer=ai_interviewer,
             work_model=work_model,
             job_url=_safe_http_url(data.get("job_url")) or deterministic_job_url,
         )
@@ -5678,6 +5689,7 @@ async def process_calendar_email(
     *,
     force: bool = False,
     use_ai: bool = True,
+    priority: str = "live",
 ) -> bool:
     if candidate_proposed_availability(db, email):
         # Our own Sent proposal, not yet confirmed. Keep it as Interview
@@ -5694,21 +5706,21 @@ async def process_calendar_email(
                 email.company = invitation.company
             if not job_role_or_empty(email.job_role) and job_role_or_empty(invitation.job_role):
                 email.job_role = job_role_or_empty(invitation.job_role)
-        return await _process_calendar_email(db, email, force=force, use_ai=use_ai)
+        return await _process_calendar_email(db, email, force=force, use_ai=use_ai, priority=priority)
     if email.label in CALENDAR_LABELS:
-        return await _process_calendar_email(db, email, force=force, use_ai=use_ai)
+        return await _process_calendar_email(db, email, force=force, use_ai=use_ai, priority=priority)
     if misfiled_interview_booking(email):
         subtype = "reminder" if re.search(r"\breminder\b", email.subject or "", re.I) else "confirmation"
         if not email.human_corrected:
             email.label = EmailLabel.INTERVIEW_SCHEDULED.value
             email.interview_subtype = subtype
-            return await _process_calendar_email(db, email, force=force, use_ai=use_ai)
+            return await _process_calendar_email(db, email, force=force, use_ai=use_ai, priority=priority)
         # Keep the category the user chose; only the appointment goes on the calendar.
         label, previous_subtype = email.label, email.interview_subtype
         email.label = EmailLabel.INTERVIEW_SCHEDULED.value
         email.interview_subtype = subtype
         try:
-            return await _process_calendar_email(db, email, force=force, use_ai=use_ai)
+            return await _process_calendar_email(db, email, force=force, use_ai=use_ai, priority=priority)
         finally:
             email.label = label
             email.interview_subtype = previous_subtype
@@ -5721,6 +5733,7 @@ async def _process_calendar_email(
     *,
     force: bool,
     use_ai: bool,
+    priority: str = "live",
 ) -> bool:
     if email.label not in CALENDAR_LABELS:
         return False
@@ -5785,10 +5798,12 @@ async def _process_calendar_email(
         and bool(_thread_events(db, email, kind="confirmed") or _prior_confirmed_interview(db, email))
     )
     if use_ai:
-        slots, access, details, completed = await extract_calendar_details(email, related_emails, known_slots=known_slots)
+        slots, access, details, completed = await extract_calendar_details(
+            email, related_emails, known_slots=known_slots, priority=priority,
+        )
     else:
         slots, access, details, completed = await extract_calendar_details(
-            email, related_emails, use_ai=False, known_slots=known_slots,
+            email, related_emails, use_ai=False, known_slots=known_slots, priority=priority,
         )
     details = _fill_missing_role(db, email, details)
     # Keep the email row free of schedule-stage labels ("Recruiter Screen").

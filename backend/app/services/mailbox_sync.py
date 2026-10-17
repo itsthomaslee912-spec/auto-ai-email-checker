@@ -245,8 +245,10 @@ async def _run_sync_job_exclusive(
                 message=f"Synced {imported} new messages",
             )
         await publish("sync.done", dict(job))
-        # Full/incremental sync downloads without classifying. Sent proposals
-        # need that follow-up pass so availability reaches the calendar.
+        # Every imported message is already classified by AI during ingest.
+        # This is a backstop only: it finds and finishes anything that
+        # somehow stayed classification_pending (e.g. a worker restart
+        # mid-sync), which should be rare now and is a cheap no-op otherwise.
         if imported and not _should_stop(mailbox_id):
             from app.services.reclassify import start_mailbox_reclassify
 
@@ -455,7 +457,7 @@ async def _incremental_gmail(db: Session, mailbox: MailboxConnection) -> None:
             normalized = normalize_gmail_message(raw)
             if _message_sender_is_excluded(mailbox, normalized):
                 continue
-            email = await ingest_normalized_message(db, mailbox, normalized, download_only=True)
+            email = await ingest_normalized_message(db, mailbox, normalized, download_only=False, priority="background")
             if email:
                 imported += 1
             await asyncio.sleep(0)
@@ -544,7 +546,7 @@ async def _sync_gmail(db: Session, mailbox: MailboxConnection, limit: int) -> No
             normalized = normalize_gmail_message(raw)
             if _message_sender_is_excluded(mailbox, normalized):
                 continue
-            email = await ingest_normalized_message(db, mailbox, normalized, download_only=True)
+            email = await ingest_normalized_message(db, mailbox, normalized, download_only=False, priority="background")
             if email:
                 imported += 1
             elif mid in existing:
@@ -603,7 +605,7 @@ async def _sync_outlook(db: Session, mailbox: MailboxConnection, limit: int) -> 
             )
             return
         email = await ingest_normalized_message(
-            db, mailbox, normalize_outlook_message(raw), download_only=True
+            db, mailbox, normalize_outlook_message(raw), download_only=False, priority="background"
         )
         if email:
             imported += 1
@@ -668,7 +670,7 @@ async def _sync_outlook_delta(db: Session, mailbox: MailboxConnection) -> None:
                             continue
                         raise
                     raw["_mail_folder"] = folder
-                    email = await ingest_normalized_message(db, mailbox, normalize_outlook_message(raw), download_only=True)
+                    email = await ingest_normalized_message(db, mailbox, normalize_outlook_message(raw), download_only=False, priority="background")
                     if email:
                         imported += 1
                     await asyncio.sleep(0)
