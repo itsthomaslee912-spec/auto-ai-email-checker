@@ -241,6 +241,11 @@ def _primary_message_text(subject: str, sender: str, body_text: str, snippet: st
 
 def _is_pre_interview_screen(text: str) -> bool:
     """Written screening for a named role — interview is not booked yet."""
+    if re.search(
+        r"\b(?:hr|recruit(?:er|ing)(?: team)?) (?:is|are) waiting for your (?:response|answers?)\b.{0,100}\bquestions?\b",
+        text,
+    ):
+        return True
     before_booking = any(
         re.search(p, text)
         for p in [
@@ -866,6 +871,11 @@ def apply_label_guards(
     )
     if heuristic is not None and strong:
         return heuristic
+    # Availability is the candidate's own outbound proposal. An incoming
+    # employer message may request availability, but it cannot itself be the
+    # candidate's availability response.
+    if label == EmailLabel.INTERVIEW_AVAILABILITY.value and direction != "outgoing":
+        return heuristic or EmailLabel.INTERVIEW_INVITATION.value
     # Outlook/Google attendee responses can arrive as an otherwise-empty mail
     # whose subject is only "Declined: <event title>" or "Tentative: ...".
     # That is an RSVP state, never an employer rejecting the application.

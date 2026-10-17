@@ -2313,10 +2313,12 @@ def message_appointment_slots(email: EmailMessage) -> list[ExtractedSlot]:
             if slot is not None:
                 return [slot]
     # The reply already names a clock. Quoted options ("Oct 12 at 8am or
-    # Oct 13 at 9am") are not appointments this message booked.
+    # Oct 13 at 9am") are not appointments this message booked. If the fresh
+    # message has no time at all, never fall back to quoted history: doing so
+    # moves an old availability proposal onto the reply's received date.
     if times:
         return _prefer_specific_slots(fresh_slots)
-    return _prefer_specific_slots(parse_text_slots(full, reference))
+    return []
 
 
 _CLOCK_OR_DATE_RE = re.compile(
@@ -5801,6 +5803,22 @@ async def _process_calendar_email(
         CalendarEvent.kind == "availability",
     ).first() is not None
     if not completed and not reusable_scheduled_availability and not recoverable_cancellation:
+        # A previous extractor version fell back to quoted history when an
+        # invitation/availability message named no current time. Retire those
+        # phantom source-owned chips during repair instead of preserving them.
+        if email.label in {EmailLabel.INTERVIEW_INVITATION.value, EmailLabel.INTERVIEW_AVAILABILITY.value}:
+            stale = db.query(CalendarEvent).filter(
+                CalendarEvent.source_email_id == email.id,
+                CalendarEvent.kind == "availability",
+                CalendarEvent.is_visible.is_(True),
+            ).all()
+            for event in stale:
+                event.is_visible = False
+            if stale:
+                email.calendar_processed_hash = email_calendar_hash(email)
+                email.calendar_processed_at = datetime.now(timezone.utc)
+                email.calendar_processing_error = None
+                return True
         email.calendar_processing_error = "Calendar extraction deferred until the selected AI provider is available"
         return False
 

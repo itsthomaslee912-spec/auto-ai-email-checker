@@ -1082,6 +1082,49 @@ def test_unknown_sender_invite_becomes_a_visible_calendar_item():
         assert event.meeting_url == "https://mavensecurities.zoom.us/j/93169163898"
 
 
+def test_incoming_availability_follow_up_does_not_reuse_quoted_old_times():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        email = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="tsmc-follow-up",
+            thread_id="tsmc-thread",
+            folder="inbox",
+            subject="Re: TSMC opportunity",
+            sender="Recruiter <recruiter@example.com>",
+            received_at=datetime(2026, 10, 16, 21, 2, tzinfo=timezone.utc),
+            body_text=(
+                "Do you need more time to answer HR's questions? If helpful, I can schedule a chat.\n\n"
+                "From: Candidate\nSent: October 6, 2026\n"
+                "I'm available today at 5:00 PM ET or tomorrow at 4:30 PM ET."
+            ),
+            label=EmailLabel.INTERVIEW_AVAILABILITY.value,
+            company="TSMC",
+            job_role="NASC Opportunity",
+        )
+        db.add(email)
+        db.flush()
+        phantom = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=email.id,
+            slot_index=0,
+            kind="availability",
+            origin="email",
+            title="TSMC - NASC Opportunity",
+            company="TSMC",
+            job_role="NASC Opportunity",
+            start_at=datetime(2026, 10, 16, 21, 0, tzinfo=timezone.utc),
+            end_at=datetime(2026, 10, 16, 21, 30, tzinfo=timezone.utc),
+            is_visible=True,
+        )
+        db.add(phantom)
+        db.flush()
+
+        assert message_appointment_slots(email) == []
+        assert asyncio.run(process_calendar_email(db, email, force=True, use_ai=False)) is True
+        assert db.get(CalendarEvent, phantom.id).is_visible is False
+
+
 def test_sent_reply_proposing_a_time_becomes_an_available_calendar_slot():
     """A candidate's own Sent reply naming a time is not an employer booking,
 

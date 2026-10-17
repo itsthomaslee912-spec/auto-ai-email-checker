@@ -30,6 +30,20 @@ def test_direction_and_latest_unquoted_text_control_classification():
         "",
     ) == EmailLabel.REJECTED_CLOSED.value
 
+
+def test_incoming_mail_cannot_be_candidate_interview_availability():
+    assert apply_label_guards(
+        EmailLabel.INTERVIEW_AVAILABILITY.value,
+        subject="Re: Interview availability",
+        sender="Recruiter <recruiter@example.com>",
+        body_text=(
+            "HR is waiting for your response to some of their questions. Do you need more time? "
+            "I would be happy to schedule a chat if helpful."
+        ),
+        snippet="",
+        direction="incoming",
+    ) == EmailLabel.SCREENING.value
+
 BLOCKSTREAM = """Hi Thomas,
 
 Thank you so much for your interest in joining Blockstream! We have received several applications for the Software Engineer, Enterprise Custody role and are doing our best to review them as quickly as possible.
