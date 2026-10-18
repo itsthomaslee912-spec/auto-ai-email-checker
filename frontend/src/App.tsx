@@ -741,9 +741,24 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
 
   const refreshAutoSyncStatus = useCallback(async () => {
     try {
-      setAutoSyncStatus(await fetchAutoSyncStatus());
+      const status = await fetchAutoSyncStatus();
+      setAutoSyncStatus(status);
       autoSyncFailCountRef.current = 0;
       setAutoSyncOffline(false);
+      // The backend's per-mailbox state is authoritative. A dropped/reconnected
+      // SSE stream can lose the sync.done event that would otherwise clear
+      // syncingIds, leaving an account stuck showing "Syncing..." forever even
+      // though the server has long since finished. Reconcile on every poll.
+      if (syncingIdsRef.current.size > 0) {
+        const stillRunning = new Set(
+          (status.mailboxes ?? []).filter((mailbox) => mailbox.state === "running").map((mailbox) => mailbox.mailbox_id),
+        );
+        const next = new Set([...syncingIdsRef.current].filter((id) => stillRunning.has(id)));
+        if (next.size !== syncingIdsRef.current.size) {
+          syncingIdsRef.current = next;
+          setSyncingIds(next);
+        }
+      }
     } catch {
       autoSyncFailCountRef.current += 1;
       if (autoSyncFailCountRef.current >= 2) setAutoSyncOffline(true);
