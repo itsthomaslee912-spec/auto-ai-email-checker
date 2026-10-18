@@ -1985,6 +1985,37 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     return mailboxUnreadCounts[selectedMailboxId] ?? 0;
   }, [selectedMailboxId, mailboxUnreadCounts]);
 
+  const filteredScopeUnread = useMemo(
+    () => tallyCounts(
+      countCells,
+      (cell) => (selectedMailboxId == null || cell.mailbox_id === selectedMailboxId)
+        && (label === "all" || cell.label === label),
+    ).unread,
+    [countCells, label, selectedMailboxId],
+  );
+
+  useEffect(() => {
+    if (inboxType !== "unread_first" || loading || loadingMore || !hasMore) return;
+    if (searchQuery || interviewSubtype !== "all" || filteredScopeUnread <= 0) return;
+    if (emails.some((email) => !email.is_read)) return;
+
+    // Reading every unread item in the current page moves those rows into the
+    // read bucket. They still occupy enough space that the bottom-of-list
+    // pagination trigger cannot fire, even when older unread mail remains.
+    // Pull the next cursor page so the unread badge and list cannot disagree.
+    void loadMore();
+  }, [
+    emails,
+    filteredScopeUnread,
+    hasMore,
+    inboxType,
+    interviewSubtype,
+    loadMore,
+    loading,
+    loadingMore,
+    searchQuery,
+  ]);
+
   async function confirmMarkAllRead() {
     const scopeId = selectedMailboxId;
     setMarkingAllRead(true);

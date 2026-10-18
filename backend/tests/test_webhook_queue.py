@@ -1,5 +1,7 @@
 import asyncio
 import json
+import threading
+from collections import deque
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -110,3 +112,43 @@ def test_gmail_burst_keeps_latest_history_without_losing_inflight_job(monkeypatc
     next_claim = webhook_queue._claim_next_job()
     assert next_claim is not None
     assert next_claim[2] == latest
+
+
+def test_multiple_workers_let_another_account_progress(monkeypatch):
+    monkeypatch.setattr(webhook_queue, "WEBHOOK_WORKER_CONCURRENCY", 2)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_finished = asyncio.Event()
+    claims = deque([
+        (1, "google", {"name": "slow"}, 1, "slow"),
+        (2, "google", {"name": "fast"}, 1, "fast"),
+    ])
+    claims_lock = threading.Lock()
+
+    def claim():
+        with claims_lock:
+            return claims.popleft() if claims else None
+
+    async def process(_provider, payload):
+        if payload["name"] == "slow":
+            first_started.set()
+            await release_first.wait()
+        else:
+            second_finished.set()
+
+    monkeypatch.setattr(webhook_queue, "_recover_interrupted_jobs", lambda: None)
+    monkeypatch.setattr(webhook_queue, "_claim_next_job", claim)
+    monkeypatch.setattr(webhook_queue, "_complete_job", lambda *_args: None)
+    monkeypatch.setattr(webhook_queue, "_process_job", process)
+
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        loop = asyncio.create_task(webhook_queue.webhook_queue_loop(stop))
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        await asyncio.wait_for(second_finished.wait(), timeout=1)
+        release_first.set()
+        await asyncio.sleep(0.05)
+        stop.set()
+        await asyncio.wait_for(loop, timeout=3)
+
+    asyncio.run(scenario())

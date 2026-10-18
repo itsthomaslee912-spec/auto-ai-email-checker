@@ -3389,6 +3389,8 @@ def test_company_variants_match_and_keep_the_fuller_name():
     assert companies_match("collectfanatics", "Fanatics Collectibles")
     assert fuller_company_name("collectfanatics", "Fanatics Collectibles") == "Fanatics Collectibles"
     assert companies_match("kochind", "Koch Industries")
+    assert fuller_company_name("HRT", "Hudson River Trading") == "Hudson River Trading"
+    assert not companies_match("HRT", "Human Resources Team")
     assert not companies_match("United Health", "United Airlines")
     assert employer_instead_of_sender_domain(
         EmailMessage(
@@ -3398,6 +3400,75 @@ def test_company_variants_match_and_keep_the_fuller_name():
         ),
         "collectfanatics",
     ) == "Fanatics Collectibles"
+
+
+def test_acronym_and_expanded_company_calendar_chips_collapse():
+    factory, (mailbox_id, _) = _database()
+    start = datetime(2026, 10, 19, 20, tzinfo=timezone.utc)
+    with factory() as db:
+        acronym_email = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="hrt-calendar-invite",
+            thread_id="hrt-calendar-thread",
+            subject="Invitation: HRT Interview - CoderPad & Zoom",
+            sender="recruiter@example.com",
+            received_at=start - timedelta(days=2),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="HRT",
+        )
+        confirmation_email = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="hrt-confirmation",
+            thread_id="hrt-confirmation-thread",
+            subject="HRT Interview Confirmation",
+            sender="recruiter@example.com",
+            received_at=start - timedelta(days=1),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+            company="Hudson River Trading",
+            job_role="Experienced Software Engineer",
+        )
+        db.add_all([acronym_email, confirmation_email])
+        db.flush()
+        db.add_all([
+            CalendarEvent(
+                mailbox_id=mailbox_id,
+                source_email_id=acronym_email.id,
+                source_thread_id=acronym_email.thread_id,
+                kind="confirmed",
+                origin="email",
+                title="HRT",
+                company="HRT",
+                start_at=start,
+                end_at=start + timedelta(minutes=30),
+                interview_status="calendar_invite",
+                is_visible=True,
+            ),
+            CalendarEvent(
+                mailbox_id=mailbox_id,
+                source_email_id=confirmation_email.id,
+                source_thread_id=confirmation_email.thread_id,
+                kind="confirmed",
+                origin="email",
+                title="Hudson River Trading — Experienced Software Engineer",
+                company="Hudson River Trading",
+                job_role="Experienced Software Engineer",
+                start_at=start,
+                end_at=start + timedelta(minutes=30),
+                interview_status="confirmation",
+                is_visible=True,
+            ),
+        ])
+        db.commit()
+
+        assert collapse_duplicate_calendar_events(db, mailbox_id) is True
+        db.commit()
+
+        visible = db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True)).all()
+        assert len(visible) == 1
+        assert visible[0].company == "Hudson River Trading"
+        assert visible[0].job_role == "Experienced Software Engineer"
 
 
 def test_company_name_drops_sentence_spill_after_the_employer():

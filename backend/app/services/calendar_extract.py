@@ -1456,6 +1456,43 @@ def _glued_domain_matches_name(domain_compact: str, name_tokens: set[str]) -> bo
     return bool(hits)
 
 
+_COMPANY_INITIALISM_IGNORED_WORDS = {
+    "and", "co", "company", "corp", "corporation", "inc", "incorporated",
+    "llc", "ltd", "limited", "of", "plc", "the",
+}
+
+
+def _company_initialism_matches(left: str | None, right: str | None) -> bool:
+    """Match an explicit acronym to a multi-word employer name.
+
+    Calendar invitations often use a familiar acronym while the confirmation
+    expands it (for example, ``HRT`` and ``Hudson River Trading``). Requiring
+    an all-uppercase acronym with at least three letters keeps this narrower
+    than general fuzzy company matching.
+    """
+    def explicit_initialism(value: str | None) -> str:
+        text = (value or "").strip()
+        compact = re.sub(r"[^A-Za-z0-9]", "", text)
+        return compact.casefold() if 3 <= len(compact) <= 8 and compact.isupper() else ""
+
+    def expanded_initialism(value: str | None) -> str:
+        words = [
+            word
+            for word in re.findall(r"[A-Za-z0-9]+", value or "")
+            if word.casefold() not in _COMPANY_INITIALISM_IGNORED_WORDS
+        ]
+        if len(words) < 3:
+            return ""
+        return "".join(word[0] for word in words).casefold()
+
+    left_short = explicit_initialism(left)
+    right_short = explicit_initialism(right)
+    return bool(
+        (left_short and left_short == expanded_initialism(right))
+        or (right_short and right_short == expanded_initialism(left))
+    )
+
+
 @lru_cache(maxsize=65536)
 def companies_match(left: str | None, right: str | None) -> bool:
     """Treat shortened and legal variants as one employer.
@@ -1489,6 +1526,11 @@ def companies_match(left: str | None, right: str | None) -> bool:
     if _domainish_company(right_compact, right_tokens) and _glued_domain_matches_name(right_compact, left_tokens):
         return True
     return False
+
+
+def _calendar_companies_match(left: str | None, right: str | None) -> bool:
+    """Company match used only after calendar time and mailbox also agree."""
+    return companies_match(left, right) or _company_initialism_matches(left, right)
 
 
 def fuller_company_name(left: str | None, right: str | None) -> str:
@@ -3958,7 +4000,7 @@ def _same_scheduled_interview(left: CalendarEvent, right: CalendarEvent) -> bool
         left.mailbox_id == right.mailbox_id
         and left.kind == "confirmed"
         and right.kind == "confirmed"
-        and (same_source or same_thread_without_company or companies_match(left.company, right.company))
+        and (same_source or same_thread_without_company or _calendar_companies_match(left.company, right.company))
         and _starts_within_minute(left, right)
     ):
         return False
@@ -3980,7 +4022,7 @@ def _same_available_window(left: CalendarEvent, right: CalendarEvent) -> bool:
         left.mailbox_id == right.mailbox_id
         and left.kind == "availability"
         and right.kind == "availability"
-        and (same_source or same_thread_without_company or companies_match(left.company, right.company))
+        and (same_source or same_thread_without_company or _calendar_companies_match(left.company, right.company))
         and roles_compatible(left.job_role, right.job_role)
         and _starts_within_minute(left, right)
     ):

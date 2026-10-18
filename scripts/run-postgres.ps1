@@ -21,8 +21,11 @@ if ($LASTEXITCODE -eq 0) {
 }
 
 # Listen on local and LAN IPv4 interfaces. pg_hba.conf restricts remote access
-# to the explicitly authorized client hosts.
-& $PgCtl -D $DataDir -l $LogFile -o "-h 0.0.0.0 -p 5432" start
+# to the explicitly authorized client hosts. After an unclean shutdown
+# PostgreSQL replays its WAL before accepting connections, which can take
+# several minutes on a large data directory, so give pg_ctl a long wait
+# instead of the 60s default before treating startup as failed.
+& $PgCtl -D $DataDir -l $LogFile -o "-h 0.0.0.0 -p 5432" -t 300 -w start
 if ($LASTEXITCODE -ne 0) {
     throw "PostgreSQL failed to start. Check logs/postgresql.log."
 }

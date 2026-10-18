@@ -45,23 +45,41 @@ class _PriorityGate:
         self._waiters: list[tuple[int, int, asyncio.Event]] = []
 
     async def _acquire(self, tier: int) -> None:
+        waiter: tuple[int, int, asyncio.Event] | None = None
         async with self._lock:
             if self._in_use < self._concurrency:
                 self._in_use += 1
                 return
             event = asyncio.Event()
-            heapq.heappush(self._waiters, (tier, next(self._seq), event))
-        await event.wait()
+            waiter = (tier, next(self._seq), event)
+            heapq.heappush(self._waiters, waiter)
+        try:
+            await event.wait()
+        except BaseException:
+            # Cancellation while queued must not leave a dead waiter in the
+            # heap. If ownership was handed to this waiter at the same moment,
+            # pass the slot onward (or release it) instead of leaking the only
+            # AI slot forever.
+            async with self._lock:
+                if event.is_set():
+                    self._handoff_or_release()
+                elif waiter in self._waiters:
+                    self._waiters.remove(waiter)
+                    heapq.heapify(self._waiters)
+            raise
+
+    def _handoff_or_release(self) -> None:
+        if self._waiters:
+            _, _, event = heapq.heappop(self._waiters)
+            event.set()
+        else:
+            self._in_use -= 1
 
     async def _release(self) -> None:
         async with self._lock:
-            if self._waiters:
-                # Hand the slot directly to the next waiter; _in_use is
-                # unchanged since ownership transfers rather than freeing up.
-                _, _, event = heapq.heappop(self._waiters)
-                event.set()
-            else:
-                self._in_use -= 1
+            # Hand the slot directly to the next waiter; _in_use is unchanged
+            # when ownership transfers rather than becoming free.
+            self._handoff_or_release()
 
 
 _ai_call_gate: _PriorityGate | None = None

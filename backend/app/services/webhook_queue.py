@@ -14,6 +14,8 @@ from app.services.mailbox_sync import process_gmail_notification, process_outloo
 
 logger = logging.getLogger(__name__)
 _wake_event = asyncio.Event()
+WEBHOOK_JOB_TIMEOUT_SECONDS = 300
+WEBHOOK_WORKER_CONCURRENCY = 4
 
 
 def _dedupe_key(provider: str, provider_id: str | None, payload: dict) -> str:
@@ -143,17 +145,25 @@ def _retry_job(job_id: int, attempts: int, exc: Exception) -> None:
         db.commit()
 
 
-async def webhook_queue_loop(stop_event: asyncio.Event) -> None:
-    """Drain durable provider notifications and retry transient failures."""
-    await asyncio.to_thread(_recover_interrupted_jobs)
+async def _webhook_worker(stop_event: asyncio.Event) -> None:
     while not stop_event.is_set():
         claimed = await asyncio.to_thread(_claim_next_job)
         if claimed is not None:
             job_id, provider, payload, attempts, claimed_payload = claimed
             try:
-                await _process_job(provider, payload)
+                await asyncio.wait_for(
+                    _process_job(provider, payload),
+                    timeout=WEBHOOK_JOB_TIMEOUT_SECONDS,
+                )
             except asyncio.CancelledError:
                 raise
+            except TimeoutError as exc:
+                logger.error(
+                    "Webhook job %s exceeded %ss; scheduling retry",
+                    job_id,
+                    WEBHOOK_JOB_TIMEOUT_SECONDS,
+                )
+                await asyncio.to_thread(_retry_job, job_id, attempts, exc)
             except Exception as exc:
                 logger.exception("Webhook job %s failed; scheduling retry", job_id)
                 await asyncio.to_thread(_retry_job, job_id, attempts, exc)
@@ -166,3 +176,18 @@ async def webhook_queue_loop(stop_event: asyncio.Event) -> None:
             await asyncio.wait_for(_wake_event.wait(), timeout=2)
         except TimeoutError:
             pass
+
+
+async def webhook_queue_loop(stop_event: asyncio.Event) -> None:
+    """Drain durable provider notifications without one account blocking all others."""
+    await asyncio.to_thread(_recover_interrupted_jobs)
+    workers = [
+        asyncio.create_task(_webhook_worker(stop_event))
+        for _ in range(WEBHOOK_WORKER_CONCURRENCY)
+    ]
+    try:
+        await asyncio.gather(*workers)
+    finally:
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)

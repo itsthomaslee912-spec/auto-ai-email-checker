@@ -17,7 +17,12 @@ Write-Host "  Backend:  http://127.0.0.1:8000"
 Write-Host "  Frontend: http://127.0.0.1:5173 (LAN: http://<this-pc-ip>:5173)"
 Write-Host ""
 
-& (Join-Path $Root "scripts\run-postgres.ps1")
+try {
+  & (Join-Path $Root "scripts\run-postgres.ps1")
+} catch {
+  Write-Warning "PostgreSQL did not start yet: $($_.Exception.Message)"
+  Write-Warning "The service supervisor will keep retrying it in the background."
+}
 
 $Runtime = Join-Path $Root ".tmp"
 $SupervisorPidFile = Join-Path $Runtime "service-supervisor.pid"
