@@ -1593,11 +1593,11 @@ _INTERVIEW_STAGE_RE = re.compile(
             hiring\s*manager|hm|culture|onsite|on[\s-]?site|virtual|video|
             final|panel|loop|take[\s-]?home|coding|system\s*design|
             role\s*alignment|intro(?:ductory|duction)?|initial|first|second|
-            third|next|screening
+            third|next|screening|agent|ai
         )
         \s+
     )?
-    (?:screen(?:ing)?|interview|round|call|chat|discussion|conversation|meet(?:ing)?|session)
+    (?:screen(?:ing)?|interview|round|call|chat|discussion|conversation|meet(?:ing)?|session|agent)
     (?:\s+\d+)?
     $
     """
