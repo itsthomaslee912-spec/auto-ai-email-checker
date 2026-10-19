@@ -1106,6 +1106,10 @@ def candidate_own_name(email: EmailMessage, messages: list[EmailMessage] | None 
             for match in pattern.finditer(text):
                 name, address = match.group(1), match.group(2)
                 if _normalized_address(address) == owner:
+                    # A timestamp right before the name ("9:30 AM Jordan
+                    # Meeker <...>") can get swept into the match as a
+                    # leading word; it is never part of a real name.
+                    name = re.sub(r"^(?:AM|PM)\s+", "", name, flags=re.I)
                     cleaned = clean_company_name(name)
                     if cleaned and "@" not in cleaned and cleaned.casefold() != owner:
                         return cleaned
@@ -2844,8 +2848,18 @@ def _title(email: EmailMessage, details: InterviewDetails) -> str:
     return role or company or (email.subject or "").strip() or "Interview"
 
 
-def _apply_details(event: CalendarEvent, email: EmailMessage, access: MeetingAccess, details: InterviewDetails) -> None:
+def _apply_details(
+    event: CalendarEvent, email: EmailMessage, access: MeetingAccess, details: InterviewDetails,
+    db: Session | None = None,
+) -> None:
     candidate_company = clean_company_name(details.company) or clean_company_name(email.company) or (email.company or "").strip()
+    # Final merge point for the event's company, so guard here too: any
+    # upstream source (AI extraction, a stored email.company from an older,
+    # unguarded code path) could still be the candidate's own name.
+    if candidate_company and db is not None and email.mailbox_id:
+        owner_name = candidate_own_name(email) or mailbox_candidate_name(db, email.mailbox_id)
+        if owner_name and companies_match(candidate_company, owner_name):
+            candidate_company = ""
     if companies_match(candidate_company, event.company):
         event.company = clean_company_name(fuller_company_name(event.company, candidate_company)) or candidate_company
     elif _company_quality(candidate_company) >= _company_quality(event.company):
@@ -2882,8 +2896,9 @@ def _apply_common(
     slot: ExtractedSlot,
     access: MeetingAccess,
     details: InterviewDetails,
+    db: Session | None = None,
 ) -> None:
-    _apply_details(event, email, access, details)
+    _apply_details(event, email, access, details, db)
     stored_start = as_utc(event.start_at) if event.start_at is not None else None
     stored_end = as_utc(event.end_at) if event.end_at is not None else None
     event.start_at = slot.start_at
@@ -6098,7 +6113,7 @@ async def _process_calendar_email(
                 application_status="active",
                 is_visible=True,
             )
-            _apply_common(event, email, slot, access, details)
+            _apply_common(event, email, slot, access, details, db)
             event.kind = "availability"
             event.interview_status = None
             # An older invitation can be refreshed after its confirmation.
@@ -6150,9 +6165,9 @@ async def _process_calendar_email(
             # slot stays hidden so a later pass cannot bring that time back.
             event.is_visible = event.superseded_by_event_id is None
             if slots:
-                _apply_common(event, email, _slot_for_event(event, slots), access, details)
+                _apply_common(event, email, _slot_for_event(event, slots), access, details, db)
             else:
-                _apply_details(event, email, access, details)
+                _apply_details(event, email, access, details, db)
             changed = True
         elif not stale_incoming and (slots or (status != "cancellation" and sourced_availability)):
             event = sourced_availability[0] if sourced_availability else CalendarEvent(
@@ -6166,11 +6181,11 @@ async def _process_calendar_email(
             event.is_visible = True
             event.superseded_by_event_id = None
             if slots:
-                _apply_common(event, email, slots[0], access, details)
+                _apply_common(event, email, slots[0], access, details, db)
             else:
                 # A corrected classification is authoritative even when a later
                 # extraction cannot reproduce the already-stored appointment.
-                _apply_details(event, email, access, details)
+                _apply_details(event, email, access, details, db)
             db.add(event)
             db.flush()
             changed = True

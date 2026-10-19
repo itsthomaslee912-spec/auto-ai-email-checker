@@ -14,6 +14,7 @@ from app.services.calendar_extract import (
     companies_match,
     employer_instead_of_sender_domain,
     job_role_or_empty,
+    mailbox_candidate_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -141,7 +142,12 @@ async def apply_outcome(
     # employer, but a weak local model can still do it (e.g. a quoted "From:
     # Jordan Meeker <...>" reply makes the model echo "Jordan Meeker" back as
     # the company). Reject it defensively rather than trust instruction-following.
+    # The reliable name<->address pairing that proves this often lives in a
+    # different thread than the one being classified, so fall back to a
+    # mailbox-wide search when this message alone doesn't carry it.
     name = candidate_own_name(email)
+    if not name and email.mailbox_id:
+        name = mailbox_candidate_name(db, email.mailbox_id)
     if company and name and companies_match(company, name):
         company = ""
     email.company = company
