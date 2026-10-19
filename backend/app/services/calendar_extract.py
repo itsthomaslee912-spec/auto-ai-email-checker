@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import html
 import json
@@ -1117,6 +1118,16 @@ def candidate_own_name(email: EmailMessage, messages: list[EmailMessage] | None 
 
 
 _mailbox_candidate_name_cache: dict[int, str] = {}
+_mailbox_candidate_name_checked_at: dict[int, float] = {}
+# This scans up to 2000 messages with a regex pass over each — real CPU cost,
+# not just an I/O round trip. collapse_duplicate_calendar_events calls this
+# once per mailbox on every single email processed (webhooks, reclassify,
+# auto-sync), so a mailbox with no detectable name would otherwise pay that
+# full cost on every call forever, which starves the whole process under
+# load even though the scan itself runs on a worker thread (CPU-bound work
+# still contends for the GIL with the main request-handling thread). Cache a
+# negative result too, just not permanently — new mail may add the pairing.
+_MAILBOX_CANDIDATE_NAME_RECHECK_SECONDS = 1800
 
 
 def mailbox_candidate_name(db: Session, mailbox_id: int, owner_address: str = "") -> str:
@@ -1125,13 +1136,14 @@ def mailbox_candidate_name(db: Session, mailbox_id: int, owner_address: str = ""
     A reliable 'Name <owner-address>' pairing often lives in a different
     thread than the one being processed (an old application confirmation, not
     today's interview invite). Searching only the current thread's messages
-    misses that, so this scans the mailbox broadly instead. Only a positive
-    result is cached — an empty one is retried, since the pairing may show up
-    in mail that arrives later.
+    misses that, so this scans the mailbox broadly instead.
     """
     cached = _mailbox_candidate_name_cache.get(mailbox_id)
     if cached:
         return cached
+    checked_at = _mailbox_candidate_name_checked_at.get(mailbox_id)
+    if checked_at is not None and time.monotonic() - checked_at < _MAILBOX_CANDIDATE_NAME_RECHECK_SECONDS:
+        return ""
     if not owner_address:
         row = db.query(MailboxConnection.email_address).filter(MailboxConnection.id == mailbox_id).first()
         owner_address = row[0] if row else ""
@@ -1159,6 +1171,8 @@ def mailbox_candidate_name(db: Session, mailbox_id: int, owner_address: str = ""
             break
     if name:
         _mailbox_candidate_name_cache[mailbox_id] = name
+    else:
+        _mailbox_candidate_name_checked_at[mailbox_id] = time.monotonic()
     return name
 
 
@@ -2543,6 +2557,26 @@ skip_landing_page_resolution: ContextVar[bool] = ContextVar(
 defer_duplicate_collapse: ContextVar[bool] = ContextVar(
     "defer_duplicate_collapse", default=False
 )
+
+#: mailbox_id -> time.monotonic() of its last full collapse pass. The pass
+#: rescans every stored event for the mailbox (~17s observed for 161 events)
+#: and the live path runs it after every processed email for immediacy. A
+#: burst through that path for one mailbox — many webhook messages back to
+#: back, or a reclassify batch — would otherwise re-run the full mailbox
+#: rescan once per message, which is the same quadratic blowup the bulk
+#: backfill loop was already written to avoid. A short per-mailbox cooldown
+#: keeps isolated messages collapsing immediately while coalescing bursts.
+_last_collapse_at: dict[int, float] = {}
+_COLLAPSE_COOLDOWN_SECONDS = 10
+
+
+def _collapse_due(mailbox_id: int) -> bool:
+    last = _last_collapse_at.get(mailbox_id)
+    now = time.monotonic()
+    if last is not None and now - last < _COLLAPSE_COOLDOWN_SECONDS:
+        return False
+    _last_collapse_at[mailbox_id] = now
+    return True
 
 
 #: Hostname -> time.monotonic() of its last failed connection. A broken DNS
@@ -6006,7 +6040,11 @@ async def _process_calendar_email(
                 target.outcome_at = outcome_at
                 _link_event_email(db, target, email.id)
             changed = True
-        if not defer_duplicate_collapse.get() and collapse_duplicate_calendar_events(db, email.mailbox_id):
+        if (
+            not defer_duplicate_collapse.get()
+            and _collapse_due(email.mailbox_id)
+            and await asyncio.to_thread(collapse_duplicate_calendar_events, db, email.mailbox_id)
+        ):
             changed = True
         email.calendar_processed_hash = digest
         email.calendar_processed_at = datetime.now(timezone.utc)
@@ -6205,7 +6243,11 @@ async def _process_calendar_email(
                 if _hide_prior_bookings_replaced_by(db, email, event):
                     changed = True
 
-    if not defer_duplicate_collapse.get() and collapse_duplicate_calendar_events(db, email.mailbox_id):
+    if (
+        not defer_duplicate_collapse.get()
+        and _collapse_due(email.mailbox_id)
+        and await asyncio.to_thread(collapse_duplicate_calendar_events, db, email.mailbox_id)
+    ):
         changed = True
 
     email.calendar_processed_hash = digest
