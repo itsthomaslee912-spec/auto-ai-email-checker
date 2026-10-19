@@ -1088,6 +1088,14 @@ def candidate_own_name(email: EmailMessage, messages: list[EmailMessage] | None 
     calendar invites carry an ATTENDEE 'CN=Jordan Meeker:mailto:...' for the
     candidate's own address. Either source gives a cheap, reliable name to
     reject when a model or heuristic mistakes the candidate for the employer.
+
+    A calendar notification subject like "Interview with Jordan Meeker @ ...
+    (jordanwm914@gmail.com)" is deliberately NOT treated as a signal here: the
+    trailing "(owner-address)" is boilerplate Google/Outlook attendee
+    formatting present on every such subject regardless of what "with X"
+    names — it can just as easily be "Interview with WITHIN", a real
+    employer. Only a name genuinely paired with the owner's own address (not
+    merely co-occurring in the same subject) is a reliable signal.
     """
     owner = _mailbox_owner_address(email)
     if not owner:
@@ -1102,6 +1110,52 @@ def candidate_own_name(email: EmailMessage, messages: list[EmailMessage] | None 
                     if cleaned and "@" not in cleaned and cleaned.casefold() != owner:
                         return cleaned
     return ""
+
+
+_mailbox_candidate_name_cache: dict[int, str] = {}
+
+
+def mailbox_candidate_name(db: Session, mailbox_id: int, owner_address: str = "") -> str:
+    """The account holder's name, found once across their whole mailbox and cached.
+
+    A reliable 'Name <owner-address>' pairing often lives in a different
+    thread than the one being processed (an old application confirmation, not
+    today's interview invite). Searching only the current thread's messages
+    misses that, so this scans the mailbox broadly instead. Only a positive
+    result is cached — an empty one is retried, since the pairing may show up
+    in mail that arrives later.
+    """
+    cached = _mailbox_candidate_name_cache.get(mailbox_id)
+    if cached:
+        return cached
+    if not owner_address:
+        row = db.query(MailboxConnection.email_address).filter(MailboxConnection.id == mailbox_id).first()
+        owner_address = row[0] if row else ""
+    owner_address = _normalized_address(owner_address or "")
+    if not owner_address:
+        return ""
+    needle = f"%{owner_address}%"
+    name = ""
+    for item in (
+        db.query(EmailMessage)
+        .filter(
+            EmailMessage.mailbox_id == mailbox_id,
+            or_(
+                EmailMessage.body_text.ilike(needle),
+                EmailMessage.body_html.ilike(needle),
+                EmailMessage.snippet.ilike(needle),
+            ),
+        )
+        .order_by(EmailMessage.id.asc())
+        .limit(2000)
+        .all()
+    ):
+        name = candidate_own_name(item)
+        if name:
+            break
+    if name:
+        _mailbox_candidate_name_cache[mailbox_id] = name
+    return name
 
 
 def _organizer_addresses(email: EmailMessage) -> set[str]:
@@ -2625,6 +2679,7 @@ async def extract_calendar_details(
     use_ai: bool = True,
     known_slots: list[ExtractedSlot] | None = None,
     priority: str = "live",
+    db: Session | None = None,
 ) -> tuple[list[ExtractedSlot], MeetingAccess, InterviewDetails, bool]:
     messages = [*(related_emails or []), email]
     text = "\n".join(_calendar_text(item) for item in messages)
@@ -2672,6 +2727,8 @@ async def extract_calendar_details(
             )
     known_company = _source_anchored_company(email, messages)
     candidate_name = candidate_own_name(email, messages)
+    if not candidate_name and db is not None and email.mailbox_id:
+        candidate_name = mailbox_candidate_name(db, email.mailbox_id)
     if known_company and candidate_name and companies_match(known_company, candidate_name):
         known_company = ""
     known_role = _known_role(messages)
@@ -2882,6 +2939,8 @@ def refresh_calendar_event_details(db: Session, email: EmailMessage) -> bool:
         )
     company = _source_anchored_company(email, messages)
     name = candidate_own_name(email, messages)
+    if not name and email.mailbox_id:
+        name = mailbox_candidate_name(db, email.mailbox_id)
     if company and name and companies_match(company, name):
         company = ""
     found_role = None if job_role_or_empty(email.job_role) else _open_role_for_employer(db, email, company or email.company or "")
@@ -4350,30 +4409,7 @@ def repair_candidate_name_as_company(db: Session, mailbox_id: int | None = None)
         )
         if not events and not emails:
             continue
-        name = ""
-        if owner_address:
-            # Mail that quotes the candidate's own address ("From: Jordan Meeker
-            # <owner>", an ICS attendee line) is what carries their name, so
-            # search for that directly instead of hoping it is in recent mail.
-            needle = f"%{owner_address}%"
-            candidates = (
-                db.query(EmailMessage)
-                .filter(
-                    EmailMessage.mailbox_id == box_id,
-                    or_(
-                        EmailMessage.body_text.ilike(needle),
-                        EmailMessage.body_html.ilike(needle),
-                        EmailMessage.snippet.ilike(needle),
-                    ),
-                )
-                .order_by(EmailMessage.id.asc())
-                .limit(2000)
-                .all()
-            )
-            for item in candidates:
-                name = candidate_own_name(item)
-                if name:
-                    break
+        name = mailbox_candidate_name(db, box_id, owner_address)
         if not name:
             continue
         for event in events:
@@ -5994,11 +6030,11 @@ async def _process_calendar_email(
     )
     if use_ai:
         slots, access, details, completed = await extract_calendar_details(
-            email, related_emails, known_slots=known_slots, priority=priority,
+            email, related_emails, known_slots=known_slots, priority=priority, db=db,
         )
     else:
         slots, access, details, completed = await extract_calendar_details(
-            email, related_emails, use_ai=False, known_slots=known_slots, priority=priority,
+            email, related_emails, use_ai=False, known_slots=known_slots, priority=priority, db=db,
         )
     details = _fill_missing_role(db, email, details)
     # Keep the email row free of schedule-stage labels ("Recruiter Screen").
