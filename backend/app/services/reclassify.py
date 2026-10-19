@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 _jobs: dict[int, dict[str, Any]] = {}
 _running: set[int] = set()
 _cancel_requested: set[int] = set()
+_rerun_requested: dict[int, bool] = {}
 _job_lock = asyncio.Lock()
 _mailbox_gate: asyncio.Semaphore | None = None
 
@@ -68,8 +69,22 @@ async def start_mailbox_reclassify(mailbox_id: int, *, pending_only: bool = Fals
     async with _job_lock:
         current = _jobs.get(mailbox_id)
         if mailbox_id in _running or (current and current.get("state") == "running"):
+            # A job is already in flight for this mailbox (e.g. two webhook
+            # notifications for the same mailbox landed concurrently). Don't
+            # silently drop this request — remember to run again once the
+            # in-flight job finishes so newly-pending emails still get
+            # classified. If any queued request wants a full reclassify
+            # (pending_only=False), the rerun must not be pending-only either.
+            existing = _rerun_requested.get(mailbox_id)
+            _rerun_requested[mailbox_id] = pending_only if existing is None else (existing and pending_only)
+            logger.info(
+                "Reclassify already running for mailbox %s; queuing rerun (pending_only=%s)",
+                mailbox_id,
+                _rerun_requested[mailbox_id],
+            )
             return get_reclassify_status(mailbox_id)
         _cancel_requested.discard(mailbox_id)
+        _rerun_requested.pop(mailbox_id, None)
         _running.add(mailbox_id)
         job = _set_job(
             mailbox_id,
@@ -449,3 +464,6 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
       finally:
         _running.discard(mailbox_id)
         _cancel_requested.discard(mailbox_id)
+        rerun_pending_only = _rerun_requested.pop(mailbox_id, None)
+        if rerun_pending_only is not None:
+            asyncio.create_task(start_mailbox_reclassify(mailbox_id, pending_only=rerun_pending_only))
