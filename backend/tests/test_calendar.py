@@ -210,6 +210,126 @@ def test_placeholder_repair_makes_a_teams_join_link_authoritative_over_phone():
         assert event.phone_number == "786.218.0775"
 
 
+def test_placeholder_repair_recovers_company_from_linked_sender_domain_subject():
+    factory, (mailbox_id, _) = _database()
+    start = datetime(2026, 10, 20, 14, 30, tzinfo=timezone.utc)
+    with factory() as db:
+        confirmation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="within-interview-confirmation",
+            thread_id="within-confirmation-thread",
+            subject="WITHIN Interview Confirmation",
+            sender="WITHIN Jobs <jobs@within.co>",
+            received_at=start - timedelta(days=4),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+            company="",
+            job_role="Member of Technical Staff, AI",
+        )
+        db.add(confirmation)
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=confirmation.id,
+            source_thread_id=confirmation.thread_id,
+            kind="confirmed",
+            origin="email",
+            title="Member of Technical Staff, AI",
+            company="",
+            job_role="Member of Technical Staff, AI",
+            start_at=start,
+            end_at=start + timedelta(minutes=30),
+            meeting_type="video",
+            meeting_provider="Google Meet",
+            is_visible=True,
+        )
+        db.add(event)
+        db.commit()
+
+        assert repair_placeholder_calendar_fields(db, mailbox_id) == 1
+        db.commit()
+
+        assert event.company == "WITHIN"
+        assert event.title == "WITHIN — Member of Technical Staff, AI"
+
+
+def test_calendar_repair_prunes_unrelated_employers_and_restores_source_company():
+    factory, (mailbox_id, _) = _database()
+    start = datetime(2026, 10, 20, 14, 30, tzinfo=timezone.utc)
+    with factory() as db:
+        within = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="within-source",
+            thread_id="within-thread",
+            subject="WITHIN Interview Confirmation",
+            sender="WITHIN Jobs <jobs@within.co>",
+            received_at=start - timedelta(days=4),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+            company="",
+            job_role="Member of Technical Staff, AI",
+        )
+        morgan = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="morgan-unrelated",
+            thread_id="morgan-thread",
+            subject="HR Phone Screening",
+            sender="Recruiting <recruiting@careers.morganstanley.com>",
+            received_at=start - timedelta(days=3),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            company="Morgan Stanley",
+            job_role="Member of Technical Staff, AI",
+        )
+        adyen = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="adyen-unrelated",
+            thread_id="adyen-thread",
+            subject="Adyen Intro Call",
+            sender="Recruiting <recruiting@adyen.com>",
+            received_at=start - timedelta(days=2),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            company="Adyen",
+            job_role="Member of Technical Staff, AI",
+        )
+        db.add_all([within, morgan, adyen])
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=within.id,
+            source_thread_id=within.thread_id,
+            kind="confirmed",
+            origin="email",
+            title="Morgan Stanley — Member of Technical Staff, AI",
+            company="Morgan Stanley",
+            job_role="Member of Technical Staff, AI",
+            start_at=start,
+            end_at=start + timedelta(minutes=30),
+            meeting_type="video",
+            meeting_provider="Google Meet",
+            is_visible=True,
+        )
+        db.add(event)
+        db.flush()
+        db.add_all(
+            CalendarEventEmail(event_id=event.id, email_id=item.id)
+            for item in (within, morgan, adyen)
+        )
+        db.commit()
+
+        assert collapse_duplicate_calendar_events(db, mailbox_id) is True
+        db.commit()
+
+        assert event.company == "WITHIN"
+        assert event.title == "WITHIN — Member of Technical Staff, AI"
+        linked_ids = {
+            row[0]
+            for row in db.query(CalendarEventEmail.email_id)
+            .filter(CalendarEventEmail.event_id == event.id)
+            .all()
+        }
+        assert linked_ids == {within.id}
+
+
 def test_time_change_uses_ics_uid_across_threads_to_move_existing_chip():
     factory, (mailbox_id, _) = _database()
     zoom_url = "https://us02web.zoom.us/j/12345678901?pwd=StuutInterview"

@@ -138,6 +138,7 @@ def test_gmail_incremental_advances_cursor_only_after_fetch_and_ingest(monkeypat
     assert mailbox.sync_cursor == "200"
     assert get_messages.await_args.args[1] == ["new"]
     assert ingest.await_count == 1
+    assert ingest.await_args.kwargs["download_only"] is True
 
     mailbox.sync_cursor = "200"
     db.commit()
@@ -151,7 +152,7 @@ def test_gmail_incremental_advances_cursor_only_after_fetch_and_ingest(monkeypat
     engine.dispose()
 
 
-def test_gmail_webhook_classifies_new_messages_with_active_ai_settings(monkeypatch):
+def test_gmail_webhook_commits_before_starting_background_classification(monkeypatch):
     engine, db, mailbox = _mailbox(Provider.GOOGLE)
     mailbox.sync_cursor = "100"
     db.commit()
@@ -168,6 +169,8 @@ def test_gmail_webhook_classifies_new_messages_with_active_ai_settings(monkeypat
     monkeypatch.setattr(mailbox_sync, "normalize_gmail_message", lambda raw: raw)
     ingest = AsyncMock(return_value=object())
     monkeypatch.setattr(mailbox_sync, "ingest_normalized_message", ingest)
+    classify_downloaded = AsyncMock()
+    monkeypatch.setattr(mailbox_sync, "_classify_downloaded_mail", classify_downloaded)
 
     created = asyncio.run(
         mailbox_sync.process_gmail_notification(db, mailbox.email_address, "200")
@@ -175,7 +178,8 @@ def test_gmail_webhook_classifies_new_messages_with_active_ai_settings(monkeypat
 
     assert created == 1
     assert ingest.await_count == 1
-    assert ingest.await_args.kwargs == {}
+    assert ingest.await_args.kwargs == {"download_only": True}
+    classify_downloaded.assert_awaited_once_with(mailbox.id)
     assert mailbox.sync_cursor == "200"
     db.close()
     engine.dispose()

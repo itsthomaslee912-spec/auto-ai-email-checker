@@ -19,7 +19,7 @@ import httpx
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from app.models import CalendarEvent, CalendarEventEmail, EmailLabel, EmailMessage
+from app.models import CalendarEvent, CalendarEventEmail, EmailLabel, EmailMessage, MailboxConnection
 from app.services.ai_backend import ai_call_semaphore, get_ai_backend
 from app.timeutil import as_utc
 
@@ -44,6 +44,10 @@ CONTEXT_LABELS = {
 
 _EMAIL_ADDRESS_RE = re.compile(r"[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 _ORGANIZER_RE = re.compile(r"\bORGANIZER(?:;[^:\r\n]*)?:mailto:([^\s;\r\n]+)", re.I)
+_NAME_EMAIL_RE = re.compile(
+    r"([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){0,3})\s*(?:&lt;|<)\s*([^<>\s]+@[^<>\s]+)\s*(?:&gt;|>)"
+)
+_CN_MAILTO_RE = re.compile(r'CN="?([^;"\r\n]+)"?[^\r\n]{0,60}:mailto:([^\s;\r\n]+)', re.I)
 _AUTOMATED_LOCAL_PARTS = {
     "calendar-notification",
     "mailer-daemon",
@@ -1077,6 +1081,29 @@ def _mailbox_owner_address(email: EmailMessage) -> str:
     return _normalized_address(getattr(mailbox, "email_address", "") or "")
 
 
+def candidate_own_name(email: EmailMessage, messages: list[EmailMessage] | None = None) -> str:
+    """The account holder's own name, as mail they're on spells it.
+
+    Quoted reply chains carry 'From: Jordan Meeker <jordanwm914@gmail.com>' and
+    calendar invites carry an ATTENDEE 'CN=Jordan Meeker:mailto:...' for the
+    candidate's own address. Either source gives a cheap, reliable name to
+    reject when a model or heuristic mistakes the candidate for the employer.
+    """
+    owner = _mailbox_owner_address(email)
+    if not owner:
+        return ""
+    for item in messages or [email]:
+        text = html.unescape(_message_text(item))
+        for pattern in (_NAME_EMAIL_RE, _CN_MAILTO_RE):
+            for match in pattern.finditer(text):
+                name, address = match.group(1), match.group(2)
+                if _normalized_address(address) == owner:
+                    cleaned = clean_company_name(name)
+                    if cleaned and "@" not in cleaned and cleaned.casefold() != owner:
+                        return cleaned
+    return ""
+
+
 def _organizer_addresses(email: EmailMessage) -> set[str]:
     text = _message_text(email)
     addresses = {
@@ -2056,7 +2083,7 @@ def correct_sender_domain_employers(db: Session, mailbox_id: int | None = None) 
 
 
 def repair_calendar_event_email_links(db: Session, mailbox_id: int | None = None) -> int:
-    """Backfill safe cross-thread Microsoft Bookings links for existing events."""
+    """Reconcile every confirmed event with its source message's safe context."""
     query = db.query(CalendarEvent).filter(
         CalendarEvent.is_visible.is_(True),
         CalendarEvent.kind == "confirmed",
@@ -2068,8 +2095,6 @@ def repair_calendar_event_email_links(db: Session, mailbox_id: int | None = None
     for event in query.all():
         source = db.get(EmailMessage, event.source_email_id)
         if source is None:
-            continue
-        if not _schedule_tokens(_message_text(source)) and "onmicrosoft.com" not in (source.sender or "").casefold():
             continue
         related = _related_interview_emails(db, source)
         # A calendar request can put the booking URL past the bounded message
@@ -2107,8 +2132,40 @@ def _known_company(messages: list[EmailMessage]) -> str:
     values = [(index, (item.company or "").strip()) for index, item in enumerate(messages)]
     values = [(index, value) for index, value in values if value]
     if not values:
+        # Classification can leave company blank even when a sender-domain
+        # corroborated subject names it ("WITHIN Interview Confirmation" from
+        # jobs@within.co). Keep this deterministic fallback available to both
+        # initial extraction and later calendar repair.
+        values = [
+            (index, inferred)
+            for index, item in enumerate(messages)
+            if (inferred := _company_named_in_message(item))
+        ]
+    if not values:
         return ""
     return max(values, key=lambda item: (_company_quality(item[1]), item[0]))[1]
+
+
+def _source_anchored_company(email: EmailMessage, messages: list[EmailMessage]) -> str:
+    """Choose company context without letting unrelated linked mail beat the source."""
+    known = clean_company_name(_known_company(messages))
+    stored = clean_company_name(
+        employer_instead_of_sender_domain(email, (email.company or "").strip())
+    )
+    inferred = clean_company_name(
+        employer_instead_of_sender_domain(email, _company_named_in_message(email))
+    )
+    if stored:
+        return fuller_company_name(stored, known) if companies_match(stored, known) else stored
+    if inferred:
+        if known and companies_match(inferred, known):
+            return fuller_company_name(inferred, known)
+        # A sent reply's own address is not an employer identity. Its related
+        # incoming invitation remains the useful company context.
+        if (getattr(email, "folder", "") or "").casefold() == "sent" and known:
+            return known
+        return inferred
+    return known
 
 
 def _known_role(messages: list[EmailMessage]) -> str:
@@ -2613,11 +2670,10 @@ async def extract_calendar_details(
                 access.phone_number,
                 access.access_code,
             )
-    known_company = clean_company_name(
-        employer_instead_of_sender_domain(
-            email, _known_company(messages) or _company_named_in_message(email),
-        )
-    )
+    known_company = _source_anchored_company(email, messages)
+    candidate_name = candidate_own_name(email, messages)
+    if known_company and candidate_name and companies_match(known_company, candidate_name):
+        known_company = ""
     known_role = _known_role(messages)
     deterministic_job_url = extract_job_url(text)
     deterministic_interviewer = extract_interviewer(current_text, email.sender or "")
@@ -2701,6 +2757,11 @@ async def extract_calendar_details(
         # interviewer's own name for the employer; never let an extracted
         # company that is really the interviewer override a known one.
         if ai_company and ai_interviewer and companies_match(ai_company, ai_interviewer):
+            ai_company = ""
+        # The model is told not to use the candidate's own name as the employer,
+        # but a weak local model can still do it (e.g. "Interview with Jordan
+        # Meeker" where Jordan Meeker is the account holder, not the recruiter).
+        if ai_company and candidate_name and companies_match(ai_company, candidate_name):
             ai_company = ""
         details = InterviewDetails(
             company=clean_company_name(
@@ -2819,11 +2880,10 @@ def refresh_calendar_event_details(db: Session, email: EmailMessage) -> bool:
             ),
             "",
         )
-    company = clean_company_name(
-        employer_instead_of_sender_domain(
-            email, _known_company(messages) or _company_named_in_message(email),
-        )
-    )
+    company = _source_anchored_company(email, messages)
+    name = candidate_own_name(email, messages)
+    if company and name and companies_match(company, name):
+        company = ""
     found_role = None if job_role_or_empty(email.job_role) else _open_role_for_employer(db, email, company or email.company or "")
     if found_role is None:
         role = _known_role(messages)
@@ -4264,6 +4324,71 @@ def repair_corrupted_company_names(db: Session, mailbox_id: int | None = None) -
     return repaired
 
 
+def repair_candidate_name_as_company(db: Session, mailbox_id: int | None = None) -> int:
+    """Clear a stored company value that is actually the account holder's own name.
+
+    A weak local model can echo the candidate's own name back as the employer
+    (a quoted "From: Jordan Meeker <...>" reply, an ICS attendee list, or a
+    subject like "Interview with Jordan Meeker" where Jordan Meeker is the
+    candidate, not the recruiter). Detect each mailbox's own name once from a
+    sample of its mail and blank any stored company that matches it.
+    """
+    repaired = 0
+    mailbox_query = db.query(MailboxConnection.id, MailboxConnection.email_address)
+    if mailbox_id is not None:
+        mailbox_query = mailbox_query.filter(MailboxConnection.id == mailbox_id)
+    for box_id, owner_address in mailbox_query.all():
+        events = (
+            db.query(CalendarEvent)
+            .filter(CalendarEvent.mailbox_id == box_id, CalendarEvent.company != "")
+            .all()
+        )
+        emails = (
+            db.query(EmailMessage)
+            .filter(EmailMessage.mailbox_id == box_id, EmailMessage.company != "")
+            .all()
+        )
+        if not events and not emails:
+            continue
+        name = ""
+        if owner_address:
+            # Mail that quotes the candidate's own address ("From: Jordan Meeker
+            # <owner>", an ICS attendee line) is what carries their name, so
+            # search for that directly instead of hoping it is in recent mail.
+            needle = f"%{owner_address}%"
+            candidates = (
+                db.query(EmailMessage)
+                .filter(
+                    EmailMessage.mailbox_id == box_id,
+                    or_(
+                        EmailMessage.body_text.ilike(needle),
+                        EmailMessage.body_html.ilike(needle),
+                        EmailMessage.snippet.ilike(needle),
+                    ),
+                )
+                .order_by(EmailMessage.id.asc())
+                .limit(2000)
+                .all()
+            )
+            for item in candidates:
+                name = candidate_own_name(item)
+                if name:
+                    break
+        if not name:
+            continue
+        for event in events:
+            if companies_match(event.company, name):
+                event.company = ""
+                if event.origin == "email":
+                    event.title = event.job_role or event.title
+                repaired += 1
+        for email in emails:
+            if companies_match(email.company, name):
+                email.company = ""
+                repaired += 1
+    return repaired
+
+
 def repair_meeting_join_urls(db: Session, mailbox_id: int | None = None) -> int:
     """Replace branding/account Zoom URLs with the real join link from linked mail."""
     repaired = 0
@@ -5481,13 +5606,34 @@ def repair_phantom_availability_slots(db: Session, mailbox_id: int | None = None
 
 
 def repair_placeholder_calendar_fields(db: Session, mailbox_id: int | None = None) -> int:
-    """Drop placeholder literals stored in user-visible calendar fields."""
+    """Repair missing and placeholder values in user-visible calendar fields."""
     query = db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True))
     if mailbox_id is not None:
         query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
     repaired = 0
     for event in query.all():
         company = clean_company_name(event.company)
+        source = db.get(EmailMessage, event.source_email_id) if event.source_email_id else None
+        source_company = _source_anchored_company(source, [source]) if source is not None else ""
+        # The source confirmation is a stronger identity anchor than historical
+        # links. Old duplicate merges can leave unrelated employers attached to
+        # an event; do not let those stale links keep rewriting the chip.
+        source_inferred_without_stored_company = bool(
+            source is not None
+            and not (source.company or "").strip()
+            and _company_named_in_message(source)
+        )
+        if source_company and (
+            not company
+            or (
+                source_inferred_without_stored_company
+                and not companies_match(company, source_company)
+                and not _company_supported_by_messages(company, [source])
+            )
+        ):
+            company = source_company
+        if not company:
+            company = clean_company_name(_known_company(_linked_messages(db, event)))
         role = job_role_or_empty(event.job_role)
         provider = clean_meeting_provider(event.meeting_provider)
         meeting_type = event.meeting_type or "unspecified"
@@ -5624,6 +5770,10 @@ def repair_quoted_option_bookings(db: Session, mailbox_id: int | None = None) ->
 def collapse_duplicate_calendar_events(db: Session, mailbox_id: int | None = None) -> bool:
     """Keep one visible chip for each scheduled interview and each open window."""
     changed = repair_calendar_attendee_response_labels(db, mailbox_id) > 0
+    # Remove stale links before any field repair reads them. This applies to all
+    # confirmed email events, not only Microsoft Bookings messages.
+    if repair_calendar_event_email_links(db, mailbox_id) > 0:
+        changed = True
     if repair_mixed_thread_appointments(db, mailbox_id) > 0:
         changed = True
     if repair_quoted_option_bookings(db, mailbox_id) > 0:
@@ -5639,6 +5789,9 @@ def collapse_duplicate_calendar_events(db: Session, mailbox_id: int | None = Non
     if repair_availability_window_appointments(db, mailbox_id) > 0:
         changed = True
     if repair_corrupted_company_names(db, mailbox_id) > 0:
+        changed = True
+        companies_match.cache_clear()
+    if repair_candidate_name_as_company(db, mailbox_id) > 0:
         changed = True
         companies_match.cache_clear()
     if repair_meeting_join_urls(db, mailbox_id) > 0:

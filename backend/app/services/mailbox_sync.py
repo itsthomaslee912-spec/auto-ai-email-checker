@@ -245,10 +245,9 @@ async def _run_sync_job_exclusive(
                 message=f"Synced {imported} new messages",
             )
         await publish("sync.done", dict(job))
-        # Every imported message is already classified by AI during ingest.
-        # This is a backstop only: it finds and finishes anything that
-        # somehow stayed classification_pending (e.g. a worker restart
-        # mid-sync), which should be rare now and is a cheap no-op otherwise.
+        # Provider download must finish independently of the selected AI
+        # backend. New rows are committed immediately as classification_pending
+        # and enriched here after the mailbox cursor and UI are up to date.
         if imported and not _should_stop(mailbox_id):
             from app.services.reclassify import start_mailbox_reclassify
 
@@ -457,7 +456,7 @@ async def _incremental_gmail(db: Session, mailbox: MailboxConnection) -> None:
             normalized = normalize_gmail_message(raw)
             if _message_sender_is_excluded(mailbox, normalized):
                 continue
-            email = await ingest_normalized_message(db, mailbox, normalized, download_only=False, priority="background")
+            email = await ingest_normalized_message(db, mailbox, normalized, download_only=True, priority="background")
             if email:
                 imported += 1
             await asyncio.sleep(0)
@@ -546,7 +545,7 @@ async def _sync_gmail(db: Session, mailbox: MailboxConnection, limit: int) -> No
             normalized = normalize_gmail_message(raw)
             if _message_sender_is_excluded(mailbox, normalized):
                 continue
-            email = await ingest_normalized_message(db, mailbox, normalized, download_only=False, priority="background")
+            email = await ingest_normalized_message(db, mailbox, normalized, download_only=True, priority="background")
             if email:
                 imported += 1
             elif mid in existing:
@@ -605,7 +604,7 @@ async def _sync_outlook(db: Session, mailbox: MailboxConnection, limit: int) -> 
             )
             return
         email = await ingest_normalized_message(
-            db, mailbox, normalize_outlook_message(raw), download_only=False, priority="background"
+            db, mailbox, normalize_outlook_message(raw), download_only=True, priority="background"
         )
         if email:
             imported += 1
@@ -670,7 +669,7 @@ async def _sync_outlook_delta(db: Session, mailbox: MailboxConnection) -> None:
                             continue
                         raise
                     raw["_mail_folder"] = folder
-                    email = await ingest_normalized_message(db, mailbox, normalize_outlook_message(raw), download_only=False, priority="background")
+                    email = await ingest_normalized_message(db, mailbox, normalize_outlook_message(raw), download_only=True, priority="background")
                     if email:
                         imported += 1
                     await asyncio.sleep(0)
@@ -730,6 +729,13 @@ def _record_notification_failure(db: Session, mailbox: MailboxConnection, exc: E
     db.commit()
 
 
+async def _classify_downloaded_mail(mailbox_id: int) -> None:
+    """Start eventual enrichment after provider mail is safely committed."""
+    from app.services.reclassify import start_mailbox_reclassify
+
+    await start_mailbox_reclassify(mailbox_id, pending_only=True)
+
+
 async def process_gmail_notification(db: Session, email_address: str, history_id: str | None) -> int:
     normalized_address = (email_address or "").strip().casefold()
     candidates = (
@@ -784,12 +790,13 @@ async def _process_gmail_notification_for(
                     continue
                 if not _gmail_message_belongs_to_mailbox(mailbox, raw):
                     continue
-                # Webhook imports are live messages, so classify them with the
-                # provider and model currently selected in Settings.
+                # Persist webhook mail before waiting on AI. A slow local model
+                # must never hold the Gmail history cursor or hide the message
+                # from the inbox UI.
                 normalized = normalize_gmail_message(raw)
                 if _message_sender_is_excluded(mailbox, normalized):
                     continue
-                email = await ingest_normalized_message(db, mailbox, normalized)
+                email = await ingest_normalized_message(db, mailbox, normalized, download_only=True)
                 if email:
                     created += 1
             if history.get("historyId"):
@@ -803,6 +810,8 @@ async def _process_gmail_notification_for(
             mailbox.webhook.last_delivery_success_at = datetime.now(timezone.utc)
             mailbox.webhook.last_delivery_error = None
         db.commit()
+        if created:
+            await _classify_downloaded_mail(mailbox.id)
         return created
 
 
@@ -823,11 +832,16 @@ async def process_outlook_notification(db: Session, subscription_id: str, messag
     except Exception as exc:
         _record_notification_failure(db, mailbox, exc)
         raise
-    email = await ingest_normalized_message(db, mailbox, normalize_outlook_message(raw))
+    # Make the Outlook message visible before classification/calendar work.
+    email = await ingest_normalized_message(
+        db, mailbox, normalize_outlook_message(raw), download_only=True,
+    )
     mailbox.last_sync_completed_at = datetime.now(timezone.utc)
     mailbox.last_sync_error = None
     if mailbox.webhook is not None:
         mailbox.webhook.last_delivery_success_at = datetime.now(timezone.utc)
         mailbox.webhook.last_delivery_error = None
     db.commit()
+    if email:
+        await _classify_downloaded_mail(mailbox.id)
     return 1 if email else 0

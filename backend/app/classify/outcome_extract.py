@@ -8,7 +8,13 @@ from sqlalchemy.orm import Session
 
 from app.models import EmailLabel, EmailMessage
 from app.services.ai_backend import ai_call_semaphore, get_ai_backend
-from app.services.calendar_extract import clean_company_name, employer_instead_of_sender_domain, job_role_or_empty
+from app.services.calendar_extract import (
+    candidate_own_name,
+    clean_company_name,
+    companies_match,
+    employer_instead_of_sender_domain,
+    job_role_or_empty,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +137,13 @@ async def apply_outcome(
         return False
     company, role = extracted
     company = clean_company_name(employer_instead_of_sender_domain(email, company))
+    # The prompt tells the model never to use the candidate's own name as the
+    # employer, but a weak local model can still do it (e.g. a quoted "From:
+    # Jordan Meeker <...>" reply makes the model echo "Jordan Meeker" back as
+    # the company). Reject it defensively rather than trust instruction-following.
+    name = candidate_own_name(email)
+    if company and name and companies_match(company, name):
+        company = ""
     email.company = company
     email.job_role = job_role_or_empty(role)
     email.outcome_extracted = True
