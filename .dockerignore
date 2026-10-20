@@ -10,5 +10,4 @@ logs
 backend/.venv
 frontend/node_modules
 frontend/dist
-src-tauri/target
 

@@ -10,7 +10,7 @@ x-backend: &backend
     DATABASE_URL: postgresql+psycopg://email_app:${POSTGRES_PASSWORD:-email_app}@postgres:5432/email_platform
     KAFKA_BOOTSTRAP_SERVERS: kafka:29092
     KAFKA_TOPIC_PREFIX: aec
-    EMAIL_CLASSIFICATION_MODE: ai_only
+    EMAIL_CLASSIFICATION_MODE: ${EMAIL_CLASSIFICATION_MODE:-ai_only}
     WEBHOOK_BASE_URL: ${WEBHOOK_BASE_URL:-http://localhost:8000}
     BACKEND_PUBLIC_URL: ${BACKEND_PUBLIC_URL:-http://localhost:8000}
     FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:8080}
@@ -22,6 +22,14 @@ x-backend: &backend
   restart: unless-stopped
   networks:
     - backend
+  deploy:
+    resources:
+      limits:
+        cpus: "1.5"
+        memory: 1g
+      reservations:
+        cpus: "0.25"
+        memory: 256m
 
 services:
   frontend:
@@ -37,6 +45,14 @@ services:
     networks:
       - edge
       - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128m
+        reservations:
+          cpus: "0.1"
+          memory: 32m
 
   email-api:
     <<: *backend
@@ -58,6 +74,12 @@ services:
     environment:
       <<: *backend-env
       RUNTIME_ROLE: worker
+    healthcheck:
+      test: ["CMD-SHELL", "find /tmp/worker-heartbeat -newermt '-30 seconds' | grep -q ."]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 20s
 
   postgres:
     image: postgres:16-alpine
@@ -75,6 +97,14 @@ services:
     restart: unless-stopped
     networks:
       - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1g
+        reservations:
+          cpus: "0.25"
+          memory: 256m
 
   kafka:
     image: confluentinc/cp-kafka:7.7.1
@@ -102,6 +132,14 @@ services:
     restart: unless-stopped
     networks:
       - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1.5g
+        reservations:
+          cpus: "0.25"
+          memory: 512m
 
   schema-registry:
     image: confluentinc/cp-schema-registry:7.7.1
@@ -115,6 +153,14 @@ services:
     restart: unless-stopped
     networks:
       - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512m
+        reservations:
+          cpus: "0.1"
+          memory: 128m
 
 volumes:
   postgres-data:

@@ -40,10 +40,6 @@ pnpm-debug.log*
 .idea/
 .vscode/
 backend/uploads/
-backend/build-desktop/
-src-tauri/binaries/
-src-tauri/target/
-src-tauri/gen/
 /release/
 
 plan.md

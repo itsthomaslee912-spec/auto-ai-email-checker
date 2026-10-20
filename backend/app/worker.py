@@ -4,8 +4,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from pathlib import Path
 
 from app.db import init_db
+
+HEARTBEAT_PATH = Path("/tmp/worker-heartbeat")
+HEARTBEAT_INTERVAL_SECONDS = 15
+
+
+async def heartbeat_loop(stop_event: asyncio.Event) -> None:
+    """Touch a file on an interval so the container healthcheck can detect a hung event loop."""
+    while not stop_event.is_set():
+        HEARTBEAT_PATH.write_text("")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=HEARTBEAT_INTERVAL_SECONDS)
+        except TimeoutError:
+            pass
 from app.realtime.renewal import renewal_loop
 from app.services.auto_sync import auto_sync_loop
 from app.services.calendar_backfill import backfill_calendar_events
@@ -43,6 +57,7 @@ async def run() -> None:
             await start_all_pending_reclassify()
 
     tasks = [
+        asyncio.create_task(heartbeat_loop(stop_event)),
         asyncio.create_task(renewal_loop(stop_event)),
         asyncio.create_task(auto_sync_loop(stop_event)),
         asyncio.create_task(webhook_queue_loop(stop_event)),

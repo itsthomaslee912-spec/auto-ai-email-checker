@@ -1,264 +1,174 @@
 # Auto AI Email Checker
 
-Real-time Gmail / Outlook inbox classifier. New mail is ingested via provider webhooks, labeled with AI, and pushed to a React dashboard over an authenticated WebSocket.
+Docker-only Gmail and Outlook email classifier with interview calendar tracking.
 
-The container runtime uses a durable event pipeline: provider mail is committed with a transactional Kafka outbox, classified by a worker process, and delivered to the browser with reconnect recovery. SSE remains available temporarily for older clients.
+## Architecture
 
-**Branch:** `feature/v1`  
-**Stack:** React (Vite) frontend · FastAPI backend · PostgreSQL · OpenAI · Tauri
+Docker Compose starts these services:
 
-Labels: Application Confirmation ? Application Action Required ? Screening ? Assessment ? Interview Invitation ? Interview Scheduled ? Interview Follow-up ? Offer ? Rejected / Closed ? Recruitment Alert ? Other
+- `frontend`: React production build served by Nginx on port `8080`.
+- `email-api`: FastAPI REST, OAuth, webhook and WebSocket service.
+- `email-worker`: mailbox synchronization, reconciliation, AI processing and Kafka consumers.
+- `postgres`: durable email, calendar, activity and transactional-outbox storage.
+- `kafka`: asynchronous email and UI activity events.
+- `schema-registry`: event-contract registry.
 
----
-
-## Easy run (Windows)
-
-One-time setup (creates `.env`, Python venv, npm install):
-
-```bat
-scripts\setup.bat
-```
-
-Start PostgreSQL, backend, and frontend under the automatic service supervisor:
-
-```bat
-run.bat
-```
-
-Stop the servers and tunnel started by the launcher:
-
-```bat
-stop.bat
-```
-
-Or from PowerShell:
-
-```powershell
-.\run.ps1
-```
-
-To also start the public ngrok tunnel for webhook delivery:
-
-```powershell
-.\run.ps1 -WithNgrok
-```
-
-- Backend: http://127.0.0.1:8000  
-- Frontend: http://127.0.0.1:5173  
-
-Every connected account is reconciled automatically every 2 minutes while the backend is running. Registered webhooks remain the immediate-delivery path, while incremental polling is always kept as a safety net for missed notifications, tunnel outages, and stale subscriptions. This works without ngrok. Set `AUTO_SYNC_INTERVAL_SECONDS` and `AUTO_SYNC_MAX_MESSAGES` in `.env` to change the interval and recent-message limit. ngrok remains optional for immediate provider webhook updates.
-The first **Sync** for an account imports its history and saves provider cursors. Later **Sync** runs fetch changes from those cursors. Use **Full rescan** in the account controls to scan the mailbox again; an expired cursor also triggers a full rescan automatically. Cursor state is saved only after each batch of changes is processed.
-The inbox shows the current automatic sync state. If no account is connected, the sync worker stops, an account fails to sync, or the backend cannot be reached, a full-screen alert explains the issue and offers a connection or retry action. The alert clears after sync is available again.
-Application data is stored in PostgreSQL; SQLite is used only by isolated automated tests.
-
-Individual servers: `scripts\run-backend.bat` · `scripts\run-frontend.bat`
-
-### Docker Compose runtime
-
-The Docker runtime separates the latency-sensitive API from mailbox synchronization and AI processing:
+New mail follows this path:
 
 ```text
-frontend -> email-api -> PostgreSQL
-                    \-> Kafka -> email-worker
+Gmail / Outlook
+  -> OAuth + webhook
+  -> durable webhook job
+  -> import and deduplicate
+  -> transactional outbox
+  -> Kafka email.imported.v1
+  -> AI classification and extraction
+  -> calendar event/chip update
+  -> Kafka user.activity.v1
+  -> authenticated WebSocket
+  -> React UI
 ```
 
-Prepare the environment and start it:
+Webhooks are the immediate-delivery path. Incremental polling remains enabled as
+a fallback for disconnected, expired or unhealthy webhooks, and as a slower
+reconciliation safety net for healthy subscriptions.
+
+## Requirements
+
+- Docker Desktop with Docker Compose v2
+- A public HTTPS address for Gmail/Outlook webhook delivery
+- OAuth credentials for each provider you enable
+- An OpenAI or Gemini key, or a separately reachable Ollama service
+
+## Configure
+
+From PowerShell:
 
 ```powershell
-if (-not (Test-Path .env)) { Copy-Item .env.docker.example .env }
-# Fill in OAuth, webhook, encryption, session, and AI settings in .env.
+cd E:\my_project\auto-ai-email-checker
+
+if (-not (Test-Path .env)) {
+    Copy-Item .env.docker.example .env
+}
+
+notepad .env
+```
+
+Do not commit `.env`. Important settings include:
+
+```dotenv
+POSTGRES_PASSWORD=replace-with-a-strong-password
+SESSION_SECRET=replace-with-a-long-random-secret
+TOKEN_ENCRYPTION_KEY=replace-with-a-fernet-key
+
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4o-mini
+
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+GMAIL_PUBSUB_TOPIC=
+GMAIL_PUBSUB_AUDIENCE=https://mail.example.com/api/webhooks/gmail
+
+MICROSOFT_CLIENT_ID=
+MICROSOFT_CLIENT_SECRET=
+MICROSOFT_WEBHOOK_CLIENT_STATE=
+
+WEBHOOK_BASE_URL=https://mail.example.com
+BACKEND_PUBLIC_URL=https://mail.example.com
+FRONTEND_ORIGIN=https://mail.example.com
+GOOGLE_REDIRECT_URI=https://mail.example.com/api/auth/google/callback
+MICROSOFT_REDIRECT_URI=https://mail.example.com/api/auth/microsoft/callback
+```
+
+The values in `.env.docker.example` document every Docker setting.
+
+## Start
+
+```powershell
 docker compose up --build -d
 docker compose ps
 ```
 
-Open `http://localhost:8080`. Provider webhook and OAuth callback URLs must use the same externally reachable origin, for example `https://mail.example.com/api/webhooks/gmail`.
-
-The same backend image supports three roles:
+Open:
 
 ```text
-RUNTIME_ROLE=api     FastAPI, REST, OAuth, webhooks, WebSockets
-RUNTIME_ROLE=worker  sync, reconciliation, renewal, AI classification, Kafka outbox
-RUNTIME_ROLE=all     legacy desktop/non-Docker combined process
+http://localhost:8080
 ```
 
-Kafka is enabled when `KAFKA_BOOTSTRAP_SERVERS` is non-empty. With an empty value, the existing direct local-classification path remains active. This permits a shadow migration without stopping the desktop application.
+Health check:
 
-Operational endpoints:
+```powershell
+Invoke-WebRequest http://localhost:8080/api/health
+```
+
+Follow service logs:
+
+```powershell
+docker compose logs -f email-api email-worker kafka
+```
+
+## Stop and restart
+
+Stop containers while preserving PostgreSQL and Kafka volumes:
+
+```powershell
+docker compose down
+```
+
+Restart:
+
+```powershell
+docker compose up -d
+```
+
+Rebuild after source or dependency changes:
+
+```powershell
+docker compose up --build -d
+```
+
+Delete containers and all Docker-managed application data only when you
+intentionally want a fresh installation:
+
+```powershell
+docker compose down -v
+```
+
+## OAuth and webhooks
+
+### Gmail
+
+1. Enable Gmail API and Cloud Pub/Sub in Google Cloud.
+2. Create a Web OAuth client.
+3. Register `https://YOUR_HOST/api/auth/google/callback` as a redirect URI.
+4. Create a Pub/Sub topic and grant
+   `gmail-api-push@system.gserviceaccount.com` publisher access.
+5. Push Pub/Sub notifications to `https://YOUR_HOST/api/webhooks/gmail`.
+
+### Outlook
+
+1. Register an application in Microsoft Entra ID.
+2. Register `https://YOUR_HOST/api/auth/microsoft/callback` as a Web redirect URI.
+3. Grant delegated `Mail.ReadWrite`, `User.Read`, `openid`, `profile`, `email`
+   and `offline_access` permissions.
+4. Set a long random `MICROSOFT_WEBHOOK_CLIENT_STATE` value.
+
+## Operational endpoints
 
 ```text
 GET /api/health
 GET /api/health/ready
 GET /api/health/events
-WS  /api/ws/activity
 GET /api/activity?after_sequence=0
+WS  /api/ws/activity
 ```
 
-### Windows desktop application
+## Repository layout
 
-The Tauri installer bundles the React UI, FastAPI sidecar, and a portable
-PostgreSQL runtime. On first launch it creates an isolated database cluster in
-`%APPDATA%\com.autoai.emailchecker\postgres-data` and listens only on
-`127.0.0.1:55432`, avoiding conflicts with development PostgreSQL on port 5432.
-
-Build the NSIS installer:
-
-```powershell
-.\scripts\build-desktop.ps1
+```text
+backend/                 FastAPI API, workers, integrations and tests
+frontend/                React UI and Nginx production configuration
+compose.yml              Complete runtime definition
+.env.docker.example      Environment template
+.dockerignore            Docker build exclusions
 ```
-
-The installer is generated under `src-tauri\target\release\bundle\nsis`.
-Desktop OAuth/API settings can be placed in
-`%APPDATA%\com.autoai.emailchecker\.env`; database credentials are generated
-and managed locally by the application.
-
----
-
-## Quick start
-
-### 1. Environment
-
-```bash
-cp .env.example .env
-```
-
-Fill in at least:
-
-| Variable | Purpose |
-|---|---|
-| `OPENAI_API_KEY` | Classification (Chat Completions) |
-| `OPENAI_MODEL` | Model id, default `gpt-4o-mini` |
-| `GEMINI_API_KEY` | Gemini API key (may also be saved in Settings) |
-| `GEMINI_MODEL` | Gemini model id, default `gemini-3.8-flash` |
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Gmail OAuth |
-| `MICROSOFT_CLIENT_ID` / `MICROSOFT_CLIENT_SECRET` | Outlook OAuth |
-| `GMAIL_PUBSUB_TOPIC` | e.g. `projects/PROJECT/topics/gmail-push` |
-| `WEBHOOK_BASE_URL` | Public HTTPS URL (ngrok) for Graph + docs |
-| `BACKEND_PUBLIC_URL` | Same public backend URL; used for OAuth callbacks when redirect URIs are still localhost |
-| `GOOGLE_REDIRECT_URI` / `MICROSOFT_REDIRECT_URI` | OAuth callbacks; must be reachable from other computers (usually `{WEBHOOK_BASE_URL}/api/auth/.../callback`) |
-| `TOKEN_ENCRYPTION_KEY` | Fernet key (optional; a local fallback exists) |
-| `MICROSOFT_WEBHOOK_CLIENT_STATE` | Shared secret for Graph notifications |
-| `FRONTEND_ORIGIN` | Default frontend URL after OAuth (`http://localhost:5173`); remote browsers send their own origin automatically |
-
-Generate a Fernet key:
-
-```bash
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-```
-
-### 2. Backend
-
-```bash
-cd backend
-python -m venv .venv
-
-# Windows
-.venv\Scripts\activate
-# macOS / Linux
-source .venv/bin/activate
-
-pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
-```
-
-Health check: [http://localhost:8000/api/health](http://localhost:8000/api/health)
-
-### 3. Frontend
-
-Requires Node.js 18+.
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-Open [http://localhost:5173](http://localhost:5173). The Vite proxy forwards `/api` to the backend.
-
-### 4. Public tunnel (required for webhooks)
-
-```bash
-ngrok http 8000
-```
-
-`run.bat` starts ngrok automatically when it is installed and on PATH. Check its public URL at `http://127.0.0.1:4040`. Set `WEBHOOK_BASE_URL` to that HTTPS URL (no trailing slash), e.g. `https://abc123.ngrok-free.app`, and restart the backend if the URL changed. The PowerShell launcher still requires starting ngrok separately.
-
-`scripts/configure-webhook-env.ps1` also sets `BACKEND_PUBLIC_URL` and the Google/Microsoft OAuth redirect URIs to that same public URL so email connect works from other computers (not only on the server machine).
-
----
-
-## Google (Gmail) setup
-
-1. Create a Google Cloud project.
-2. Enable **Gmail API** and **Cloud Pub/Sub API**.
-3. Configure OAuth consent screen; create **OAuth client ID** (Web application).
-4. Authorized redirect URIs (add both if you use local + remote):
-   - `http://localhost:8000/api/auth/google/callback`
-   - `https://YOUR_TUNNEL/api/auth/google/callback`
-5. Create a Pub/Sub topic, e.g. `gmail-push`.
-6. Grant `gmail-api-push@system.gserviceaccount.com` **Pub/Sub Publisher** on that topic.
-7. Create a **push** subscription to  
-   `https://YOUR_TUNNEL/api/webhooks/gmail`
-8. Put the full topic name in `GMAIL_PUBSUB_TOPIC`:  
-   `projects/YOUR_PROJECT/topics/gmail-push`
-
-On Connect Gmail, the backend calls `users.watch` and stores `historyId`. Pub/Sub push → fetch new messages → classify → SSE.
-
----
-
-## Microsoft (Outlook) setup
-
-1. Register an app in [Azure Portal](https://portal.azure.com/) → Microsoft Entra ID → App registrations.
-2. Add redirect URIs (Web): `http://localhost:8000/api/auth/microsoft/callback` and `https://YOUR_TUNNEL/api/auth/microsoft/callback`.
-3. Create a client secret; copy Application (client) ID and secret into `.env`.
-4. API permissions (delegated): `Mail.ReadWrite`, `User.Read`, plus OpenID (`openid`, `profile`, `email`, `offline_access`).
-5. Grant admin consent if your tenant requires it.
-6. Set `MICROSOFT_WEBHOOK_CLIENT_STATE` to a long random string.
-7. Ensure `WEBHOOK_BASE_URL` is HTTPS (Graph requirement).
-
-On Connect Outlook, the backend creates a Graph subscription on `me/mailFolders('Inbox')/messages`. Notifications hit `/api/webhooks/outlook` (validation handshake included). Subscriptions auto-renew hourly when close to expiry.
-
----
-
-## API overview
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/api/health` | Liveness |
-| GET | `/api/auth/google/start` | Start Gmail OAuth |
-| GET | `/api/auth/google/callback` | OAuth callback |
-| GET | `/api/auth/microsoft/start` | Start Outlook OAuth |
-| GET | `/api/auth/microsoft/callback` | OAuth callback |
-| GET | `/api/mailboxes` | Connected accounts |
-| DELETE | `/api/mailboxes/{id}` | Disconnect |
-| POST | `/api/mailboxes/{id}/sync` | Initial full import, then incremental sync |
-| POST | `/api/mailboxes/{id}/sync/full` | Full mailbox rescan |
-| POST | `/api/mailboxes/{id}/reclassify` | Re-run OpenAI labels on stored mail |
-| GET | `/api/emails?label=` | Classified inbox |
-| GET | `/api/events` | SSE stream (`email.classified`) |
-| POST | `/api/webhooks/gmail` | Pub/Sub push |
-| POST | `/api/webhooks/outlook` | Graph notifications |
-
----
-
-## Repo layout
-
-```
-backend/app/          FastAPI app, OAuth, Gmail/Outlook, classifier, webhooks, SSE
-frontend/src/         React dashboard (connect + live inbox)
-.env.example          Environment template
-```
-
-## How email classification works
-
-New mail and **Sync** use the AI provider selected in Settings (OpenAI, Gemini, or local Ollama), with local rules for clear cases. The classifier chooses one of the eleven labels above. If the selected cloud provider has no API key, local rules classify clear cases and use **Other** for the rest.
-
-**Interview Scheduled** also has a separate `interview_subtype` field: `confirmation`, `calendar_invite`, `reminder`, `reschedule`, `time_change`, or `cancellation`. These are metadata values, not extra categories. The message reader displays the subtype.
-
-Existing stored labels are migrated when the backend starts. Old interview messages with evidence of a confirmed booking become **Interview Scheduled**; other old interview messages become **Interview Invitation**. The active classification prompt is updated to the eleven-label taxonomy. Use **Reclassify** if you want OpenAI to revisit stored messages under the new definitions; this makes API calls and can take time.
-
-Human label corrections remain pinned during reclassification. Changing a message to **Interview Scheduled** also derives its subtype from the message text.
-
-## Notes
-
-- Gmail and Outlook webhooks need a public HTTPS tunnel for immediate updates. Local polling works without a tunnel.
-- The backend renews existing Gmail watches and Outlook subscriptions while it is running.
