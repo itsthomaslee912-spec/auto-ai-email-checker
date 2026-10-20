@@ -1,10 +1,9 @@
-"""Broadcast Kafka user-activity events to WebSockets connected to this API replica."""
+"""Broadcast delivery-ready notifications to clients on this API replica."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import socket
 
 from app.config import get_settings
 from app.realtime.sse import broadcast_envelope
@@ -13,55 +12,58 @@ from app.services.event_bus import topic
 logger = logging.getLogger(__name__)
 
 
-def _config() -> dict[str, str]:
-    settings = get_settings()
-    instance = socket.gethostname()
-    config = {
-        "bootstrap.servers": settings.kafka_bootstrap_servers,
-        # Every API replica needs every activity event for its own sockets.
-        "group.id": f"api-ui-{instance}",
-        "client.id": f"{settings.kafka_client_id}-api-{instance}",
-        "enable.auto.commit": "true",
-        "auto.offset.reset": "latest",
-        "security.protocol": settings.kafka_security_protocol,
+def client_notification(envelope: dict) -> dict:
+    """Translate the notification-service contract to the browser contract."""
+    delivery = envelope.get("payload") or {}
+    return {
+        "event": delivery.get("event_type") or "message",
+        "event_id": delivery.get("source_event_id"),
+        "notification_id": delivery.get("notification_id"),
+        "sequence": delivery.get("sequence"),
+        "user_id": envelope.get("user_id"),
+        "data": delivery.get("data") or {},
     }
-    if settings.kafka_sasl_mechanism:
-        config.update({
-            "sasl.mechanism": settings.kafka_sasl_mechanism,
-            "sasl.username": settings.kafka_sasl_username,
-            "sasl.password": settings.kafka_sasl_password,
-        })
-    return config
 
 
 async def activity_consumer_loop(stop_event: asyncio.Event) -> None:
-    if not get_settings().kafka_enabled:
+    settings = get_settings()
+    if not settings.rabbitmq_enabled:
         await stop_event.wait()
         return
-    from confluent_kafka import Consumer, KafkaError
 
-    consumer = Consumer(_config())
-    consumer.subscribe([topic("user.activity.v1")])
-    logger.info("Kafka activity-to-WebSocket bridge started")
+    import aio_pika
+
+    connection = await aio_pika.connect_robust(settings.rabbitmq_url)
+    channel = await connection.channel()
+    await channel.set_qos(prefetch_count=max(1, settings.rabbitmq_prefetch_count))
+    exchange = await channel.declare_exchange(
+        settings.rabbitmq_exchange, aio_pika.ExchangeType.TOPIC, durable=True
+    )
+    # Every API replica needs a transient subscription. Reconnect recovery is
+    # served from PostgreSQL's durable ActivityEvent records.
+    queue = await channel.declare_queue("", exclusive=True, auto_delete=True, robust=False)
+    await queue.bind(exchange, routing_key=topic("notification.ready.v1"))
+    logger.info("RabbitMQ notification-to-client gateway started")
     try:
-        while not stop_event.is_set():
-            message = await asyncio.to_thread(consumer.poll, 1.0)
-            if message is None:
-                continue
-            if message.error():
-                if message.error().code() != KafkaError._PARTITION_EOF:
-                    logger.warning("Activity consumer error: %s", message.error())
-                continue
-            try:
-                envelope = json.loads(message.value().decode("utf-8"))
-                await broadcast_envelope({
-                    "event": envelope.get("event_type") or "message",
-                    "event_id": envelope.get("event_id"),
-                    "sequence": envelope.get("sequence"),
-                    "user_id": envelope.get("user_id"),
-                    "data": envelope.get("payload") or {},
-                })
-            except Exception:
-                logger.exception("Invalid activity event")
+        async with queue.iterator() as messages:
+            while not stop_event.is_set():
+                next_message = asyncio.create_task(anext(messages))
+                stopped = asyncio.create_task(stop_event.wait())
+                done, pending = await asyncio.wait(
+                    (next_message, stopped), return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                if stopped in done:
+                    break
+                message = next_message.result()
+                try:
+                    envelope = json.loads(message.body.decode("utf-8"))
+                    await broadcast_envelope(client_notification(envelope))
+                    await message.ack()
+                except Exception:
+                    logger.exception("Invalid activity event")
+                    await message.reject(requeue=False)
     finally:
-        await asyncio.to_thread(consumer.close)
+        await connection.close()

@@ -281,6 +281,31 @@ def _list_meta(
         return meta
 
 
+def _message_total_from_meta(
+    meta: dict,
+    valid_labels: set[str],
+    *,
+    mailbox_id: int | None,
+    label: str | None,
+    folder: str | None,
+) -> int:
+    """Reuse the cached sidebar aggregation for ordinary inbox totals.
+
+    The common list path previously issued a second COUNT query after the
+    page query even though the same rows had already been aggregated for the
+    sidebar. Search and subtype filters still use an exact database count.
+    """
+    label_filter = label if label and label != "all" and label in valid_labels else None
+    folder_filter = folder if folder and folder != "all" and folder in VALID_FOLDERS else None
+    return sum(
+        int(amount)
+        for mid, row_label, row_folder, _unread, amount in meta["count_breakdown"]
+        if (mailbox_id is None or mid == mailbox_id)
+        and (label_filter is None or row_label == label_filter)
+        and (folder_filter is None or row_folder == folder_filter)
+    )
+
+
 def _thread_key():
     """Messages with no provider thread stay as their own conversation."""
     return func.coalesce(
@@ -460,6 +485,14 @@ def list_emails(
                 (q or "").strip().lower(),
             ),
             before_id,
+        )
+    elif not q and interview_subtype is None:
+        total = _message_total_from_meta(
+            meta,
+            valid,
+            mailbox_id=mailbox_id,
+            label=label,
+            folder=folder,
         )
     else:
         total = int(filtered.order_by(None).with_entities(func.count(EmailMessage.id)).scalar() or 0)

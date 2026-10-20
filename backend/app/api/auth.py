@@ -24,7 +24,7 @@ from app.auth.pending_oauth import pop_pending, put_pending
 from app.auth.public_urls import sanitize_frontend_return
 from app.auth.session import MailboxOwnedElsewhere, require_user
 from app.config import get_settings
-from app.db import get_db
+from app.db import SessionLocal, get_db
 from app.services.mailbox_sync import start_mailbox_sync
 from app.services.webhook_registration import register_mailbox_webhook
 
@@ -230,4 +230,15 @@ async def _register_connected_mailbox(
 
 
 async def _kickoff_sync(mailbox_id: int, *, register_webhook: bool = True) -> None:
+    if get_settings().distributed_runtime:
+        from app.services.job_queue import enqueue
+
+        with SessionLocal() as db:
+            enqueue(
+                db,
+                mailbox_id,
+                "sync",
+                options={"register_webhook": register_webhook},
+            )
+        return
     await start_mailbox_sync(mailbox_id, register_webhook=register_webhook)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Lock
 
 from app.db import SessionLocal
@@ -10,10 +10,26 @@ _lock = Lock()
 _delivery: dict[str, dict[str, datetime | str | None]] = {}
 
 
+def _next_timestamp(state: dict[str, datetime | str | None]) -> datetime:
+    """Return a timestamp ordered after the previous in-process delivery event.
+
+    Some Windows clocks return the same microsecond for consecutive calls. A
+    later failure must still supersede a success (and vice versa).
+    """
+    now = datetime.now(timezone.utc)
+    previous = [
+        value
+        for key in ("last_success_at", "last_failure_at")
+        if isinstance((value := state.get(key)), datetime)
+    ]
+    latest = max(previous, default=None)
+    return latest + timedelta(microseconds=1) if latest is not None and now <= latest else now
+
+
 def record_webhook_delivery_success(provider: str) -> None:
     with _lock:
         state = _delivery.setdefault(provider, {})
-        state["last_success_at"] = datetime.now(timezone.utc)
+        state["last_success_at"] = _next_timestamp(state)
         state["last_error"] = None
 
 
@@ -32,7 +48,7 @@ def persist_webhook_delivery_success(provider: str) -> None:
 def record_webhook_delivery_failure(provider: str, message: str) -> None:
     with _lock:
         state = _delivery.setdefault(provider, {})
-        state["last_failure_at"] = datetime.now(timezone.utc)
+        state["last_failure_at"] = _next_timestamp(state)
         state["last_error"] = message
 
 

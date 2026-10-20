@@ -2,24 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
-from app.api import ai_settings, app_auth, auth, calendar_events, classify, emails, events, health, mailboxes, webhooks
+from app.api import ai_settings, app_auth, auth, calendar_events, classify, emails, events, health, mailboxes, monitoring, notifications, webhooks
 from app.auth.session import require_user
 from app.config import get_settings
 from app.db import init_db
-from app.realtime.renewal import renewal_loop
-from app.services.outcome_backfill import backfill_outcomes
-from app.services.calendar_backfill import backfill_calendar_events
-from app.services.auto_sync import auto_sync_loop
-from app.services.webhook_queue import webhook_queue_loop
-from app.services.reclassify import start_all_pending_reclassify
-from app.services.outbox_publisher import outbox_publisher_loop
 from app.services.activity_consumer import activity_consumer_loop
-from app.services.email_event_consumer import email_event_consumer_loop
+from app.services.service_health import service_heartbeat_loop
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,42 +22,14 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
+    if get_settings().run_db_init:
+        init_db()
     stop_event = asyncio.Event()
-    background_tasks: list[asyncio.Task] = []
-    role = get_settings().runtime_role.strip().lower()
-
-    async def start_background() -> None:
-        renewal_task = asyncio.create_task(renewal_loop(stop_event))
-        backfill_task = asyncio.create_task(backfill_outcomes(stop_event))
-
-        async def calendar_after_outcomes() -> None:
-            await backfill_task
-            await backfill_calendar_events(stop_event)
-
-        async def pending_reclassify_after_warmup() -> None:
-            # Let health probes and first sync settle before flooding Ollama.
-            await asyncio.sleep(15)
-            await start_all_pending_reclassify()
-
-        background_tasks.extend([
-            renewal_task,
-            backfill_task,
-            asyncio.create_task(calendar_after_outcomes()),
-            asyncio.create_task(auto_sync_loop(stop_event)),
-            asyncio.create_task(webhook_queue_loop(stop_event)),
-            asyncio.create_task(pending_reclassify_after_warmup()),
-            asyncio.create_task(outbox_publisher_loop(stop_event)),
-            asyncio.create_task(email_event_consumer_loop(stop_event)),
-        ])
-
-    # The legacy/default ``all`` role preserves desktop behavior. Container
-    # deployments set RUNTIME_ROLE=api and run background work via app.worker.
-    if role == "all":
-        asyncio.get_running_loop().call_later(1, lambda: asyncio.create_task(start_background()))
-    elif role == "api":
-        background_tasks.append(asyncio.create_task(activity_consumer_loop(stop_event)))
-    logger.info("Auto AI Email Checker API started (runtime role=%s)", role)
+    background_tasks = [
+        asyncio.create_task(activity_consumer_loop(stop_event)),
+        asyncio.create_task(service_heartbeat_loop(stop_event, "email-api")),
+    ]
+    logger.info("Auto AI Email Checker API started")
     try:
         yield
     finally:
@@ -74,6 +41,7 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title="Auto AI Email Checker", version="0.1.0", lifespan=lifespan)
+    app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[settings.frontend_origin, "http://localhost:5173", "http://127.0.0.1:5173"],
@@ -81,6 +49,23 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def request_timing(request: Request, call_next):
+        started = time.perf_counter()
+        response = await call_next(request)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        response.headers["Server-Timing"] = f"app;dur={elapsed_ms:.1f}"
+        if elapsed_ms >= settings.slow_request_threshold_ms:
+            logger.warning(
+                "Slow request method=%s path=%s status=%s duration_ms=%.1f",
+                request.method,
+                request.url.path,
+                response.status_code,
+                elapsed_ms,
+            )
+        return response
+
     signed_in = [Depends(require_user)]
     # Public: health, sign-in, OAuth callbacks (state-bound), provider webhooks.
     app.include_router(health.router)
@@ -94,7 +79,9 @@ def create_app() -> FastAPI:
     app.include_router(emails.router, dependencies=signed_in)
     app.include_router(calendar_events.router, dependencies=signed_in)
     app.include_router(classify.router, dependencies=signed_in)
+    app.include_router(notifications.router)
     app.include_router(events.router)
+    app.include_router(monitoring.router)
     return app
 
 

@@ -71,7 +71,17 @@ def _cursor_lock(mailbox_id: int) -> asyncio.Lock:
 def _webhook_is_active(mailbox: MailboxConnection) -> bool:
     webhook = mailbox.webhook
     expires_at = as_utc(webhook.expires_at) if webhook else None
-    return bool(webhook and webhook.external_id and expires_at and expires_at > datetime.now(timezone.utc))
+    invalid_client_state = bool(
+        webhook
+        and "clientstate" in (webhook.last_delivery_error or "").casefold()
+    )
+    return bool(
+        webhook
+        and webhook.external_id
+        and expires_at
+        and expires_at > datetime.now(timezone.utc)
+        and not invalid_client_state
+    )
 
 
 def _message_sender_is_excluded(mailbox: MailboxConnection, normalized: dict) -> bool:
@@ -126,10 +136,20 @@ def _gmail_message_belongs_to_mailbox(mailbox: MailboxConnection, raw: dict) -> 
 
 
 def _should_stop(mailbox_id: int) -> bool:
+    if getattr(get_settings(), "distributed_runtime", False):
+        from app.services.job_queue import stop_is_requested
+
+        return stop_is_requested(mailbox_id, "sync")
     return mailbox_id in _cancel_requested
 
 
 def get_sync_status(mailbox_id: int) -> dict[str, Any]:
+    if getattr(get_settings(), "distributed_runtime", False):
+        from app.db import SessionLocal
+        from app.services.job_queue import get_status
+
+        with SessionLocal() as db:
+            return get_status(db, mailbox_id, "sync")
     return dict(
         _jobs.get(
             mailbox_id,
@@ -151,6 +171,10 @@ def _set_job(mailbox_id: int, **fields: Any) -> dict[str, Any]:
     job = _jobs.get(mailbox_id) or {"mailbox_id": mailbox_id}
     job.update(fields)
     _jobs[mailbox_id] = job
+    if getattr(get_settings(), "distributed_runtime", False):
+        from app.services.job_queue import persist
+
+        persist(mailbox_id, "sync", job)
     return job
 
 
@@ -180,6 +204,14 @@ async def start_mailbox_sync(
 
 
 async def request_stop_sync(mailbox_id: int) -> dict[str, Any]:
+    if getattr(get_settings(), "distributed_runtime", False) and mailbox_id not in _running:
+        from app.db import SessionLocal
+        from app.services.job_queue import request_stop
+
+        with SessionLocal() as db:
+            job = request_stop(db, mailbox_id, "sync")
+        await publish("sync.progress", dict(job))
+        return job
     async with _job_lock:
         if mailbox_id not in _running:
             return get_sync_status(mailbox_id)
@@ -729,10 +761,11 @@ def _record_notification_failure(db: Session, mailbox: MailboxConnection, exc: E
 
 async def _classify_downloaded_mail(mailbox_id: int) -> None:
     """Start eventual enrichment after provider mail is safely committed."""
-    # Kafka owns the classification trigger in the separated worker runtime.
-    # The direct call remains the compatible fallback for desktop and tests.
-    if get_settings().kafka_enabled:
-        return
+    # Classification is owned by the classification service. RabbitMQ delivers
+    # the live event in production; its durable database scan is the local
+    # fallback when a broker is not configured.
+    if getattr(get_settings(), "distributed_runtime", False):
+        return None
     from app.services.reclassify import start_mailbox_reclassify
 
     await start_mailbox_reclassify(mailbox_id, pending_only=True)

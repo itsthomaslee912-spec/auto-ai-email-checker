@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -380,8 +380,35 @@ class ActivityEvent(Base):
     )
 
 
+class Notification(Base):
+    """A notification prepared by the notification service for one user."""
+
+    __tablename__ = "notifications"
+    __table_args__ = (
+        UniqueConstraint("source_event_id", "channel", name="uq_notification_source_channel"),
+        Index("ix_notifications_user_created", "user_id", "created_at"),
+        Index("ix_notifications_user_unread", "user_id", "is_read", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    notification_id: Mapped[str] = mapped_column(String(36), unique=True)
+    source_event_id: Mapped[str] = mapped_column(String(36))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    event_type: Mapped[str] = mapped_column(String(80), index=True)
+    channel: Mapped[str] = mapped_column(String(24), default="in_app")
+    payload: Mapped[str] = mapped_column(Text)
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
 class OutboxEvent(Base):
-    """A domain event committed with application state and later sent to Kafka."""
+    """A domain event committed with application state and later sent to RabbitMQ."""
 
     __tablename__ = "outbox_events"
     __table_args__ = (
@@ -408,7 +435,7 @@ class OutboxEvent(Base):
 
 
 class ConsumedEvent(Base):
-    """Idempotency inbox for Kafka consumers."""
+    """Idempotency inbox for message-queue consumers."""
 
     __tablename__ = "consumed_events"
     __table_args__ = (UniqueConstraint("consumer", "event_id", name="uq_consumed_event"),)
@@ -418,4 +445,71 @@ class ConsumedEvent(Base):
     event_id: Mapped[str] = mapped_column(String(36))
     consumed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class MailboxJobState(Base):
+    """Durable command and progress record shared by an API and its owning worker."""
+
+    __tablename__ = "mailbox_job_states"
+    __table_args__ = (
+        UniqueConstraint("mailbox_id", "job_type", name="uq_mailbox_job_type"),
+        Index("ix_mailbox_jobs_claim", "job_type", "state", "updated_at"),
+        Index("ix_mailbox_jobs_lease", "job_type", "state", "lease_expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mailbox_id: Mapped[int] = mapped_column(
+        ForeignKey("mailbox_connections.id", ondelete="CASCADE"), index=True
+    )
+    job_type: Mapped[str] = mapped_column(String(32))
+    state: Mapped[str] = mapped_column(String(24), default="idle")
+    options: Mapped[str] = mapped_column(Text, default="{}")
+    progress: Mapped[str] = mapped_column(Text, default="{}")
+    stop_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    claimed_by: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True
+    )
+
+
+class ServiceHeartbeat(Base):
+    """Last-known liveness for each independently deployed service replica."""
+
+    __tablename__ = "service_heartbeats"
+    __table_args__ = (
+        UniqueConstraint("service_name", "instance_id", name="uq_service_heartbeat_replica"),
+        Index("ix_service_heartbeats_service_seen", "service_name", "last_seen_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    service_name: Mapped[str] = mapped_column(String(64))
+    instance_id: Mapped[str] = mapped_column(String(160))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class SyncRuntimeStatus(Base):
+    """Durable auto-sync loop heartbeat shared across every process.
+
+    The auto-sync poll runs in the sync-worker, but the status endpoint is
+    served by the API process. A singleton row (id=1) lets the API read when
+    the owning worker last polled instead of relying on in-process globals that
+    never cross the process boundary.
+    """
+
+    __tablename__ = "sync_runtime_status"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    last_check_at: Mapped[datetime | None] = mapped_column(UtcDateTime(), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )

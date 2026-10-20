@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     microsoft_webhook_client_state: str = "change-me-to-a-long-random-string"
 
     database_url: str
+    # Tune per replica so concurrent requests reuse warm PostgreSQL
+    # connections without allowing a scaled deployment to exhaust the server.
+    database_pool_size: int = 12
+    database_max_overflow: int = 12
+    database_pool_timeout_seconds: float = 5.0
+    database_pool_recycle_seconds: int = 300
     token_encryption_key: str = ""
     webhook_base_url: str = "http://localhost:8000"
     frontend_origin: str = "http://localhost:5173"
@@ -55,32 +61,36 @@ class Settings(BaseSettings):
     # same cadence as the active polling path.
     auto_sync_webhook_safety_net_seconds: int = 900
 
-    # Runtime separation. ``all`` preserves the desktop/development behavior;
-    # container deployments run ``api`` and ``worker`` as separate processes.
-    runtime_role: str = "all"
+    # RabbitMQ is optional for embedded/local runs. When configured, durable
+    # events are committed to the transactional outbox and relayed through a
+    # topic exchange. An empty URL retains the database-backed fallback path.
+    rabbitmq_url: str = ""
+    rabbitmq_exchange: str = "aec.events"
+    rabbitmq_routing_prefix: str = "aec"
+    rabbitmq_prefetch_count: int = 8
+    rabbitmq_outbox_batch_size: int = 100
+    rabbitmq_outbox_poll_seconds: float = 0.25
+    command_queue_poll_seconds: float = 0.25
 
-    # Kafka is optional during the migration. When configured, every durable
-    # activity event is written to the transactional outbox and published by
-    # the worker process. Empty bootstrap servers keep the existing local
-    # single-process delivery path working.
-    kafka_bootstrap_servers: str = ""
-    kafka_client_id: str = "auto-ai-email-checker"
-    kafka_topic_prefix: str = "aec"
-    kafka_security_protocol: str = "PLAINTEXT"
-    kafka_sasl_mechanism: str = ""
-    kafka_sasl_username: str = ""
-    kafka_sasl_password: str = ""
-    kafka_outbox_batch_size: int = 100
-    kafka_outbox_poll_seconds: float = 1.0
+    # Emit a warning for slow API requests while always returning a
+    # Server-Timing header for browser and monitoring diagnostics.
+    slow_request_threshold_ms: float = 750.0
+    mailbox_job_lease_seconds: int = 600
+    leader_lease_check_seconds: float = 10.0
+    # Native worker processes initialize the schema on startup by default.
+    run_db_init: bool = True
 
     websocket_heartbeat_seconds: int = 25
+    # Route long-running commands to their owning worker and persist progress.
+    # Tests and embedded legacy deployments can leave this disabled.
+    distributed_runtime: bool = False
     # ``ai_only`` disables semantic regex heuristics and model-result guards.
     # ``hybrid`` preserves the existing desktop fallback during migration.
     email_classification_mode: str = "hybrid"
 
     @property
-    def kafka_enabled(self) -> bool:
-        return bool(self.kafka_bootstrap_servers.strip())
+    def rabbitmq_enabled(self) -> bool:
+        return bool(self.rabbitmq_url.strip())
 
 
 @lru_cache

@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -10,16 +11,17 @@ from app.models import OutboxEvent
 from app.services import outbox_publisher
 
 
-class _Producer:
-    def __init__(self, _config):
+class _Message:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _Exchange:
+    def __init__(self):
         self.delivered = []
 
-    def produce(self, topic, *, key, value, on_delivery):
-        self.delivered.append((topic, key, value))
-        on_delivery(None, None)
-
-    def flush(self, _timeout):
-        return 0
+    async def publish(self, message, *, routing_key):
+        self.delivered.append((routing_key, message))
 
 
 def _session_factory():
@@ -65,20 +67,19 @@ def test_publisher_recovers_stale_claim_but_not_active_claim(monkeypatch):
         db.commit()
 
     settings = SimpleNamespace(
-        kafka_enabled=True,
-        kafka_bootstrap_servers="kafka:29092",
-        kafka_client_id="test",
-        kafka_security_protocol="PLAINTEXT",
-        kafka_sasl_mechanism="",
-        kafka_sasl_username="",
-        kafka_sasl_password="",
-        kafka_outbox_batch_size=100,
+        rabbitmq_enabled=True,
+        rabbitmq_outbox_batch_size=100,
     )
     monkeypatch.setattr(outbox_publisher, "SessionLocal", sessions)
     monkeypatch.setattr(outbox_publisher, "get_settings", lambda: settings)
-    monkeypatch.setitem(sys.modules, "confluent_kafka", SimpleNamespace(Producer=_Producer))
+    monkeypatch.setitem(sys.modules, "aio_pika", SimpleNamespace(
+        Message=_Message,
+        DeliveryMode=SimpleNamespace(PERSISTENT=2),
+    ))
+    exchange = _Exchange()
 
-    assert outbox_publisher._publish_batch() == 2
+    assert asyncio.run(outbox_publisher._publish_batch(exchange)) == 2
+    assert len(exchange.delivered) == 2
 
     with sessions() as db:
         statuses = {

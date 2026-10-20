@@ -28,6 +28,34 @@ _last_error: str | None = None
 _polling_reasons: dict[int, str | None] = {}
 
 
+def _distributed() -> bool:
+    return getattr(get_settings(), "distributed_runtime", False)
+
+
+def _persist_runtime_status(last_check_at: datetime, last_error: str | None) -> None:
+    """Record the latest auto-sync poll so other processes can read it."""
+    from app.models import SyncRuntimeStatus
+
+    with SessionLocal() as db:
+        row = db.get(SyncRuntimeStatus, 1)
+        if row is None:
+            row = SyncRuntimeStatus(id=1)
+            db.add(row)
+        row.last_check_at = last_check_at
+        row.last_error = str(last_error)[:512] if last_error else None
+        db.commit()
+
+
+def _load_runtime_status() -> tuple[datetime | None, str | None]:
+    from app.models import SyncRuntimeStatus
+
+    with SessionLocal() as db:
+        row = db.get(SyncRuntimeStatus, 1)
+        if row is None:
+            return None, None
+        return as_utc(row.last_check_at), row.last_error
+
+
 def has_registered_webhook(mailbox: MailboxConnection, now: datetime | None = None) -> bool:
     webhook = mailbox.webhook
     expires_at = as_utc(webhook.expires_at) if webhook else None
@@ -246,12 +274,20 @@ def get_auto_sync_status(db: Session) -> dict:
             ),
         })
 
-    recent = _last_check_at is not None and datetime.now(timezone.utc) - _last_check_at < timedelta(seconds=interval * 2)
+    # The auto-sync loop runs in the sync-worker process, so the API must read
+    # its heartbeat from the database rather than from in-process globals.
+    if _distributed():
+        last_check_at, last_error = _load_runtime_status()
+        loop_running = last_check_at is not None
+    else:
+        last_check_at, last_error, loop_running = _last_check_at, _last_error, _loop_running
+
+    recent = last_check_at is not None and datetime.now(timezone.utc) - last_check_at < timedelta(seconds=interval * 2)
     if not mailboxes:
         state = "no_account"
-    elif not _loop_running or not recent:
+    elif not loop_running or not recent:
         state = "stopped"
-    elif _last_error or problems:
+    elif last_error or problems:
         state = "error"
     elif syncing:
         state = "syncing"
@@ -270,8 +306,8 @@ def get_auto_sync_status(db: Session) -> dict:
         "polling_accounts": polling_accounts,
         "webhook_delivery": provider_delivery,
         "ngrok": ngrok,
-        "last_check_at": _last_check_at.isoformat() if _last_check_at else None,
-        "last_error": _last_error,
+        "last_check_at": last_check_at.isoformat() if last_check_at else None,
+        "last_error": last_error,
         "problem_mailboxes": problems,
         "mailboxes": mailbox_statuses,
     }
@@ -287,6 +323,11 @@ async def run_auto_sync_check() -> None:
         logger.exception("Automatic sync check failed")
     finally:
         _last_check_at = datetime.now(timezone.utc)
+        if _distributed():
+            try:
+                await asyncio.to_thread(_persist_runtime_status, _last_check_at, _last_error)
+            except Exception:
+                logger.exception("Could not persist auto-sync runtime status")
 
 
 async def auto_sync_loop(stop_event: asyncio.Event) -> None:

@@ -11,6 +11,8 @@ import InterviewAlarm from "./components/InterviewAlarm";
 import InterviewEmailAlert from "./components/InterviewEmailAlert";
 import SettingsPage, { type SettingsSection } from "./pages/SettingsPage";
 import CalendarPage, { warmCalendarCache } from "./pages/CalendarPage";
+import MonitoringPage from "./pages/MonitoringPage";
+import StatisticsPage from "./pages/StatisticsPage";
 import {
   disconnectMailbox,
   openEvents,
@@ -288,12 +290,14 @@ function providerMark(provider: Provider): string {
   return provider === "google" ? "G" : "O";
 }
 
-type SidebarIconName = "home" | "inbox" | "calendar" | "categories" | "sent" | "spam" | "trash" | "archive" | "settings";
+type SidebarIconName = "home" | "inbox" | "calendar" | "monitoring" | "statistics" | "categories" | "sent" | "spam" | "trash" | "archive" | "settings";
 
 function SidebarIcon({ name }: { name: SidebarIconName }) {
   const path = name === "home" ? <><path d="m3 10 9-7 9 7" /><path d="M5 9v11h14V9M9 20v-7h6v7" /></>
     : name === "inbox" ? <><rect x="3" y="4" width="18" height="16" rx="3" /><path d="M3 14h5l2 3h4l2-3h5M8 8h8" /></>
     : name === "calendar" ? <><rect x="3" y="4.5" width="18" height="16" rx="3" /><path d="M7 2.5v4M17 2.5v4M3 9h18" /><path d="M8 13h3v3H8z" /></>
+    : name === "monitoring" ? <><path d="M3 12h3.5l2-6 3.5 12 2.5-7.5L18.5 12H21" /><rect x="2.5" y="4" width="19" height="16" rx="3.5" /></>
+    : name === "statistics" ? <><path d="M21 21H4a1 1 0 0 1-1-1V3" /><path d="M7 15l3.5-4 3 2.5L20 6" /><circle cx="20" cy="6" r="1.4" fill="currentColor" stroke="none" /></>
     : name === "categories" ? <><path d="M12 3v6M8 9h8M9 9l-4 11M15 9l4 11M4 20h16" /></>
     : name === "sent" ? <><path d="m3 11 18-8-7 18-3.5-7.5L3 11Z" /><path d="m10.5 13.5 4-4" /></>
     : name === "spam" ? <><path d="M8 3h8l5 5v8l-5 5H8l-5-5V8l5-5Z" /><path d="M12 7v6M12 17h.01" /></>
@@ -304,7 +308,9 @@ function SidebarIcon({ name }: { name: SidebarIconName }) {
 }
 
 export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUser; onSignOut: () => void }) {
-  const [activePage, setActivePage] = useState<"inbox" | "calendar">("inbox");
+  const [activePage, setActivePage] = useState<"inbox" | "calendar" | "monitoring" | "statistics">(
+    sessionUser.is_admin ? "monitoring" : "inbox",
+  );
   const [calendarMounted, setCalendarMounted] = useState(false);
   const [mailboxes, setMailboxes] = useState<Mailbox[]>([]);
   const [accountOrder, setAccountOrder] = useState<number[]>(() => {
@@ -827,6 +833,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         const item = JSON.parse((evt as MessageEvent).data) as EmailItem & {
           previous_label?: EmailLabel;
           updated?: boolean;
+          classification_completed?: boolean;
         };
         const { mailboxId, label: currentLabel, interviewSubtype: currentSubtype, query } = filterRef.current;
         const matchesMailbox = mailboxId == null || item.mailbox_id === mailboxId;
@@ -872,7 +879,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
             }
             return sortEmailsForInbox(next, inbox);
           }
-          if (!isUpdate && matches) {
+          if ((!isUpdate || item.classification_completed) && matches) {
             return sortEmailsForInbox([{ ...item, is_read: Boolean(item.is_read) }, ...prev], inbox);
           }
           return prev;
@@ -885,18 +892,17 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         );
 
         if (isUpdate) {
-          if (matchesMailbox) {
+          const labelChanged = Boolean(item.previous_label && item.previous_label !== item.label);
+          if (matchesMailbox && labelChanged) {
             setLabelCounts((prev) => {
               const next = { ...prev };
-              if (item.previous_label && item.previous_label !== item.label) {
-                next[item.previous_label] = Math.max(0, (next[item.previous_label] ?? 1) - 1);
-              }
+              next[item.previous_label!] = Math.max(0, (next[item.previous_label!] ?? 1) - 1);
               next[item.label] = (next[item.label] ?? 0) + 1;
               return next;
             });
           }
-          if (item.previous_label && item.previous_label !== item.label) {
-            const fromLabel = item.previous_label;
+          if (labelChanged) {
+            const fromLabel = item.previous_label!;
             const unread = item.is_read === false;
             setCountCells((prev) => adjustCountCell(
               adjustCountCell(prev, { mailbox_id: item.mailbox_id, label: fromLabel, folder: itemFolder, unread }, -1),
@@ -1194,9 +1200,21 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   }
 
   function openSettings(section: SettingsSection = "appearance") {
-    const adminOnly = section === "ai" || section === "training" || section === "statistics";
+    const adminOnly = section === "ai" || section === "training";
     setSettingsSection(adminOnly && !sessionUser.is_admin ? "appearance" : section);
     setSettingsOpen(true);
+  }
+
+  function openMonitoring() {
+    if (!sessionUser.is_admin) return;
+    setSettingsOpen(false);
+    setActivePage("monitoring");
+  }
+
+  function openStatistics() {
+    if (!sessionUser.is_admin) return;
+    setSettingsOpen(false);
+    setActivePage("statistics");
   }
 
   const mailboxById = useMemo(() => {
@@ -2464,7 +2482,6 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         onStopReclassifyAccount={(id) => onStopReclassify(id, false)}
         accountStatus={mailboxActions}
         reclassifyProgress={reclassifyProgress}
-        initialMailboxId={selectedMailboxId}
       />
       </>
     );
@@ -2473,7 +2490,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   return (
     <div
       ref={shellRef}
-      className={`app-shell view-${viewMode} reading-${readingPane.replace("_", "-")}${activePage === "calendar" ? " calendar-open" : ""}${tableDialogOpen ? " table-dialog-open" : ""}${sidebarCollapsed ? " sidebar-collapsed" : ""}${resizing ? ` is-resizing resizing-${resizing}` : ""}`}
+      className={`app-shell view-${viewMode} reading-${readingPane.replace("_", "-")}${activePage === "calendar" ? " calendar-open" : ""}${activePage === "monitoring" || activePage === "statistics" ? " monitoring-open" : ""}${activePage === "statistics" ? " statistics-open" : ""}${tableDialogOpen ? " table-dialog-open" : ""}${sidebarCollapsed ? " sidebar-collapsed" : ""}${resizing ? ` is-resizing resizing-${resizing}` : ""}`}
       style={
         {
           "--accounts-w": sidebarCollapsed ? "3.55rem" : `${accountsW}px`,
@@ -2513,6 +2530,12 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
               <button type="button" className={`sidebar-rail-btn${activePage === "calendar" ? " active" : ""}`} aria-label="Calendar" data-tooltip="Calendar" data-tooltip-hint="Interviews and meetings" data-tooltip-placement="right" onClick={openCalendar}>
                 <SidebarIcon name="calendar" />
               </button>
+              {sessionUser.is_admin && <button type="button" className={`sidebar-rail-btn${activePage === "monitoring" ? " active" : ""}`} aria-label="Monitoring" data-tooltip="Monitoring" data-tooltip-hint="Service health and processing queues" data-tooltip-placement="right" onClick={openMonitoring}>
+                <SidebarIcon name="monitoring" />
+              </button>}
+              {sessionUser.is_admin && <button type="button" className={`sidebar-rail-btn${activePage === "statistics" ? " active" : ""}`} aria-label="Statistics" data-tooltip="Statistics" data-tooltip-hint="Email categories and recruiting outcomes" data-tooltip-placement="right" onClick={openStatistics}>
+                <SidebarIcon name="statistics" />
+              </button>}
               <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && label !== "all" ? " active" : ""}`} aria-label="Categories" data-tooltip="Categories" data-tooltip-hint="Opens the sidebar to filter by category" data-tooltip-placement="right" onClick={() => { setActivePage("inbox"); setSidebarSections((current) => ({ ...current, categories: true })); setSidebarCollapsed(false); try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, "0"); } catch { /* ignore */ } }}>
                 <svg className="sidebar-nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3.5h6" /><path d="M10 3.5v5.2L7 12.2h10L14 8.7V3.5" /><path d="M12 12.2v8.3" /></svg>
               </button>
@@ -2593,6 +2616,8 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
           </section>
 
           <button type="button" className={`sidebar-nav-row sidebar-primary-row ${activePage === "calendar" ? "active" : ""}`} onClick={openCalendar}><SidebarIcon name="calendar" /><span>Calendar</span></button>
+          {sessionUser.is_admin && <button type="button" className={`sidebar-nav-row sidebar-primary-row ${activePage === "monitoring" ? "active" : ""}`} onClick={openMonitoring}><SidebarIcon name="monitoring" /><span>Monitoring</span></button>}
+          {sessionUser.is_admin && <button type="button" className={`sidebar-nav-row sidebar-primary-row ${activePage === "statistics" ? "active" : ""}`} onClick={openStatistics}><SidebarIcon name="statistics" /><span>Statistics</span></button>}
 
           <section className="sidebar-tree-section">
             <div className="sidebar-section-heading">
@@ -2660,6 +2685,14 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         onPointerCancel={onSplitterPointerUp}
         onKeyDown={onSplitterKeyDown("accounts")}
       />
+
+      {activePage === "monitoring" && sessionUser.is_admin && (
+        <MonitoringPage active />
+      )}
+
+      {activePage === "statistics" && sessionUser.is_admin && (
+        <StatisticsPage active mailboxes={mailboxes} initialMailboxId={selectedMailboxId} />
+      )}
 
       {activePage === "inbox" && <>
       <section className={`pane-list view-${viewMode}`}>

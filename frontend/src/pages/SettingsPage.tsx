@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState, type CSSProperties } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import {
   deleteClassifyTrainingExample,
   deleteUnusedClassifyTraining,
@@ -8,8 +8,6 @@ import {
   fetchGeminiModels,
   fetchOllamaModels,
   fetchOpenAiCosts,
-  fetchMailboxLabelStats,
-  fetchMailboxOutcomes,
   saveAiSettings,
   type AccountSyncDetail,
   type AiSettings,
@@ -17,8 +15,6 @@ import {
   type ClassifyPromptStatus,
   type ClassifyTrainingExample,
   type Mailbox,
-  type MailboxLabelStats,
-  type MailboxOutcomes,
   type SessionUser,
 } from "../api";
 import { accountColor } from "../accountColor";
@@ -36,16 +32,13 @@ import {
   type ViewMode,
 } from "../prefs";
 import type { ThemePref } from "../theme";
-import AccountSelect from "../components/AccountSelect";
 import CompactSelect from "../components/CompactSelect";
-import ModernDateTimePicker from "../components/ModernDateTimePicker";
-import LabelPieChart from "../components/LabelPieChart";
 import { IconButton } from "../components/UiIcon";
 import SignInAccountsPanel from "../components/SignInAccountsPanel";
 
-export type SettingsSection = "signin" | "accounts" | "appearance" | "ai" | "training" | "statistics";
+export type SettingsSection = "signin" | "accounts" | "appearance" | "ai" | "training";
 
-const ADMIN_SETTINGS_SECTIONS = new Set<SettingsSection>(["ai", "training", "statistics"]);
+const ADMIN_SETTINGS_SECTIONS = new Set<SettingsSection>(["ai", "training"]);
 const TRAINING_PAGE_SIZE = 20;
 const DEFAULT_GEMINI_MODELS = [
   "gemini-3.8-flash",
@@ -54,25 +47,6 @@ const DEFAULT_GEMINI_MODELS = [
   "gemini-2.5-flash-lite",
   "gemini-2.5-pro",
 ];
-
-function pad2(value: number): string {
-  return String(value).padStart(2, "0");
-}
-
-function toDatetimeLocal(value: Date): string {
-  return `${value.getFullYear()}-${pad2(value.getMonth() + 1)}-${pad2(value.getDate())}T${pad2(value.getHours())}:${pad2(value.getMinutes())}`;
-}
-
-function defaultDateRange(): { from: string; to: string } {
-  const now = new Date();
-  const start = new Date(now);
-  start.setHours(0, 0, 0, 0);
-  return { from: toDatetimeLocal(start), to: toDatetimeLocal(now) };
-}
-
-function localInputToUtcIso(value: string): string {
-  return new Date(value).toISOString();
-}
 
 function formatWhen(value: string | null): string {
   if (!value) return "";
@@ -165,7 +139,6 @@ export default function SettingsPage({
   onStopReclassifyAccount,
   accountStatus,
   reclassifyProgress,
-  initialMailboxId = null,
   sessionUser,
   onSignOut,
 }: {
@@ -205,7 +178,6 @@ export default function SettingsPage({
   onStopReclassifyAccount: (mailboxId: number) => Promise<void>;
   accountStatus: Record<number, { type: "sync" | "reclassify" | "success" | "error"; message: string }>;
   reclassifyProgress: Record<number, { processed: number; total: number; failed: number }>;
-  initialMailboxId?: number | null;
   sessionUser: SessionUser;
   onSignOut: () => void;
 }) {
@@ -288,40 +260,16 @@ export default function SettingsPage({
     }
   }
 
-  const dateDefaults = useMemo(() => defaultDateRange(), []);
-  const [statsMailboxId, setStatsMailboxId] = useState<number | "all">(
-    initialMailboxId ?? "all"
-  );
-  const [dateFrom, setDateFrom] = useState(dateDefaults.from);
-  const [dateTo, setDateTo] = useState(dateDefaults.to);
-  const [stats, setStats] = useState<MailboxLabelStats | null>(null);
-  const [statsError, setStatsError] = useState<string | null>(null);
-  const [statsLoading, setStatsLoading] = useState(false);
-  const [outcomeLabel, setOutcomeLabel] = useState<"application_confirmation" | "rejected_closed" | "interview_invitation" | "interview_scheduled">("interview_invitation");
-  const [outcomePage, setOutcomePage] = useState(0);
-  const [outcomes, setOutcomes] = useState<MailboxOutcomes | null>(null);
-  const [outcomesLoading, setOutcomesLoading] = useState(false);
-  const [outcomeCompanyQuery, setOutcomeCompanyQuery] = useState("");
-  const [outcomePieOpen, setOutcomePieOpen] = useState(false);
-  const [outcomePieCounts, setOutcomePieCounts] = useState<Record<string, number> | null>(null);
-  const [outcomePieLoading, setOutcomePieLoading] = useState(false);
-  const OUTCOME_PAGE_SIZE = 20;
-
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.defaultPrevented) return;
-      if (outcomePieOpen) {
-        event.preventDefault();
-        setOutcomePieOpen(false);
-        return;
-      }
       if (document.querySelector("[aria-expanded='true']")) return;
       event.preventDefault();
       onClose();
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [onClose, outcomePieOpen]);
+  }, [onClose]);
 
   useEffect(() => {
     if (section !== "training") return;
@@ -390,81 +338,6 @@ export default function SettingsPage({
     }
   }
 
-  async function loadStats(
-    event?: FormEvent,
-    mailboxId: number | "all" = statsMailboxId
-  ) {
-    event?.preventDefault();
-    if (dateFrom > dateTo) {
-      setStatsError("From must be on or before To");
-      return;
-    }
-    const fromIso = localInputToUtcIso(dateFrom);
-    const toIso = localInputToUtcIso(dateTo);
-    setStatsLoading(true);
-    setStatsError(null);
-    try {
-      setStats(await fetchMailboxLabelStats(mailboxId, fromIso, toIso));
-    } catch (err) {
-      setStats(null);
-      setStatsError(err instanceof Error ? err.message : "Failed to load statistics");
-    } finally {
-      setStatsLoading(false);
-    }
-  }
-
-  async function loadOutcomes(mailboxId = statsMailboxId, page = outcomePage, label = outcomeLabel) {
-    if (mailboxId === "all") { setOutcomes(null); return; }
-    setOutcomesLoading(true);
-    try {
-      setOutcomes(await fetchMailboxOutcomes(mailboxId, localInputToUtcIso(dateFrom), localInputToUtcIso(dateTo), { label, limit: OUTCOME_PAGE_SIZE, offset: page * OUTCOME_PAGE_SIZE }));
-    } catch (err) { setStatsError(err instanceof Error ? err.message : "Failed to load extracted outcomes"); }
-    finally { setOutcomesLoading(false); }
-  }
-
-  async function copyOutcomes() {
-    if (!outcomes || statsMailboxId === "all") return;
-    const pages = await Promise.all(
-      Array.from({ length: Math.ceil(outcomes.total / 200) }, (_, index) =>
-        fetchMailboxOutcomes(statsMailboxId, localInputToUtcIso(dateFrom), localInputToUtcIso(dateTo), { label: outcomeLabel, limit: 200, offset: index * 200 })
-      )
-    );
-    const rows = pages.flatMap((page) => page.items);
-    await navigator.clipboard.writeText(["Company\tRole\tSubject", ...rows.map((item) => `${item.company}\t${item.role}\t${item.subject}`)].join("\n"));
-  }
-
-  const visibleOutcomes = useMemo(() => {
-    const query = outcomeCompanyQuery.trim().toLocaleLowerCase();
-    return !query ? outcomes?.items ?? [] : (outcomes?.items ?? []).filter((item) => item.company.toLocaleLowerCase().includes(query));
-  }, [outcomes, outcomeCompanyQuery]);
-
-  async function loadOutcomePie() {
-    if (statsMailboxId === "all") return;
-    setOutcomePieLoading(true);
-    try {
-      const labels: ("application_confirmation" | "rejected_closed" | "interview_invitation" | "interview_scheduled")[] = ["application_confirmation", "rejected_closed", "interview_invitation", "interview_scheduled"];
-      const fromIso = localInputToUtcIso(dateFrom);
-      const toIso = localInputToUtcIso(dateTo);
-      const pages = await Promise.all(labels.map((label) => fetchMailboxOutcomes(statsMailboxId, fromIso, toIso, { label, limit: 1, offset: 0 })));
-      setOutcomePieCounts(Object.fromEntries(pages.map((page, index) => [labels[index], page.total])));
-    } catch (err) { setStatsError(err instanceof Error ? err.message : "Failed to load extraction statistics"); }
-    finally { setOutcomePieLoading(false); }
-  }
-
-  useEffect(() => {
-    if (section !== "statistics") return;
-    void loadStats();
-    // Load once when opening Statistics.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [section]);
-
-  useEffect(() => {
-    if (section !== "statistics" || statsMailboxId === "all") return;
-    void loadOutcomes(statsMailboxId, outcomePage, outcomeLabel);
-    // Outcome browsing intentionally covers the full account history.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [section, statsMailboxId, outcomeLabel, outcomePage]);
-
   async function handleUpdatePrompt() {
     await onUpdatePrompt();
   }
@@ -477,7 +350,6 @@ export default function SettingsPage({
       ? ([
           { id: "ai", label: "AI model" },
           { id: "training", label: "Training" },
-          { id: "statistics", label: "Statistics" },
         ] as const)
       : []),
   ];
@@ -1020,80 +892,6 @@ export default function SettingsPage({
               </div>
             )}
 
-            {section === "statistics" && (
-              <div className="settings-panel">
-                <section className="settings-block">
-                  <h3>Category statistics</h3>
-                  <p className="settings-help">
-                    Counts from the start of today through now. All accounts shows every mailbox.
-                    The pie chart shows the category distribution for the selected account or all accounts.
-                  </p>
-                  <form
-                    className="stats-form stats-filter-card"
-                    onSubmit={(event) => {
-                      void loadStats(event);
-                      void loadOutcomes();
-                    }}
-                  >
-                    <AccountSelect
-                      value={statsMailboxId}
-                      mailboxes={mailboxes}
-                      onChange={(value) => {
-                        setStatsMailboxId(value);
-                        setStats(null);
-                        setOutcomePage(0);
-                        void loadStats(undefined, value);
-                        void loadOutcomes(value, 0);
-                      }}
-                    />
-                    <ModernDateTimePicker label="From" value={dateFrom} onChange={setDateFrom} />
-                    <ModernDateTimePicker label="To" value={dateTo} onChange={setDateTo} />
-                    <button type="submit" className="action-btn" disabled={statsLoading}>
-                      {statsLoading ? "Loading…" : "Search"}
-                    </button>
-                  </form>
-                  {statsError && <p className="error">{statsError}</p>}
-                  {stats && stats.total === 0 && !statsError && (
-                    <p className="hint">No emails in this date range.</p>
-                  )}
-                  {stats && (
-                    <div className="stats-visuals stats-account">
-                      <LabelPieChart counts={stats.label_counts} />
-                    </div>
-                  )}
-                  {statsMailboxId !== "all" && (
-                    <section className="outcome-browser">
-                      <div className="outcome-toolbar">
-                        <div>
-                          <h4>AI company & role extraction</h4>
-                          <p className="settings-help">Company and role saved from the selected recruiting category.</p>
-                        </div>
-                      </div>
-                      <div className="outcome-browser-actions">
-                          <div className="outcome-tabs" role="tablist" aria-label="Extraction category">{([ ["interview_invitation", "Interview Invitation"], ["interview_scheduled", "Interview Scheduled"], ["application_confirmation", "Applied"], ["rejected_closed", "Rejected"] ] as const).map(([label, title]) => <button key={label} type="button" role="tab" aria-selected={outcomeLabel === label} className={outcomeLabel === label ? "active" : ""} onClick={() => { setOutcomeLabel(label); setOutcomePage(0); void loadOutcomes(statsMailboxId, 0, label); }}>{title}</button>)}</div>
-                          <input className="modern-control outcome-company-search" type="search" value={outcomeCompanyQuery} onChange={(event) => setOutcomeCompanyQuery(event.target.value)} placeholder="Search company" aria-label="Search company name" />
-                          <button type="button" className="settings-btn outcome-stats-btn" aria-label="Show extracted-data statistics" aria-expanded={outcomePieOpen} onClick={() => { setOutcomePieOpen(true); void loadOutcomePie(); }}>◔</button>
-                          <button type="button" className="settings-btn outcome-copy-btn" aria-label="Copy all results" disabled={!outcomes?.items.length} onClick={() => void copyOutcomes()}>⧉</button>
-                      </div>
-                      {outcomesLoading && <p className="hint">Loading extracted data…</p>}
-                      {!outcomesLoading && outcomes && (
-                        <div className="outcome-table-wrap"><table className="settings-table outcome-table"><thead><tr><th>Date</th><th>Company</th><th>Role</th><th>Subject</th></tr></thead><tbody>{visibleOutcomes.map((item, index) => <tr key={`${item.subject}-${index}`}><td>{formatWhen(item.received_at) || "—"}</td><td>{item.company || "—"}</td><td>{item.role || "—"}</td><td>{item.subject}</td></tr>)}</tbody></table></div>
-                      )}
-                      {outcomes && outcomes.total === 0 && !outcomesLoading && <p className="hint">No extracted records found for this account and category.</p>}
-                      {outcomes && outcomes.total > OUTCOME_PAGE_SIZE && <div className="pagination"><button type="button" className="action-btn" disabled={outcomePage === 0} onClick={() => { const page = outcomePage - 1; setOutcomePage(page); void loadOutcomes(statsMailboxId, page); }}>Previous</button><span>Page {outcomePage + 1} of {Math.ceil(outcomes.total / OUTCOME_PAGE_SIZE)}</span><button type="button" className="action-btn" disabled={(outcomePage + 1) * OUTCOME_PAGE_SIZE >= outcomes.total} onClick={() => { const page = outcomePage + 1; setOutcomePage(page); void loadOutcomes(statsMailboxId, page); }}>Next</button></div>}
-                    </section>
-                  )}
-                  {outcomePieOpen && (
-                    <div className="outcome-pie-modal-backdrop" role="presentation" onMouseDown={() => setOutcomePieOpen(false)}>
-                      <section className="outcome-pie-modal" role="dialog" aria-modal="true" aria-labelledby="outcome-pie-title" onMouseDown={(event) => event.stopPropagation()}>
-                        <header><div><span className="stats-eyebrow">AI extraction</span><h3 id="outcome-pie-title">Company & role statistics</h3></div><button type="button" className="dialog-close" aria-label="Close statistics" onClick={() => setOutcomePieOpen(false)}>×</button></header>
-                        {outcomePieLoading ? <p className="hint">Loading extraction statistics…</p> : outcomePieCounts && <LabelPieChart counts={outcomePieCounts} labels={["application_confirmation", "rejected_closed", "interview_invitation", "interview_scheduled"]} />}
-                      </section>
-                    </div>
-                  )}
-                </section>
-              </div>
-            )}
           </div>
         </div>
       </div>

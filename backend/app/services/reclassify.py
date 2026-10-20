@@ -34,10 +34,20 @@ def _mailbox_gate_semaphore() -> asyncio.Semaphore:
 
 
 def _should_stop(mailbox_id: int) -> bool:
+    if getattr(get_settings(), "distributed_runtime", False):
+        from app.services.job_queue import stop_is_requested
+
+        return stop_is_requested(mailbox_id, "reclassify")
     return mailbox_id in _cancel_requested
 
 
 def get_reclassify_status(mailbox_id: int) -> dict[str, Any]:
+    if getattr(get_settings(), "distributed_runtime", False):
+        from app.db import SessionLocal
+        from app.services.job_queue import get_status
+
+        with SessionLocal() as db:
+            return get_status(db, mailbox_id, "reclassify")
     return dict(
         _jobs.get(
             mailbox_id,
@@ -58,6 +68,10 @@ def _set_job(mailbox_id: int, **fields: Any) -> dict[str, Any]:
     job = _jobs.get(mailbox_id) or {"mailbox_id": mailbox_id}
     job.update(fields)
     _jobs[mailbox_id] = job
+    if getattr(get_settings(), "distributed_runtime", False):
+        from app.services.job_queue import persist
+
+        persist(mailbox_id, "reclassify", job)
     return job
 
 
@@ -101,6 +115,14 @@ async def start_mailbox_reclassify(mailbox_id: int, *, pending_only: bool = Fals
 
 
 async def request_stop_reclassify(mailbox_id: int) -> dict[str, Any]:
+    if getattr(get_settings(), "distributed_runtime", False) and mailbox_id not in _running:
+        from app.db import SessionLocal
+        from app.services.job_queue import request_stop
+
+        with SessionLocal() as db:
+            job = request_stop(db, mailbox_id, "reclassify")
+        await publish("reclassify.progress", dict(job))
+        return job
     async with _job_lock:
         if mailbox_id not in _running:
             return get_reclassify_status(mailbox_id)
@@ -362,11 +384,16 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                 else:
                     db.rollback()
                 payload = None
-                if label_changed:
+                if label_changed or was_pending:
                     db.refresh(email)
                     payload = EmailOut.model_validate(email).model_dump()
                     payload["previous_label"] = previous_label
                     payload["updated"] = True
+                    # A fast-import email may not be present in the browser's
+                    # active category until its final label is known. Let the
+                    # UI insert this otherwise update-shaped event when the
+                    # classification pipeline finishes.
+                    payload["classification_completed"] = was_pending
                 return {
                     "updated": label_changed,
                     "payload": payload,
@@ -438,8 +465,8 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                     continue
                 if applied.get("updated"):
                     updated += 1
-                    if applied.get("payload"):
-                        await publish("email.classified", applied["payload"])
+                if applied.get("payload"):
+                    await publish("email.classified", applied["payload"])
                 # Pending catch-up must stay non-blocking; calendar backfill picks
                 # up newly labeled mail afterward. Full reclassify still refreshes
                 # calendar immediately.

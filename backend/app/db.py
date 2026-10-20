@@ -22,10 +22,10 @@ if database_url.get_backend_name() == "sqlite":
 else:
     # Drop connections older than this so a restarted PostgreSQL is picked up
     # instead of leaving requests stuck on a dead socket.
-    engine_kwargs["pool_recycle"] = 300
-    engine_kwargs["pool_size"] = 12
-    engine_kwargs["max_overflow"] = 12
-    engine_kwargs["pool_timeout"] = 5
+    engine_kwargs["pool_recycle"] = max(30, settings.database_pool_recycle_seconds)
+    engine_kwargs["pool_size"] = max(1, settings.database_pool_size)
+    engine_kwargs["max_overflow"] = max(0, settings.database_max_overflow)
+    engine_kwargs["pool_timeout"] = max(0.1, settings.database_pool_timeout_seconds)
 
 engine = create_engine(database_url, connect_args=connect_args, **engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -284,6 +284,28 @@ def init_db() -> None:
                 conn.execute(text(
                     "ALTER TABLE mailbox_connections ADD COLUMN calendar_color VARCHAR(7)"
                 ))
+        if "mailbox_job_states" in tables:
+            job_cols = {c["name"] for c in inspect(conn).get_columns("mailbox_job_states")}
+            timestamp_type = (
+                "TIMESTAMP WITH TIME ZONE"
+                if database_url.get_backend_name() == "postgresql"
+                else "TIMESTAMP"
+            )
+            for column, ddl in (
+                ("claimed_by", "VARCHAR(160)"),
+                ("lease_expires_at", timestamp_type),
+                ("attempts", "INTEGER DEFAULT 0"),
+                ("next_retry_at", timestamp_type),
+                ("last_error", "VARCHAR(512)"),
+            ):
+                if column not in job_cols:
+                    conn.execute(text(
+                        f"ALTER TABLE mailbox_job_states ADD COLUMN {column} {ddl}"
+                    ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_mailbox_jobs_lease "
+                "ON mailbox_job_states (job_type, state, lease_expires_at)"
+            ))
         if "classify_corrections" in tables:
             correction_cols = {c["name"] for c in inspect(conn).get_columns("classify_corrections")}
             if "evaluation_holdout" not in correction_cols:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -13,7 +14,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import Base
 from app.email import gmail
-from app.models import EmailLabel, EmailMessage, MailboxConnection, Provider, User
+from app.models import EmailLabel, EmailMessage, MailboxConnection, Provider, User, WebhookSubscription
 from app.realtime import gmail_watch
 from app.services import mailbox_sync
 
@@ -33,6 +34,22 @@ def _mailbox(provider: Provider):
     db.add(mailbox)
     db.commit()
     return engine, db, mailbox
+
+
+def test_outlook_client_state_failure_forces_subscription_replacement():
+    _engine, db, mailbox = _mailbox(Provider.MICROSOFT)
+    db.add(WebhookSubscription(
+        mailbox_id=mailbox.id,
+        provider=Provider.MICROSOFT.value,
+        external_id='["existing-subscription"]',
+        expires_at=datetime.now(timezone.utc) + timedelta(days=3),
+        last_delivery_error="Invalid Outlook clientState",
+    ))
+    db.commit()
+    db.refresh(mailbox)
+
+    assert mailbox_sync._webhook_is_active(mailbox) is False
+    db.close()
 
 
 def test_gmail_history_reads_all_pages_and_preserves_expired_signal(monkeypatch):

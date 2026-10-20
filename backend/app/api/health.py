@@ -38,14 +38,14 @@ async def auto_sync_check(db: Session = Depends(get_db)) -> dict:
 
 @router.get("/api/health/events", dependencies=[Depends(require_user)])
 def event_pipeline_health(db: Session = Depends(get_db)) -> dict:
-    """Report durable event backlog without contacting Kafka on the request path."""
+    """Report durable event backlog without contacting RabbitMQ on the request path."""
     rows = db.query(OutboxEvent.status, func.count(OutboxEvent.id)).group_by(
         OutboxEvent.status
     ).all()
     counts = {str(status): int(count) for status, count in rows}
     return {
         "status": "ok",
-        "kafka_configured": get_settings().kafka_enabled,
+        "rabbitmq_configured": get_settings().rabbitmq_enabled,
         "outbox": counts,
         "pending": counts.get("pending", 0) + counts.get("failed", 0),
     }

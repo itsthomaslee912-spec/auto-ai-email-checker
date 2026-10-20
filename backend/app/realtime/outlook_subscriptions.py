@@ -110,6 +110,11 @@ async def create_outlook_subscription(
     webhook.provider = Provider.MICROSOFT.value
     webhook.external_id = dump_outlook_subscription_ids(ids)
     webhook.resource = ",".join(OUTLOOK_LIVE_FOLDERS)
+    # A replacement subscription uses the current configured clientState.
+    # Clear the failure from the superseded subscription immediately; normal
+    # delivery will populate the next success timestamp.
+    webhook.last_delivery_failure_at = None
+    webhook.last_delivery_error = None
     expires: list[datetime] = []
     for item in created:
         exp = item.get("expirationDateTime")

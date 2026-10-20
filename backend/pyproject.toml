@@ -1,0 +1,48 @@
+[project]
+name = "auto-ai-email-checker-backend"
+version = "0.1.0"
+description = "Gmail/Outlook AI email classifier with interview calendar tracking."
+requires-python = ">=3.12"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.ruff]
+# The app package lives directly under backend/, which is pytest's rootdir.
+target-version = "py312"
+line-length = 100
+extend-exclude = [".venv", "scripts"]
+
+[tool.ruff.lint]
+# A pragmatic, low-noise baseline for a codebase adopting linting for the
+# first time. Expand this list as the team burns down findings.
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort (import ordering)
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+]
+ignore = [
+    "E501",  # line length is enforced by the formatter, not the linter
+    "B008",  # FastAPI/Depends idiom relies on function calls in defaults
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests deliberately reach into private helpers and use bare asserts.
+"tests/**" = ["F401", "F811"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+filterwarnings = ["ignore::DeprecationWarning"]

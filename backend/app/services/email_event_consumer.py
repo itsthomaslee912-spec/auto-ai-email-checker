@@ -1,4 +1,4 @@
-"""Kafka trigger that turns imported-email events into AI enrichment work."""
+"""RabbitMQ consumer that turns imported-email events into AI enrichment work."""
 from __future__ import annotations
 
 import asyncio
@@ -13,25 +13,6 @@ from app.services.reclassify import get_reclassify_status, start_mailbox_reclass
 
 logger = logging.getLogger(__name__)
 CONSUMER_NAME = "email-classifiers-v1"
-
-
-def _consumer_config() -> dict[str, str]:
-    settings = get_settings()
-    config = {
-        "bootstrap.servers": settings.kafka_bootstrap_servers,
-        "group.id": CONSUMER_NAME,
-        "client.id": f"{settings.kafka_client_id}-classifier",
-        "enable.auto.commit": "false",
-        "auto.offset.reset": "earliest",
-        "security.protocol": settings.kafka_security_protocol,
-    }
-    if settings.kafka_sasl_mechanism:
-        config.update({
-            "sasl.mechanism": settings.kafka_sasl_mechanism,
-            "sasl.username": settings.kafka_sasl_username,
-            "sasl.password": settings.kafka_sasl_password,
-        })
-    return config
 
 
 async def _classify_mailbox(mailbox_id: int) -> None:
@@ -65,39 +46,52 @@ def _mark_consumed(event_id: str) -> None:
 
 async def email_event_consumer_loop(stop_event: asyncio.Event) -> None:
     settings = get_settings()
-    if not settings.kafka_enabled:
+    if not settings.rabbitmq_enabled:
         await stop_event.wait()
         return
 
-    from confluent_kafka import Consumer, KafkaError
+    import aio_pika
 
-    consumer = Consumer(_consumer_config())
-    consumer.subscribe([topic("email.imported.v1")])
-    logger.info("Email Kafka consumer started")
+    connection = await aio_pika.connect_robust(settings.rabbitmq_url)
+    channel = await connection.channel()
+    await channel.set_qos(prefetch_count=max(1, settings.rabbitmq_prefetch_count))
+    exchange = await channel.declare_exchange(
+        settings.rabbitmq_exchange, aio_pika.ExchangeType.TOPIC, durable=True
+    )
+    prefix = settings.rabbitmq_routing_prefix.strip().strip(".")
+    queue_name = f"{prefix}.{CONSUMER_NAME}" if prefix else CONSUMER_NAME
+    queue = await channel.declare_queue(
+        queue_name, durable=True
+    )
+    await queue.bind(exchange, routing_key=topic("email.imported.v1"))
+    logger.info("Email RabbitMQ consumer started")
     try:
-        while not stop_event.is_set():
-            message = await asyncio.to_thread(consumer.poll, 1.0)
-            if message is None:
-                continue
-            if message.error():
-                if message.error().code() != KafkaError._PARTITION_EOF:
-                    logger.warning("Kafka consumer error: %s", message.error())
-                continue
-            try:
-                envelope = json.loads(message.value().decode("utf-8"))
-                event_id = str(envelope["event_id"])
-                if _already_consumed(event_id):
-                    await asyncio.to_thread(consumer.commit, message, False)
-                    continue
-                payload = envelope.get("payload") or {}
-                mailbox_id = int(payload["mailbox_id"])
-                if payload.get("classification_pending", True):
-                    await _classify_mailbox(mailbox_id)
-                _mark_consumed(event_id)
-                await asyncio.to_thread(consumer.commit, message, False)
-            except Exception:
-                logger.exception("Could not process imported-email event")
-                await asyncio.sleep(2)
+        async with queue.iterator() as messages:
+            while not stop_event.is_set():
+                next_message = asyncio.create_task(anext(messages))
+                stopped = asyncio.create_task(stop_event.wait())
+                done, pending = await asyncio.wait(
+                    (next_message, stopped), return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                if stopped in done:
+                    break
+                message = next_message.result()
+                try:
+                    envelope = json.loads(message.body.decode("utf-8"))
+                    event_id = str(envelope["event_id"])
+                    if not _already_consumed(event_id):
+                        payload = envelope.get("payload") or {}
+                        if payload.get("classification_pending", True):
+                            await _classify_mailbox(int(payload["mailbox_id"]))
+                        _mark_consumed(event_id)
+                    await message.ack()
+                except Exception:
+                    logger.exception("Could not process imported-email event")
+                    await message.nack(requeue=True)
+                    await asyncio.sleep(2)
     finally:
-        await asyncio.to_thread(consumer.close)
-        logger.info("Email Kafka consumer stopped")
+        await connection.close()
+        logger.info("Email RabbitMQ consumer stopped")

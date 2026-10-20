@@ -460,6 +460,45 @@ def test_reclassify_commits_calendar_changes_before_worker_session_closes(monkey
         assert db.query(CalendarEvent).filter(CalendarEvent.mailbox_id == mailbox_id).count() == 1
 
 
+def test_pending_classification_publishes_completion_when_label_is_unchanged(monkeypatch):
+    from app.services import ai_backend, reclassify
+
+    SessionLocal = _session_factory()
+    with SessionLocal() as db:
+        email = _seed_email(db, label=EmailLabel.OTHER.value)
+        email.classification_pending = True
+        db.commit()
+        mailbox_id = email.mailbox_id
+        email_id = email.id
+
+    async def classify_as_other(**_kwargs):
+        return SimpleNamespace(
+            label=EmailLabel.OTHER.value,
+            category_subtype=None,
+            interview_subtype=None,
+            confidence=None,
+            response_id=None,
+        )
+
+    publish = AsyncMock()
+    monkeypatch.setattr("app.db.SessionLocal", SessionLocal)
+    monkeypatch.setattr(reclassify, "classify_email", classify_as_other)
+    monkeypatch.setattr(reclassify, "get_ai_backend", lambda: SimpleNamespace(provider="test"))
+    monkeypatch.setattr(reclassify, "publish", publish)
+    ai_backend._ai_call_gate = None
+    reclassify._mailbox_gate = None
+
+    asyncio.run(reclassify._run_reclassify_job(mailbox_id, pending_only=True))
+
+    classified = [call.args[1] for call in publish.await_args_list if call.args[0] == "email.classified"]
+    assert len(classified) == 1
+    assert classified[0]["id"] == email_id
+    assert classified[0]["classification_completed"] is True
+    assert classified[0]["updated"] is True
+    with SessionLocal() as db:
+        assert db.get(EmailMessage, email_id).classification_pending is False
+
+
 def test_prompt_loader_falls_back_to_seed(monkeypatch):
     invalidate_prompt_cache()
     monkeypatch.setattr("app.classify.prompt_store._load_from_db", lambda: None)

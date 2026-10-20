@@ -5,13 +5,14 @@ from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from app.auth.session import mailbox_scope
 from app.auth.oauth_google import ensure_google_access_token
 from app.auth.oauth_microsoft import ensure_microsoft_access_token
 from app.db import SessionLocal, get_db
 from app.classify.outcome_extract import OUTCOME_LABELS, apply_outcome
+from app.config import get_settings
 from app.models import EmailLabel, EmailMessage, MailboxConnection, Provider
 from app.realtime.gmail_watch import stop_gmail_watch
 from app.realtime.outlook_subscriptions import (
@@ -267,15 +268,26 @@ def mailbox_outcomes(
         raise HTTPException(status_code=400, detail="Unsupported outcome label")
     _active_mailbox(db, mailbox_id)
     start, end, start_label, end_label = _parse_range(date_from, date_to)
+    requested_labels = [label] if label is not None else list(OUTCOME_LABELS)
     rows = (
         db.query(EmailMessage)
         .filter(
             EmailMessage.mailbox_id == mailbox_id,
-            EmailMessage.label.in_(OUTCOME_LABELS),
+            EmailMessage.label.in_(requested_labels),
             EmailMessage.received_at.is_not(None),
             EmailMessage.received_at >= start,
             EmailMessage.received_at < end,
         )
+        # Outcome statistics never need message bodies. Avoid fetching large
+        # HTML/text columns for every historical recruiting email.
+        .options(load_only(
+            EmailMessage.id,
+            EmailMessage.label,
+            EmailMessage.company,
+            EmailMessage.job_role,
+            EmailMessage.received_at,
+            EmailMessage.subject,
+        ))
         .order_by(EmailMessage.received_at.desc(), EmailMessage.id.desc())
         .all()
     )
@@ -375,6 +387,7 @@ async def disconnect_mailbox_record(db: Session, mailbox: MailboxConnection) -> 
 @router.post("/{mailbox_id}/sync")
 async def sync_mailbox(mailbox_id: int, db: Session = Depends(get_db)) -> dict:
     from app.services.mailbox_sync import start_mailbox_sync
+    from app.services.job_queue import enqueue
 
     mailbox = (
         db.query(MailboxConnection)
@@ -383,7 +396,10 @@ async def sync_mailbox(mailbox_id: int, db: Session = Depends(get_db)) -> dict:
     )
     if mailbox is None:
         raise HTTPException(status_code=404, detail="Mailbox not found")
-    status = await start_mailbox_sync(mailbox.id, force_full=True)
+    if get_settings().distributed_runtime:
+        status = enqueue(db, mailbox.id, "sync", options={"force_full": True})
+    else:
+        status = await start_mailbox_sync(mailbox.id, force_full=True)
     return {"ok": True, **status}
 
 
@@ -405,6 +421,7 @@ async def stop_mailbox_sync(mailbox_id: int, db: Session = Depends(get_db)) -> d
 @router.post("/{mailbox_id}/sync/full")
 async def full_rescan_mailbox(mailbox_id: int, db: Session = Depends(get_db)) -> dict:
     from app.services.mailbox_sync import start_mailbox_sync
+    from app.services.job_queue import enqueue
 
     mailbox = (
         db.query(MailboxConnection)
@@ -413,7 +430,10 @@ async def full_rescan_mailbox(mailbox_id: int, db: Session = Depends(get_db)) ->
     )
     if mailbox is None:
         raise HTTPException(status_code=404, detail="Mailbox not found")
-    status = await start_mailbox_sync(mailbox.id, force_full=True)
+    if get_settings().distributed_runtime:
+        status = enqueue(db, mailbox.id, "sync", options={"force_full": True})
+    else:
+        status = await start_mailbox_sync(mailbox.id, force_full=True)
     return {"ok": True, **status}
 
 
@@ -428,6 +448,7 @@ def mailbox_sync_status(mailbox_id: int, db: Session = Depends(get_db)) -> dict:
 @router.post("/{mailbox_id}/reclassify")
 async def reclassify_mailbox(mailbox_id: int, db: Session = Depends(get_db)) -> dict:
     from app.services.reclassify import start_mailbox_reclassify
+    from app.services.job_queue import enqueue
 
     mailbox = (
         db.query(MailboxConnection)
@@ -436,7 +457,10 @@ async def reclassify_mailbox(mailbox_id: int, db: Session = Depends(get_db)) -> 
     )
     if mailbox is None:
         raise HTTPException(status_code=404, detail="Mailbox not found")
-    status = await start_mailbox_reclassify(mailbox.id)
+    if get_settings().distributed_runtime:
+        status = enqueue(db, mailbox.id, "reclassify", options={"pending_only": False})
+    else:
+        status = await start_mailbox_reclassify(mailbox.id)
     return {"ok": True, **status}
 
 

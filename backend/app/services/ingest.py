@@ -174,7 +174,7 @@ async def ingest_normalized_message(
         # Flush inside the duplicate-protected transaction. A webhook and a
         # reconciliation sync may race to insert the same provider message.
         db.flush()
-        if get_settings().kafka_enabled:
+        if get_settings().rabbitmq_enabled:
             imported_event = event_envelope(
                 "email.imported.v1",
                 {

@@ -53,6 +53,53 @@ export interface AutoSyncStatus {
   mailboxes?: AccountSyncDetail[];
 }
 
+export interface MonitoringService {
+  name: string;
+  label: string;
+  description: string;
+  status: "healthy" | "stale" | "offline" | string;
+  replicas: number;
+  last_seen_at: string | null;
+}
+
+export interface MonitoringSnapshot {
+  generated_at: string;
+  overall_status: "healthy" | "degraded" | string;
+  services: MonitoringService[];
+  infrastructure: {
+    postgres: { status: string; label: string };
+    rabbitmq: { status: string; label: string; configured: boolean };
+  };
+  metrics: {
+    users: number;
+    active_mailboxes: number;
+    emails: number;
+    pending_classification: number;
+  };
+  queues: {
+    active_mailbox_jobs: number;
+    pending_webhooks: number;
+    pending_events: number;
+    failed_events: number;
+    mailbox_jobs: Record<string, number>;
+    webhook_jobs: Record<string, number>;
+    outbox: Record<string, number>;
+  };
+  mailbox_issues: {
+    mailbox_id: number;
+    email_address: string;
+    provider: Provider;
+    message: string;
+    last_sync_completed_at: string | null;
+  }[];
+}
+
+export async function fetchMonitoringSnapshot(): Promise<MonitoringSnapshot> {
+  const res = await apiFetch(`${API_BASE}/api/admin/monitoring`);
+  if (!res.ok) throw new Error(await readApiError(res, "Failed to load system monitoring"));
+  return res.json();
+}
+
 export interface AccountSyncDetail {
   mailbox_id: number;
   email_address: string;

@@ -1,6 +1,6 @@
 """Durable domain/activity events shared by HTTP and worker processes.
 
-The database is the source of truth. Kafka publication is performed from the
+The database is the source of truth. RabbitMQ publication is performed from the
 transactional outbox, so a broker outage never loses an accepted event.
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ DOMAIN_TOPIC_BY_ACTIVITY = {
 
 
 def topic(name: str) -> str:
-    prefix = get_settings().kafka_topic_prefix.strip().strip(".")
+    prefix = get_settings().rabbitmq_routing_prefix.strip().strip(".")
     return f"{prefix}.{name}" if prefix else name
 
 
@@ -88,7 +88,7 @@ def resolve_user_id(db: Session, data: dict[str, Any]) -> int | None:
 
 
 def persist_activity(db: Session, event_type: str, data: dict[str, Any]) -> dict[str, Any]:
-    """Store a reconnectable activity and, when enabled, its Kafka outbox event."""
+    """Store a reconnectable activity and, when enabled, its broker outbox event."""
     user_id = resolve_user_id(db, data)
     envelope = event_envelope(
         event_type,
@@ -108,7 +108,7 @@ def persist_activity(db: Session, event_type: str, data: dict[str, Any]) -> dict
     db.add(activity)
     db.flush()
     envelope["sequence"] = activity.id
-    if get_settings().kafka_enabled:
+    if get_settings().rabbitmq_enabled:
         enqueue(db, "user.activity.v1", str(user_id), envelope)
         domain_topic = DOMAIN_TOPIC_BY_ACTIVITY.get(event_type)
         if domain_topic:

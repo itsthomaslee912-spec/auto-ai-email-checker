@@ -1,138 +1,104 @@
 # Auto AI Email Checker
 
-Docker-only Gmail and Outlook email classifier with interview calendar tracking.
+Native Windows Gmail and Outlook email classifier with interview calendar tracking.
 
 ## Architecture
-
-Docker Compose starts these services:
-
-- `frontend`: React production build served by Nginx on port `8080`.
-- `email-api`: FastAPI REST, OAuth, webhook and WebSocket service.
-- `email-worker`: mailbox synchronization, reconciliation, AI processing and Kafka consumers.
-- `postgres`: durable email, calendar, activity and transactional-outbox storage.
-- `kafka`: asynchronous email and UI activity events.
-- `schema-registry`: event-contract registry.
-
-New mail follows this path:
 
 ```text
 Gmail / Outlook
   -> OAuth + webhook
+  -> sync-worker
   -> durable webhook job
-  -> import and deduplicate
+  -> import and deduplicate in PostgreSQL
   -> transactional outbox
-  -> Kafka email.imported.v1
+  -> event-relay
+  -> RabbitMQ email.imported.v1 queue
+  -> classification-worker
   -> AI classification and extraction
   -> calendar event/chip update
-  -> Kafka user.activity.v1
+  -> RabbitMQ user.activity.v1 routing key
+  -> notification-service
+  -> durable in-app notification
+  -> RabbitMQ notification.ready.v1 routing key
   -> authenticated WebSocket
   -> React UI
 ```
 
-Webhooks are the immediate-delivery path. Incremental polling remains enabled as
-a fallback for disconnected, expired or unhealthy webhooks, and as a slower
-reconciliation safety net for healthy subscriptions.
+PostgreSQL is the durable source of truth. RabbitMQ provides acknowledged work
+delivery and live-event fan-out. The notification service is an independent
+process that consumes user activity, persists in-app notifications, and emits
+delivery-ready events for the API WebSocket gateway. The API, sync worker,
+classification worker, event relay, notification service, PostgreSQL,
+RabbitMQ, Vite, and optional ngrok tunnel all run directly on Windows.
 
 ## Requirements
 
-- Docker Desktop with Docker Compose v2
-- A public HTTPS address for Gmail/Outlook webhook delivery
-- OAuth credentials for each provider you enable
-- An OpenAI or Gemini key, or a separately reachable Ollama service
+- Windows PowerShell
+- The project-local PostgreSQL installation under `.local/postgresql`
+- Erlang/OTP and RabbitMQ Server installed as a Windows service
+- Python virtual environment at `backend/.venv`
+- Frontend dependencies under `frontend/node_modules`
+- OAuth credentials for each enabled email provider
+- An OpenAI or Gemini API key, or a reachable Ollama service
 
-## Configure
+## First-time setup
 
-From PowerShell:
+If `.env` does not exist, copy the native template and add your credentials:
 
 ```powershell
-cd E:\my_project\auto-ai-email-checker
-
-if (-not (Test-Path .env)) {
-    Copy-Item .env.docker.example .env
-}
-
+Copy-Item .env.example .env
 notepad .env
 ```
 
-Do not commit `.env`. Important settings include:
-
-```dotenv
-POSTGRES_PASSWORD=replace-with-a-strong-password
-SESSION_SECRET=replace-with-a-long-random-secret
-TOKEN_ENCRYPTION_KEY=replace-with-a-fernet-key
-
-OPENAI_API_KEY=
-OPENAI_MODEL=gpt-4o-mini
-
-GOOGLE_CLIENT_ID=
-GOOGLE_CLIENT_SECRET=
-GMAIL_PUBSUB_TOPIC=
-GMAIL_PUBSUB_AUDIENCE=https://mail.example.com/api/webhooks/gmail
-
-MICROSOFT_CLIENT_ID=
-MICROSOFT_CLIENT_SECRET=
-MICROSOFT_WEBHOOK_CLIENT_STATE=
-
-WEBHOOK_BASE_URL=https://mail.example.com
-BACKEND_PUBLIC_URL=https://mail.example.com
-FRONTEND_ORIGIN=https://mail.example.com
-GOOGLE_REDIRECT_URI=https://mail.example.com/api/auth/google/callback
-MICROSOFT_REDIRECT_URI=https://mail.example.com/api/auth/microsoft/callback
-```
-
-The values in `.env.docker.example` document every Docker setting.
-
-## Start
+Install RabbitMQ from an Administrator PowerShell:
 
 ```powershell
-docker compose up --build -d
-docker compose ps
+.\scripts\install-rabbitmq.ps1
 ```
 
-Open:
+The installer resumes interrupted downloads, verifies official installer
+checksums, installs RabbitMQ as an automatic Windows service, and enables its
+management plugin.
 
-```text
-http://localhost:8080
-```
-
-Health check:
+Install application dependencies if needed:
 
 ```powershell
-Invoke-WebRequest http://localhost:8080/api/health
+.\backend\.venv\Scripts\python.exe -m pip install -r .\backend\requirements.txt
+Set-Location frontend
+npm install
+Set-Location ..
 ```
 
-Follow service logs:
+## Run
+
+Start locally:
 
 ```powershell
-docker compose logs -f email-api email-worker kafka
+.\run.ps1
 ```
 
-## Stop and restart
-
-Stop containers while preserving PostgreSQL and Kafka volumes:
+Start with the webhook tunnel and open the browser:
 
 ```powershell
-docker compose down
+.\run.bat
 ```
 
-Restart:
+`run.bat` enables backend development reload. Changes under `backend/app`
+reload FastAPI and restart the sync, classification, event-relay, and
+notification worker processes. Vite continues to hot-reload frontend changes.
+
+To run without backend reload, use `run.ps1` directly.
+
+Open `http://localhost:5173`. Logs are written under `logs/`.
+
+Stop all application services:
 
 ```powershell
-docker compose up -d
+.\stop.bat
 ```
 
-Rebuild after source or dependency changes:
-
-```powershell
-docker compose up --build -d
-```
-
-Delete containers and all Docker-managed application data only when you
-intentionally want a fresh installation:
-
-```powershell
-docker compose down -v
-```
+The launcher verifies RabbitMQ before starting and attempts to start the
+Windows `RabbitMQ` service when necessary.
 
 ## OAuth and webhooks
 
@@ -149,7 +115,7 @@ docker compose down -v
 
 1. Register an application in Microsoft Entra ID.
 2. Register `https://YOUR_HOST/api/auth/microsoft/callback` as a Web redirect URI.
-3. Grant delegated `Mail.ReadWrite`, `User.Read`, `openid`, `profile`, `email`
+3. Grant delegated `Mail.ReadWrite`, `User.Read`, `openid`, `profile`, `email`,
    and `offline_access` permissions.
 4. Set a long random `MICROSOFT_WEBHOOK_CLIENT_STATE` value.
 
@@ -160,15 +126,35 @@ GET /api/health
 GET /api/health/ready
 GET /api/health/events
 GET /api/activity?after_sequence=0
+GET /api/notifications
+GET /api/notifications?unread_only=true
+POST /api/notifications/{notification_id}/read
+POST /api/notifications/read-all
 WS  /api/ws/activity
 ```
 
 ## Repository layout
 
 ```text
-backend/                 FastAPI API, workers, integrations and tests
-frontend/                React UI and Nginx production configuration
-compose.yml              Complete runtime definition
-.env.docker.example      Environment template
-.dockerignore            Docker build exclusions
+backend/       FastAPI API, workers, integrations, and tests
+frontend/      React and Vite user interface
+scripts/       Native Windows setup and process supervision
+run.ps1        Native application launcher
+run.bat        Launcher with ngrok enabled
+stop.bat       Native service shutdown
+.env.example   Native environment template
 ```
+
+## Service boundaries
+
+- `email-api` owns REST, OAuth callbacks, webhook admission, authenticated
+  WebSocket delivery, and reconnect recovery.
+- `sync-worker` owns Gmail and Microsoft Graph communication after requests are
+  durably accepted.
+- `classification-worker` owns model calls and calendar projections.
+- `event-relay` delivers PostgreSQL transactional-outbox events to RabbitMQ.
+- `notification-service` consumes `user.activity.v1`, persists idempotent
+  in-app notifications, and emits `notification.ready.v1` delivery events.
+
+Manual sync and reclassification requests use the durable mailbox-job queue.
+Workers persist progress and honor stop requests across process boundaries.
