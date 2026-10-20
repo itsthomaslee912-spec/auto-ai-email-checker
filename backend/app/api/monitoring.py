@@ -27,7 +27,7 @@ router = APIRouter(
 )
 
 SERVICE_DETAILS = {
-    "email-api": ("Email API", "REST, OAuth, webhooks and notification WebSockets"),
+    "email-api": ("Email API", "REST, OAuth, webhooks and WebSocket events"),
     "sync-worker": ("Sync worker", "Gmail and Microsoft mailbox ingestion"),
     "classification-worker": ("Classification worker", "AI classification and calendar extraction"),
     "event-relay": ("Event relay", "PostgreSQL outbox delivery to RabbitMQ"),

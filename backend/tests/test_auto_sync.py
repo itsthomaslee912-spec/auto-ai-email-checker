@@ -485,6 +485,53 @@ def test_transient_network_error_does_not_raise_a_problem(monkeypatch):
     engine.dispose()
 
 
+def test_successful_sync_supersedes_older_durable_job_error(monkeypatch):
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(auto_sync, "get_settings", lambda: SimpleNamespace(auto_sync_interval_seconds=120))
+    monkeypatch.setattr(auto_sync, "_loop_running", True)
+    monkeypatch.setattr(auto_sync, "_last_check_at", now)
+    monkeypatch.setattr(auto_sync, "_last_error", None)
+
+    with session_factory() as db:
+        user = User(external_id="recovered-job-test")
+        db.add(user)
+        db.flush()
+        mailbox = MailboxConnection(
+            user_id=user.id,
+            provider="google",
+            email_address="recovered@example.com",
+            access_token_enc="x",
+            is_active=True,
+            last_sync_completed_at=now,
+            last_sync_error=None,
+        )
+        db.add(mailbox)
+        db.commit()
+
+        monkeypatch.setattr(
+            auto_sync,
+            "get_sync_status",
+            lambda _: {
+                "state": "error",
+                "failed": 0,
+                "message": "",
+                "updated_at": (now - timedelta(seconds=40)).isoformat(),
+            },
+        )
+
+        status = auto_sync.get_auto_sync_status(db)
+
+        assert status["state"] == "active"
+        assert status["problem_mailboxes"] == []
+        assert status["mailboxes"][0]["state"] == "done"
+    engine.dispose()
+
+
 def _mailbox_with_webhook(session_factory, *, success_ago: timedelta, failure_ago: timedelta | None, error: str | None):
     with session_factory() as db:
         user = User(external_id="quota-webhook")

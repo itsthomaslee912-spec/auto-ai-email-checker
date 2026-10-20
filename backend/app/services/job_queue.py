@@ -42,7 +42,14 @@ def _recover_expired(db: Session, job_type: str, now: datetime) -> int:
 
 
 def default_status(mailbox_id: int, job_type: str) -> dict[str, Any]:
-    common = {"mailbox_id": mailbox_id, "state": "idle", "failed": 0, "total": 0, "message": ""}
+    common = {
+        "mailbox_id": mailbox_id,
+        "state": "idle",
+        "failed": 0,
+        "total": 0,
+        "message": "",
+        "updated_at": None,
+    }
     if job_type == "sync":
         return {**common, "listed": 0, "skipped": 0, "imported": 0}
     return {**common, "updated": 0, "processed": 0}
@@ -56,6 +63,7 @@ def _decode(row: MailboxJobState) -> dict[str, Any]:
         pass
     status["mailbox_id"] = row.mailbox_id
     status["state"] = row.state
+    status["updated_at"] = row.updated_at.isoformat() if row.updated_at else None
     return status
 
 

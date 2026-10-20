@@ -381,6 +381,9 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                 needs_calendar = previous_label in CALENDAR_LABELS or email.label in CALENDAR_LABELS or email.folder == "sent"
                 if label_changed or outcome_changed or was_pending:
                     db.commit()
+                    from app.api.emails import invalidate_email_list_caches
+
+                    invalidate_email_list_caches()
                 else:
                     db.rollback()
                 payload = None

@@ -88,6 +88,7 @@ class _BookingRef:
     id: int
     mailbox_id: int
     source_email_id: int | None
+    source_thread_id: str | None
     company: str
     job_role: str
     source_received_at: datetime | None
@@ -154,7 +155,15 @@ def _booked_by_event(request: EmailMessage, events: list[_BookingRef] | tuple[_B
     for event in events:
         if event.source_email_id == request.id:
             return True
-        if event.mailbox_id != request.mailbox_id or not request.company:
+        if event.mailbox_id != request.mailbox_id:
+            continue
+        # The accepted reply and resulting booking often share the original
+        # invitation thread even when the classifier left company blank. That
+        # thread identity is stronger than fuzzy company/role matching and
+        # prevents a booked interview from remaining in "needs attention".
+        if request.thread_id and event.source_thread_id == request.thread_id:
+            return True
+        if not request.company:
             continue
         booked_at = as_utc(event.source_received_at) or as_utc(event.created_at)
         if booked_at is None or received is None or booked_at <= received:
@@ -185,6 +194,7 @@ def _confirmed_bookings(db: Session, mailbox_ids: list[int]) -> tuple[list[_Book
                 id=row.id,
                 mailbox_id=row.mailbox_id,
                 source_email_id=row.source_email_id,
+                source_thread_id=row.source_thread_id,
                 company=row.company or "",
                 job_role=row.job_role or "",
                 source_received_at=row.source_received_at,
@@ -194,6 +204,7 @@ def _confirmed_bookings(db: Session, mailbox_ids: list[int]) -> tuple[list[_Book
                 CalendarEvent.id,
                 CalendarEvent.mailbox_id,
                 CalendarEvent.source_email_id,
+                CalendarEvent.source_thread_id,
                 CalendarEvent.company,
                 CalendarEvent.job_role,
                 CalendarEvent.source_received_at,

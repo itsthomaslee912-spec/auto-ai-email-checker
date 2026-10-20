@@ -216,7 +216,11 @@ async def ingest_normalized_message(
         return None
     db.refresh(email)
 
-    await publish("email.classified", EmailOut.model_validate(email).model_dump(mode="json"))
+    # A download-only row has only the temporary database label "other". Do
+    # not announce it as classified: the classification worker publishes the
+    # real item with classification_completed=True once enrichment finishes.
+    if not download_only:
+        await publish("email.classified", EmailOut.model_validate(email).model_dump(mode="json"))
     if calendar_changed:
         await publish("calendar.changed", {"action": "extracted", "mailbox_id": email.mailbox_id})
     return email

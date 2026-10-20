@@ -97,7 +97,13 @@ InterviewSubtypeLiteral = Literal[
 def _from_active_mailbox(query):
     return query.join(
         MailboxConnection, MailboxConnection.id == EmailMessage.mailbox_id
-    ).filter(mailbox_scope())
+    ).filter(
+        mailbox_scope(),
+        # Download and classification are intentionally separate services.
+        # A downloaded row temporarily carries label="other", but that is not
+        # a classification result and must never leak into the inbox UI.
+        EmailMessage.classification_pending.is_not(True),
+    )
 
 
 def _search_filter(query: str, dialect: str):
@@ -121,12 +127,19 @@ def _search_filter(query: str, dialect: str):
     )
 
 
-def _email_from_active_mailbox(db: Session, email_id: int) -> EmailMessage | None:
-    return (
-        _from_active_mailbox(db.query(EmailMessage))
-        .filter(EmailMessage.id == email_id)
-        .one_or_none()
-    )
+def _email_from_active_mailbox(
+    db: Session,
+    email_id: int,
+    *,
+    include_pending: bool = False,
+) -> EmailMessage | None:
+    query = db.query(EmailMessage).join(
+        MailboxConnection,
+        MailboxConnection.id == EmailMessage.mailbox_id,
+    ).filter(mailbox_scope())
+    if not include_pending:
+        query = query.filter(EmailMessage.classification_pending.is_not(True))
+    return query.filter(EmailMessage.id == email_id).one_or_none()
 
 
 def _normalize_cursor_at(value: datetime) -> datetime:
@@ -821,7 +834,9 @@ async def update_email_label(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> EmailMessage:
-    email = _email_from_active_mailbox(db, email_id)
+    # Pending rows remain absent from inbox lists, but an explicit human label
+    # operation must still be able to finish their classification.
+    email = _email_from_active_mailbox(db, email_id, include_pending=True)
     if email is None:
         raise HTTPException(status_code=404, detail="Email not found")
 

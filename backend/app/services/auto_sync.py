@@ -231,9 +231,28 @@ def get_auto_sync_status(db: Session) -> dict:
         if reason:
             polling_accounts += 1
         job = get_sync_status(mailbox.id)
-        if job["state"] == "running":
+        job_state = job["state"]
+        job_updated_at = None
+        try:
+            if job.get("updated_at"):
+                job_updated_at = as_utc(datetime.fromisoformat(str(job["updated_at"])))
+        except (TypeError, ValueError):
+            pass
+        # A durable job can retain ``error`` after a later webhook/polling
+        # request proves that the mailbox recovered. This happens most often
+        # when a transient network failure races another successful delivery.
+        # Do not let that superseded job state contradict current health.
+        job_recovered = bool(
+            job_state == "error"
+            and mailbox.last_sync_error is None
+            and mailbox.last_sync_completed_at
+            and job_updated_at
+            and as_utc(mailbox.last_sync_completed_at) > job_updated_at
+        )
+        effective_job_state = "done" if job_recovered else job_state
+        if effective_job_state == "running":
             syncing = True
-        elif job["state"] == "error" or job.get("failed", 0) > 0:
+        elif effective_job_state == "error" or job.get("failed", 0) > 0:
             message = job.get("message") or "Sync failed"
             # A momentary network/DNS loss or quota throttle clears on the next
             # retry, so it must not raise a "needs attention" alert the user
@@ -254,7 +273,7 @@ def get_auto_sync_status(db: Session) -> dict:
             "mailbox_id": mailbox.id,
             "email_address": mailbox.email_address,
             "provider": mailbox.provider,
-            "state": job["state"],
+            "state": effective_job_state,
             "last_sync_started_at": (
                 as_utc(mailbox.last_sync_started_at).isoformat()
                 if mailbox.last_sync_started_at else None
@@ -267,7 +286,7 @@ def get_auto_sync_status(db: Session) -> dict:
                 None if is_transient_sync_error(mailbox.last_sync_error) else mailbox.last_sync_error
             ),
             "needs_reconnect": needs_reconnect(mailbox.last_sync_error)
-            or (job["state"] == "error" and needs_reconnect(job.get("message"))),
+            or (effective_job_state == "error" and needs_reconnect(job.get("message"))),
             "webhook_registered": has_registered_webhook(mailbox),
             "webhook_verified": webhook_verified,
             "sync_method": "polling" if reason else "webhook",

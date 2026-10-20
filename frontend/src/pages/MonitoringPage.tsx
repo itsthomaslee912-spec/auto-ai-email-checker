@@ -9,14 +9,55 @@ const VIEW_KEY = "monitoring-view";
 const FLOW_STAGES = ["providers", "sync", "postgres", "relay", "rabbitmq", "classification", "notification", "api", "browser"] as const;
 type Stage = (typeof FLOW_STAGES)[number];
 const EVENT_FLOW: Record<string, Stage[]> = {
-  "sync.progress": ["providers", "sync", "postgres", "relay", "rabbitmq"],
-  "sync.done": ["providers", "sync", "postgres", "relay", "rabbitmq"],
-  "email.classified": ["rabbitmq", "classification", "postgres", "notification", "api", "browser"],
-  "reclassify.progress": ["classification", "postgres", "notification", "api", "browser"],
-  "reclassify.done": ["classification", "postgres", "notification", "api", "browser"],
-  "calendar.changed": ["classification", "postgres", "api", "browser"],
+  "sync.progress": ["providers", "sync", "postgres", "relay", "rabbitmq", "notification", "api", "browser"],
+  "sync.done": ["providers", "sync", "postgres", "relay", "rabbitmq", "notification", "api", "browser"],
+  "email.classified": ["classification", "postgres", "relay", "rabbitmq", "notification", "api", "browser"],
+  "reclassify.progress": ["classification", "postgres", "relay", "rabbitmq", "notification", "api", "browser"],
+  "reclassify.done": ["classification", "postgres", "relay", "rabbitmq", "notification", "api", "browser"],
+  "calendar.changed": ["classification", "postgres", "relay", "rabbitmq", "notification", "api", "browser"],
 };
-const FLOW_HOLD_MS = 1800;
+const EVENT_LABELS: Record<string, string> = {
+  "sync.progress": "Mailbox sync progressing",
+  "sync.done": "Mailbox sync completed",
+  "email.classified": "Email classified",
+  "reclassify.progress": "AI reclassification progressing",
+  "reclassify.done": "AI reclassification completed",
+  "calendar.changed": "Interview calendar updated",
+};
+const FLOW_STEP_MS = 135;
+const FLOW_ACTIVE_MS = 620;
+
+type FlowWindow = { start: number; end: number };
+type StreamState = "connecting" | "connected" | "reconnecting";
+type LiveActivity = { label: string; detail: string; receivedAt: number };
+
+function eventDetail(eventName: string, data: Record<string, unknown>): string {
+  const mailbox = typeof data.mailbox_id === "number" ? `Mailbox #${data.mailbox_id}` : "Live system event";
+  const total = typeof data.total === "number" ? data.total : null;
+  if (eventName === "sync.progress") {
+    const imported = typeof data.imported === "number" ? data.imported : 0;
+    return total ? `${mailbox} · ${number(imported)} of ${number(total)} messages` : `${mailbox} · ${number(imported)} imported`;
+  }
+  if (eventName === "reclassify.progress") {
+    const processed = typeof data.processed === "number" ? data.processed : 0;
+    return total ? `${mailbox} · ${number(processed)} of ${number(total)} processed` : `${mailbox} · processing`;
+  }
+  if (eventName === "sync.done") {
+    const imported = typeof data.imported === "number" ? data.imported : null;
+    return imported == null ? `${mailbox} · ${String(data.state ?? "complete")}` : `${mailbox} · ${number(imported)} imported`;
+  }
+  if (eventName === "reclassify.done") {
+    const updated = typeof data.updated === "number" ? data.updated : null;
+    return updated == null ? `${mailbox} · ${String(data.state ?? "complete")}` : `${mailbox} · ${number(updated)} updated`;
+  }
+  if (eventName === "email.classified") {
+    return typeof data.label === "string" ? `${mailbox} · ${data.label}` : mailbox;
+  }
+  if (eventName === "calendar.changed") {
+    return typeof data.action === "string" ? `${mailbox} · ${data.action.replaceAll("_", " ")}` : mailbox;
+  }
+  return mailbox;
+}
 
 function relativeTime(value: string | null): string {
   if (!value) return "No heartbeat received";
@@ -103,15 +144,36 @@ function ArchNode({
   );
 }
 
-function ArchEdge({ label, count, error, live }: { label: string; count?: number; error?: number; live?: boolean }) {
+type ConnectorDirection = "down" | "up" | "right" | "left" | "vertical-both" | "horizontal-both";
+
+function ArchConnector({
+  label, detail, count, error, live, direction = "down", className = "",
+}: {
+  label: string;
+  detail?: string;
+  count?: number;
+  error?: number;
+  live?: boolean;
+  direction?: ConnectorDirection;
+  className?: string;
+}) {
+  const vertical = direction === "down" || direction === "up" || direction === "vertical-both";
   return (
-    <div className={`arch-edge${live ? " is-live" : ""}`} aria-hidden="true">
-      <span className="arch-edge-chip">
-        {label}
+    <div className={`arch-connector is-${direction}${vertical ? " is-vertical" : " is-horizontal"}${live ? " is-live" : ""} ${className}`} aria-hidden="true">
+      <svg viewBox={vertical ? "0 0 24 100" : "0 0 100 24"} preserveAspectRatio="none">
+        <path className="arch-connector-line" d={vertical ? "M12 4V96" : "M4 12H96"} vectorEffect="non-scaling-stroke" />
+        {(direction === "down" || direction === "vertical-both") && <path className="arch-connector-arrow" d="M7 88l5 8 5-8" vectorEffect="non-scaling-stroke" />}
+        {(direction === "up" || direction === "vertical-both") && <path className="arch-connector-arrow" d="M7 12l5-8 5 8" vectorEffect="non-scaling-stroke" />}
+        {(direction === "right" || direction === "horizontal-both") && <path className="arch-connector-arrow" d="M88 7l8 5-8 5" vectorEffect="non-scaling-stroke" />}
+        {(direction === "left" || direction === "horizontal-both") && <path className="arch-connector-arrow" d="M12 7l-8 5 8 5" vectorEffect="non-scaling-stroke" />}
+      </svg>
+      {live && <span className="arch-packets"><i /><i /></span>}
+      <span className="arch-connector-chip">
+        <strong>{label}</strong>
+        {detail && <small>{detail}</small>}
         {typeof count === "number" && count > 0 && <b className="arch-edge-badge">{number(count)}</b>}
         {typeof error === "number" && error > 0 && <b className="arch-edge-badge is-error">{number(error)} failed</b>}
       </span>
-      <svg className="arch-edge-arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v15M6 13l6 6 6-6" /></svg>
     </div>
   );
 }
@@ -169,30 +231,55 @@ export default function MonitoringPage({ active }: { active: boolean }) {
   // Live data flow: subscribe to the shared event stream and briefly light up
   // the pipeline stages each event passes through, so the diagram animates
   // actual traffic (a synced email, a classification, a calendar update).
-  const pulsesRef = useRef<Record<string, number>>({});
+  const pulsesRef = useRef<Partial<Record<Stage, FlowWindow>>>({});
   const [, setFlowTick] = useState(0);
+  const [streamState, setStreamState] = useState<StreamState>("connecting");
+  const [lastActivity, setLastActivity] = useState<LiveActivity | null>(null);
+  const [liveEventCount, setLiveEventCount] = useState(0);
   useEffect(() => {
     if (!active || view !== "architecture") return;
     const stream = openEvents();
     const handlers: Array<[string, EventListener]> = [];
-    const bump = (stages: Stage[]) => {
-      const until = Date.now() + FLOW_HOLD_MS;
-      for (const stage of stages) pulsesRef.current[stage] = until;
+    setStreamState("connecting");
+    const bump = (eventName: string, stages: Stage[], event: Event) => {
+      const now = Date.now();
+      let data: Record<string, unknown> = {};
+      try {
+        const parsed = JSON.parse((event as MessageEvent).data || "{}") as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) data = parsed as Record<string, unknown>;
+      } catch {
+        // The animation still represents the event even if optional telemetry is malformed.
+      }
+      pulsesRef.current = {};
+      stages.forEach((stage, index) => {
+        const start = now + index * FLOW_STEP_MS;
+        pulsesRef.current[stage] = { start, end: start + FLOW_ACTIVE_MS };
+      });
+      setLastActivity({ label: EVENT_LABELS[eventName] ?? eventName, detail: eventDetail(eventName, data), receivedAt: now });
+      setLiveEventCount((count) => count + 1);
       setFlowTick((tick) => tick + 1);
     };
     for (const [eventName, stages] of Object.entries(EVENT_FLOW)) {
-      const handler: EventListener = () => bump(stages);
+      const handler: EventListener = (event) => bump(eventName, stages, event);
       stream.addEventListener(eventName, handler);
       handlers.push([eventName, handler]);
     }
+    const onConnected: EventListener = () => setStreamState("connected");
+    const onReconnecting: EventListener = () => setStreamState("reconnecting");
+    stream.addEventListener("connected", onConnected);
+    stream.addEventListener("reconnecting", onReconnecting);
+    handlers.push(["connected", onConnected], ["reconnecting", onReconnecting]);
     const ticker = window.setInterval(() => {
       const now = Date.now();
-      let changed = false;
-      for (const key of Object.keys(pulsesRef.current)) {
-        if (pulsesRef.current[key] <= now) { delete pulsesRef.current[key]; changed = true; }
+      const windows = Object.entries(pulsesRef.current) as Array<[Stage, FlowWindow]>;
+      if (!windows.length) return;
+      let activeWindow = false;
+      for (const [stage, window] of windows) {
+        if (window.end <= now) delete pulsesRef.current[stage];
+        else activeWindow = true;
       }
-      if (changed) setFlowTick((tick) => tick + 1);
-    }, 350);
+      if (activeWindow || windows.length) setFlowTick((tick) => tick + 1);
+    }, 90);
     return () => {
       handlers.forEach(([name, handler]) => stream.removeEventListener(name, handler));
       stream.close();
@@ -201,7 +288,10 @@ export default function MonitoringPage({ active }: { active: boolean }) {
   }, [active, view]);
 
   const flowNow = Date.now();
-  const liveStage = (stage: Stage): boolean => (pulsesRef.current[stage] ?? 0) > flowNow;
+  const liveStage = (stage: Stage): boolean => {
+    const window = pulsesRef.current[stage];
+    return Boolean(window && window.start <= flowNow && window.end > flowNow);
+  };
   const liveEdge = (from: Stage, to: Stage): boolean => liveStage(from) || liveStage(to);
   const flowing = FLOW_STAGES.some(liveStage);
 
@@ -274,53 +364,97 @@ export default function MonitoringPage({ active }: { active: boolean }) {
             <div className="monitoring-section-title">
               <div><p>Runtime</p><h2>Live pipeline</h2></div>
               <div className="arch-legend" aria-hidden="true">
-                <span className={`arch-live-chip${flowing ? " is-active" : ""}`}><span className="arch-live-dot" />{flowing ? "Data flowing" : "Idle"}</span>
+                <span className={`arch-live-chip${flowing ? " is-active" : ""}`}><span className="arch-live-dot" />{flowing ? "Event in flight" : "Listening"}</span>
                 <span><span className="monitor-status-dot status-healthy" />Healthy</span>
                 <span><span className="monitor-status-dot status-stale" />Degraded</span>
                 <span><span className="monitor-status-dot status-offline" />Offline</span>
               </div>
             </div>
 
-            <div className="arch-diagram" role="list" aria-label="Service pipeline">
-              <ArchNode live={liveStage("providers")}
-                icon="provider" title="Email providers" subtitle="Gmail · Microsoft Graph" variant="endpoint"
-                status={snapshot.mailbox_issues.length ? "stale" : "healthy"}
-                statusLabel={snapshot.mailbox_issues.length ? `${snapshot.mailbox_issues.length} issues` : "connected"}
-                meta={`${number(snapshot.metrics.active_mailboxes)} mailboxes`}
-              />
-              <ArchEdge label="webhooks · polling" count={snapshot.queues.pending_webhooks} live={liveEdge("providers", "sync")} />
+            <div className={`arch-telemetry is-${streamState}`} aria-live="polite">
+              <div className="arch-stream-signal" aria-hidden="true"><i /><i /><i /><i /></div>
+              <div className="arch-stream-copy">
+                <span>Live event stream</span>
+                <strong>{streamState === "connected" ? "WebSocket connected" : streamState === "reconnecting" ? "Reconnecting automatically" : "Connecting to activity stream"}</strong>
+              </div>
+              <div className="arch-last-event">
+                <span>{lastActivity ? lastActivity.label : "Awaiting the next application event"}</span>
+                <strong>{lastActivity ? lastActivity.detail : "The route will animate when live data arrives"}</strong>
+              </div>
+              <div className="arch-live-stat"><span>Events this session</span><strong>{number(liveEventCount)}</strong></div>
+              <div className="arch-live-stat"><span>Last event</span><strong>{lastActivity ? relativeTime(new Date(lastActivity.receivedAt).toISOString()) : "—"}</strong></div>
+            </div>
 
-              <ArchNode live={liveStage("sync")} icon="sync" title="Sync worker" subtitle={svc("sync-worker")?.description ?? "Mailbox ingestion"}
-                status={svc("sync-worker")?.status ?? "offline"} meta={`${number(snapshot.queues.active_mailbox_jobs)} jobs · ${nodeMeta(svc("sync-worker"))}`} />
-              <ArchEdge label="writes rows" live={liveEdge("sync", "postgres")} />
+            <div className="arch-diagram" role="list" aria-label="System service topology">
+              <div className="arch-zone-label arch-zone-external"><span>External systems</span></div>
+              <div className="arch-zone-label arch-zone-data"><span>Durable data plane</span></div>
+              <div className="arch-zone-label arch-zone-client"><span>Client channel</span></div>
 
-              <ArchNode live={liveStage("postgres")} icon="store" title="PostgreSQL" subtitle="System of record · transactional outbox" variant="store"
-                status={snapshot.infrastructure.postgres.status} meta={`${number(snapshot.metrics.emails)} emails stored`} />
-              <ArchEdge label="outbox: email.imported.v1" count={snapshot.queues.pending_events} error={snapshot.queues.failed_events} live={liveEdge("postgres", "relay")} />
+              <div className="arch-slot arch-slot-providers">
+                <ArchNode live={liveStage("providers")}
+                  icon="provider" title="Email providers" subtitle="Gmail API · Microsoft Graph" variant="endpoint"
+                  status={snapshot.mailbox_issues.length ? "stale" : "healthy"}
+                  statusLabel={snapshot.mailbox_issues.length ? `${snapshot.mailbox_issues.length} issues` : "connected"}
+                  meta={`${number(snapshot.metrics.active_mailboxes)} mailboxes`}
+                />
+              </div>
+              <ArchConnector className="arch-route-provider" label="Inbound mail" detail="webhook + safety polling" count={snapshot.queues.pending_webhooks} live={liveEdge("providers", "sync")} />
+              <div className="arch-slot arch-slot-browser">
+                <ArchNode live={liveStage("browser")} icon="client" title="Browser UI" subtitle="Inbox · calendar · in-app alerts" variant="endpoint"
+                  status="healthy" statusLabel="connected" meta="reconnectable event stream" />
+              </div>
+              <ArchConnector className="arch-route-browser" label="HTTPS" detail="REST ↓ · WebSocket ↑" direction="vertical-both" live={liveEdge("api", "browser")} />
 
-              <ArchNode live={liveStage("relay")} icon="relay" title="Event relay" subtitle={svc("event-relay")?.description ?? "Outbox → RabbitMQ"}
-                status={svc("event-relay")?.status ?? "offline"} meta={nodeMeta(svc("event-relay"))} />
-              <ArchEdge label="publish to exchange" live={liveEdge("relay", "rabbitmq")} />
+              <div className="arch-slot arch-slot-sync">
+                <ArchNode live={liveStage("sync")} icon="sync" title="Sync worker" subtitle="Webhook and polling mailbox ingestion"
+                  status={svc("sync-worker")?.status ?? "offline"} meta={`${number(snapshot.queues.active_mailbox_jobs)} jobs · ${nodeMeta(svc("sync-worker"))}`} />
+              </div>
+              <ArchConnector className="arch-route-sync-db" label="Commit" detail="emails + job state" direction="right" live={liveEdge("sync", "postgres")} />
+              <div className="arch-slot arch-slot-postgres">
+                <ArchNode live={liveStage("postgres")} icon="store" title="PostgreSQL" subtitle="Mail · jobs · activity log · transactional outbox" variant="store"
+                  status={snapshot.infrastructure.postgres.status} meta={`${number(snapshot.metrics.emails)} emails stored`} />
+              </div>
+              <ArchConnector className="arch-route-db-api" label="Application data" detail="queries ↔ commands" direction="horizontal-both" live={liveEdge("postgres", "api")} />
+              <div className="arch-slot arch-slot-api">
+                <ArchNode live={liveStage("api")} icon="api" title="Email API" subtitle={svc("email-api")?.description ?? "REST · OAuth · webhooks · WebSocket events"}
+                  status={svc("email-api")?.status ?? "offline"} meta={nodeMeta(svc("email-api"))} />
+              </div>
 
-              <ArchNode live={liveStage("rabbitmq")} icon="broker" title="RabbitMQ" subtitle="Topic exchange · durable task & event delivery" variant="store"
-                status={snapshot.infrastructure.rabbitmq.status}
-                statusLabel={snapshot.infrastructure.rabbitmq.status === "disabled" ? "disabled" : undefined} />
-              <ArchEdge label="email.imported.v1" count={snapshot.metrics.pending_classification} live={liveEdge("rabbitmq", "classification")} />
+              <ArchConnector className="arch-route-outbox" label="Transactional outbox" detail="claim pending events" count={snapshot.queues.pending_events} error={snapshot.queues.failed_events} live={liveEdge("postgres", "relay")} />
+              <div className="arch-slot arch-slot-relay">
+                <ArchNode live={liveStage("relay")} icon="relay" title="Event relay" subtitle={svc("event-relay")?.description ?? "Outbox publisher with confirms"}
+                  status={svc("event-relay")?.status ?? "offline"} meta={nodeMeta(svc("event-relay"))} />
+              </div>
+              <ArchConnector className="arch-route-publish" label="Topic publish" detail="publisher confirms" live={liveEdge("relay", "rabbitmq")} />
 
-              <ArchNode live={liveStage("classification")} icon="classify" title="Classification worker" subtitle={svc("classification-worker")?.description ?? "AI classify + calendar"}
-                status={svc("classification-worker")?.status ?? "offline"} meta={nodeMeta(svc("classification-worker"))} />
-              <ArchEdge label="user.activity.v1" live={liveEdge("classification", "notification")} />
+              <div className="arch-zone-label arch-zone-worker"><span>Async consumers</span></div>
+              <div className="arch-zone-label arch-zone-broker"><span>Event backbone</span></div>
+              <div className="arch-zone-label arch-zone-delivery"><span>Notification delivery</span></div>
 
-              <ArchNode live={liveStage("notification")} icon="notify" title="Notification service" subtitle={svc("notification-service")?.description ?? "Notification routing"}
-                status={svc("notification-service")?.status ?? "offline"} meta={nodeMeta(svc("notification-service"))} />
-              <ArchEdge label="notification.ready.v1" live={liveEdge("notification", "api")} />
+              <div className="arch-slot arch-slot-classification">
+                <ArchNode live={liveStage("classification")} icon="classify" title="Classification worker" subtitle="Consumes imports · writes AI labels and calendar"
+                  status={svc("classification-worker")?.status ?? "offline"} meta={nodeMeta(svc("classification-worker"))} />
+              </div>
+              <ArchConnector className="arch-route-classify" label="email.imported.v1" detail="durable work queue" direction="left" count={snapshot.metrics.pending_classification} live={liveEdge("rabbitmq", "classification")} />
+              <div className="arch-slot arch-slot-rabbitmq">
+                <ArchNode live={liveStage("rabbitmq")} icon="broker" title="RabbitMQ" subtitle="Topic exchange · durable queues · acknowledgements" variant="store"
+                  status={snapshot.infrastructure.rabbitmq.status}
+                  statusLabel={snapshot.infrastructure.rabbitmq.status === "disabled" ? "disabled" : undefined}
+                  meta={snapshot.infrastructure.rabbitmq.status === "disabled" ? "database fallback active" : "aec.events exchange"} />
+              </div>
+              <ArchConnector className="arch-route-notify" label="user.activity.v1" detail="durable consumer" direction="right" live={liveEdge("rabbitmq", "notification")} />
+              <div className="arch-slot arch-slot-notification">
+                <ArchNode live={liveStage("notification")} icon="notify" title="Notification service" subtitle="Persists in-app notifications · emits delivery events"
+                  status={svc("notification-service")?.status ?? "offline"} meta={nodeMeta(svc("notification-service"))} />
+              </div>
+              <ArchConnector className="arch-route-ready" label="notification.ready.v1" detail="outbox → broker → API" direction="up" live={liveEdge("notification", "api")} />
+            </div>
 
-              <ArchNode live={liveStage("api")} icon="api" title="Email API" subtitle={svc("email-api")?.description ?? "REST · OAuth · WebSockets"}
-                status={svc("email-api")?.status ?? "offline"} meta={nodeMeta(svc("email-api"))} />
-              <ArchEdge label="SSE · WebSocket" live={liveEdge("api", "browser")} />
-
-              <ArchNode live={liveStage("browser")} icon="client" title="Browser UI" subtitle="Live inbox, calendar & notifications" variant="endpoint"
-                status="healthy" statusLabel="streaming" meta="real-time updates" />
+            <div className="arch-contracts" aria-label="Runtime message flows">
+              <article><span>01</span><div><strong>Ingest</strong><p>Provider → sync worker → PostgreSQL</p></div></article>
+              <article><span>02</span><div><strong>Classify</strong><p>Outbox → RabbitMQ → AI worker → PostgreSQL</p></div></article>
+              <article><span>03</span><div><strong>Notify</strong><p>Activity event → notification service → API → WebSocket</p></div></article>
+              <article><span>04</span><div><strong>Recover</strong><p>PostgreSQL remains authoritative during broker or browser reconnects</p></div></article>
             </div>
           </section>
         ) : (

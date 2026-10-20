@@ -642,10 +642,10 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     }
   }, []);
 
-  // Sync/reclassify completion only needs fresh mailbox metadata (sync
-  // status, counts). The email list itself already stays current via the
-  // email.classified SSE event; re-running loadFirstPage here would reset
-  // scroll position and flash the list on every routine background sync.
+  // Sync completion only needs fresh mailbox metadata. Classification
+  // completion also reloads the first page below: SSE delivery is best-effort,
+  // so relying only on email.classified can leave a pre-classification row in
+  // browser memory if that individual event was missed.
   const refreshMailboxes = useCallback(async () => {
     try {
       const boxes = await fetchMailboxes();
@@ -1010,6 +1010,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
           setReclassifyingIds(next);
         }
         void refreshMailboxes();
+        void loadFirstPage();
         setMailboxAction(
           mailboxId,
           data.state === "error" ? "error" : "success",
@@ -1055,7 +1056,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
       }
     });
     return () => source.close();
-  }, [load, refreshMailboxes]);
+  }, [load, loadFirstPage, refreshMailboxes]);
 
   useEffect(() => {
     applyTheme(themePref);

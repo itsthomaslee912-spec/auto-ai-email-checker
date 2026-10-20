@@ -204,6 +204,73 @@ def test_list_emails_filters_folder():
     assert mixed.json()["mailbox_unread_counts"] == {str(mailbox_id): 4}
 
 
+def test_pending_classification_is_hidden_from_lists_counts_details_and_conversations():
+    SessionLocal = _session_factory()
+    with SessionLocal() as db:
+        user = User(external_id="u-pending-hidden")
+        db.add(user)
+        db.flush()
+        mailbox = MailboxConnection(
+            user_id=user.id,
+            provider=Provider.GOOGLE.value,
+            email_address="pending@example.com",
+            access_token_enc="x",
+            refresh_token_enc="",
+            is_active=True,
+        )
+        db.add(mailbox)
+        db.flush()
+        mailbox_id = mailbox.id
+        visible = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="classified",
+            thread_id="same-thread",
+            subject="Classified interview",
+            sender="recruiter@example.com",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            received_at=datetime(2026, 10, 20, 12, tzinfo=timezone.utc),
+            classification_pending=False,
+        )
+        pending = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="pending",
+            thread_id="same-thread",
+            subject="Temporary Other",
+            sender="recruiter@example.com",
+            label=EmailLabel.OTHER.value,
+            received_at=datetime(2026, 10, 20, 13, tzinfo=timezone.utc),
+            classification_pending=True,
+        )
+        db.add_all([visible, pending])
+        db.commit()
+        visible_id, pending_id = visible.id, pending.id
+
+    app = FastAPI()
+    app.include_router(emails.router)
+
+    def override_get_db():
+        with SessionLocal() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+
+    flat = client.get("/api/emails").json()
+    assert flat["total"] == 1
+    assert [item["id"] for item in flat["items"]] == [visible_id]
+    assert flat["label_counts"][EmailLabel.OTHER.value] == 0
+    assert flat["mailbox_unread_counts"] == {str(mailbox_id): 1}
+
+    grouped = client.get("/api/emails", params={"conversation": "true"}).json()
+    assert grouped["total"] == 1
+    assert grouped["items"][0]["id"] == visible_id
+    assert grouped["items"][0]["thread_count"] == 1
+
+    assert client.get(f"/api/emails/{pending_id}").status_code == 404
+    conversation = client.get(f"/api/emails/{visible_id}/conversation").json()
+    assert [item["id"] for item in conversation] == [visible_id]
+
+
 def test_conversation_view_keeps_the_newest_message_in_each_thread():
     SessionLocal = _session_factory()
     db = SessionLocal()

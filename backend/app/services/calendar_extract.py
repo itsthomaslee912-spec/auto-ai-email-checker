@@ -49,6 +49,12 @@ _NAME_EMAIL_RE = re.compile(
     r"([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){0,3})\s*(?:&lt;|<)\s*([^<>\s]+@[^<>\s]+)\s*(?:&gt;|>)"
 )
 _CN_MAILTO_RE = re.compile(r'CN="?([^;"\r\n]+)"?[^\r\n]{0,60}:mailto:([^\s;\r\n]+)', re.I)
+_OWNER_INTERVIEW_SUBJECT_RE = re.compile(
+    r"\b(?:virtual\s+)?interview\s+with\s+"
+    r"([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3})"
+    r"(?=\s*(?:[-@]|\())",
+    re.I,
+)
 _AUTOMATED_LOCAL_PARTS = {
     "calendar-notification",
     "mailer-daemon",
@@ -236,7 +242,8 @@ _REPLY_ATTRIBUTION_RE = re.compile(
 _TIME_PATTERN = re.compile(
     # "2026:1:30pm" glues the clock to the year. A colon after a year is still
     # the start of the time; a colon after a digit is the middle of a clock.
-    r"(?:(?<![\d:])|(?<=\b20\d{2}:))(?P<hour>1[0-2]|0?[1-9])(?::?(?P<minute>[0-5]\d))?\s*(?P<ampm>a\.?m\.?|p\.?m\.?)\b",
+    r"(?:(?<![\d:])|(?<=\b20\d{2}:))(?P<hour>1[0-2]|0?[1-9])(?::?(?P<minute>[0-5]\d))?\s*"
+    r"(?:(?P<ampm>a\.?m\.?|p\.?m\.?)\b|(?=(?:UTC|GMT|ET|EST|EDT|PT|PST|PDT|CT|CST|CDT|MT|MST|MDT)\b))",
     re.I,
 )
 _DURATION_PATTERNS = (
@@ -245,11 +252,23 @@ _DURATION_PATTERNS = (
         re.I,
     ),
     re.compile(r"\bduration\s*:?\s*(?:up\s+to\s+)?(?P<amount>\d{1,3})\s*(?P<unit>minutes?|mins?|hours?|hrs?)\b", re.I),
-    re.compile(r"\b(?P<amount>\d{1,3})\s*[- ]\s*(?P<unit>minutes?|mins?|hours?|hrs?)\s+(?:interview|meeting|call|conversation)\b", re.I),
+    re.compile(
+        r"\b(?P<amount>\d{1,3})\s*[- ]\s*(?P<unit>minutes?|mins?|hours?|hrs?)"
+        r"(?:\s+(?:video|virtual|phone|technical|panel|on-?site))*\s+"
+        r"(?:interview|meeting|call|conversation)\b",
+        re.I,
+    ),
 )
 _INTRODUCED_ZONE_RE = re.compile(
     r"\b(?:all\s+in|(?:the\s+)?(?:following\s+)?times?(?:\s+are)?(?:\s+in)?)\s+"
     r"(?P<zone>(?:eastern|pacific|central|mountain)(?:\s+standard)?\s+time|et|est|edt|pt|pst|pdt|ct|cst|cdt|mt|mst|mdt)\b",
+    re.I,
+)
+_TRAILING_LIST_ZONE_RE = re.compile(
+    r"\ball\s+times(?:\s+are)?(?:\s+displayed)?\s+in\s+"
+    r"(?P<zone>(?:America|Europe|Asia|Australia)/[A-Za-z_+-]+(?:/[A-Za-z_+-]+)?|"
+    r"(?:eastern|pacific|central|mountain)(?:\s+standard)?\s+time|"
+    r"et|est|edt|pt|pst|pdt|ct|cst|cdt|mt|mst|mdt|utc|gmt)\b",
     re.I,
 )
 
@@ -480,9 +499,10 @@ def _meeting_zone_from_messages(messages: list[EmailMessage]) -> str | None:
 def _clock_parts(match: re.Match[str]) -> tuple[int, int]:
     hour = int(match.group("hour"))
     minute = int(match.group("minute") or 0)
-    if match.group("ampm").lower().startswith("p") and hour != 12:
+    meridiem = match.group("ampm")
+    if meridiem and meridiem.lower().startswith("p") and hour != 12:
         hour += 12
-    elif match.group("ampm").lower().startswith("a") and hour == 12:
+    elif meridiem and meridiem.lower().startswith("a") and hour == 12:
         hour = 0
     return hour, minute
 
@@ -525,6 +545,18 @@ def _zone_near_clock(source: str, clock_start: int, clock_end: int) -> tuple[tim
     found = _zone_from_nearby_text(zone_span)
     if found is not None:
         return found
+    # ATS availability confirmations often put one timezone after the entire
+    # list ("All times displayed in America/New_York").  The first entries can
+    # be several lines away, so the ordinary 80-character clock window misses
+    # it even though it governs every slot in the list.
+    following = source[clock_end : clock_end + 600]
+    trailing = _TRAILING_LIST_ZONE_RE.search(following)
+    if trailing is not None:
+        quoted = re.search(r"\b(?:On\s+[^\n]{0,100}\s+wrote|From\s*:)\b", following[: trailing.start()], re.I)
+        if quoted is None:
+            found = _zone_from_nearby_text(trailing.group("zone"))
+            if found is not None:
+                return found
     earlier = source[max(0, clock_start - 400) : clock_start]
     matches = list(_INTRODUCED_ZONE_RE.finditer(earlier))
     if not matches:
@@ -605,7 +637,12 @@ def _slot_from_date_and_nearby_times(
             start = start.replace(year=start.year + 1)
     except (KeyError, TypeError, ValueError):
         return None
-    stated_duration = _duration_from_nearby_text(window[:240])
+    # The requested duration commonly introduces a following list rather than
+    # being repeated on every bullet ("a 1-hour video interview ... available
+    # at: October 21 at 4 PM"). Include the nearby lead-in so each proposed
+    # time inherits that duration.
+    duration_context = source[max(0, position - 320) : date_end + 240]
+    stated_duration = _duration_from_nearby_text(duration_context)
     end = start + (stated_duration or DEFAULT_INTERVIEW_DURATION)
     end_is_explicit = stated_duration is not None
     is_window = False
@@ -1082,6 +1119,29 @@ def _mailbox_owner_address(email: EmailMessage) -> str:
     return _normalized_address(getattr(mailbox, "email_address", "") or "")
 
 
+def _name_matches_owner_localpart(name: str, owner: str) -> bool:
+    """Corroborate a subject name against a personal mailbox local-part.
+
+    Calendar notification subjects merely co-locate an attendee address with
+    an ambiguous ``Interview with X`` phrase. Treat X as the account holder
+    only when its spelling also matches the address (for example Jordan Meeker
+    and ``jordanwm914``). This keeps company subjects such as ``Interview with
+    WITHIN (...@gmail.com)`` from becoming owner-name evidence.
+    """
+    words = [re.sub(r"[^a-z]", "", part.casefold()) for part in name.split()]
+    words = [part for part in words if part]
+    local = re.sub(r"[^a-z]", "", owner.partition("@")[0].casefold())
+    if len(words) < 2 or not local:
+        return False
+    joined = "".join(words)
+    first, last = words[0], words[-1]
+    return bool(
+        joined == local
+        or (local.startswith(first) and last[0] in local[len(first) :])
+        or local.startswith(first[0] + last)
+    )
+
+
 def candidate_own_name(email: EmailMessage, messages: list[EmailMessage] | None = None) -> str:
     """The account holder's own name, as mail they're on spells it.
 
@@ -1091,12 +1151,12 @@ def candidate_own_name(email: EmailMessage, messages: list[EmailMessage] | None 
     reject when a model or heuristic mistakes the candidate for the employer.
 
     A calendar notification subject like "Interview with Jordan Meeker @ ...
-    (jordanwm914@gmail.com)" is deliberately NOT treated as a signal here: the
+    (jordanwm914@gmail.com)" is accepted only when the person's spelling also
+    matches the owner's email local-part. The
     trailing "(owner-address)" is boilerplate Google/Outlook attendee
     formatting present on every such subject regardless of what "with X"
     names — it can just as easily be "Interview with WITHIN", a real
-    employer. Only a name genuinely paired with the owner's own address (not
-    merely co-occurring in the same subject) is a reliable signal.
+    employer. Mere co-occurrence is therefore not enough.
     """
     owner = _mailbox_owner_address(email)
     if not owner:
@@ -1114,6 +1174,13 @@ def candidate_own_name(email: EmailMessage, messages: list[EmailMessage] | None 
                     cleaned = clean_company_name(name)
                     if cleaned and "@" not in cleaned and cleaned.casefold() != owner:
                         return cleaned
+        subject = html.unescape(item.subject or "")
+        if owner in subject.casefold():
+            match = _OWNER_INTERVIEW_SUBJECT_RE.search(subject)
+            if match:
+                name = clean_company_name(match.group(1))
+                if name and _name_matches_owner_localpart(name, owner):
+                    return name
     return ""
 
 
@@ -1200,6 +1267,7 @@ def mailbox_candidate_name(db: Session, mailbox_id: int, owner_address: str = ""
                 EmailMessage.body_text.ilike(needle),
                 EmailMessage.body_html.ilike(needle),
                 EmailMessage.snippet.ilike(needle),
+                EmailMessage.subject.ilike(needle),
             ),
         )
         .order_by(EmailMessage.id.asc())
@@ -1823,12 +1891,11 @@ def _pending_scheduler_invitation(db: Session, email: EmailMessage) -> EmailMess
     """The invitation whose Calendly link this anonymous confirmation answers.
 
     A generic scheduler (Calendly, etc.) confirmation names the interviewer
-    but never the employer or role. The only link back to that context is
-    the earlier invitation email's own booking-page link, which the
-    confirmation itself never repeats. If exactly one still-open invitation
-    with such a link was sent shortly before, it is safe to borrow its
-    company and role; more than one is ambiguous and must be left blank
-    rather than guessed.
+    but never the employer or role. The earlier invitation's booking-page
+    link is the anchor even though the confirmation never repeats that link.
+    When several recent invitations contain Calendly links, require a clear
+    winner based on booking recency, event-type terms, and interviewer name;
+    otherwise leave the fields blank rather than guessing.
     """
     if not _CALENDLY_SENDER_RE.search(email.sender or ""):
         return None
@@ -1850,7 +1917,59 @@ def _pending_scheduler_invitation(db: Session, email: EmailMessage) -> EmailMess
         for item in candidates
         if _CALENDLY_BOOKING_LINK_RE.search(_message_text(item))
     ]
-    return matches[0] if len(matches) == 1 else None
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        return None
+
+    source_text = _message_text(email)
+    source_words = set(re.findall(r"[a-z0-9]+", source_text.casefold()))
+    interviewer = extract_interviewer(source_text, email.sender)
+    interviewer_words = {
+        word
+        for word in re.findall(r"[a-z]+", interviewer.casefold())
+        if len(word) >= 4
+    }
+    generic_booking_words = {
+        "book", "booking", "call", "interview", "meeting", "minute",
+        "minutes", "schedule", "scheduled",
+    }
+
+    def match_score(item: EmailMessage) -> int:
+        item_text = _message_text(item)
+        item_folded = item_text.casefold()
+        distance = received_at - (as_utc(item.received_at) or received_at)
+        score = 6 if distance <= timedelta(hours=6) else 3 if distance <= timedelta(days=1) else 1
+
+        booking_words: set[str] = set()
+        for url in _CALENDLY_BOOKING_LINK_RE.findall(item_text):
+            parts = [part for part in urlparse(url).path.strip("/").split("/") if part]
+            # First path component is the Calendly account; later components
+            # name the event type (for example, "technical-interview").
+            for part in parts[1:]:
+                booking_words.update(re.findall(r"[a-z0-9]+", part.casefold()))
+        specific_booking_words = booking_words - generic_booking_words
+        if specific_booking_words.intersection(source_words):
+            score += 6
+
+        interviewer_hits = {
+            word for word in interviewer_words
+            if re.search(rf"\b{re.escape(word)}\b", item_folded)
+        }
+        if interviewer_hits:
+            score += 5 if len(interviewer_hits) == 1 else 8
+        if (item.company or "").strip() and job_role_or_empty(item.job_role):
+            score += 1
+        return score
+
+    ranked = sorted(
+        ((match_score(item), as_utc(item.received_at) or received_at, item) for item in matches),
+        key=lambda value: (value[0], value[1], value[2].id),
+        reverse=True,
+    )
+    best_score, _, best = ranked[0]
+    runner_up_score = ranked[1][0]
+    return best if best_score >= 8 and best_score >= runner_up_score + 4 else None
 
 
 def _related_interview_emails(
@@ -2421,12 +2540,33 @@ def authoritative_reschedule_slots(
 
 def _date_parts(date_match: re.Match[str], reference: datetime | None) -> tuple[int, int, int] | None:
     try:
-        month = int(date_match.groupdict().get("month_num") or MONTH_NUMBERS[(date_match.group("month") or "").lower()])
+        numeric_month = date_match.groupdict().get("month_num")
+        month = int(numeric_month or MONTH_NUMBERS[(date_match.group("month") or "").lower()])
         day = int(date_match.group("day"))
         year_raw = date_match.groupdict().get("year")
         year = int(year_raw) if year_raw else (reference.year if reference else datetime.now(timezone.utc).year)
     except (KeyError, TypeError, ValueError):
         return None
+    if numeric_month:
+        # Slash dates arrive in both US (MM/DD) and international (DD/MM)
+        # recruiting mail. Unambiguous day-first values such as 19/08 must be
+        # swapped. When both halves are valid months, choose the interpretation
+        # closest to the message date: interviews are normally scheduled in the
+        # following days, and this prevents an August 3 email's 11/08/2026 from
+        # becoming a phantom November 8 appointment.
+        if month > 12 and day <= 12:
+            month, day = day, month
+        elif reference is not None and month <= 12 and day <= 12 and month != day:
+            options: list[tuple[int, int, int]] = []
+            for candidate_month, candidate_day in ((month, day), (day, month)):
+                try:
+                    candidate = datetime(year, candidate_month, candidate_day, tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                distance = abs((candidate.date() - reference.date()).days)
+                options.append((distance, candidate_month, candidate_day))
+            if options:
+                _, month, day = min(options)
     return year, month, day
 
 
@@ -3680,6 +3820,77 @@ def _replacement_times(email: EmailMessage) -> list[ExtractedSlot]:
     return parse_text_slots(_without_quoted_history(_calendar_text(email)), email.received_at)
 
 
+_AVAILABILITY_DECLINED_RE = re.compile(
+    r"\b(?:"
+    r"we(?:'re|\s+are)\s+(?:closed|not\s+available|unavailable)"
+    r"|(?:are|is)\s+closed\b"
+    r"|no\s+longer\s+available"
+    r"|does(?:n'?t|\s+not)\s+work|do(?:n'?t|\s+not)\s+work|won'?t\s+work"
+    r"|unable\s+to\s+(?:meet|make|do)"
+    r"|can'?t\s+(?:make|do)\b"
+    r"|another\s+time|a\s+different\s+time|some\s+other\s+time"
+    r"|re-?schedule"
+    r")",
+    re.IGNORECASE,
+)
+_AVAILABILITY_REQUEST_RE = re.compile(
+    r"\b(?:"
+    r"what(?:'?s|\s+is)\s+your\s+(?:availability|open\s+calendar(?:\s+like)?)"
+    r"|what\s+does\s+your\s+(?:open\s+)?calendar\s+look\s+like"
+    r"|(?:send|share|provide|give)\b[^.?!\n]{0,40}\bavailability"
+    r"|let\s+(?:me|us)\s+know\b[^.?!\n]{0,40}\bavailab"
+    r"|your\s+availability\s+(?:for|next|the\s+following)"
+    r"|availability\s+(?:for\s+)?next\s+week"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def employer_rejects_proposed_availability(email: EmailMessage) -> bool:
+    """An employer thread reply that invalidates our open proposed times.
+
+    After we offer times from Sent (interview_availability), the employer's
+    answer -- "unfortunately we're closed those days, what is your availability
+    next week?" -- retires those offered slots. That reply routinely lands under
+    a non-calendar label (recruitment_alert, other) because it names no concrete
+    appointment, so the normal calendar path never sees it. Detect the decline
+    or the renewed availability request here; the caller only acts on it when an
+    open proposal for this conversation actually exists.
+    """
+    if email.folder in {"sent", "spam", "trash"}:
+        return False
+    fresh = _fresh_message_text(email)
+    if not fresh:
+        return False
+    return bool(_AVAILABILITY_DECLINED_RE.search(fresh) or _AVAILABILITY_REQUEST_RE.search(fresh))
+
+
+def _retire_declined_availability(db: Session, email: EmailMessage) -> bool:
+    """Hide the proposed-availability chips this employer reply has invalidated.
+
+    Only still-visible ``availability`` slots offered before this message are
+    retired; a confirmed booking is never touched, and a proposal made after
+    this reply (a fresh round of times) is left alone.
+    """
+    received = as_utc(email.received_at)
+    events = [
+        event
+        for event in _thread_events(db, email, kind="availability")
+        if event.is_visible
+        and (
+            received is None
+            or event.source_received_at is None
+            or as_utc(event.source_received_at) <= received
+        )
+    ]
+    if not events:
+        return False
+    for event in events:
+        event.is_visible = False
+        _link_event_email(db, event, email.id)
+    return True
+
+
 def authoritative_cancellation_slots(email: EmailMessage, slots: list[ExtractedSlot]) -> list[ExtractedSlot]:
     """Times that name the appointment being canceled.
 
@@ -4187,6 +4398,24 @@ def _ends_within_minute(left: CalendarEvent, right: CalendarEvent) -> bool:
     return abs((left_end - right_end).total_seconds()) <= 60
 
 
+def _same_complete_join_url(left: CalendarEvent, right: CalendarEvent) -> bool:
+    """Use a complete conference link as provider-issued event identity.
+
+    An employer can be named by a brand, parent company, subsidiary, or
+    acronym in different messages.  When both records carry the exact same
+    complete join URL, company-text similarity should not prevent otherwise
+    identical calendar records from collapsing.
+    """
+    left_url = (left.meeting_url or "").strip()
+    right_url = (right.meeting_url or "").strip()
+    return bool(
+        left_url
+        and left_url == right_url
+        and join_url_is_complete(left_url)
+        and join_url_is_complete(right_url)
+    )
+
+
 def _same_scheduled_interview(left: CalendarEvent, right: CalendarEvent) -> bool:
     """One visible chip for one booked interview.
 
@@ -4204,11 +4433,17 @@ def _same_scheduled_interview(left: CalendarEvent, right: CalendarEvent) -> bool
         and not (left.company or "").strip()
         and not (right.company or "").strip()
     )
+    same_join_url = _same_complete_join_url(left, right)
     if not (
         left.mailbox_id == right.mailbox_id
         and left.kind == "confirmed"
         and right.kind == "confirmed"
-        and (same_source or same_thread_without_company or _calendar_companies_match(left.company, right.company))
+        and (
+            same_source
+            or same_thread_without_company
+            or same_join_url
+            or _calendar_companies_match(left.company, right.company)
+        )
         and _starts_within_minute(left, right)
     ):
         return False
@@ -6052,6 +6287,12 @@ async def process_calendar_email(
         finally:
             email.label = label
             email.interview_subtype = previous_subtype
+    if employer_rejects_proposed_availability(email) and _retire_declined_availability(db, email):
+        # The employer declined our offered times (or asked for new ones) in a
+        # reply the classifier filed outside the calendar labels. Retire the
+        # stale availability chips even though this message never enters the
+        # normal calendar path.
+        return True
     return False
 
 
@@ -6149,7 +6390,42 @@ async def _process_calendar_email(
         CalendarEvent.source_email_id == email.id,
         CalendarEvent.kind == "availability",
     ).first() is not None
-    if not completed and not reusable_scheduled_availability and not recoverable_cancellation:
+    # A final acknowledgement often confirms the time without repeating it:
+    # "Great! Chat soon" after the recruiter proposed 2:30 and the candidate
+    # accepted. Reuse the newest still-open time in that same thread instead
+    # of deferring extraction or leaving both the rejected and accepted offers
+    # visible as availability.
+    confirmation_time = as_utc(email.received_at)
+    thread_confirmation_availability = None
+    if (
+        email.label == EmailLabel.INTERVIEW_SCHEDULED.value
+        and email.interview_subtype in {None, "confirmation"}
+        and email.thread_id
+    ):
+        candidates = [
+            event
+            for event in _thread_events(db, email, kind="availability")
+            if event.is_visible
+            and (
+                confirmation_time is None
+                or event.source_received_at is None
+                or as_utc(event.source_received_at) <= confirmation_time
+            )
+        ]
+        if candidates:
+            thread_confirmation_availability = max(
+                candidates,
+                key=lambda event: (
+                    as_utc(event.source_received_at) or datetime.min.replace(tzinfo=timezone.utc),
+                    event.id,
+                ),
+            )
+    if (
+        not completed
+        and not reusable_scheduled_availability
+        and thread_confirmation_availability is None
+        and not recoverable_cancellation
+    ):
         # A previous extractor version fell back to quoted history when an
         # invitation/availability message named no current time. Retire those
         # phantom source-owned chips during repair instead of preserving them.
@@ -6233,6 +6509,8 @@ async def _process_calendar_email(
             .order_by(CalendarEvent.slot_index.asc(), CalendarEvent.id.asc())
             .all()
         )
+        if not sourced_availability and not slots and thread_confirmation_availability is not None:
+            sourced_availability = [thread_confirmation_availability]
         current_source = (
             db.get(EmailMessage, event.source_email_id)
             if event is not None and event.source_email_id and event.source_email_id != email.id

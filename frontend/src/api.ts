@@ -893,6 +893,7 @@ export interface EventStream {
 class ActivitySocket implements EventStream {
   private socket: WebSocket | null = null;
   private closed = false;
+  private connectionState: "connecting" | "connected" | "reconnecting" = "connecting";
   private retry: number | null = null;
   private delay = 500;
   private lastSequence = 0;
@@ -907,6 +908,15 @@ class ActivitySocket implements EventStream {
     const listeners = this.listeners.get(name) ?? new Set<EventListener>();
     listeners.add(listener);
     this.listeners.set(name, listeners);
+    // A shared socket may already be open before a newly mounted view starts
+    // listening. Replay its state so connection indicators remain truthful.
+    if (name === this.connectionState) {
+      queueMicrotask(() => {
+        if (!this.closed && this.listeners.get(name)?.has(listener)) {
+          listener(new MessageEvent(name, { data: "{}" }));
+        }
+      });
+    }
   }
 
   removeEventListener(name: string, listener: EventListener): void {
@@ -966,6 +976,7 @@ class ActivitySocket implements EventStream {
     socket.onopen = async () => {
       this.delay = 500;
       await this.recover();
+      this.connectionState = "connected";
       this.dispatch("connected", {});
     };
     socket.onmessage = (message) => {
@@ -988,6 +999,8 @@ class ActivitySocket implements EventStream {
     };
     socket.onclose = () => {
       if (this.closed) return;
+      this.connectionState = "reconnecting";
+      this.dispatch("reconnecting", { retry_in_ms: this.delay });
       this.retry = window.setTimeout(() => this.connect(), this.delay);
       this.delay = Math.min(10_000, this.delay * 2);
     };

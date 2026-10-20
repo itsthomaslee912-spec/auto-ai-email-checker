@@ -84,6 +84,7 @@ def _count_labels(db: Session, mailbox_ids: list[int], start: datetime, end: dat
         db.query(EmailMessage.label, func.count(EmailMessage.id))
         .filter(
             EmailMessage.mailbox_id.in_(mailbox_ids),
+            EmailMessage.classification_pending.is_not(True),
             EmailMessage.received_at.is_not(None),
             EmailMessage.received_at >= start,
             EmailMessage.received_at < end,

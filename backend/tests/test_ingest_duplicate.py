@@ -73,8 +73,10 @@ def test_download_only_queues_other_without_ai_processing(tmp_path, monkeypatch)
         async def unexpected(**_kwargs):
             raise AssertionError("AI processing must not run during download-only sync")
 
-        async def publish(_event, _payload):
-            return None
+        published = []
+
+        async def publish(event, payload):
+            published.append((event, payload))
 
         monkeypatch.setattr("app.services.ingest.classify_email", unexpected)
         monkeypatch.setattr("app.services.ingest.apply_outcome", unexpected)
@@ -91,6 +93,7 @@ def test_download_only_queues_other_without_ai_processing(tmp_path, monkeypatch)
         assert email.confidence is None
         assert email.interview_subtype is None
         assert email.outcome_extracted is False
+        assert published == []
     engine.dispose()
 
 

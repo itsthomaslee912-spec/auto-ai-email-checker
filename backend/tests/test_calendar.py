@@ -706,6 +706,69 @@ def test_microsoft_bookings_parent_tenant_collapses_child_company_interview_and_
         ) == []
 
 
+def test_confirmed_event_in_same_thread_resolves_companyless_pending_request():
+    """A booking resolves its original request even when company extraction failed.
+
+    Lam Research's invitation had an empty company, while the accepted reply
+    produced the confirmed calendar row in the same provider thread. Thread
+    identity must keep the already-booked request out of the attention modal.
+    """
+    from app.services.pending_interviews import invalidate_calendar_read_cache, pending_interview_requests
+
+    factory, (mailbox_id, _) = _database()
+    requested_at = datetime(2026, 10, 20, 17, 40, tzinfo=timezone.utc)
+    with factory() as db:
+        request = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="lam-request",
+            thread_id="lam-thread",
+            folder="inbox",
+            subject="Mark Wei - Lam Research application for Sr. Cloud Engineer role",
+            sender="Kavitha Madhur <recruiter@lamresearch.com>",
+            received_at=requested_at,
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="",
+            job_role="Senior Cloud Engineer",
+        )
+        acceptance = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="lam-acceptance",
+            thread_id="lam-thread",
+            folder="sent",
+            subject="Re: Mark Wei - Lam Research application for Sr. Cloud Engineer role",
+            sender="candidate@example.com",
+            received_at=requested_at + timedelta(minutes=8),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+            company="Lam Research",
+            job_role="Sr. Cloud Engineer",
+        )
+        db.add_all([request, acceptance])
+        db.flush()
+        db.add(CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=acceptance.id,
+            source_thread_id="lam-thread",
+            source_received_at=acceptance.received_at,
+            kind="confirmed",
+            origin="email",
+            title="Lam Research — Sr. Cloud Engineer",
+            company="Lam Research",
+            job_role="Sr. Cloud Engineer",
+            start_at=datetime(2026, 10, 21, 20, 30, tzinfo=timezone.utc),
+            end_at=datetime(2026, 10, 21, 21, 0, tzinfo=timezone.utc),
+            is_visible=True,
+        ))
+        db.commit()
+        invalidate_calendar_read_cache()
+
+        assert pending_interview_requests(
+            db,
+            [mailbox_id],
+            now=datetime(2026, 10, 20, 22, 0, tzinfo=timezone.utc),
+        ) == []
+
+
 def test_mixed_thread_repair_does_not_demote_video_to_phone_on_stray_word():
     """A signature's "Cell/Phone: ..." line must not flip a video interview to
     "phone call" just because the join link could no longer be verified
@@ -1350,6 +1413,129 @@ def test_sent_reply_with_two_options_overrides_scheduled_misclassification():
         ]
 
 
+def test_employer_decline_retires_proposed_availability_across_labels():
+    """An employer "those days don't work, send new availability" reply retires
+
+    our offered times even when the classifier files it outside the calendar
+    labels (here recruitment_alert). Otherwise the proposed slots we offered
+    from Sent linger on the calendar as if the interview were still on those
+    dates, which is the reported bug: the recruiter said they were closed on
+    both proposed days, yet the chips stayed.
+    """
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="av-invite",
+            thread_id="av-thread",
+            folder="inbox",
+            subject="AV Call Request",
+            sender="Whitney Phipps <Whitney.Phipps@avinc.com>",
+            received_at=datetime(2026, 10, 19, 22, 43, tzinfo=timezone.utc),
+            body_text="Thank you for applying to AV. Please share your availability for a phone call.",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="AV",
+            job_role="Phone call",
+        )
+        proposal = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="av-proposal",
+            thread_id="av-thread",
+            folder="sent",
+            subject="Re: AV Call Request",
+            sender="Mark Abraham Wei <mark.abraham.wei@gmail.com>",
+            received_at=datetime(2026, 10, 19, 23, 36, tzinfo=timezone.utc),
+            body_text=(
+                "Hi Whitney, Thanks for reaching out. I am available 10/23 2:00 PM PST "
+                "or 10/24 2:00 PM PST. Looking forward to it."
+            ),
+            label="other",
+        )
+        db.add_all([invitation, proposal])
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, proposal, use_ai=False)) is True
+        offered = db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True)).all()
+        assert [event.kind for event in offered] == ["availability", "availability"]
+
+        decline = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="av-decline",
+            thread_id="av-thread",
+            folder="inbox",
+            subject="RE: [EXTERNAL]Re: AV Call Request",
+            sender="Whitney Phipps <Whitney.Phipps@avinc.com>",
+            received_at=datetime(2026, 10, 20, 19, 8, tzinfo=timezone.utc),
+            body_text=(
+                "Thank you for reaching back out. Unfortunately, we are closed this "
+                "Friday and Saturday. What is your open calendar like next week?"
+            ),
+            label=EmailLabel.RECRUITMENT_ALERT.value,
+            company="AV",
+        )
+        db.add(decline)
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, decline, use_ai=False)) is True
+        assert db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True)).count() == 0
+
+
+def test_positive_thread_reply_keeps_proposed_availability():
+    """A non-calendar thread reply with no decline wording leaves offers intact.
+
+    The cross-label retirement must fire only on an actual decline or renewed
+    availability request, not on any inbox reply that happens to share the
+    conversation with an open proposal.
+    """
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="keep-invite",
+            thread_id="keep-thread",
+            folder="inbox",
+            subject="Platform Engineer Interview",
+            sender="recruiter@example.com",
+            received_at=datetime(2026, 10, 19, 18, 0, tzinfo=timezone.utc),
+            body_text="Please share your availability for a 30 minute call.",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="Example Co",
+            job_role="Platform Engineer",
+        )
+        proposal = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="keep-proposal",
+            thread_id="keep-thread",
+            folder="sent",
+            subject="Re: Platform Engineer Interview",
+            sender="candidate@example.com",
+            received_at=datetime(2026, 10, 19, 18, 30, tzinfo=timezone.utc),
+            body_text="I am available October 23 at 2:00 PM PST or October 24 at 2:00 PM PST.",
+            label="other",
+        )
+        db.add_all([invitation, proposal])
+        db.flush()
+        assert asyncio.run(process_calendar_email(db, proposal, use_ai=False)) is True
+        assert db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True)).count() == 2
+
+        chit_chat = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="keep-reply",
+            thread_id="keep-thread",
+            folder="inbox",
+            subject="RE: Platform Engineer Interview",
+            sender="recruiter@example.com",
+            received_at=datetime(2026, 10, 19, 19, 0, tzinfo=timezone.utc),
+            body_text="Great, thank you for the quick reply! Talk soon.",
+            label=EmailLabel.RECRUITMENT_ALERT.value,
+            company="Example Co",
+        )
+        db.add(chit_chat)
+        db.flush()
+        assert asyncio.run(process_calendar_email(db, chit_chat, use_ai=False)) is False
+        assert db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True)).count() == 2
+
+
 def test_sent_acceptance_of_one_time_can_remain_scheduled():
     """A clear acceptance of one employer-proposed time is not demoted."""
     factory, (mailbox_id, _) = _database()
@@ -1388,6 +1574,86 @@ def test_sent_acceptance_of_one_time_can_remain_scheduled():
         assert reply.label == EmailLabel.INTERVIEW_SCHEDULED.value
         event = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == reply.id).one()
         assert event.kind == "confirmed"
+
+
+def test_confirmation_without_repeated_time_promotes_latest_thread_availability():
+    """A short final acknowledgement books the newest mutually agreed time.
+
+    H-E-B rejected the candidate's original 2:00 PM proposal, suggested 2:30,
+    the candidate accepted, and the recruiter replied "Great! Chat soon"
+    without restating the date. The 2:30 slot is confirmed and 2:00 disappears.
+    """
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="heb-invite",
+            thread_id="heb-thread",
+            folder="inbox",
+            subject="HEB-Software Engineer (Interview Availability)",
+            sender="Olivia Zuniga <recruiter@example.com>",
+            received_at=datetime(2026, 10, 16, 19, 0, tzinfo=timezone.utc),
+            body_text="Please let me know if you are available Wednesday or Thursday.",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="H-E-B",
+            job_role="Sr. Software Engineer",
+        )
+        original = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="heb-two-pm",
+            thread_id="heb-thread",
+            folder="sent",
+            subject="Re: HEB-Software Engineer (Interview Availability)",
+            sender="candidate@example.com",
+            received_at=datetime(2026, 10, 16, 19, 11, tzinfo=timezone.utc),
+            body_text="Thursday October 22 at 2:00 PM EST works well for me.",
+            label=EmailLabel.INTERVIEW_AVAILABILITY.value,
+            company="H-E-B",
+            job_role="Sr. Software Engineer",
+        )
+        accepted = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="heb-two-thirty",
+            thread_id="heb-thread",
+            folder="sent",
+            subject="RE: HEB-Software Engineer (Interview Availability)",
+            sender="candidate@example.com",
+            received_at=datetime(2026, 10, 19, 20, 59, tzinfo=timezone.utc),
+            body_text="10/22 2:30 PM EST works well for me.",
+            label=EmailLabel.INTERVIEW_AVAILABILITY.value,
+            company="H-E-B",
+            job_role="Sr. Software Engineer",
+        )
+        db.add_all([invitation, original, accepted])
+        db.flush()
+        assert asyncio.run(process_calendar_email(db, original, use_ai=False)) is True
+        assert asyncio.run(process_calendar_email(db, accepted, use_ai=False)) is True
+
+        confirmation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="heb-confirmed",
+            thread_id="heb-thread",
+            folder="inbox",
+            subject="RE: HEB-Software Engineer (Interview Availability)",
+            sender="Olivia Zuniga <recruiter@example.com>",
+            received_at=datetime(2026, 10, 20, 21, 42, tzinfo=timezone.utc),
+            body_text="Great! Chat soon",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+            company="H-E-B",
+            job_role="Sr. Software Engineer",
+        )
+        db.add(confirmation)
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, confirmation, use_ai=False)) is True
+        visible = db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True)).all()
+        assert len(visible) == 1
+        assert visible[0].kind == "confirmed"
+        assert visible[0].source_email_id == confirmation.id
+        assert visible[0].start_at == datetime(2026, 10, 22, 18, 30, tzinfo=timezone.utc)
+        assert visible[0].company == "H-E-B"
+        assert visible[0].job_role == "Sr. Software Engineer"
 
 
 def test_sent_reply_without_a_shared_thread_id_matches_by_subject():
@@ -1580,6 +1846,74 @@ Duration: Up to 45 Minutes""",
     assert len(slots) == 1
     assert slots[0].start_at == datetime(2026, 9, 29, 17, 0, tzinfo=timezone.utc)
     assert slots[0].end_at == datetime(2026, 9, 29, 17, 45, tzinfo=timezone.utc)
+
+
+def test_ambiguous_slash_date_uses_nearest_interview_date():
+    """A European 11/08 date sent on August 3 means August 11, not November 8."""
+    slots = parse_text_slots(
+        "Your call has been rescheduled for Date: 11/08/2026 Time: 9:30 EDT",
+        datetime(2026, 8, 3, 12, 25, tzinfo=timezone.utc),
+    )
+
+    assert len(slots) == 1
+    assert slots[0].start_at == datetime(2026, 8, 11, 13, 30, tzinfo=timezone.utc)
+    assert slots[0].end_at == datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc)
+
+
+def test_unambiguous_day_first_slash_date_is_supported():
+    slots = parse_text_slots(
+        "Your call has been rescheduled to Wednesday, 19/08 at 9:30 EST.",
+        datetime(2026, 8, 14, 13, 27, tzinfo=timezone.utc),
+    )
+
+    assert len(slots) == 1
+    assert slots[0].start_at == datetime(2026, 8, 19, 13, 30, tzinfo=timezone.utc)
+
+
+def test_trailing_timezone_applies_to_every_availability_line():
+    slots = parse_text_slots(
+        """Your availability (MM/DD/YY format)
+10/21/26: 05:00 PM-05:30 PM
+10/22/26: 07:00 PM-07:30 PM
+10/23/26: 04:30 PM-05:00 PM
+All times displayed in America/New_York""",
+        datetime(2026, 10, 19, 20, 33, tzinfo=timezone.utc),
+    )
+
+    assert [(slot.start_at, slot.end_at) for slot in slots] == [
+        (
+            datetime(2026, 10, 21, 21, 0, tzinfo=timezone.utc),
+            datetime(2026, 10, 21, 21, 30, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(2026, 10, 22, 23, 0, tzinfo=timezone.utc),
+            datetime(2026, 10, 22, 23, 30, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(2026, 10, 23, 20, 30, tzinfo=timezone.utc),
+            datetime(2026, 10, 23, 21, 0, tzinfo=timezone.utc),
+        ),
+    ]
+
+
+def test_availability_list_inherits_leading_interview_duration():
+    slots = parse_text_slots(
+        """I'd be happy to schedule a 1-hour video interview. I'm available at the following times:
+Tuesday, October 21st at 4:00 PM PST
+Wednesday, October 22nd at 5:00 PM PST""",
+        datetime(2026, 10, 20, 21, 36, tzinfo=timezone.utc),
+    )
+
+    assert [(slot.start_at, slot.end_at) for slot in slots] == [
+        (
+            datetime(2026, 10, 21, 23, 0, tzinfo=timezone.utc),
+            datetime(2026, 10, 22, 0, 0, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(2026, 10, 23, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 10, 23, 1, 0, tzinfo=timezone.utc),
+        ),
+    ]
 
 
 @pytest.mark.parametrize("end", ["", "not-a-date", "2026-10-05T13:00:00Z"])
@@ -2008,6 +2342,67 @@ def test_calendly_confirmation_borrows_company_and_role_from_its_invitation():
         assert event.company == "NorthBridge Solutions"
         assert event.job_role == "Senior Software Engineer"
         assert event.interviewer == "Todd Hilfred"
+
+
+def test_calendly_confirmation_selects_matching_stage_when_multiple_invites_are_open():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        unrelated = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="other-calendly-invite",
+            thread_id="other-calendly-thread",
+            subject="Ready for a new challenge?",
+            sender="greg@example.com",
+            received_at=datetime(2026, 10, 17, 23, 38, tzinfo=timezone.utc),
+            body_text="Pick a time at https://calendly.com/gme8891",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="SISU Tech Partners",
+            job_role="Senior Engineering",
+        )
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="technical-calendly-invite",
+            thread_id="technical-calendly-thread",
+            subject="Next step: Technical Interview - NorthBridge Solutions",
+            sender="northbridge@example.com",
+            received_at=datetime(2026, 10, 20, 18, 21, tzinfo=timezone.utc),
+            body_text=(
+                "The next step is a technical interview with our Hiring Manager, Todd. "
+                "Schedule at https://calendly.com/northbridgesolutions4/technical-interview"
+            ),
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="NorthBridge Solutions",
+            job_role="Senior Software Engineer",
+        )
+        db.add_all([unrelated, invitation])
+        db.flush()
+
+        confirmation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="technical-calendly-confirmation",
+            thread_id="fresh-calendly-thread",
+            subject="Confirmed: Technical Interview with Todd Hilfred on Monday, October 26, 2026",
+            sender="notifications@calendly.com",
+            received_at=datetime(2026, 10, 20, 19, 53, tzinfo=timezone.utc),
+            body_text=(
+                "Your Technical Interview with Todd Hilfred at 07:00pm (Eastern Time - US & Canada) "
+                "on Monday, October 26, 2026 is scheduled."
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+        )
+        db.add(confirmation)
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, confirmation, use_ai=False)) is True
+        db.commit()
+
+        event = db.query(CalendarEvent).filter(CalendarEvent.kind == "confirmed").one()
+        assert event.company == "NorthBridge Solutions"
+        assert event.job_role == "Senior Software Engineer"
+        assert event.interviewer == "Todd Hilfred"
+        assert db.get(CalendarEventEmail, (event.id, invitation.id)) is not None
+        assert db.get(CalendarEventEmail, (event.id, unrelated.id)) is None
 
 
 def test_cross_thread_confirmation_hides_related_availability_and_it_stays_hidden():
@@ -4326,6 +4721,68 @@ def test_same_interview_with_different_company_text_collapses_to_one_item():
         assert db.get(CalendarEventEmail, (visible[0].id, confirmation.id)) is not None
 
 
+def test_same_complete_join_url_collapses_parent_company_and_brand_names():
+    factory, (mailbox_id, _) = _database()
+    start = datetime(2026, 10, 22, 20, tzinfo=timezone.utc)
+    end = start + timedelta(minutes=30)
+    join_url = "https://teams.microsoft.com/meet/3422880214219833?p=uw0aYhHFFTxHXEBqYM"
+    with factory() as db:
+        adusa = CalendarEvent(
+            mailbox_id=mailbox_id,
+            kind="confirmed",
+            origin="email",
+            company="ADUSA",
+            job_role="Principal Platform Engineer",
+            start_at=start,
+            end_at=end,
+            meeting_type="video",
+            meeting_provider="Microsoft Teams",
+            meeting_url=join_url,
+            is_visible=True,
+        )
+        parent_company = CalendarEvent(
+            mailbox_id=mailbox_id,
+            kind="confirmed",
+            origin="email",
+            company="Ahold Delhaize",
+            job_role="Principal Platform Engineer",
+            start_at=start,
+            end_at=end,
+            meeting_type="video",
+            meeting_provider="Microsoft Teams",
+            meeting_url=join_url,
+            is_visible=True,
+        )
+        unrelated = CalendarEvent(
+            mailbox_id=mailbox_id,
+            kind="confirmed",
+            origin="email",
+            company="Unrelated Company",
+            job_role="Principal Platform Engineer",
+            start_at=start,
+            end_at=end,
+            meeting_type="video",
+            meeting_provider="Microsoft Teams",
+            meeting_url="https://teams.microsoft.com/meet/9999999999999999?p=differentPasscode",
+            is_visible=True,
+        )
+        db.add_all([adusa, parent_company, unrelated])
+        db.commit()
+
+        assert collapse_duplicate_calendar_events(db, mailbox_id) is True
+        db.commit()
+
+        visible = db.query(CalendarEvent).filter(
+            CalendarEvent.kind == "confirmed",
+            CalendarEvent.is_visible.is_(True),
+        ).all()
+        assert len(visible) == 2
+        merged = next(event for event in visible if event.meeting_url == join_url)
+        assert merged.company == "Ahold Delhaize"
+        assert db.get(CalendarEvent, adusa.id).superseded_by_event_id == merged.id
+        assert any(event.company == "Unrelated Company" for event in visible)
+
+
 def test_reminder_and_cancellation_collapse_onto_the_scheduled_interview():
     factory, (mailbox_id, _) = _database()
     start = datetime(2026, 9, 30, 17, tzinfo=timezone.utc)
@@ -5203,7 +5660,10 @@ def test_candidate_name_company_is_replaced_with_employer_from_linked_thread():
             db.flush()
             mailbox = MailboxConnection(
                 user_id=user.id, provider=Provider.GOOGLE.value,
-                email_address="jordanwm914@gmail.com", display_name="Jordan Meeker",
+                # Google can supply the local-part as the profile name. The
+                # verified calendar subject/address pairing must still identify
+                # the candidate and keep later enrichment from restoring it.
+                email_address="jordanwm914@gmail.com", display_name="jordanwm914",
                 access_token_enc="x", refresh_token_enc="", is_active=True,
             )
             db.add(mailbox)
@@ -5244,6 +5704,7 @@ def test_candidate_name_company_is_replaced_with_employer_from_linked_thread():
             db.commit()
             event_id = event.id
 
+            assert calendar_extract.mailbox_candidate_name(db, mid) == "Jordan Meeker"
             assert repair_candidate_name_as_company(db, mid) == 1
             db.commit()
 
