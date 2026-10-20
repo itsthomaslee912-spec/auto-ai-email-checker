@@ -8,6 +8,7 @@ from typing import Any
 from app.classify.openai_classifier import classify_email, infer_interview_subtype
 from app.classify.correction_retrieval import load_correction_corpus, retrieve_relevant_corrections
 from app.classify.outcome_extract import BACKFILL_LABELS, OUTCOME_LABELS, extract_company_role
+from app.config import get_settings
 from app.models import CalendarEvent, EmailLabel, EmailMessage, MailboxConnection
 from app.realtime.sse import publish
 from app.schemas import EmailOut
@@ -256,13 +257,16 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
             row: Any,
         ) -> tuple[int, str, Any, tuple[str, str] | None, bool] | None:
             try:
-                correction_examples = retrieve_relevant_corrections(
-                    correction_corpus,
-                    subject=row.subject or "",
-                    sender=row.sender or "",
-                    body_text=row.body_text or "",
-                    snippet=row.snippet or "",
-                )
+                if getattr(get_settings(), "email_classification_mode", "hybrid").strip().lower() == "ai_only":
+                    correction_examples = []
+                else:
+                    correction_examples = retrieve_relevant_corrections(
+                        correction_corpus,
+                        subject=row.subject or "",
+                        sender=row.sender or "",
+                        body_text=row.body_text or "",
+                        snippet=row.snippet or "",
+                    )
                 # A fresh context manager per call: the shared gate is a
                 # priority queue, not a reusable semaphore object. A
                 # reclassify pass is always background priority so it never
@@ -316,7 +320,11 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                     return {"skipped": True}
                 new_subtype = (
                     result.interview_subtype
-                    or infer_interview_subtype(email.subject, email.sender, email.body_text, email.snippet)
+                    or (
+                        None
+                        if getattr(get_settings(), "email_classification_mode", "hybrid").strip().lower() == "ai_only"
+                        else infer_interview_subtype(email.subject, email.sender, email.body_text, email.snippet)
+                    )
                     if result.label == EmailLabel.INTERVIEW_SCHEDULED.value
                     else None
                 )

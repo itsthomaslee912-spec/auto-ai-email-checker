@@ -17,6 +17,9 @@ from app.services.calendar_backfill import backfill_calendar_events
 from app.services.auto_sync import auto_sync_loop
 from app.services.webhook_queue import webhook_queue_loop
 from app.services.reclassify import start_all_pending_reclassify
+from app.services.outbox_publisher import outbox_publisher_loop
+from app.services.activity_consumer import activity_consumer_loop
+from app.services.email_event_consumer import email_event_consumer_loop
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,6 +30,7 @@ async def lifespan(app: FastAPI):
     init_db()
     stop_event = asyncio.Event()
     background_tasks: list[asyncio.Task] = []
+    role = get_settings().runtime_role.strip().lower()
 
     async def start_background() -> None:
         renewal_task = asyncio.create_task(renewal_loop(stop_event))
@@ -48,11 +52,17 @@ async def lifespan(app: FastAPI):
             asyncio.create_task(auto_sync_loop(stop_event)),
             asyncio.create_task(webhook_queue_loop(stop_event)),
             asyncio.create_task(pending_reclassify_after_warmup()),
+            asyncio.create_task(outbox_publisher_loop(stop_event)),
+            asyncio.create_task(email_event_consumer_loop(stop_event)),
         ])
 
-    # Let the server accept health checks before backfill work starts.
-    asyncio.get_running_loop().call_later(1, lambda: asyncio.create_task(start_background()))
-    logger.info("Auto AI Email Checker API started")
+    # The legacy/default ``all`` role preserves desktop behavior. Container
+    # deployments set RUNTIME_ROLE=api and run background work via app.worker.
+    if role == "all":
+        asyncio.get_running_loop().call_later(1, lambda: asyncio.create_task(start_background()))
+    elif role == "api":
+        background_tasks.append(asyncio.create_task(activity_consumer_loop(stop_event)))
+    logger.info("Auto AI Email Checker API started (runtime role=%s)", role)
     try:
         yield
     finally:

@@ -249,9 +249,7 @@ async def _run_sync_job_exclusive(
         # backend. New rows are committed immediately as classification_pending
         # and enriched here after the mailbox cursor and UI are up to date.
         if imported and not _should_stop(mailbox_id):
-            from app.services.reclassify import start_mailbox_reclassify
-
-            await start_mailbox_reclassify(mailbox_id, pending_only=True)
+            await _classify_downloaded_mail(mailbox_id)
     except Exception as exc:
         logger.exception("Mailbox sync failed for %s", mailbox_id)
         db.rollback()
@@ -731,6 +729,10 @@ def _record_notification_failure(db: Session, mailbox: MailboxConnection, exc: E
 
 async def _classify_downloaded_mail(mailbox_id: int) -> None:
     """Start eventual enrichment after provider mail is safely committed."""
+    # Kafka owns the classification trigger in the separated worker runtime.
+    # The direct call remains the compatible fallback for desktop and tests.
+    if get_settings().kafka_enabled:
+        return
     from app.services.reclassify import start_mailbox_reclassify
 
     await start_mailbox_reclassify(mailbox_id, pending_only=True)

@@ -1,6 +1,8 @@
 # Auto AI Email Checker
 
-Real-time Gmail / Outlook inbox classifier. New mail is ingested via provider webhooks, labeled with OpenAI, and pushed to a React dashboard over SSE.
+Real-time Gmail / Outlook inbox classifier. New mail is ingested via provider webhooks, labeled with AI, and pushed to a React dashboard over an authenticated WebSocket.
+
+The container runtime uses a durable event pipeline: provider mail is committed with a transactional Kafka outbox, classified by a worker process, and delivered to the browser with reconnect recovery. SSE remains available temporarily for older clients.
 
 **Branch:** `feature/v1`  
 **Stack:** React (Vite) frontend · FastAPI backend · PostgreSQL · OpenAI · Tauri
@@ -50,6 +52,46 @@ The inbox shows the current automatic sync state. If no account is connected, th
 Application data is stored in PostgreSQL; SQLite is used only by isolated automated tests.
 
 Individual servers: `scripts\run-backend.bat` · `scripts\run-frontend.bat`
+
+### Docker Compose runtime
+
+The Docker runtime separates the latency-sensitive API from mailbox synchronization and AI processing:
+
+```text
+frontend -> email-api -> PostgreSQL
+                    \-> Kafka -> email-worker
+```
+
+Prepare the environment and start it:
+
+```powershell
+if (-not (Test-Path .env)) { Copy-Item .env.docker.example .env }
+# Fill in OAuth, webhook, encryption, session, and AI settings in .env.
+docker compose up --build -d
+docker compose ps
+```
+
+Open `http://localhost:8080`. Provider webhook and OAuth callback URLs must use the same externally reachable origin, for example `https://mail.example.com/api/webhooks/gmail`.
+
+The same backend image supports three roles:
+
+```text
+RUNTIME_ROLE=api     FastAPI, REST, OAuth, webhooks, WebSockets
+RUNTIME_ROLE=worker  sync, reconciliation, renewal, AI classification, Kafka outbox
+RUNTIME_ROLE=all     legacy desktop/non-Docker combined process
+```
+
+Kafka is enabled when `KAFKA_BOOTSTRAP_SERVERS` is non-empty. With an empty value, the existing direct local-classification path remains active. This permits a shadow migration without stopping the desktop application.
+
+Operational endpoints:
+
+```text
+GET /api/health
+GET /api/health/ready
+GET /api/health/events
+WS  /api/ws/activity
+GET /api/activity?after_sequence=0
+```
 
 ### Windows desktop application
 

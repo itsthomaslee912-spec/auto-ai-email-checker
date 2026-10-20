@@ -359,3 +359,63 @@ class CalendarEventEmail(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class ActivityEvent(Base):
+    """Durable, per-user realtime event used for reconnect recovery."""
+
+    __tablename__ = "activity_events"
+    __table_args__ = (
+        UniqueConstraint("event_id", name="uq_activity_events_event_id"),
+        Index("ix_activity_events_user_sequence", "user_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    event_id: Mapped[str] = mapped_column(String(36))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    event_type: Mapped[str] = mapped_column(String(80), index=True)
+    payload: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+class OutboxEvent(Base):
+    """A domain event committed with application state and later sent to Kafka."""
+
+    __tablename__ = "outbox_events"
+    __table_args__ = (
+        UniqueConstraint("event_id", name="uq_outbox_events_event_id"),
+        Index("ix_outbox_events_ready", "status", "available_at", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    event_id: Mapped[str] = mapped_column(String(36))
+    topic: Mapped[str] = mapped_column(String(160))
+    partition_key: Mapped[str] = mapped_column(String(255))
+    payload: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class ConsumedEvent(Base):
+    """Idempotency inbox for Kafka consumers."""
+
+    __tablename__ = "consumed_events"
+    __table_args__ = (UniqueConstraint("consumer", "event_id", name="uq_consumed_event"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    consumer: Mapped[str] = mapped_column(String(120), index=True)
+    event_id: Mapped[str] = mapped_column(String(36))
+    consumed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

@@ -55,6 +55,33 @@ class Settings(BaseSettings):
     # same cadence as the active polling path.
     auto_sync_webhook_safety_net_seconds: int = 900
 
+    # Runtime separation. ``all`` preserves the desktop/development behavior;
+    # container deployments run ``api`` and ``worker`` as separate processes.
+    runtime_role: str = "all"
+
+    # Kafka is optional during the migration. When configured, every durable
+    # activity event is written to the transactional outbox and published by
+    # the worker process. Empty bootstrap servers keep the existing local
+    # single-process delivery path working.
+    kafka_bootstrap_servers: str = ""
+    kafka_client_id: str = "auto-ai-email-checker"
+    kafka_topic_prefix: str = "aec"
+    kafka_security_protocol: str = "PLAINTEXT"
+    kafka_sasl_mechanism: str = ""
+    kafka_sasl_username: str = ""
+    kafka_sasl_password: str = ""
+    kafka_outbox_batch_size: int = 100
+    kafka_outbox_poll_seconds: float = 1.0
+
+    websocket_heartbeat_seconds: int = 25
+    # ``ai_only`` disables semantic regex heuristics and model-result guards.
+    # ``hybrid`` preserves the existing desktop fallback during migration.
+    email_classification_mode: str = "hybrid"
+
+    @property
+    def kafka_enabled(self) -> bool:
+        return bool(self.kafka_bootstrap_servers.strip())
+
 
 @lru_cache
 def get_settings() -> Settings:

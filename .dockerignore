@@ -1,0 +1,14 @@
+.git
+.env
+**/.env
+.pytest_cache
+.tmp
+.local
+logs
+**/__pycache__
+**/*.pyc
+backend/.venv
+frontend/node_modules
+frontend/dist
+src-tauri/target
+

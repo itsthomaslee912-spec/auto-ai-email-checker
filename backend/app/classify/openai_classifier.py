@@ -126,6 +126,25 @@ def _parse_facts(content: str) -> dict[str, object]:
     return facts if isinstance(facts, dict) else {}
 
 
+def _parse_strict_ai_result(content: str) -> tuple[str, float | None, str | None, str | None]:
+    """Parse AI-only mode without regex recovery or semantic post-processing."""
+    data = json.loads((content or "").strip())
+    if not isinstance(data, dict):
+        raise ValueError("Classifier response must be a JSON object")
+    label = normalize_label(str(data.get("label", EmailLabel.OTHER.value)))
+    confidence_value = data.get("confidence")
+    confidence = float(confidence_value) if confidence_value is not None else None
+    if confidence is not None and not 0 <= confidence <= 1:
+        raise ValueError("Classifier confidence must be between 0 and 1")
+    subtype = data.get("interview_subtype")
+    if subtype is not None and subtype not in VALID_INTERVIEW_SUBTYPES:
+        raise ValueError("Classifier returned an invalid interview subtype")
+    category = data.get("category_subtype")
+    if category is not None and category not in CATEGORY_SUBTYPES.get(label, set()):
+        raise ValueError("Classifier returned an invalid category subtype")
+    return label, confidence, subtype, category
+
+
 def message_direction(folder: str | None, sender: str, account_email: str | None) -> tuple[str, bool]:
     sender_address = parseaddr(sender or "")[1].casefold()
     owner = (account_email or "").strip().casefold()
@@ -917,17 +936,26 @@ async def classify_email(
     force_openai: bool = False,
     use_openai: bool = True,
 ) -> ClassificationResult:
+    settings = get_settings()
+    ai_only = getattr(settings, "email_classification_mode", "hybrid").strip().lower() == "ai_only"
     direction, sender_is_owner = message_direction(folder, sender, account_email)
-    heuristic = _heuristic_label(subject, sender, body_text, snippet, direction=direction)
-    primary_text = _primary_message_text(subject, sender, body_text, snippet)
+    heuristic = None if ai_only else _heuristic_label(
+        subject, sender, body_text, snippet, direction=direction
+    )
+    primary_text = (
+        (body_text or snippet or "").strip()
+        if ai_only
+        else _primary_message_text(subject, sender, body_text, snippet)
+    )
     if has_saved_ai_settings():
         backend = get_ai_backend()
     else:
-        settings = get_settings()
         backend = AiBackend("openai", settings.openai_model, settings.openai_api_key)
 
     # Heuristic-only path (fallback or tests). Live/Sync use OpenAI + guards.
     if not force_openai and not use_openai:
+        if ai_only:
+            raise RuntimeError("AI-only classification requires an available AI provider")
         return ClassificationResult(
             label=(heuristic or EmailLabel.OTHER.value),  # type: ignore[arg-type]
             category_subtype=_infer_category_subtype(heuristic or EmailLabel.OTHER.value, primary_text),
@@ -935,6 +963,8 @@ async def classify_email(
             response_id=None,
         )
     if not backend.api_key:
+        if ai_only:
+            raise RuntimeError("AI-only classification requires an API key or configured Ollama backend")
         return ClassificationResult(
             label=(heuristic or EmailLabel.OTHER.value),  # type: ignore[arg-type]
             category_subtype=_infer_category_subtype(heuristic or EmailLabel.OTHER.value, primary_text),
@@ -943,7 +973,11 @@ async def classify_email(
         )
 
     client = backend.client() if backend.provider in {"ollama", "gemini"} else AsyncOpenAI(api_key=backend.api_key)
-    latest_message = _primary_message_text("", "", body_text, snippet).strip()
+    latest_message = (
+        (body_text or snippet or "").strip()
+        if ai_only
+        else _primary_message_text("", "", body_text, snippet).strip()
+    )
     user_content = (
         f"Account email: {account_email or '(unknown)'}\n"
         f"Folder: {folder}\nDirection: {direction}\nSender is account owner: {str(sender_is_owner).lower()}\n"
@@ -965,7 +999,7 @@ async def classify_email(
         )
     except Exception:
         logger.exception("%s classification failed", backend.provider)
-        if backend.provider == "ollama":
+        if backend.provider == "ollama" or ai_only:
             raise
         return ClassificationResult(
             label=(heuristic or EmailLabel.OTHER.value),  # type: ignore[arg-type]
@@ -974,7 +1008,10 @@ async def classify_email(
             response_id=None,
         )
     content = response.choices[0].message.content or "{}"
-    label, confidence = _parse_label(content)
+    if ai_only:
+        label, confidence, subtype, category_subtype = _parse_strict_ai_result(content)
+    else:
+        label, confidence = _parse_label(content)
     # Escalate only uncertain/conflicting local decisions when a stronger paid
     # backend is already configured. Most mail remains entirely local.
     escalation = get_escalation_backend(backend.provider)
@@ -994,27 +1031,36 @@ async def classify_email(
                 ],
             )
             content = reviewed.choices[0].message.content or content
-            label, confidence = _parse_label(content)
+            if ai_only:
+                label, confidence, subtype, category_subtype = _parse_strict_ai_result(content)
+            else:
+                label, confidence = _parse_label(content)
             response = reviewed
         except Exception:
             logger.exception("Ambiguous classification escalation failed; keeping local result")
-    subtype = _parse_interview_subtype(content)
-    facts = _parse_facts(content)
-    label = _label_from_facts(label, facts, direction)
-    label = apply_label_guards(
-        label,
-        subject=subject,
-        sender=sender,
-        body_text=body_text,
-        snippet=snippet,
-        direction=direction,
-    )
-    category_subtype = _parse_category_subtype(content, label) or _infer_category_subtype(label, primary_text)
+    if not ai_only:
+        subtype = _parse_interview_subtype(content)
+    if not ai_only:
+        facts = _parse_facts(content)
+        label = _label_from_facts(label, facts, direction)
+        label = apply_label_guards(
+            label,
+            subject=subject,
+            sender=sender,
+            body_text=body_text,
+            snippet=snippet,
+            direction=direction,
+        )
+    if not ai_only:
+        category_subtype = _parse_category_subtype(content, label)
+        category_subtype = category_subtype or _infer_category_subtype(label, primary_text)
 
     return ClassificationResult(
         label=label,  # type: ignore[arg-type]
         category_subtype=category_subtype,
-        interview_subtype=(subtype or infer_interview_subtype(subject, sender, body_text, snippet)) if label == EmailLabel.INTERVIEW_SCHEDULED.value else None,
+        interview_subtype=(
+            subtype if ai_only else (subtype or infer_interview_subtype(subject, sender, body_text, snippet))
+        ) if label == EmailLabel.INTERVIEW_SCHEDULED.value else None,
         confidence=confidence,
         response_id=response.id,
     )

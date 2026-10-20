@@ -14,6 +14,8 @@ from app.realtime.sse import publish
 from app.schemas import EmailOut
 from app.services.ai_backend import ai_call_semaphore
 from app.services.calendar_extract import process_calendar_email
+from app.config import get_settings
+from app.services.event_bus import enqueue, event_envelope
 from app.timeutil import as_utc
 
 logger = logging.getLogger(__name__)
@@ -95,14 +97,18 @@ async def ingest_normalized_message(
 
     classification = None
     if not download_only:
-        corpus = load_correction_corpus(db)
-        correction_examples = retrieve_relevant_corrections(
-            corpus,
-            subject=normalized.get("subject") or "",
-            sender=normalized.get("sender") or "",
-            body_text=normalized.get("body_text") or "",
-            snippet=normalized.get("snippet") or "",
-        )
+        ai_only = getattr(get_settings(), "email_classification_mode", "hybrid").strip().lower() == "ai_only"
+        if ai_only:
+            correction_examples = []
+        else:
+            corpus = load_correction_corpus(db)
+            correction_examples = retrieve_relevant_corrections(
+                corpus,
+                subject=normalized.get("subject") or "",
+                sender=normalized.get("sender") or "",
+                body_text=normalized.get("body_text") or "",
+                snippet=normalized.get("snippet") or "",
+            )
         try:
             # Live classification uses the active SQLite prompt. Every AI call
             # — live ingest, bulk sync, or background reclassify — shares one
@@ -148,11 +154,13 @@ async def ingest_normalized_message(
         category_subtype=classification.category_subtype if classification else None,
         classification_pending=download_only,
         interview_subtype=(
-            classification.interview_subtype or infer_interview_subtype(
+            classification.interview_subtype or (
+                None if getattr(get_settings(), "email_classification_mode", "hybrid").strip().lower() == "ai_only" else infer_interview_subtype(
                 normalized.get("subject") or "",
                 normalized.get("sender") or "",
                 normalized.get("body_text") or "",
                 normalized.get("snippet") or "",
+                )
             ) if classification and classification.label == EmailLabel.INTERVIEW_SCHEDULED.value else None
         ),
         confidence=classification.confidence if classification else None,
@@ -163,6 +171,23 @@ async def ingest_normalized_message(
     db.add(email)
     calendar_changed = False
     try:
+        # Flush inside the duplicate-protected transaction. A webhook and a
+        # reconciliation sync may race to insert the same provider message.
+        db.flush()
+        if get_settings().kafka_enabled:
+            imported_event = event_envelope(
+                "email.imported.v1",
+                {
+                    "email_id": email.id,
+                    "mailbox_id": mailbox.id,
+                    "content_version": 1,
+                    "classification_pending": bool(download_only),
+                },
+                user_id=mailbox.user_id,
+                aggregate_id=f"email:{email.id}",
+                producer="email-ingestion-service",
+            )
+            enqueue(db, "email.imported.v1", str(mailbox.id), imported_event)
         if not download_only:
             await apply_outcome(db, email, priority=priority)
             db.flush()

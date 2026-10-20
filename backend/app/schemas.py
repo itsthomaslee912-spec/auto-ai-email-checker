@@ -74,6 +74,8 @@ class EmailOut(BaseModel):
     category_subtype: str | None = None
     interview_subtype: str | None = None
     confidence: float | None = None
+    company: str | None = None
+    job_role: str | None = None
     is_read: bool = False
     human_corrected: bool = False
     folder: str = "inbox"

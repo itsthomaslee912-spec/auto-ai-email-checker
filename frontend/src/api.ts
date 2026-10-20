@@ -77,6 +77,8 @@ export interface EmailItem {
   sender: string;
   received_at: string | null;
   snippet: string;
+  company?: string | null;
+  job_role?: string | null;
   label: EmailLabel;
   interview_subtype: InterviewSubtype | null;
   confidence: number | null;
@@ -829,18 +831,128 @@ export function eventsUrl(): string {
   return `${API_BASE}/api/events`;
 }
 
+function activityWebSocketUrl(): string {
+  const url = new URL(`${API_BASE}/api/ws/activity`, window.location.origin);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url.toString();
+}
+
 export interface EventStream {
   addEventListener(name: string, listener: EventListener): void;
   removeEventListener(name: string, listener: EventListener): void;
   close(): void;
 }
 
-let sharedEvents: EventSource | null = null;
+class ActivitySocket implements EventStream {
+  private socket: WebSocket | null = null;
+  private closed = false;
+  private retry: number | null = null;
+  private delay = 500;
+  private lastSequence = 0;
+  private seenEventIds = new Set<string>();
+  private listeners = new Map<string, Set<EventListener>>();
+
+  constructor() {
+    this.connect();
+  }
+
+  addEventListener(name: string, listener: EventListener): void {
+    const listeners = this.listeners.get(name) ?? new Set<EventListener>();
+    listeners.add(listener);
+    this.listeners.set(name, listeners);
+  }
+
+  removeEventListener(name: string, listener: EventListener): void {
+    this.listeners.get(name)?.delete(listener);
+  }
+
+  close(): void {
+    this.closed = true;
+    if (this.retry != null) window.clearTimeout(this.retry);
+    this.socket?.close();
+    this.socket = null;
+    this.listeners.clear();
+  }
+
+  private dispatch(name: string, data: unknown): void {
+    const event = new MessageEvent(name, { data: JSON.stringify(data ?? {}) });
+    this.listeners.get(name)?.forEach((listener) => listener(event));
+  }
+
+  private acceptEvent(eventId?: string | null): boolean {
+    if (!eventId) return true;
+    if (this.seenEventIds.has(eventId)) return false;
+    this.seenEventIds.add(eventId);
+    if (this.seenEventIds.size > 2_000) {
+      const oldest = this.seenEventIds.values().next().value;
+      if (oldest) this.seenEventIds.delete(oldest);
+    }
+    return true;
+  }
+
+  private async recover(): Promise<void> {
+    if (!this.lastSequence) return;
+    try {
+      const params = new URLSearchParams({ after_sequence: String(this.lastSequence) });
+      const response = await fetch(`${API_BASE}/api/activity?${params}`, {
+        credentials: "include",
+        cache: "no-store",
+      });
+      if (!response.ok) return;
+      const result = await response.json() as {
+        items?: Array<{ event_id?: string; event_type: string; sequence: number; data: unknown }>;
+      };
+      for (const item of result.items ?? []) {
+        this.lastSequence = Math.max(this.lastSequence, Number(item.sequence) || 0);
+        if (!this.acceptEvent(item.event_id)) continue;
+        this.dispatch(item.event_type, item.data);
+      }
+    } catch {
+      // The normal reconnect reload paths remain available when recovery fails.
+    }
+  }
+
+  private connect(): void {
+    if (this.closed) return;
+    const socket = new WebSocket(activityWebSocketUrl());
+    this.socket = socket;
+    socket.onopen = async () => {
+      this.delay = 500;
+      await this.recover();
+      this.dispatch("connected", {});
+    };
+    socket.onmessage = (message) => {
+      try {
+        const payload = JSON.parse(String(message.data)) as {
+          event?: string;
+          event_id?: string | null;
+          sequence?: number | null;
+          data?: unknown;
+        };
+        if (payload.event === "connected") return;
+        if (payload.sequence != null) {
+          this.lastSequence = Math.max(this.lastSequence, Number(payload.sequence) || 0);
+        }
+        if (!this.acceptEvent(payload.event_id)) return;
+        this.dispatch(payload.event || "message", payload.data);
+      } catch {
+        // Ignore malformed transport frames; domain events are schema validated server-side.
+      }
+    };
+    socket.onclose = () => {
+      if (this.closed) return;
+      this.retry = window.setTimeout(() => this.connect(), this.delay);
+      this.delay = Math.min(10_000, this.delay * 2);
+    };
+  }
+}
+
+let sharedEvents: ActivitySocket | null = null;
 let sharedEventUsers = 0;
 
-/** Every open EventSource pins one of the browser's six HTTP/1.1 connections, so components share one. */
+/** Components share one reconnecting authenticated WebSocket. */
 export function openEvents(): EventStream {
-  if (!sharedEvents) sharedEvents = new EventSource(eventsUrl());
+  if (!sharedEvents) sharedEvents = new ActivitySocket();
   const source = sharedEvents;
   sharedEventUsers += 1;
   const added: Array<[string, EventListener]> = [];

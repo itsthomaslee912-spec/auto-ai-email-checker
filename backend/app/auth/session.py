@@ -124,6 +124,11 @@ def session_user(request: Request) -> tuple[int, bool] | None:
     return _lookup(token) if token else None
 
 
+def session_token_user(token: str | None) -> tuple[int, bool] | None:
+    """Authenticate transports such as WebSockets that do not use Request."""
+    return _lookup(token) if token else None
+
+
 async def require_user(request: Request) -> int:
     """Router dependency: reject anonymous requests and scope the rest to the signed-in account."""
     found = session_user(request)
