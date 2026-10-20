@@ -5304,6 +5304,75 @@ html[data-theme="light"] .source-email-status.status-position-closed { color: #3
 .monitoring-loading { grid-column: 3; justify-content: center; gap: .7rem; color: var(--muted); }
 .monitoring-spinner { width: 1rem; height: 1rem; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
 
+/* Live architecture diagram */
+.monitoring-viewtoggle { display: inline-flex; gap: .15rem; padding: .22rem; border: 1px solid var(--line); border-radius: 999px; background: var(--bg-pane); }
+.monitoring-viewtoggle button { display: inline-flex; align-items: center; gap: .36rem; padding: .36rem .7rem; border: none; border-radius: 999px; background: transparent; color: var(--muted); font: inherit; font-size: .72rem; font-weight: 640; cursor: pointer; transition: background .16s ease, color .16s ease; }
+.monitoring-viewtoggle button svg { width: .95rem; height: .95rem; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.monitoring-viewtoggle button:hover { color: var(--ink); }
+.monitoring-viewtoggle button.is-active { background: color-mix(in srgb, var(--accent) 20%, var(--bg-hover)); color: var(--ink); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent); }
+
+.arch-legend { display: flex; gap: .9rem; }
+.arch-legend span { display: inline-flex; align-items: center; gap: .32rem; color: var(--muted); font-size: .64rem; font-weight: 640; text-transform: none; letter-spacing: 0; }
+.arch-legend .monitor-status-dot { animation: none; }
+
+.arch-diagram { display: flex; flex-direction: column; align-items: stretch; width: 100%; max-width: 42rem; margin: 0 auto; }
+
+.arch-node { position: relative; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: .85rem; padding: .8rem .95rem; border: 1px solid var(--line); border-left: 3px solid #24b47e; border-radius: 14px; background: linear-gradient(180deg, color-mix(in srgb, var(--bg-hover) 24%, var(--bg-elev)), var(--bg-elev)); box-shadow: 0 1px 2px rgba(0, 0, 0, .14); transition: border-color .18s ease, transform .18s ease, box-shadow .18s ease; }
+.arch-node:hover { transform: translateY(-1px); border-color: color-mix(in srgb, var(--accent) 34%, var(--line)); border-left-color: var(--accent); box-shadow: 0 12px 28px color-mix(in srgb, #000 16%, transparent); }
+.arch-node.status-stale, .arch-node.status-degraded { border-left-color: #e8a02b; }
+.arch-node.status-offline, .arch-node.status-error { border-left-color: var(--danger); border-color: color-mix(in srgb, var(--danger) 36%, var(--line)); }
+.arch-node.status-disabled { border-left-color: var(--muted); opacity: .72; }
+.arch-node.is-store { border-style: dashed; background: color-mix(in srgb, var(--bg-hover) 40%, var(--bg-elev)); }
+.arch-node.is-endpoint { border-radius: 999px; }
+
+.arch-node-icon { display: grid; place-items: center; width: 2.35rem; height: 2.35rem; border-radius: 11px; background: color-mix(in srgb, var(--accent) 13%, var(--bg-hover)); color: var(--accent); }
+.arch-node.is-store .arch-node-icon { background: color-mix(in srgb, var(--accent-2) 14%, var(--bg-hover)); color: var(--accent-2); }
+.arch-node.is-endpoint .arch-node-icon { border-radius: 50%; }
+.arch-node-icon svg { width: 1.2rem; height: 1.2rem; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+
+.arch-node-body { min-width: 0; }
+.arch-node-body h3 { margin: 0; font-size: .86rem; font-weight: 700; letter-spacing: -.012em; }
+.arch-node-body p { margin: .12rem 0 0; overflow: hidden; color: var(--muted); font-size: .68rem; text-overflow: ellipsis; white-space: nowrap; }
+
+.arch-node-side { display: grid; justify-items: end; gap: .18rem; text-align: right; }
+.arch-node-status { display: inline-flex; align-items: center; gap: .34rem; padding: .22rem .5rem; border-radius: 999px; background: color-mix(in srgb, #24b47e 12%, var(--bg-hover)); color: #4bd39a; font-size: .64rem; font-weight: 680; text-transform: capitalize; }
+.arch-node.status-stale .arch-node-status, .arch-node.status-degraded .arch-node-status { background: color-mix(in srgb, #e8a02b 14%, var(--bg-hover)); color: var(--warn); }
+.arch-node.status-offline .arch-node-status, .arch-node.status-error .arch-node-status { background: color-mix(in srgb, var(--danger) 14%, var(--bg-hover)); color: var(--danger); }
+.arch-node.status-disabled .arch-node-status { background: var(--bg-hover); color: var(--muted); }
+.arch-node-meta { color: var(--muted); font-size: .62rem; font-variant-numeric: tabular-nums; }
+
+.arch-edge { display: grid; justify-items: center; gap: .1rem; padding: .18rem 0; }
+.arch-edge-chip { display: inline-flex; align-items: center; gap: .4rem; padding: .16rem .55rem; border: 1px solid var(--line); border-radius: 999px; background: var(--bg-pane); color: var(--muted); font-size: .61rem; font-weight: 620; }
+.arch-edge-badge { padding: .02rem .36rem; border-radius: 999px; background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--label-blue); font-size: .6rem; font-weight: 760; font-variant-numeric: tabular-nums; }
+.arch-edge-badge.is-error { background: color-mix(in srgb, var(--danger) 22%, transparent); color: var(--danger); }
+.arch-edge-arrow { width: 1.15rem; height: 1.15rem; fill: none; stroke: color-mix(in srgb, var(--muted) 70%, transparent); stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 3 3; }
+@keyframes arch-flow { to { stroke-dashoffset: -12; } }
+
+/* Real-time data flow: a stage lights up while an event passes through it. */
+.arch-node { transition: border-color .18s ease, transform .18s ease, box-shadow .25s ease, background .25s ease; }
+.arch-node.is-live { border-color: color-mix(in srgb, var(--accent) 60%, var(--line)); border-left-color: var(--accent); background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 12%, var(--bg-elev)), var(--bg-elev)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent), 0 10px 30px color-mix(in srgb, var(--accent) 22%, transparent); }
+.arch-node.is-live .arch-node-icon { background: color-mix(in srgb, var(--accent) 24%, var(--bg-hover)); color: color-mix(in srgb, var(--accent) 70%, #fff); animation: arch-pulse 1.3s ease-out infinite; }
+.arch-edge.is-live .arch-edge-chip { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); background: color-mix(in srgb, var(--accent) 14%, var(--bg-pane)); color: var(--label-blue); }
+.arch-edge.is-live .arch-edge-arrow { stroke: var(--accent); animation: arch-flow .7s linear infinite; }
+@keyframes arch-pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent); } 70% { box-shadow: 0 0 0 7px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+
+.arch-live-chip { display: inline-flex !important; align-items: center; gap: .36rem; padding: .18rem .5rem .18rem .42rem; border: 1px solid var(--line); border-radius: 999px; background: var(--bg-pane); color: var(--muted) !important; }
+.arch-live-chip .arch-live-dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--muted); }
+.arch-live-chip.is-active { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); color: var(--label-blue) !important; }
+.arch-live-chip.is-active .arch-live-dot { background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); animation: monitor-pulse 1.3s ease-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .arch-edge-arrow, .arch-edge.is-live .arch-edge-arrow, .arch-node.is-live .arch-node-icon, .arch-live-chip.is-active .arch-live-dot { animation: none; }
+  .arch-edge-arrow { stroke-dasharray: none; }
+}
+
+@media (max-width: 760px) {
+  .arch-node { grid-template-columns: auto minmax(0, 1fr); gap: .7rem .75rem; }
+  .arch-node-side { grid-column: 1 / -1; justify-items: start; text-align: left; flex-direction: row; }
+  .arch-node.is-endpoint { border-radius: 16px; }
+  .arch-legend { flex-wrap: wrap; }
+}
+
 /* Admin statistics */
 .app-shell.statistics-open,
 .app-shell.view-table.statistics-open {

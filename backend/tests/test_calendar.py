@@ -5120,3 +5120,137 @@ def test_quoted_option_booking_yields_to_the_later_invite():
         assert booked.company == "ADUSA"
         assert booked.job_role == "Principal Platform Engineer"
         assert booked.meeting_url == "https://teams.microsoft.com/meet/36304861417217?p=VjgU38s8zKm2tDgwbq"
+
+
+def test_mailbox_display_name_rejects_candidate_name_as_company():
+    from app.services import calendar_extract
+    from app.services.calendar_extract import (
+        _person_display_name,
+        mailbox_candidate_name,
+        repair_candidate_name_as_company,
+    )
+
+    # A personal name with no mail pairing still reads as the holder's own name.
+    assert _person_display_name("Jordan Meeker") == "Jordan Meeker"
+    assert _person_display_name("jordanwm914") == ""  # local-part fallback
+    assert _person_display_name("WITHIN") == ""  # one-word employer
+    assert _person_display_name("Acme Recruiting Team") == ""  # corporate suffix
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    calendar_extract._mailbox_candidate_name_cache.clear()
+    calendar_extract._mailbox_candidate_name_checked_at.clear()
+    try:
+        with factory() as db:
+            user = User(external_id="display-name-user")
+            db.add(user)
+            db.flush()
+            # The OAuth profile name is "Jordan Meeker"; none of this mailbox's
+            # mail ever spells that name next to the owner's own address, so the
+            # body-scan guard alone could never learn it.
+            mailbox = MailboxConnection(
+                user_id=user.id, provider=Provider.GOOGLE.value,
+                email_address="jordanwm914@gmail.com", display_name="Jordan Meeker",
+                access_token_enc="x", refresh_token_enc="", is_active=True,
+            )
+            db.add(mailbox)
+            db.flush()
+            mailbox_id = mailbox.id
+            event = CalendarEvent(
+                mailbox_id=mailbox_id, kind="confirmed", origin="email",
+                title="Jordan Meeker — Member of Technical Staff, AI",
+                company="Jordan Meeker", job_role="Member of Technical Staff, AI",
+                start_at=datetime(2026, 10, 20, 14, 30, tzinfo=timezone.utc),
+                end_at=datetime(2026, 10, 20, 15, 0, tzinfo=timezone.utc),
+                is_visible=True,
+            )
+            db.add(event)
+            db.commit()
+            event_id = event.id
+
+            assert mailbox_candidate_name(db, mailbox_id) == "Jordan Meeker"
+            assert repair_candidate_name_as_company(db, mailbox_id) == 1
+            db.commit()
+
+            fixed = db.get(CalendarEvent, event_id)
+            assert fixed.company == ""
+            # The title falls back to the role once the bogus company is cleared.
+            assert fixed.title == "Member of Technical Staff, AI"
+    finally:
+        calendar_extract._mailbox_candidate_name_cache.clear()
+        calendar_extract._mailbox_candidate_name_checked_at.clear()
+        engine.dispose()
+
+
+def test_candidate_name_company_is_replaced_with_employer_from_linked_thread():
+    """A Google 'unknown sender' invite titled 'Interview with <candidate>' must
+    not leave the candidate's own name as the employer when the thread (e.g. the
+    'Thank you for applying to WITHIN' receipt) names the real one."""
+    from app.services import calendar_extract
+    from app.services.calendar_extract import repair_candidate_name_as_company
+    from app.models import CalendarEventEmail
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    calendar_extract._mailbox_candidate_name_cache.clear()
+    calendar_extract._mailbox_candidate_name_checked_at.clear()
+    try:
+        with factory() as db:
+            user = User(external_id="within-user")
+            db.add(user)
+            db.flush()
+            mailbox = MailboxConnection(
+                user_id=user.id, provider=Provider.GOOGLE.value,
+                email_address="jordanwm914@gmail.com", display_name="Jordan Meeker",
+                access_token_enc="x", refresh_token_enc="", is_active=True,
+            )
+            db.add(mailbox)
+            db.flush()
+            mid = mailbox.id
+            # The application receipt that names the real employer.
+            receipt = EmailMessage(
+                mailbox_id=mid, provider_message_id="within-apply", thread_id="t-within",
+                subject="Thank you for applying to WITHIN", sender="WITHIN Jobs <jobs@within.co>",
+                snippet="", body_text="", label="application_confirmation",
+                company="WITHIN", job_role="Member of Technical Staff, AI",
+            )
+            # The unknown-sender invite whose title leaked the candidate's name.
+            invite = EmailMessage(
+                mailbox_id=mid, provider_message_id="within-invite", thread_id="t-within",
+                subject="Invitation from an unknown sender: Virtual Interview with Jordan Meeker "
+                        "- Member of Technical Staff @ ... (jordanwm914@gmail.com)",
+                sender="WITHIN Jobs <jobs@within.co>", snippet="", body_text="",
+                label="interview_scheduled", company="", job_role="Member of Technical Staff, AI",
+            )
+            db.add_all([receipt, invite])
+            db.flush()
+            event = CalendarEvent(
+                mailbox_id=mid, source_email_id=invite.id, kind="confirmed", origin="email",
+                title="Jordan Meeker — Member of Technical Staff, AI",
+                company="Jordan Meeker", job_role="Member of Technical Staff, AI",
+                interviewer="WITHIN Jobs",
+                start_at=datetime(2026, 10, 20, 14, 30, tzinfo=timezone.utc),
+                end_at=datetime(2026, 10, 20, 15, 0, tzinfo=timezone.utc),
+                is_visible=True,
+            )
+            db.add(event)
+            db.flush()
+            db.add_all([
+                CalendarEventEmail(event_id=event.id, email_id=receipt.id),
+                CalendarEventEmail(event_id=event.id, email_id=invite.id),
+            ])
+            db.commit()
+            event_id = event.id
+
+            assert repair_candidate_name_as_company(db, mid) == 1
+            db.commit()
+
+            fixed = db.get(CalendarEvent, event_id)
+            assert fixed.company == "WITHIN"  # recovered, not blanked
+            assert fixed.title == "WITHIN — Member of Technical Staff, AI"
+    finally:
+        calendar_extract._mailbox_candidate_name_cache.clear()
+        calendar_extract._mailbox_candidate_name_checked_at.clear()
+        engine.dispose()

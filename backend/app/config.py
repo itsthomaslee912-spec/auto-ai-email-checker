@@ -8,12 +8,16 @@ _BACKEND = Path(__file__).resolve().parents[1]
 
 
 class Settings(BaseSettings):
+    # Absolute paths only. A relative ".env"/"../.env" is resolved against each
+    # process's current working directory, so the API and the native worker
+    # processes (often started from different directories) could load a
+    # different value for the same key — notably a duplicated
+    # MICROSOFT_WEBHOOK_CLIENT_STATE — which desynchronized webhook subscription
+    # creation from notification validation ("Invalid Outlook clientState").
     model_config = SettingsConfigDict(
         env_file=(
             str(_ROOT / ".env"),
             str(_BACKEND / ".env"),
-            ".env",
-            "../.env",
         ),
         env_file_encoding="utf-8",
         extra="ignore",

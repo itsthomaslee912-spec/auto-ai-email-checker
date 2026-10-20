@@ -23,6 +23,49 @@ def is_transient_quota_error(message: str | None) -> bool:
     return "quota" in text or "rate limit" in text or "ratelimitexceeded" in text
 
 
+# DNS and socket failures surface as the underlying OS error text (httpx wraps
+# ``socket.gaierror`` as ``ConnectError``). They mean the host briefly lost its
+# connection to the provider, not that the account or its credentials are broken.
+_NETWORK_ERROR_MARKERS = (
+    "getaddrinfo failed",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "failed to establish a new connection",
+    "max retries exceeded",
+    "connection refused",
+    "connection reset",
+    "connection aborted",
+    "network is unreachable",
+    "no route to host",
+    "server disconnected",
+    "timed out",
+    # Windows WSA codes: getaddrinfo, TRY_AGAIN, timeout, reset, refused,
+    # net unreachable.
+    "11001",
+    "11002",
+    "10060",
+    "10054",
+    "10061",
+    "10051",
+)
+
+
+def is_transient_network_error(message: str | None) -> bool:
+    """Return whether a sync failed because the host could not reach the provider."""
+    text = (message or "").casefold()
+    return any(marker in text for marker in _NETWORK_ERROR_MARKERS)
+
+
+def is_transient_sync_error(message: str | None) -> bool:
+    """Return whether a sync error is self-healing and should not alarm the user.
+
+    Quota throttling and momentary network/DNS loss both clear on their own, so
+    the auto-sync loop just retries them rather than flagging the account as
+    broken.
+    """
+    return is_transient_quota_error(message) or is_transient_network_error(message)
+
+
 def _should_retry_gmail(resp: httpx.Response) -> bool:
     if resp.status_code == 429 or resp.status_code in {500, 502, 503, 504}:
         return True

@@ -1117,6 +1117,34 @@ def candidate_own_name(email: EmailMessage, messages: list[EmailMessage] | None 
     return ""
 
 
+# A display name of "Jordan Meeker" is the account holder, not an employer. A
+# single word is not trusted here: it could be the "jordanwm914" local-part
+# fallback, or a real one-word company, so only a multi-word personal name with
+# no corporate suffix is treated as the candidate's own name.
+_PERSON_DISPLAY_NAME_RE = re.compile(r"^[^\W\d_][\w.'-]*(?:\s+[^\W\d_][\w.'-]*){1,3}$")
+_NON_PERSON_NAME_TOKENS = frozenset({
+    "inc", "llc", "ltd", "corp", "co", "llp", "plc", "gmbh", "ag", "sa", "bv",
+    "nv", "pte", "pty", "group", "holdings", "labs", "technologies", "systems",
+    "solutions", "software", "team", "recruiting", "talent", "careers", "jobs",
+    "hr", "support", "notifications", "noreply",
+})
+
+
+def _person_display_name(value: str | None) -> str:
+    """Return a mailbox display name only when it reads as the holder's own name.
+
+    The OAuth profile name is the most reliable source of the candidate's name,
+    but it can also be the email local-part fallback or, rarely, a company. A
+    multi-word name with no corporate suffix is a person, not an employer.
+    """
+    text = " ".join((value or "").split())
+    if not text or "@" in text or not _PERSON_DISPLAY_NAME_RE.match(text):
+        return ""
+    if any(token.strip(".").casefold() in _NON_PERSON_NAME_TOKENS for token in text.split()):
+        return ""
+    return text
+
+
 _mailbox_candidate_name_cache: dict[int, str] = {}
 _mailbox_candidate_name_checked_at: dict[int, float] = {}
 # This scans up to 2000 messages with a regex pass over each — real CPU cost,
@@ -1141,11 +1169,23 @@ def mailbox_candidate_name(db: Session, mailbox_id: int, owner_address: str = ""
     cached = _mailbox_candidate_name_cache.get(mailbox_id)
     if cached:
         return cached
+    row = (
+        db.query(MailboxConnection.email_address, MailboxConnection.display_name)
+        .filter(MailboxConnection.id == mailbox_id)
+        .first()
+    )
+    # The OAuth profile name is the authoritative, zero-cost source of the
+    # account holder's name. Prefer it so the "company is not the candidate's
+    # own name" guard still fires on mailboxes whose mail never spells the name
+    # next to the owner's address.
+    profile_name = _person_display_name(row[1] if row else None)
+    if profile_name:
+        _mailbox_candidate_name_cache[mailbox_id] = profile_name
+        return profile_name
     checked_at = _mailbox_candidate_name_checked_at.get(mailbox_id)
     if checked_at is not None and time.monotonic() - checked_at < _MAILBOX_CANDIDATE_NAME_RECHECK_SECONDS:
         return ""
     if not owner_address:
-        row = db.query(MailboxConnection.email_address).filter(MailboxConnection.id == mailbox_id).first()
         owner_address = row[0] if row else ""
     owner_address = _normalized_address(owner_address or "")
     if not owner_address:
@@ -4433,13 +4473,16 @@ def repair_corrupted_company_names(db: Session, mailbox_id: int | None = None) -
 
 
 def repair_candidate_name_as_company(db: Session, mailbox_id: int | None = None) -> int:
-    """Clear a stored company value that is actually the account holder's own name.
+    """Replace a stored company value that is actually the account holder's own name.
 
     A weak local model can echo the candidate's own name back as the employer
     (a quoted "From: Jordan Meeker <...>" reply, an ICS attendee list, or a
-    subject like "Interview with Jordan Meeker" where Jordan Meeker is the
-    candidate, not the recruiter). Detect each mailbox's own name once from a
-    sample of its mail and blank any stored company that matches it.
+    Google "unknown sender" invite titled "Interview with Jordan Meeker" where
+    Jordan Meeker is the candidate, not the recruiter). Detect each mailbox's
+    own name once from a sample of its mail, then recover the real employer from
+    the event's own linked thread ("Thank you for applying to WITHIN" names the
+    employer even when the invite does not); only blank it when nothing else in
+    the thread names an employer.
     """
     repaired = 0
     mailbox_query = db.query(MailboxConnection.id, MailboxConnection.email_address)
@@ -4462,11 +4505,16 @@ def repair_candidate_name_as_company(db: Session, mailbox_id: int | None = None)
         if not name:
             continue
         for event in events:
-            if companies_match(event.company, name):
-                event.company = ""
-                if event.origin == "email":
-                    event.title = event.job_role or event.title
-                repaired += 1
+            if not companies_match(event.company, name):
+                continue
+            recovered = clean_company_name(_known_company(_linked_messages(db, event)))
+            if recovered and companies_match(recovered, name):
+                recovered = ""
+            event.company = recovered
+            if event.origin == "email":
+                role = job_role_or_empty(event.job_role)
+                event.title = f"{recovered} — {role}" if recovered and role else (recovered or role or event.title)
+            repaired += 1
         for email in emails:
             if companies_match(email.company, name):
                 email.company = ""

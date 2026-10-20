@@ -443,6 +443,48 @@ def test_auto_sync_status_distinguishes_no_account_stopped_and_failure(monkeypat
     engine.dispose()
 
 
+def test_transient_network_error_does_not_raise_a_problem(monkeypatch):
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    monkeypatch.setattr(auto_sync, "get_settings", lambda: SimpleNamespace(auto_sync_interval_seconds=120))
+    monkeypatch.setattr(auto_sync, "_loop_running", True)
+    monkeypatch.setattr(auto_sync, "_last_check_at", datetime.now(timezone.utc))
+    monkeypatch.setattr(auto_sync, "_last_error", None)
+
+    dns_error = "[Errno 11001] getaddrinfo failed"
+    with session_factory() as db:
+        user = User(external_id="dns-test")
+        db.add(user)
+        db.flush()
+        mailbox = MailboxConnection(
+            user_id=user.id, provider="google", email_address="test@example.com",
+            access_token_enc="x", is_active=True,
+        )
+        db.add(mailbox)
+        db.commit()
+
+        # A momentary DNS loss arrives either as the worker's job error or as the
+        # persisted last_sync_error; neither should alarm the user, because the
+        # next auto-sync tick retries on its own.
+        monkeypatch.setattr(auto_sync, "get_sync_status", lambda _: {"state": "error", "message": dns_error})
+        status = auto_sync.get_auto_sync_status(db)
+        assert status["problem_mailboxes"] == []
+        assert status["state"] == "active"
+
+        monkeypatch.setattr(auto_sync, "get_sync_status", lambda _: {"state": "done", "failed": 0})
+        db.get(MailboxConnection, mailbox.id).last_sync_error = dns_error
+        db.commit()
+        status = auto_sync.get_auto_sync_status(db)
+        assert status["problem_mailboxes"] == []
+        assert status["mailboxes"][0]["last_error"] is None
+        assert status["mailboxes"][0]["needs_reconnect"] is False
+        assert status["state"] == "active"
+    engine.dispose()
+
+
 def _mailbox_with_webhook(session_factory, *, success_ago: timedelta, failure_ago: timedelta | None, error: str | None):
     with session_factory() as db:
         user = User(external_id="quota-webhook")

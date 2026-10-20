@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.auth.oauth_google import ensure_google_access_token
 from app.auth.oauth_microsoft import ensure_microsoft_access_token
@@ -759,6 +760,25 @@ def _record_notification_failure(db: Session, mailbox: MailboxConnection, exc: E
     db.commit()
 
 
+def _record_notification_success(db: Session, mailbox: MailboxConnection) -> None:
+    """Persist recovery even when another worker changed the row concurrently.
+
+    A worker can load an empty error, another worker can then record a transient
+    failure, and the first worker can subsequently succeed. Explicitly marking
+    the nullable error fields dirty ensures that final success clears the newer
+    database value instead of leaving a stale dashboard warning.
+    """
+    now = datetime.now(timezone.utc)
+    mailbox.last_sync_completed_at = now
+    mailbox.last_sync_error = None
+    flag_modified(mailbox, "last_sync_error")
+    if mailbox.webhook is not None:
+        mailbox.webhook.last_delivery_success_at = now
+        mailbox.webhook.last_delivery_error = None
+        flag_modified(mailbox.webhook, "last_delivery_error")
+    db.commit()
+
+
 async def _classify_downloaded_mail(mailbox_id: int) -> None:
     """Start eventual enrichment after provider mail is safely committed."""
     # Classification is owned by the classification service. RabbitMQ delivers
@@ -839,12 +859,7 @@ async def _process_gmail_notification_for(
                 db.commit()
         elif history_id:
             mailbox.sync_cursor = str(history_id)
-        mailbox.last_sync_completed_at = datetime.now(timezone.utc)
-        mailbox.last_sync_error = None
-        if mailbox.webhook is not None:
-            mailbox.webhook.last_delivery_success_at = datetime.now(timezone.utc)
-            mailbox.webhook.last_delivery_error = None
-        db.commit()
+        _record_notification_success(db, mailbox)
         if created:
             await _classify_downloaded_mail(mailbox.id)
         return created
@@ -871,12 +886,7 @@ async def process_outlook_notification(db: Session, subscription_id: str, messag
     email = await ingest_normalized_message(
         db, mailbox, normalize_outlook_message(raw), download_only=True,
     )
-    mailbox.last_sync_completed_at = datetime.now(timezone.utc)
-    mailbox.last_sync_error = None
-    if mailbox.webhook is not None:
-        mailbox.webhook.last_delivery_success_at = datetime.now(timezone.utc)
-        mailbox.webhook.last_delivery_error = None
-    db.commit()
+    _record_notification_success(db, mailbox)
     if email:
         await _classify_downloaded_mail(mailbox.id)
     return 1 if email else 0

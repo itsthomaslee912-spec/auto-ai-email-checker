@@ -296,6 +296,36 @@ def test_gmail_webhook_failure_marks_mailbox_webhook_unhealthy(monkeypatch):
     engine.dispose()
 
 
+def test_webhook_success_clears_error_written_by_concurrent_worker():
+    engine, db, mailbox = _mailbox(Provider.MICROSOFT)
+    db.add(WebhookSubscription(
+        mailbox_id=mailbox.id,
+        provider=Provider.MICROSOFT.value,
+        external_id='["subscription"]',
+    ))
+    db.commit()
+    db.refresh(mailbox)
+    assert mailbox.last_sync_error is None
+    assert mailbox.webhook.last_delivery_error is None
+
+    ConcurrentSession = sessionmaker(bind=engine)
+    with ConcurrentSession() as concurrent_db:
+        concurrent_mailbox = concurrent_db.get(MailboxConnection, mailbox.id)
+        concurrent_mailbox.last_sync_error = "[Errno 11001] getaddrinfo failed"
+        concurrent_mailbox.webhook.last_delivery_error = "[Errno 11001] getaddrinfo failed"
+        concurrent_db.commit()
+
+    # This session loaded both values before the concurrent failure. A normal
+    # assignment to None would therefore emit no UPDATE for either error field.
+    mailbox_sync._record_notification_success(db, mailbox)
+    db.expire_all()
+
+    assert db.get(MailboxConnection, mailbox.id).last_sync_error is None
+    assert db.get(MailboxConnection, mailbox.id).webhook.last_delivery_error is None
+    db.close()
+    engine.dispose()
+
+
 def test_reconnect_clears_sign_in_errors_but_keeps_other_failures():
     from datetime import datetime, timezone
 

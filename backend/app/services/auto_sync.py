@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import SessionLocal
-from app.email.gmail import is_transient_quota_error
+from app.email.gmail import is_transient_quota_error, is_transient_sync_error
 from app.models import MailboxConnection
 from app.services.mailbox_sync import get_sync_status, start_mailbox_sync
 from app.services.ngrok_status import get_ngrok_status
@@ -234,12 +234,17 @@ def get_auto_sync_status(db: Session) -> dict:
         if job["state"] == "running":
             syncing = True
         elif job["state"] == "error" or job.get("failed", 0) > 0:
-            problems.append({
-                "mailbox_id": mailbox.id,
-                "email_address": mailbox.email_address,
-                "message": job.get("message") or "Sync failed",
-            })
-        elif mailbox.last_sync_error and not is_transient_quota_error(mailbox.last_sync_error):
+            message = job.get("message") or "Sync failed"
+            # A momentary network/DNS loss or quota throttle clears on the next
+            # retry, so it must not raise a "needs attention" alert the user
+            # cannot act on.
+            if not is_transient_sync_error(message):
+                problems.append({
+                    "mailbox_id": mailbox.id,
+                    "email_address": mailbox.email_address,
+                    "message": message,
+                })
+        elif mailbox.last_sync_error and not is_transient_sync_error(mailbox.last_sync_error):
             problems.append({
                 "mailbox_id": mailbox.id,
                 "email_address": mailbox.email_address,
@@ -259,7 +264,7 @@ def get_auto_sync_status(db: Session) -> dict:
                 if mailbox.last_sync_completed_at else None
             ),
             "last_error": (
-                None if is_transient_quota_error(mailbox.last_sync_error) else mailbox.last_sync_error
+                None if is_transient_sync_error(mailbox.last_sync_error) else mailbox.last_sync_error
             ),
             "needs_reconnect": needs_reconnect(mailbox.last_sync_error)
             or (job["state"] == "error" and needs_reconnect(job.get("message"))),
