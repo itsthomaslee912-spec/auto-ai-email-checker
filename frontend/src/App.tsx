@@ -38,6 +38,7 @@ import {
   stopReclassifyMailbox,
   updateClassifyPrompt,
   updateEmailLabel,
+  updateCachedEmailDetail,
   type EmailDetail,
   type EmailItem,
   type EmailLabel,
@@ -835,6 +836,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
           updated?: boolean;
           classification_completed?: boolean;
         };
+        updateCachedEmailDetail(item);
         const { mailboxId, label: currentLabel, interviewSubtype: currentSubtype, query } = filterRef.current;
         const matchesMailbox = mailboxId == null || item.mailbox_id === mailboxId;
         const matchesLabel = currentLabel === "all" || item.label === currentLabel;
@@ -890,6 +892,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
             ? { ...prev, label: item.label, interview_subtype: item.interview_subtype, confidence: item.confidence }
             : prev,
         );
+        setThreadMessages((prev) => prev.map((message) =>
+          message.id === item.id ? { ...message, ...item } : message
+        ));
 
         if (isUpdate) {
           const labelChanged = Boolean(item.previous_label && item.previous_label !== item.label);
@@ -1617,6 +1622,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     setSaveTraining(useTraining);
     setSavingLabel(true);
     setSelected((prev) => (prev && prev.id === emailId ? { ...prev, label: nextLabel, interview_subtype: subtype ?? null } : prev));
+    setThreadMessages((prev) => prev.map((message) =>
+      message.id === emailId ? { ...message, label: nextLabel, interview_subtype: subtype ?? null } : message
+    ));
     setEmails((prev) => {
       const currentLabel = filterRef.current.label;
       const currentSubtype = filterRef.current.interviewSubtype;
@@ -1629,6 +1637,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     try {
       const updated = await updateEmailLabel(emailId, nextLabel, useTraining, subtype);
       setSelected((prev) => (prev && prev.id === emailId ? { ...prev, ...updated } : prev));
+      setThreadMessages((prev) => prev.map((message) =>
+        message.id === emailId ? { ...message, ...updated } : message
+      ));
       setEmails((prev) => prev.map((item) => item.id === emailId ? { ...item, ...updated } : item));
       if (useTraining) {
         setUnusedTraining((count) => count + 1);
@@ -1636,6 +1647,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
       }
     } catch (err) {
       setSelected((prev) => (prev && prev.id === emailId ? { ...prev, label: previous, interview_subtype: previousSubtype } : prev));
+      setThreadMessages((prev) => prev.map((message) =>
+        message.id === emailId ? { ...message, label: previous, interview_subtype: previousSubtype } : message
+      ));
       setEmails((prev) =>
         prev.map((item) => (item.id === emailId ? { ...item, label: previous } : item))
       );

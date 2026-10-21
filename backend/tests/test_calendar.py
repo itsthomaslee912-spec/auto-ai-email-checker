@@ -4864,6 +4864,72 @@ def test_booked_interview_hides_earlier_window_when_the_offer_has_no_role():
         assert db.get(CalendarEvent, later.id).is_visible is True
 
 
+def test_booking_one_offered_slot_hides_all_siblings_from_same_submission():
+    factory, (mailbox_id, _) = _database()
+    offered_at = datetime(2026, 10, 20, 0, 33, tzinfo=timezone.utc)
+    booked_at = datetime(2026, 10, 20, 23, 28, tzinfo=timezone.utc)
+    starts = [
+        datetime(2026, 10, 21, 21, 0, tzinfo=timezone.utc),
+        datetime(2026, 10, 22, 23, 0, tzinfo=timezone.utc),
+        datetime(2026, 10, 23, 20, 30, tzinfo=timezone.utc),
+    ]
+    with factory() as db:
+        source = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="opendoor-availability",
+            subject="Interview availability confirmation - Opendoor Labs Inc.",
+            sender="no-reply@ats.rippling.com",
+            received_at=offered_at,
+            label=EmailLabel.INTERVIEW_AVAILABILITY.value,
+            company="Opendoor",
+            job_role="Software Engineer",
+        )
+        db.add(source)
+        db.flush()
+        options = [
+            CalendarEvent(
+                mailbox_id=mailbox_id,
+                source_email_id=source.id,
+                source_received_at=offered_at,
+                slot_index=index,
+                kind="availability",
+                origin="email",
+                company="Opendoor",
+                job_role="Software Engineer",
+                start_at=start,
+                end_at=start + timedelta(minutes=30),
+                is_visible=True,
+            )
+            for index, start in enumerate(starts)
+        ]
+        booked = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_received_at=booked_at,
+            kind="confirmed",
+            origin="email",
+            company="Opendoor Labs Inc.",
+            job_role="Senior Software Engineer, Security",
+            start_at=starts[0],
+            end_at=starts[0] + timedelta(minutes=30),
+            interview_status="confirmation",
+            meeting_type="video",
+            meeting_provider="Google Meet",
+            meeting_url="https://meet.google.com/mwi-hxpr-sbm",
+            is_visible=True,
+        )
+        db.add_all([*options, booked])
+        db.commit()
+
+        assert collapse_duplicate_calendar_events(db, mailbox_id) is True
+        db.commit()
+
+        assert db.get(CalendarEvent, booked.id).is_visible is True
+        for option in options:
+            stored = db.get(CalendarEvent, option.id)
+            assert stored.is_visible is False
+            assert stored.superseded_by_event_id == booked.id
+
+
 def test_earlier_availability_variant_hides_after_booking_and_a_later_offer_stays():
     factory, (mailbox_id, _) = _database()
     with factory() as db:

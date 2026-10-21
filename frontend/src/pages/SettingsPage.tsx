@@ -374,10 +374,8 @@ export default function SettingsPage({
                 key={item.id}
                 type="button"
                 className={section === item.id ? "settings-nav-btn active" : "settings-nav-btn"}
-                onClick={() => {
-                  if (item.id === "training") setTrainingLoading(true);
-                  onSectionChange(item.id);
-                }}
+                aria-current={section === item.id ? "page" : undefined}
+                onClick={() => onSectionChange(item.id)}
               >
                 {item.label}
                 {item.id === "training" && unusedTraining > 0 ? (

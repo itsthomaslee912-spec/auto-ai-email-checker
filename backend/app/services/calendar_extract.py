@@ -4300,15 +4300,47 @@ def _hide_overlapping_availability(
         .filter(
             CalendarEvent.mailbox_id == confirmed.mailbox_id,
             CalendarEvent.kind == "availability",
-            CalendarEvent.is_visible.is_(True),
+            or_(
+                CalendarEvent.is_visible.is_(True),
+                CalendarEvent.superseded_by_event_id == confirmed.id,
+            ),
             CalendarEvent.start_at < end_at,
             CalendarEvent.end_at > start_at,
         )
         .all()
         if companies_match(company, event.company)
     ]
+    # Once a booked time matches one option from an availability submission,
+    # every other option from that same submission is closed too.  Company and
+    # role text often become more specific in the final invite, so the shared
+    # source email is the reliable identity for those sibling options.
+    matched_source_ids = {
+        event.source_email_id
+        for event in rows
+        if event.source_email_id is not None
+        and (event.is_visible or event.superseded_by_event_id == confirmed.id)
+    }
     for event in rows:
         if event.id in already_hidden:
+            continue
+        if not event.is_visible:
+            continue
+        event.is_visible = False
+        event.superseded_by_event_id = confirmed.id
+        db.flush()
+        _transfer_event_email_links(db, event, confirmed)
+    if not matched_source_ids:
+        return
+    booked_at = as_utc(confirmed.source_received_at)
+    siblings = db.query(CalendarEvent).filter(
+        CalendarEvent.mailbox_id == confirmed.mailbox_id,
+        CalendarEvent.kind == "availability",
+        CalendarEvent.is_visible.is_(True),
+        CalendarEvent.source_email_id.in_(matched_source_ids),
+    ).all()
+    for event in siblings:
+        offered_at = as_utc(event.source_received_at)
+        if booked_at and offered_at and offered_at > booked_at:
             continue
         event.is_visible = False
         event.superseded_by_event_id = confirmed.id

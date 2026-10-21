@@ -289,7 +289,12 @@ export async function fetchEmails(opts?: {
     signal: opts?.signal,
   });
   if (!res.ok) throw new Error(await readApiError(res, "Failed to load emails"));
-  return res.json();
+  const page = (await res.json()) as EmailPage;
+  // A list refresh may be the recovery path after a missed realtime event.
+  // Patch any prefetched bodies too so reopening a row cannot restore an old
+  // category from the detail cache.
+  page.items.forEach(updateCachedEmailDetail);
+  return page;
 }
 
 export async function markAllRead(mailboxId?: number | null): Promise<{ marked: number }> {
@@ -327,6 +332,13 @@ export function peekEmailDetail(id: number): EmailDetail | undefined {
 
 export function peekEmailDetailRequest(id: number): Promise<EmailDetail> | undefined {
   return detailInflight.get(id);
+}
+
+/** Keep a prefetched/open message consistent with list and realtime updates. */
+export function updateCachedEmailDetail(update: EmailItem): void {
+  const cached = detailCache.get(update.id);
+  if (!cached) return;
+  rememberEmailDetail({ ...cached, ...update });
 }
 
 /** Warm the body cache without marking the message read. */
@@ -374,7 +386,9 @@ export async function updateEmailLabel(
     body: JSON.stringify({ label, save_training: saveTraining, interview_subtype: interviewSubtype }),
   });
   if (!res.ok) throw new Error(await readApiError(res, "Failed to update category"));
-  return res.json();
+  const detail = (await res.json()) as EmailDetail;
+  rememberEmailDetail(detail);
+  return detail;
 }
 
 export interface ClassifyPromptStatus {

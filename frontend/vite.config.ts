@@ -11,7 +11,11 @@ export default defineConfig({
       "/api": {
         target: "http://127.0.0.1:8000",
         changeOrigin: true,
-    timeout: 300000,
+        // The activity feed uses /api/ws/activity. Without WebSocket upgrade
+        // proxying, REST calls still work but the browser never receives
+        // email.classified (or any other live) events.
+        ws: true,
+        timeout: 300000,
       },
     },
   },
