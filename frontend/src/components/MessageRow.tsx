@@ -39,6 +39,9 @@ function MessageRow({
   const subtypeTitle = email.label === "interview_scheduled" && email.interview_subtype
     ? INTERVIEW_SUBTYPE_TITLES[email.interview_subtype]
     : null;
+  const participant = email.folder === "sent" && email.recipients
+    ? senderName(email.recipients)
+    : senderName(email.sender);
 
   if (viewMode === "table") {
     return (
@@ -57,7 +60,7 @@ function MessageRow({
       >
         <span className="table-cell">
           <strong className="table-primary">
-            {senderName(email.sender)}
+            {participant}
             {(email.thread_count ?? 1) > 1 && <span className="thread-count">{email.thread_count}</span>}
           </strong>
           {accountAddress && <AccountChip address={accountAddress} tint={accountTint} />}
@@ -85,13 +88,13 @@ function MessageRow({
   return (
     <button type="button" className={itemClass} onClick={() => onOpen(email.id)} onPointerEnter={() => onPrefetch(email.id)}>
       <span className={`avatar soft label-${email.label}`}>
-        {initialsFrom(senderName(email.sender))}
+        {initialsFrom(participant)}
       </span>
       <span className="msg-body">
         <span className="msg-top">
           <span className="msg-from">
             <span className="msg-sender-line">
-              <strong>{senderName(email.sender)}</strong>
+              <strong>{participant}</strong>
               {(email.thread_count ?? 1) > 1 && <span className="thread-count">{email.thread_count}</span>}
             </span>
             {accountAddress ? <AccountChip address={accountAddress} tint={accountTint} /> : null}

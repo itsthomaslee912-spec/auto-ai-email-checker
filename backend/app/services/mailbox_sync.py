@@ -56,6 +56,14 @@ _job_lock = asyncio.Lock()
 _cursor_locks: dict[int, asyncio.Lock] = {}
 _sync_gate: asyncio.Semaphore | None = None
 
+# An individual sync must not run unbounded. It holds the per-mailbox cursor
+# lock and the single sync-gate slot, so a hung provider/history call (for
+# example an enormous Gmail history backlog that paginates for over an hour)
+# would otherwise stall every other mailbox's sync indefinitely. A timed-out
+# sync is recorded as an error, retried, and resumes from the last committed
+# cursor.
+SYNC_JOB_TIMEOUT_SECONDS = 600
+
 
 def _sync_gate_semaphore() -> asyncio.Semaphore:
     """Keep bulk account reconciliation from starving API and webhook work."""
@@ -257,10 +265,18 @@ async def _run_sync_job_exclusive(
         mailbox.last_sync_error = None
         db.commit()
         async with _cursor_lock(mailbox_id):
-            await bootstrap_mailbox(
-                db, mailbox, initial_sync=max_results,
-                register_webhook=register_webhook, force_full=force_full,
-            )
+            try:
+                await asyncio.wait_for(
+                    bootstrap_mailbox(
+                        db, mailbox, initial_sync=max_results,
+                        register_webhook=register_webhook, force_full=force_full,
+                    ),
+                    timeout=SYNC_JOB_TIMEOUT_SECONDS,
+                )
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                raise RuntimeError(
+                    f"Sync timed out after {SYNC_JOB_TIMEOUT_SECONDS}s and was stopped"
+                ) from exc
         imported = _jobs[mailbox_id].get("imported", 0)
         if _should_stop(mailbox_id):
             job = _set_job(
@@ -318,6 +334,12 @@ async def bootstrap_mailbox(
             await register_mailbox_webhook(db, mailbox)
         except Exception:
             logger.exception("Webhook registration failed for mailbox %s", mailbox.id)
+            # A failed registration can leave the shared session in a doomed
+            # transaction. Roll back so the mailbox sync below does not inherit
+            # it and fail with "rollback() fully before proceeding", which would
+            # otherwise be stored as the sync error and misread as a sign-in
+            # expiry (it contains the word "reconnect").
+            db.rollback()
 
     if mailbox.provider == Provider.GOOGLE.value:
         if force_full or not mailbox.full_sync_completed or not mailbox.sync_cursor:
@@ -823,10 +845,10 @@ async def process_gmail_notification(db: Session, email_address: str, history_id
 async def _process_gmail_notification_for(
     db: Session, mailbox: MailboxConnection, history_id: str | None,
 ) -> int:
+    created = 0
     async with _cursor_lock(mailbox.id):
         token = await ensure_google_access_token(db, mailbox)
         start_id = mailbox.sync_cursor
-        created = 0
         if start_id:
             try:
                 history = await gmail_list_history(token, start_id)
@@ -860,9 +882,12 @@ async def _process_gmail_notification_for(
         elif history_id:
             mailbox.sync_cursor = str(history_id)
         _record_notification_success(db, mailbox)
-        if created:
-            await _classify_downloaded_mail(mailbox.id)
-        return created
+    # Classification is enrichment and runs the (possibly slow, possibly local)
+    # AI model, so it must happen AFTER the cursor lock is released -- otherwise
+    # it blocks the next webhook notification for this mailbox behind the model.
+    if created:
+        await _classify_downloaded_mail(mailbox.id)
+    return created
 
 
 async def process_outlook_notification(db: Session, subscription_id: str, message_id: str) -> int:

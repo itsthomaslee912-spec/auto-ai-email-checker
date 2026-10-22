@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import or_
-from sqlalchemy.orm import Session, load_only
+from sqlalchemy.orm import Session, aliased, load_only
 
 from app.models import CalendarEvent, CalendarEventEmail, EmailMessage
 from app.services.calendar_extract import companies_match, leaves_interview_unbooked, roles_compatible
@@ -111,16 +112,20 @@ class _MailRef:
 
 _cache_lock = threading.Lock()
 _cache_inflight: dict[tuple, threading.Event] = {}
-_booking_cache: dict[tuple, tuple[list[_BookingRef], set[int]]] = {}
-_follower_cache: dict[tuple, list[_MailRef]] = {}
+_CACHE_TTL_SECONDS = 2.0
+_booking_cache: dict[tuple, tuple[float, tuple[list[_BookingRef], dict[int, set[int]]]]] = {}
+_follower_cache: dict[tuple, tuple[float, list[_MailRef]]] = {}
 
 
 def _cached(slot: dict, key: tuple, loader):
-    """Share one database read across the events list and the pending-interview list."""
+    """Share a briefly-lived read without allowing cross-process stale state."""
     with _cache_lock:
         hit = slot.get(key)
         if hit is not None:
-            return hit
+            cached_at, value = hit
+            if time.monotonic() - cached_at <= _CACHE_TTL_SECONDS:
+                return value
+            slot.pop(key, None)
         waiter = _cache_inflight.get(key)
         if waiter is None:
             waiter = threading.Event()
@@ -133,11 +138,14 @@ def _cached(slot: dict, key: tuple, loader):
         with _cache_lock:
             hit = slot.get(key)
             if hit is not None:
-                return hit
+                cached_at, value = hit
+                if time.monotonic() - cached_at <= _CACHE_TTL_SECONDS:
+                    return value
+                slot.pop(key, None)
     try:
         value = loader()
         with _cache_lock:
-            slot[key] = value
+            slot[key] = (time.monotonic(), value)
             if len(slot) > 16:
                 slot.pop(next(iter(slot)))
         return value
@@ -148,15 +156,30 @@ def _cached(slot: dict, key: tuple, loader):
             waiter.set()
 
 
-def _booked_by_event(request: EmailMessage, events: list[_BookingRef] | tuple[_BookingRef, ...], linked_email_ids: set[int]) -> bool:
-    if request.id in linked_email_ids:
-        return True
+def _booked_by_event(
+    request: EmailMessage,
+    events: list[_BookingRef] | tuple[_BookingRef, ...],
+    linked_email_ids: dict[int, set[int]],
+) -> bool:
     received = as_utc(request.received_at)
     for event in events:
-        if event.source_email_id == request.id:
-            return True
         if event.mailbox_id != request.mailbox_id:
             continue
+        # A row extracted directly from this message is definitive even when
+        # provider timestamps are skewed or a later reclassification changes
+        # received_at. Historical CalendarEventEmail associations are broader
+        # and remain subject to the ordering guard below.
+        if event.source_email_id == request.id:
+            return True
+        booked_at = as_utc(event.source_received_at) or as_utc(event.created_at)
+        # Recruiter threads are often reused for later interview rounds. A
+        # broad historical association can link the new request/availability
+        # to the old calendar row, but an older booking cannot resolve a newer
+        # request in that thread.
+        if received is not None and booked_at is not None and booked_at < received:
+            continue
+        if request.id in linked_email_ids.get(event.id, set()):
+            return True
         # The accepted reply and resulting booking often share the original
         # invitation thread even when the classifier left company blank. That
         # thread identity is stronger than fuzzy company/role matching and
@@ -165,7 +188,6 @@ def _booked_by_event(request: EmailMessage, events: list[_BookingRef] | tuple[_B
             return True
         if not request.company:
             continue
-        booked_at = as_utc(event.source_received_at) or as_utc(event.created_at)
         if booked_at is None or received is None or booked_at <= received:
             continue
         if companies_match(event.company, request.company) and _same_role(event.job_role, request.job_role):
@@ -180,7 +202,7 @@ def invalidate_calendar_read_cache() -> None:
         _follower_cache.clear()
 
 
-def _confirmed_bookings(db: Session, mailbox_ids: list[int]) -> tuple[list[_BookingRef], set[int]]:
+def _confirmed_bookings(db: Session, mailbox_ids: list[int]) -> tuple[list[_BookingRef], dict[int, set[int]]]:
     """Confirmed rows used only to decide whether an offer was booked.
 
     The match needs a handful of columns. Loading every event body made the
@@ -188,7 +210,7 @@ def _confirmed_bookings(db: Session, mailbox_ids: list[int]) -> tuple[list[_Book
     """
     key = (id(db.get_bind()), tuple(mailbox_ids))
 
-    def load() -> tuple[list[_BookingRef], set[int]]:
+    def load() -> tuple[list[_BookingRef], dict[int, set[int]]]:
         booked_events = [
             _BookingRef(
                 id=row.id,
@@ -216,14 +238,16 @@ def _confirmed_bookings(db: Session, mailbox_ids: list[int]) -> tuple[list[_Book
             ).all()
         ]
         booked_ids = [event.id for event in booked_events]
-        linked_email_ids = {
-            row.email_id
-            for row in db.query(CalendarEventEmail.email_id).filter(CalendarEventEmail.event_id.in_(booked_ids)).all()
-        } if booked_ids else set()
+        linked_email_ids: dict[int, set[int]] = {}
+        if booked_ids:
+            for row in db.query(CalendarEventEmail.event_id, CalendarEventEmail.email_id).filter(
+                CalendarEventEmail.event_id.in_(booked_ids)
+            ).all():
+                linked_email_ids.setdefault(row.event_id, set()).add(row.email_id)
         return booked_events, linked_email_ids
 
     bookings, linked = _cached(_booking_cache, key, load)
-    return bookings, set(linked)
+    return bookings, {event_id: set(email_ids) for event_id, email_ids in linked.items()}
 
 
 def _emails_by_id(db: Session, ids: set[int], *, with_body: bool = False) -> dict[int, EmailMessage]:
@@ -314,7 +338,12 @@ def resolved_availability_ids(db: Session, events: list[CalendarEvent]) -> set[i
     # A newer request only replaces the old times when it offers times itself or drops the booking.
     followers = [
         message for message in later_messages
-        if message.label != "interview_invitation" or message.id in offer_source_ids
+        # A provider notice can say "you have an upcoming interview" without
+        # carrying a date/time. A scheduled classification alone is not proof
+        # that an availability request was booked; confirmed calendar rows are
+        # checked separately by _booked_by_event.
+        if message.label != "interview_scheduled"
+        and (message.label != "interview_invitation" or message.id in offer_source_ids)
     ]
     # Our Sent proposals stay labeled "other", but they are the source of newer availability.
     offer_sources = _emails_by_id(db, {source_id for source_id in offer_source_ids if source_id})
@@ -366,12 +395,56 @@ def pending_interview_requests(db: Session, mailbox_ids: list[int], now: datetim
             requests.append(message)
         elif message.id in unbooked_ids:
             requests.append(message)
+        elif message.label == "interview_scheduled":
+            # Only a successfully extracted confirmed CalendarEvent can close
+            # the request. Metadata-only reminders (for example BrightHire's
+            # recording notice) have no booked time and must leave it pending.
+            continue
         else:
             closers_by_mailbox.setdefault(message.mailbox_id, []).append(message)
     booked_events, linked_email_ids = _confirmed_bookings(db, mailbox_ids)
     booked_by_mailbox: dict[int, list[_BookingRef]] = {}
     for event in booked_events:
         booked_by_mailbox.setdefault(event.mailbox_id, []).append(event)
+
+    # An invitation whose own offered availability was already replaced by a
+    # confirmed booking is booked, even when that booking landed in a separate
+    # thread and the invitation carries no company/role to match on (a stale
+    # "RE: ADP Opportunity" invite otherwise lingers as "not booked" forever).
+    # The calendar records that fulfilment as superseded_by_event_id, so read
+    # it directly instead of re-deriving the link from fuzzy identity.
+    superseding = aliased(CalendarEvent)
+    fulfilled_availability = (
+        db.query(
+            CalendarEvent.id,
+            CalendarEvent.source_email_id,
+            superseding.source_received_at,
+            superseding.created_at,
+        )
+        .join(superseding, superseding.id == CalendarEvent.superseded_by_event_id)
+        .filter(
+            CalendarEvent.mailbox_id.in_(mailbox_ids),
+            CalendarEvent.kind == "availability",
+            superseding.kind == "confirmed",
+            superseding.is_visible.is_(True),
+        )
+        .all()
+    )
+    fulfilled_event_ids = [row.id for row in fulfilled_availability]
+    fulfilled_request_times: dict[int, datetime | None] = {
+        row.source_email_id: as_utc(row.source_received_at) or as_utc(row.created_at)
+        for row in fulfilled_availability
+        if row.source_email_id is not None
+    }
+    if fulfilled_event_ids:
+        booking_times = {
+            row.id: as_utc(row.source_received_at) or as_utc(row.created_at)
+            for row in fulfilled_availability
+        }
+        for link in db.query(CalendarEventEmail.event_id, CalendarEventEmail.email_id).filter(
+            CalendarEventEmail.event_id.in_(fulfilled_event_ids)
+        ).all():
+            fulfilled_request_times[link.email_id] = booking_times.get(link.event_id)
 
     pending: list[PendingInterview] = []
     newest_by_mailbox: dict[int, list[_MailRef]] = {}
@@ -390,6 +463,10 @@ def pending_interview_requests(db: Session, mailbox_ids: list[int], now: datetim
             continue
         if _booked_by_event(request, booked_by_mailbox.get(request.mailbox_id, ()), linked_email_ids):
             continue
+        if request.id in fulfilled_request_times:
+            booked_at = fulfilled_request_times[request.id]
+            if received is None or booked_at is None or booked_at >= received:
+                continue
         kind = "invitation" if request.label == "interview_invitation" else "reschedule"
         pending.append(PendingInterview(request, kind))
 

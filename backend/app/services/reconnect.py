@@ -2,7 +2,16 @@ from __future__ import annotations
 
 from app.models import MailboxConnection
 
-_RECONNECT_MARKERS = ("reconnect", "invalid_grant")
+# Match the exact phrasings the OAuth layer emits for a revoked/expired grant
+# (see oauth_google.py / oauth_microsoft.py). A bare "reconnect" is too broad:
+# an internal PendingRollbackError ("Can't reconnect until invalid transaction
+# is rolled back") also contains the word, and matching it wrongly froze the
+# mailbox as "sign-in expired" and made auto-sync skip it forever.
+_RECONNECT_MARKERS = (
+    "invalid_grant",
+    "reconnect this account",
+    "reconnect mailbox",
+)
 
 
 def needs_reconnect(error: str | None) -> bool:

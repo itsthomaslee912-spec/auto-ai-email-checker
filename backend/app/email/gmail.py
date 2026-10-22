@@ -540,6 +540,7 @@ def normalize_gmail_message(raw: dict) -> dict:
     headers = payload.get("headers") or []
     subject = _header(headers, "Subject")
     sender = _header(headers, "From")
+    recipients = _header(headers, "To")
     # Prefer Received-header delivery time: Date/internalDate can be hours early
     # for delayed/batched mail (e.g. ClinchTalent / Waymo digests).
     received_at = _gmail_received_at(raw, headers)
@@ -575,6 +576,7 @@ def normalize_gmail_message(raw: dict) -> dict:
         "thread_id": raw.get("threadId"),
         "subject": subject,
         "sender": sender,
+        "recipients": recipients,
         "received_at": received_at,
         "snippet": snippet,
         "body_text": body_text[:20000],

@@ -76,6 +76,7 @@ _LIST_COLUMNS = load_only(
     EmailMessage.provider_message_id,
     EmailMessage.subject,
     EmailMessage.sender,
+    EmailMessage.recipients,
     EmailMessage.received_at,
     EmailMessage.snippet,
     EmailMessage.label,
@@ -698,7 +699,11 @@ async def get_email(
             changed = True
 
     has_body = bool(html or text)
-    if not has_body:
+    # Rows created before recipient metadata was stored already have their
+    # body, so a body-only lazy load can never repair the incorrect Sent
+    # recipient shown by the reader. Refresh those legacy Sent rows once.
+    needs_recipients = email.folder == MailFolder.SENT.value and not (email.recipients or "").strip()
+    if not has_body or needs_recipients:
         mailbox = (
             db.query(MailboxConnection)
             .filter(MailboxConnection.id == email.mailbox_id, mailbox_scope())
@@ -714,6 +719,7 @@ async def get_email(
                     normalized = normalize_gmail_message(raw)
                     email.body_text = normalized.get("body_text") or email.body_text or ""
                     email.body_html = normalized.get("body_html") or email.body_html or ""
+                    email.recipients = normalized.get("recipients") or email.recipients or ""
                     if normalized.get("snippet"):
                         email.snippet = normalized["snippet"][:1000]
                     if normalized.get("folder"):
@@ -728,13 +734,19 @@ async def get_email(
                     normalized = normalize_outlook_message(raw)
                     email.body_text = normalized.get("body_text") or email.body_text or ""
                     email.body_html = normalized.get("body_html") or email.body_html or ""
+                    email.recipients = normalized.get("recipients") or email.recipients or ""
                     if normalized.get("snippet"):
                         email.snippet = normalized["snippet"][:1000]
                     if normalized.get("folder"):
                         email.folder = normalized["folder"]
                     changed = True
             except Exception as exc:
-                raise HTTPException(status_code=502, detail=f"Could not load email body: {exc}") from exc
+                # Recipient backfill is display metadata. If the saved body is
+                # available, a temporary provider failure must not prevent the
+                # user from opening the message.
+                if not has_body:
+                    raise HTTPException(status_code=502, detail=f"Could not load email body: {exc}") from exc
+                logger.warning("Could not backfill recipients for email_id=%s: %s", email.id, exc)
 
     if mark_read:
         read_targets = [email]
@@ -1023,7 +1035,12 @@ async def send_email(payload: SendEmailIn, db: Session = Depends(get_db)) -> Sen
     # for the next provider sync.
     sent = EmailMessage(
         mailbox_id=mailbox.id, provider_message_id=provider_message_id or f"local-sent-{datetime.now(timezone.utc).timestamp()}",
-        subject=payload.subject.strip() or "(no subject)", sender=f"To: {to_address}",
+        subject=payload.subject.strip() or "(no subject)",
+        sender=(
+            f"{mailbox.display_name} <{mailbox.email_address}>"
+            if mailbox.display_name else mailbox.email_address
+        ),
+        recipients=to_address,
         received_at=datetime.now(timezone.utc), snippet=payload.body_text[:500], body_text=payload.body_text,
         folder=MailFolder.SENT.value, is_read=True, label=EmailLabel.OTHER.value,
         thread_id=original.thread_id if original is not None else None,

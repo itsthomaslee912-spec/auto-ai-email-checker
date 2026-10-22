@@ -187,11 +187,21 @@ def init_db() -> None:
     from app import models  # noqa: F401
     from sqlalchemy import inspect, text
 
-    Base.metadata.create_all(bind=engine)
-
-    # Webhook delivery health must survive application restarts. These columns
-    # are safe to add on both PostgreSQL and SQLite installations.
+    # The API and every native worker start at roughly the same time and each
+    # calls init_db(). Serialize PostgreSQL schema initialization so two
+    # processes cannot both inspect a missing column and then race to add it.
+    # The transaction-scoped advisory lock is released automatically on commit,
+    # rollback, or process failure.
     with engine.begin() as conn:
+        if database_url.get_backend_name() == "postgresql":
+            conn.execute(text(
+                "SELECT pg_advisory_xact_lock(hashtext('auto_ai_email_checker_schema_init'))"
+            ))
+
+        Base.metadata.create_all(bind=conn)
+
+        # Webhook delivery health must survive application restarts. These
+        # columns are safe to add on both PostgreSQL and SQLite installations.
         tables = inspect(conn).get_table_names()
         if "webhook_subscriptions" in tables:
             webhook_cols = {
@@ -254,6 +264,10 @@ def init_db() -> None:
                 conn.execute(text(
                     "ALTER TABLE email_messages ADD COLUMN category_subtype VARCHAR(48)"
                 ))
+            if "recipients" not in email_cols:
+                conn.execute(text(
+                    "ALTER TABLE email_messages ADD COLUMN recipients TEXT DEFAULT ''"
+                ))
         if "calendar_events" in tables:
             calendar_cols = {c["name"] for c in inspect(conn).get_columns("calendar_events")}
             if "interviewer" not in calendar_cols:
@@ -263,6 +277,11 @@ def init_db() -> None:
             if "work_model" not in calendar_cols:
                 conn.execute(text(
                     "ALTER TABLE calendar_events ADD COLUMN work_model VARCHAR(32) DEFAULT 'unspecified'"
+                ))
+            if "company_human_corrected" not in calendar_cols:
+                conn.execute(text(
+                    "ALTER TABLE calendar_events "
+                    "ADD COLUMN company_human_corrected BOOLEAN DEFAULT FALSE"
                 ))
             if {"interview_status", "is_visible"}.issubset(calendar_cols):
                 # Cancellations used to be hidden. Preserve those historical
@@ -513,48 +532,59 @@ def init_db() -> None:
 
     if database_url.get_backend_name() == "postgresql":
         with engine.begin() as conn:
+            # Keep the PostgreSQL-only backfills/index creation under the same
+            # cross-process startup lock as the portable migrations above.
+            conn.execute(text(
+                "SELECT pg_advisory_xact_lock(hashtext('auto_ai_email_checker_schema_init'))"
+            ))
             if "email_messages" in inspect(conn).get_table_names():
                 # Backfill rows where is_read is NULL (added before server DEFAULT was set).
                 conn.execute(text("UPDATE email_messages SET is_read = FALSE WHERE is_read IS NULL"))
-                conn.execute(text(
-                    "CREATE INDEX IF NOT EXISTS ix_email_messages_received_id "
-                    "ON email_messages (received_at DESC NULLS LAST, id DESC)"
-                ))
-                conn.execute(text(
-                    "CREATE INDEX IF NOT EXISTS ix_email_messages_label_received "
-                    "ON email_messages (label, received_at DESC NULLS LAST, id DESC)"
-                ))
-                conn.execute(text(
-                    "CREATE INDEX IF NOT EXISTS ix_email_messages_folder_received "
-                    "ON email_messages (folder, received_at DESC NULLS LAST, id DESC)"
-                ))
-                conn.execute(text(
-                    "CREATE INDEX IF NOT EXISTS ix_email_messages_sidebar_counts "
-                    "ON email_messages (mailbox_id, label, folder, is_read)"
-                ))
-                conn.execute(text(
-                    "CREATE INDEX IF NOT EXISTS ix_email_messages_thread "
-                    "ON email_messages (mailbox_id, thread_id, received_at DESC, id DESC)"
-                ))
-                # Mailbox-scoped list queries: filter by mailbox_id then sort.
-                # Leading mailbox_id lets the planner avoid a full-table sort.
-                conn.execute(text(
-                    "CREATE INDEX IF NOT EXISTS ix_email_messages_mailbox_received "
-                    "ON email_messages (mailbox_id, received_at DESC NULLS LAST, id DESC)"
-                ))
-                conn.execute(text(
-                    "CREATE INDEX IF NOT EXISTS ix_email_messages_mailbox_label_received "
-                    "ON email_messages (mailbox_id, label, received_at DESC NULLS LAST, id DESC)"
-                ))
-                conn.execute(text(
-                    "CREATE INDEX IF NOT EXISTS ix_email_messages_mailbox_folder_received "
-                    "ON email_messages (mailbox_id, folder, received_at DESC NULLS LAST, id DESC)"
-                ))
-                conn.execute(text(
-                    "CREATE INDEX IF NOT EXISTS ix_email_messages_mailbox_unread_received "
-                    "ON email_messages (mailbox_id, is_read, received_at DESC NULLS LAST, id DESC)"
-                ))
-                _ensure_search_index(conn)
+                index_statements = {
+                    "ix_email_messages_received_id":
+                        "CREATE INDEX ix_email_messages_received_id "
+                        "ON email_messages (received_at DESC NULLS LAST, id DESC)",
+                    "ix_email_messages_label_received":
+                        "CREATE INDEX ix_email_messages_label_received "
+                        "ON email_messages (label, received_at DESC NULLS LAST, id DESC)",
+                    "ix_email_messages_folder_received":
+                        "CREATE INDEX ix_email_messages_folder_received "
+                        "ON email_messages (folder, received_at DESC NULLS LAST, id DESC)",
+                    "ix_email_messages_sidebar_counts":
+                        "CREATE INDEX ix_email_messages_sidebar_counts "
+                        "ON email_messages (mailbox_id, label, folder, is_read)",
+                    "ix_email_messages_thread":
+                        "CREATE INDEX ix_email_messages_thread "
+                        "ON email_messages (mailbox_id, thread_id, received_at DESC, id DESC)",
+                    # Mailbox-scoped list queries filter by mailbox_id then sort.
+                    "ix_email_messages_mailbox_received":
+                        "CREATE INDEX ix_email_messages_mailbox_received "
+                        "ON email_messages (mailbox_id, received_at DESC NULLS LAST, id DESC)",
+                    "ix_email_messages_mailbox_label_received":
+                        "CREATE INDEX ix_email_messages_mailbox_label_received "
+                        "ON email_messages (mailbox_id, label, received_at DESC NULLS LAST, id DESC)",
+                    "ix_email_messages_mailbox_folder_received":
+                        "CREATE INDEX ix_email_messages_mailbox_folder_received "
+                        "ON email_messages (mailbox_id, folder, received_at DESC NULLS LAST, id DESC)",
+                    "ix_email_messages_mailbox_unread_received":
+                        "CREATE INDEX ix_email_messages_mailbox_unread_received "
+                        "ON email_messages (mailbox_id, is_read, received_at DESC NULLS LAST, id DESC)",
+                }
+                for index_name, ddl in index_statements.items():
+                    # CREATE INDEX IF NOT EXISTS still acquires a table lock
+                    # before discovering that the index exists. Avoid that
+                    # lock entirely during normal application restarts.
+                    exists = conn.execute(
+                        text("SELECT to_regclass(:name) IS NOT NULL"),
+                        {"name": index_name},
+                    ).scalar()
+                    if not exists:
+                        conn.execute(text(ddl))
+                search_index_exists = conn.execute(
+                    text("SELECT to_regclass('ix_email_messages_search_trgm') IS NOT NULL")
+                ).scalar()
+                if not search_index_exists:
+                    _ensure_search_index(conn)
 
     seed_default_classify_prompt()
     seed_admin_account()

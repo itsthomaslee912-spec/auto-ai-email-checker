@@ -6,6 +6,7 @@ import ModernDateTimePicker from "../components/ModernDateTimePicker";
 import { accountColor, accountInk, defaultAccountColor } from "../accountColor";
 import {
   createCalendarEvent,
+  deleteCalendarEvent,
   openEvents,
   fetchCalendarEvents,
   fetchCalendarEventEmails,
@@ -1216,6 +1217,7 @@ export default function CalendarPage({
   const [sidebarClosing, setSidebarClosing] = useState(false);
   const [emailMessages, setEmailMessages] = useState<EmailDetail[]>([]); const [emailLoading, setEmailLoading] = useState(false); const [emailError, setEmailError] = useState(""); const [expandedEmailId, setExpandedEmailId] = useState<number | null>(null);
   const [editor, setEditor] = useState<Editor | null>(null); const [saving, setSaving] = useState(false); const [saveError, setSaveError] = useState("");
+  const [deleting, setDeleting] = useState(false);
   const [statusSaving, setStatusSaving] = useState(false); const [statusError, setStatusError] = useState("");
   const [dragSelection, setDragSelection] = useState<DragSelection | null>(null);
   const [hourHeight, setHourHeight] = useState(HOUR_HEIGHT);
@@ -1314,7 +1316,7 @@ export default function CalendarPage({
       if (hasOpened) onChange();
       hasOpened = true;
     };
-    source.addEventListener("open", onOpen);
+    source.addEventListener("connected", onOpen);
     source.addEventListener("calendar.changed", onChange);
     return () => {
       window.clearTimeout(timer);
@@ -1387,7 +1389,10 @@ export default function CalendarPage({
   }, [view, start.getTime(), hourHeight]);
   useEffect(() => {
     setEmailMessages([]); setEmailError(""); setExpandedEmailId(null); setStatusError("");
-    if (!selected) return;
+    if (!selected || selected.origin === "manual") {
+      setEmailLoading(false);
+      return;
+    }
     let active = true; setEmailLoading(true);
     fetchCalendarEventEmails(selected.id).then((messages) => {
       if (!active) return;
@@ -1531,7 +1536,7 @@ export default function CalendarPage({
   };
 
   const confirmInterviewStatus = async (next: ConfirmableStatus, applicationStatus?: CalendarEvent["application_status"]) => {
-    if (!selected || selected.kind !== "confirmed" || statusSaving || cardStatus(selected).key === next) return;
+    if (!selected || selected.origin !== "manual" || selected.kind !== "confirmed" || statusSaving || cardStatus(selected).key === next) return;
     setStatusSaving(true);
     setStatusError("");
     const payload: CalendarEventPayload = next === "canceled"
@@ -1549,6 +1554,23 @@ export default function CalendarPage({
       setStatusError(err instanceof Error ? err.message : "Failed to confirm interview status");
     } finally {
       setStatusSaving(false);
+    }
+  };
+
+  const deleteSelectedEvent = async () => {
+    if (!selected || selected.origin !== "manual" || deleting) return;
+    if (!window.confirm(`Delete “${selected.title}”? This cannot be undone.`)) return;
+    setDeleting(true);
+    setStatusError("");
+    try {
+      await deleteCalendarEvent(selected.id);
+      CALENDAR_RANGE_CACHE.clear();
+      setEvents((current) => current.filter((event) => event.id !== selected.id));
+      setSelected(null);
+    } catch (err) {
+      setStatusError(err instanceof Error ? err.message : "Failed to delete event");
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -1677,11 +1699,12 @@ export default function CalendarPage({
           </dl>
           {statusError && <p className="error-text">{statusError}</p>}
 
-          {selected.kind === "confirmed" && <div className="details-actions">
-            {selected.kind === "confirmed" && <button className="details-secondary-action" type="button" onClick={() => setEditor(editorFor(new Date(selected.start_at), selected.mailbox_id, timeZone, selected))}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m10.8 2.7 2.5 2.5-7.7 7.7-3 .5.5-3 7.7-7.7ZM9.4 4.1l2.5 2.5" /></svg>Edit event</button>}
+          {selected.kind === "confirmed" && selected.origin === "manual" && <div className="details-actions">
+            <button className="details-secondary-action" type="button" onClick={() => setEditor(editorFor(new Date(selected.start_at), selected.mailbox_id, timeZone, selected))}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m10.8 2.7 2.5 2.5-7.7 7.7-3 .5.5-3 7.7-7.7ZM9.4 4.1l2.5 2.5" /></svg>Edit event</button>
+            <button className="details-secondary-action is-danger" type="button" disabled={deleting} onClick={() => void deleteSelectedEvent()}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4h10M6 4V2.8h4V4m1.7 0-.6 9H4.9l-.6-9M6.5 6.5v4.2m3-4.2v4.2" /></svg>{deleting ? "Deleting…" : "Delete event"}</button>
           </div>}
 
-          <section className="source-email">
+          {selected.origin === "email" && <section className="source-email">
             <div className="source-email-heading">
               <span className="source-email-icon"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="2" /><path d="m3 5 5 4 5-4" /></svg></span>
               <div><h3>Associated emails</h3><p>{emailLoading ? "Loading linked messages…" : `${emailMessages.length} linked message${emailMessages.length === 1 ? "" : "s"}`}</p></div>
@@ -1696,7 +1719,7 @@ export default function CalendarPage({
                 const messageStatus = selected.kind === "confirmed" ? emailInterviewStatus(message) : null;
                 const statusMatches = messageStatus != null && selectedStatus?.key === messageStatus.key;
                 return <li key={message.id}>
-                  {messageStatus && !(messageStatus.key === "active" && statusMatches) && <div className="source-email-status-bar"><span className={`source-email-status ${messageStatus.className}`}>{messageStatus.label}</span>{statusMatches ? <span className="source-email-status-match">Confirmed for this interview</span> : <button type="button" disabled={statusSaving} onClick={() => void confirmInterviewStatus(messageStatus.key, messageStatus.applicationStatus)}>Confirm this status</button>}</div>}
+                  {messageStatus && !(messageStatus.key === "active" && statusMatches) && <div className="source-email-status-bar"><span className={`source-email-status ${messageStatus.className}`}>{messageStatus.label}</span>{statusMatches || selected.origin === "email" ? <span className="source-email-status-match">{statusMatches ? "Confirmed for this interview" : "Detected from email"}</span> : <button type="button" disabled={statusSaving} onClick={() => void confirmInterviewStatus(messageStatus.key, messageStatus.applicationStatus)}>Confirm this status</button>}</div>}
                   <button className="source-email-list-item" type="button" aria-expanded={expanded} onClick={() => {
                     if (expanded) {
                       setExpandedEmailId(null);
@@ -1716,7 +1739,7 @@ export default function CalendarPage({
                 </li>;
               })}
             </ol>}
-          </section>
+          </section>}
         </div>
       </aside> : <aside className="calendar-sidebar">
         <section className="calendar-status-card">

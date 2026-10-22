@@ -21,7 +21,12 @@ async def run_service(
     heartbeat_path: str | None = None,
 ) -> None:
     """Run one background service with a shared shutdown and health lifecycle."""
-    if get_settings().run_db_init:
+    settings = get_settings()
+    # In the distributed local runtime the API owns schema initialization.
+    # Starting every worker with DDL caused concurrent ALTER TABLE races and
+    # could take the API offline. A standalone worker still initializes its
+    # database for backwards-compatible development usage.
+    if settings.run_db_init and not settings.distributed_runtime:
         init_db()
     stop_event = asyncio.Event()
     event_loop = asyncio.get_running_loop()

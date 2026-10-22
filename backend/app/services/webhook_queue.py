@@ -16,6 +16,11 @@ logger = logging.getLogger(__name__)
 _wake_event = asyncio.Event()
 WEBHOOK_JOB_TIMEOUT_SECONDS = 300
 WEBHOOK_WORKER_CONCURRENCY = 4
+# After this many failed attempts a job is parked as "failed" instead of being
+# retried forever. Safety polling still reconciles the mailbox, so a dead broker
+# notification is not lost data -- it just stops churning the queue (and the
+# "inbound mail" monitor counter) on a notification that cannot be processed.
+WEBHOOK_JOB_MAX_ATTEMPTS = 8
 
 
 def _dedupe_key(provider: str, provider_id: str | None, payload: dict) -> str:
@@ -138,10 +143,20 @@ def _retry_job(job_id: int, attempts: int, exc: Exception) -> None:
         job = db.get(WebhookDeliveryJob, job_id)
         if job is None:
             return
-        job.status = "pending"
+        job.last_error = (str(exc) or exc.__class__.__name__)[:512]
         job.claimed_at = None
-        job.available_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
-        job.last_error = str(exc)[:512]
+        if attempts >= WEBHOOK_JOB_MAX_ATTEMPTS:
+            # Stop retrying a notification that keeps failing; safety polling
+            # will still reconcile the mailbox. Parking it clears the stuck
+            # "processing"/"pending" count instead of churning indefinitely.
+            job.status = "failed"
+            logger.error(
+                "Webhook job %s failed after %s attempts; parking as failed",
+                job_id, attempts,
+            )
+        else:
+            job.status = "pending"
+            job.available_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
         db.commit()
 
 

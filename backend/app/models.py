@@ -128,6 +128,10 @@ class EmailMessage(Base):
     thread_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     subject: Mapped[str] = mapped_column(String(998), default="")
     sender: Mapped[str] = mapped_column(String(512), default="")
+    # Provider To header / recipients. Keeping this separate from sender is
+    # essential for Sent mail: the sender is the connected account while the
+    # reader must show the external recipient.
+    recipients: Mapped[str] = mapped_column(Text, default="")
     received_at: Mapped[datetime | None] = mapped_column(UtcDateTime(), nullable=True)
     snippet: Mapped[str] = mapped_column(Text, default="")
     body_text: Mapped[str] = mapped_column(Text, default="")
@@ -314,6 +318,7 @@ class CalendarEvent(Base):
     origin: Mapped[str] = mapped_column(String(16), default="email")
     title: Mapped[str] = mapped_column(String(512), default="Interview")
     company: Mapped[str] = mapped_column(String(255), default="")
+    company_human_corrected: Mapped[bool] = mapped_column(Boolean, default=False)
     job_role: Mapped[str] = mapped_column(String(255), default="")
     interviewer: Mapped[str] = mapped_column(String(255), default="")
     work_model: Mapped[str] = mapped_column(String(32), default="unspecified")

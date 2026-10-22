@@ -53,9 +53,13 @@ def test_normalize_gmail_message_stamps_folder():
         "id": "g1",
         "labelIds": ["SPAM"],
         "snippet": "hello",
-        "payload": {"headers": [{"name": "Subject", "value": "Hi"}]},
+        "payload": {"headers": [
+            {"name": "Subject", "value": "Hi"},
+            {"name": "To", "value": "Deana Coffey <deana.coffey@example.com>"},
+        ]},
     }
     assert normalize_gmail_message(raw)["folder"] == MailFolder.SPAM.value
+    assert normalize_gmail_message(raw)["recipients"] == "Deana Coffey <deana.coffey@example.com>"
     sent = {
         "id": "g-sent",
         "labelIds": ["SENT"],
@@ -89,9 +93,11 @@ def test_normalize_outlook_message_stamps_folder():
         "subject": "Hi",
         "_mail_folder": "deleteditems",
         "from": {"emailAddress": {"address": "a@b.com"}},
+        "toRecipients": [{"emailAddress": {"name": "Deana Coffey", "address": "deana@example.com"}}],
         "body": {"contentType": "text", "content": "hello"},
     }
     assert normalize_outlook_message(raw)["folder"] == MailFolder.TRASH.value
+    assert normalize_outlook_message(raw)["recipients"] == "Deana Coffey <deana@example.com>"
 
 
 def test_normalize_outlook_message_keeps_unread_state():

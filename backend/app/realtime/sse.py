@@ -31,9 +31,6 @@ async def subscribe() -> AsyncIterator[str]:
 
 
 async def publish(event: str, data: dict[str, Any]) -> None:
-    if event == "calendar.changed":
-        from app.services.pending_interviews import invalidate_calendar_read_cache
-        invalidate_calendar_read_cache()
     def persist() -> dict[str, Any]:
         with SessionLocal() as db:
             try:
@@ -53,6 +50,14 @@ async def publish(event: str, data: dict[str, Any]) -> None:
 
 async def broadcast_envelope(envelope: dict[str, Any]) -> None:
     """Fan out an already-persisted envelope inside this API process."""
+    # Calendar changes can originate in this API process or arrive from a
+    # worker through RabbitMQ.  In both cases the API replica that serves the
+    # next calendar request must discard its process-local pending-interview
+    # snapshot before notifying the browser to refetch it.
+    if envelope.get("event") == "calendar.changed":
+        from app.services.pending_interviews import invalidate_calendar_read_cache
+
+        invalidate_calendar_read_cache()
     payload = json.dumps(envelope, default=str)
     dead: list[asyncio.Queue[str]] = []
     for queue in list(_subscribers):

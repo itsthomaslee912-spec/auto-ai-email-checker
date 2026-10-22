@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -79,3 +81,20 @@ def test_notification_delivery_preserves_browser_event_contract():
         "user_id": 5,
         "data": {"mailbox_id": 8},
     }
+
+
+def test_remote_calendar_notification_invalidates_api_calendar_cache():
+    """Worker-originated changes must invalidate this API replica before refetch."""
+    from app.realtime import sse
+    from app.services import pending_interviews
+
+    pending_interviews._booking_cache[("booking",)] = (0.0, ([], {}))
+    pending_interviews._follower_cache[("followers",)] = (0.0, [])
+
+    asyncio.run(sse.broadcast_envelope({
+        "event": "calendar.changed",
+        "data": {"mailbox_id": 8},
+    }))
+
+    assert pending_interviews._booking_cache == {}
+    assert pending_interviews._follower_cache == {}

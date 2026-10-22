@@ -207,6 +207,11 @@ def list_calendar_event_emails(event_id: int, db: Session = Depends(get_db)) -> 
     event = _event_query(db).filter(CalendarEvent.id == event_id).one_or_none()
     if event is None:
         raise HTTPException(status_code=404, detail="Calendar event not found")
+    # Manual events are owned entirely by the user. Older app versions could
+    # persist a fuzzy outcome/source link on them; never expose that legacy
+    # association as if the message created or updated the manual event.
+    if event.origin == "manual":
+        return []
 
     # Include legacy availability rows that were folded into this confirmed
     # event. This recovers invitations created before durable links existed.
@@ -316,11 +321,19 @@ async def update_calendar_event(
     event = _event_query(db).filter(CalendarEvent.id == event_id).one_or_none()
     if event is None:
         raise HTTPException(status_code=404, detail="Calendar event not found")
+    if event.origin != "manual":
+        raise HTTPException(
+            status_code=403,
+            detail="Email-extracted calendar events are read-only",
+        )
     fields = payload.model_fields_set
     if "title" in fields and payload.title is not None:
         event.title = payload.title.strip()
     if "company" in fields:
         event.company = (payload.company or "").strip()
+        # User corrections are authoritative; calendar backfill must not
+        # replace this value with a later heuristic extraction.
+        event.company_human_corrected = True
     if "role" in fields:
         event.job_role = (payload.role or "").strip()
     if "interviewer" in fields:
@@ -347,6 +360,12 @@ async def update_calendar_event(
         event.phone_number = _validate_phone(payload.phone_number)
     if "phone_access_code" in fields:
         event.phone_access_code = (payload.phone_access_code or "").strip() or None
+    if "company" in fields and "title" not in fields and event.origin == "email":
+        event.title = (
+            f"{event.company} — {event.job_role}"
+            if event.company and event.job_role
+            else event.company or event.job_role or event.title
+        )
     start_at = payload.start_at if "start_at" in fields and payload.start_at is not None else event.start_at
     end_at = payload.end_at if "end_at" in fields and payload.end_at is not None else event.end_at
     event.start_at, event.end_at = _validate_times(start_at, end_at)
@@ -354,3 +373,26 @@ async def update_calendar_event(
     db.refresh(event)
     await publish("calendar.changed", {"action": "updated", "event_id": event.id, "mailbox_id": event.mailbox_id})
     return _event_out(event)
+
+
+@router.delete("/{event_id}", status_code=204)
+async def delete_calendar_event(
+    event_id: int,
+    db: Session = Depends(get_db),
+) -> None:
+    """Delete a user-created calendar event; extracted events remain durable."""
+    event = _event_query(db).filter(CalendarEvent.id == event_id).one_or_none()
+    if event is None:
+        raise HTTPException(status_code=404, detail="Calendar event not found")
+    if event.origin != "manual":
+        raise HTTPException(
+            status_code=403,
+            detail="Email-extracted calendar events cannot be deleted",
+        )
+    mailbox_id = event.mailbox_id
+    db.delete(event)
+    db.commit()
+    await publish(
+        "calendar.changed",
+        {"action": "deleted", "event_id": event_id, "mailbox_id": mailbox_id},
+    )

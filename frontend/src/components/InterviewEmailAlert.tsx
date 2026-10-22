@@ -87,12 +87,17 @@ function buildRows(pending: PendingInterview[], mail: MailAlert[]) {
   const scheduled: Row[] = [];
   for (const item of mail) {
     if (pendingIds.has(item.email_id)) continue;
+    // Invitation rows belong in the attention modal only when the backend's
+    // pending-interview resolver says they are still unresolved.  The unread
+    // alerts feed is intentionally broader and can still contain the original
+    // invitation after a later message/ICS books it (often in another thread).
+    if (item.label === "interview_invitation") continue;
     const row: Row = {
       emailId: item.email_id,
       mailboxId: item.mailbox_id,
       account: item.email_account,
-      kind: item.label === "interview_invitation" && !item.start_at ? "invitation" : "scheduled",
-      subtype: item.label === "interview_invitation" ? "booked" : item.interview_subtype,
+      kind: "scheduled",
+      subtype: item.interview_subtype,
       company: item.company,
       role: item.role,
       subject: item.subject,
@@ -223,7 +228,7 @@ export default function InterviewEmailAlert({ mailboxes, refreshKey, suppressed,
     const first = window.setTimeout(() => { void refresh(); }, 1500);
     const timer = window.setInterval(() => { void refresh(); }, REFRESH_MS);
     const source = openEvents();
-    const names = ["email.classified", "sync.done", "calendar.changed"];
+    const names = ["connected", "email.classified", "sync.done", "calendar.changed"];
     names.forEach((name) => source.addEventListener(name, scheduleRefresh));
     return () => {
       window.clearTimeout(first);

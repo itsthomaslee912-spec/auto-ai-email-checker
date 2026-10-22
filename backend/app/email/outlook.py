@@ -198,7 +198,7 @@ async def outlook_get_message(
             f"{GRAPH}/me/messages/{message_id}",
             headers={"Authorization": f"Bearer {access_token}"},
             params={
-                "$select": "id,subject,from,receivedDateTime,bodyPreview,body,conversationId,parentFolderId,isRead",
+                "$select": "id,subject,from,toRecipients,receivedDateTime,bodyPreview,body,conversationId,parentFolderId,isRead",
             },
         )
 
@@ -238,7 +238,7 @@ async def outlook_list_recent(
     folders = ("inbox", "junkemail", "deleteditems", "archive", "sentitems")
     collected: dict[str, dict] = {}
     per_folder = max(1, top)
-    select = "id,subject,from,receivedDateTime,bodyPreview,body,conversationId,isRead"
+    select = "id,subject,from,toRecipients,receivedDateTime,bodyPreview,body,conversationId,isRead"
     async with httpx.AsyncClient(timeout=60) as client:
         for folder in folders:
             messages: list[dict] = []
@@ -309,6 +309,16 @@ async def outlook_attach_folder(access_token: str, raw: dict) -> dict:
 def normalize_outlook_message(raw: dict) -> dict:
     sender_obj = ((raw.get("from") or {}).get("emailAddress") or {})
     sender = sender_obj.get("address") or sender_obj.get("name") or ""
+    recipients = ", ".join(
+        (
+            f'{address.get("name")} <{address.get("address")}>'
+            if address.get("name") and address.get("address")
+            else address.get("address") or address.get("name") or ""
+        )
+        for item in raw.get("toRecipients") or []
+        for address in [(item.get("emailAddress") or {})]
+        if address.get("address") or address.get("name")
+    )
     received_raw = raw.get("receivedDateTime")
     received_at = None
     if received_raw:
@@ -342,6 +352,7 @@ def normalize_outlook_message(raw: dict) -> dict:
         "thread_id": raw.get("conversationId"),
         "subject": raw.get("subject") or "",
         "sender": sender,
+        "recipients": recipients,
         "received_at": received_at,
         "snippet": snippet,
         "body_text": body_text[:20000],

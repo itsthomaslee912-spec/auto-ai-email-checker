@@ -122,6 +122,7 @@ export interface EmailItem {
   provider_message_id: string;
   subject: string;
   sender: string;
+  recipients?: string;
   received_at: string | null;
   snippet: string;
   company?: string | null;
@@ -656,6 +657,13 @@ export async function updateCalendarEvent(id: number, payload: CalendarEventPayl
   });
   if (!res.ok) throw new Error(await readApiError(res, "Failed to update event"));
   return res.json();
+}
+
+export async function deleteCalendarEvent(id: number): Promise<void> {
+  const res = await apiFetch(`${API_BASE}/api/calendar-events/${id}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error(await readApiError(res, "Failed to delete event"));
 }
 
 export interface AiStatus {

@@ -232,6 +232,11 @@ function senderName(sender: string): string {
   return sender || "Unknown";
 }
 
+function firstAddress(value: string): string {
+  const first = value.split(",", 1)[0]?.trim() ?? "";
+  return (first.match(/<([^>]+)>/)?.[1] ?? first).trim();
+}
+
 function initialsFrom(text: string): string {
   const clean = text.replace(/@.*/, "").replace(/[^a-zA-Z0-9 ]/g, " ").trim();
   const parts = clean.split(/\s+/).filter(Boolean);
@@ -1951,7 +1956,10 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     const run = async () => {
       setSendingReply(true);
       try {
-        await sendEmail({ mailbox_id: replyMailbox.id, to_address: selected.sender.match(/<([^>]+)>/)?.[1] ?? selected.sender, subject: /^re:/i.test(selected.subject) ? selected.subject : `Re: ${selected.subject}`, body_text: replyText, attachments: await filePayload(replyFiles), reply_to_email_id: selected.id });
+        const toAddress = selected.folder === "sent" && selected.recipients
+          ? firstAddress(selected.recipients)
+          : firstAddress(selected.sender);
+        await sendEmail({ mailbox_id: replyMailbox.id, to_address: toAddress, subject: /^re:/i.test(selected.subject) ? selected.subject : `Re: ${selected.subject}`, body_text: replyText, attachments: await filePayload(replyFiles), reply_to_email_id: selected.id });
         setBanner(scheduleAt ? "Reply scheduled and sent." : "Reply sent. It is now in Sent.");
         setReplyOpen(false); setReplyText(""); setReplyInstruction(""); setReplyFiles([]); setScheduleAt("");
         if (folder === "sent") void loadFirstPage();
@@ -2110,6 +2118,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   const selectedSenderAddress = selected
     ? (selected.sender.match(/<([^>]+)>/)?.[1] ?? (selected.sender.includes("@") ? selected.sender.trim() : "")).trim()
     : "";
+  const readerRecipient = selected?.folder === "sent" && selected.recipients
+    ? selected.recipients
+    : readerAccount;
   const conversationMessages = conversationView && threadMessages.length > 1 ? threadMessages : [];
   const selectedThreadIndex = selected == null ? -1 : conversationMessages.findIndex((message) => message.id === selected.id);
   const showConversation = selectedThreadIndex >= 0;
@@ -2134,6 +2145,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     const name = senderName(message.sender);
     const preview = (message.snippet || message.body_text || "").replace(/\s+/g, " ").trim();
     const read = message.id === selected?.id ? Boolean(selected.is_read) : message.is_read;
+    const recipient = message.folder === "sent" && message.recipients
+      ? message.recipients
+      : readerAccount;
     return (
       <section key={message.id} className={`thread-card${open ? " is-open" : ""}${read ? "" : " is-unread"}`}>
         <button
@@ -2151,7 +2165,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         </button>
         {open && (
           <>
-            {readerAccount ? <p className="thread-to">to <span className="to-address">{readerAccount}</span></p> : null}
+            {recipient ? <p className="thread-to">to <span className="to-address">{recipient}</span></p> : null}
             {message.label === "application_action_required" ? (
               <ApplicationActionCopies
                 subject={message.subject}
@@ -2969,15 +2983,15 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                       ) : null}
                     </div>
                     <div className="reader-chips">
-                      {readerAccount ? (
+                      {readerRecipient ? (
                         <span
                           className="reader-chip reader-to-chip"
-                          title={readerAccount}
+                          title={readerRecipient}
                           style={readerMailbox ? ({ "--account-color": accountColor(readerMailbox) } as CSSProperties) : undefined}
                         >
                           <span className="reader-to-dot" aria-hidden="true" />
                           <span className="reader-to-label">To</span>
-                          <span className="to-address">{readerAccount}</span>
+                          <span className="to-address">{readerRecipient}</span>
                         </span>
                       ) : null}
                       <span className={`folder-pill folder-${mailFolderOf(selected)}`}>
@@ -3096,7 +3110,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                 <section className="reply-composer" aria-label="Reply composer">
                   <header>
                     <strong>Reply</strong>
-                    <span>From {replyMailbox?.email_address ?? "selected account"} to {selected.sender}</span>
+                    <span>From {replyMailbox?.email_address ?? "selected account"} to {selected.folder === "sent" && selected.recipients ? selected.recipients : selected.sender}</span>
                   </header>
                   <textarea autoFocus value={replyText} onChange={(event) => setReplyText(event.target.value)} placeholder="Write your reply" />
                   <form className="reply-ai-prompt" onSubmit={(event) => { event.preventDefault(); void draftAiReply(); }}>
