@@ -102,7 +102,7 @@ def _email_calendar_events(db: Session):
 
 # Bump when deterministic extraction semantics change so stored messages can
 # be reprocessed by maintenance/backfill paths.
-_CALENDAR_EXTRACT_VERSION = "5"
+_CALENDAR_EXTRACT_VERSION = "6"
 _SCHEDULE_TOKEN_RE = re.compile(
     r"https://[^\s<>\"']+/schedule/(?P<token>[a-z0-9-]{12,})(?=[/?.#\s<>\"']|$)",
     re.I,
@@ -293,6 +293,13 @@ _TRAILING_LIST_ZONE_RE = re.compile(
 )
 
 DEFAULT_INTERVIEW_DURATION = timedelta(minutes=30)
+
+# A dated interview agenda can list several panel segments. Back-to-back
+# segments with short breaks are one booked block; once the gap between two
+# consecutive segments exceeds this, they are separate commitments on the day
+# (e.g. a 1:45 PM session and a 6:00 PM session three hours later) and each
+# becomes its own calendar block rather than one artificial multi-hour envelope.
+_AGENDA_SEGMENT_GAP = timedelta(hours=2)
 
 EXTRACT_PROMPT = """Extract interview calendar details from the supplied recruiting email conversation.
 Return one JSON object only with this shape:
@@ -593,23 +600,27 @@ def _next_weekday_on_or_after(reference: datetime, weekday: int) -> datetime:
     return (reference + timedelta(days=days_ahead)).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def _agenda_envelope_slot(
+def _agenda_envelope_slots(
     source: str,
     position: int,
     date_end: int,
     year: int,
     month: int,
     day: int,
-) -> ExtractedSlot | None:
-    """Return the outer block for a dated, multi-segment interview agenda.
+) -> list[ExtractedSlot]:
+    """Return one block per contiguous run of a dated interview agenda.
 
     ATS reminders often list several panel segments and breaks beneath one date.
-    Those segments are one booked interview block on the user's calendar, not
-    unrelated availability choices and not merely the first agenda row.
+    Back-to-back segments (short breaks) are one booked interview block on the
+    user's calendar, not unrelated availability choices and not merely the first
+    agenda row. A long break between two segments, however, marks two separate
+    commitments on the day — a 1:45 PM session and a 6:00 PM session are not one
+    five-hour event — so segments are grouped into runs split at long gaps and
+    each run becomes its own block.
     """
     lead_in = source[max(0, position - 160) : date_end]
     if not re.search(r"\bagenda\s*:?", lead_in, re.I):
-        return None
+        return []
     scope_end = min(len(source), date_end + 1800)
     for pattern in _DATE_PATTERNS:
         next_date = pattern.search(source, date_end + 8, scope_end)
@@ -654,12 +665,24 @@ def _agenda_envelope_slot(
         ranges.append((start.astimezone(timezone.utc), end.astimezone(timezone.utc), zone_name))
         offset += len(line)
     if len(ranges) < 2:
-        return None
-    start_at = min(item[0] for item in ranges)
-    end_at = max(item[1] for item in ranges)
-    if not timedelta(0) < end_at - start_at <= timedelta(hours=12):
-        return None
-    return ExtractedSlot(start_at, end_at, ranges[0][2], True, False)
+        return []
+    ranges.sort(key=lambda item: item[0])
+    # Split the day's segments into runs wherever a long break separates two
+    # consecutive segments; back-to-back segments stay in one run.
+    runs: list[list[tuple[datetime, datetime, str]]] = [[ranges[0]]]
+    for previous, current in zip(ranges, ranges[1:]):
+        if current[0] - previous[1] > _AGENDA_SEGMENT_GAP:
+            runs.append([current])
+        else:
+            runs[-1].append(current)
+    slots: list[ExtractedSlot] = []
+    for run in runs:
+        start_at = min(item[0] for item in run)
+        end_at = max(item[1] for item in run)
+        if not timedelta(0) < end_at - start_at <= timedelta(hours=12):
+            continue
+        slots.append(ExtractedSlot(start_at, end_at, run[0][2], True, False))
+    return slots
 
 
 def _slot_from_date_and_nearby_times(
@@ -670,16 +693,16 @@ def _slot_from_date_and_nearby_times(
     month: int,
     day: int,
     reference: datetime | None,
-) -> ExtractedSlot | None:
+) -> list[ExtractedSlot]:
     line_prefix = source[max(0, source.rfind("\n", 0, position) + 1) : position]
     if re.search(r"\bSent\s*:\s*[^\n]{0,100}$", line_prefix, re.I):
-        return None
+        return []
     window = source[date_end : date_end + 240]
     if re.search(r"\bwrote\s*:", window[:160], re.I) and re.search(r"\bOn\s+[^\n]{0,100}$", line_prefix, re.I):
-        return None
-    agenda_slot = _agenda_envelope_slot(source, position, date_end, year, month, day)
-    if agenda_slot is not None:
-        return agenda_slot
+        return []
+    agenda_slots = _agenda_envelope_slots(source, position, date_end, year, month, day)
+    if agenda_slots:
+        return agenda_slots
     times = list(_TIME_PATTERN.finditer(source, date_end, date_end + 240))
     lookback_start = max(0, position - 90)
     before_times = list(_TIME_PATTERN.finditer(source, lookback_start, position))
@@ -696,7 +719,7 @@ def _slot_from_date_and_nearby_times(
             else:
                 times = [before_times[-1]]
     if not times or (times[0].start() >= date_end and times[0].start() - date_end > 100):
-        return None
+        return []
     after_clock = source[times[0].end() : times[0].end() + 500]
     # A later "On Oct 1 ... wrote" quotes another message. It does not make
     # the offered "October 2 at 12:00 PM" above it into a send-time header.
@@ -705,11 +728,11 @@ def _slot_from_date_and_nearby_times(
     if later_quote and later_quote.start() > 0:
         header = after_clock[: later_quote.start()]
     if _REPLY_ATTRIBUTION_RE.search(header[:160]):
-        return None
+        return []
     # Spark quotes "On Oct 1, 2026, 9:56 AM -0400, Name wrote" with the address
     # after a block of HTML, so the short window above can miss it.
     if re.match(r"\s*[-+]\d{4}\b", source[times[0].end() :]) and re.search(r"\bwrote\b", after_clock, re.I):
-        return None
+        return []
     end_clock = times[1] if len(times) > 1 else None
     if end_clock is not None:
         between_clocks = source[times[0].end() : end_clock.start()]
@@ -720,7 +743,7 @@ def _slot_from_date_and_nearby_times(
     # Include "9am time in Tampa" / "8am in Venice, CA" city tails.
     zone_match = _zone_near_clock(source, times[0].start(), used_end_time.end())
     if zone_match is None:
-        return None
+        return []
     zone, zone_name = zone_match
     try:
         start_hour, start_minute = _clock_parts(times[0])
@@ -728,7 +751,7 @@ def _slot_from_date_and_nearby_times(
         if reference and start.astimezone(timezone.utc) < reference - timedelta(days=120):
             start = start.replace(year=start.year + 1)
     except (KeyError, TypeError, ValueError):
-        return None
+        return []
     # The requested duration commonly introduces a following list rather than
     # being repeated on every bullet ("a 1-hour video interview ... available
     # at: October 21 at 4 PM"). Include the nearby lead-in so each proposed
@@ -756,7 +779,7 @@ def _slot_from_date_and_nearby_times(
                 )
                 and re.search(r"\b(?:between|from|available|availability|free)\b", before, re.I)
             )
-    return ExtractedSlot(start.astimezone(timezone.utc), end.astimezone(timezone.utc), zone_name, end_is_explicit, is_window)
+    return [ExtractedSlot(start.astimezone(timezone.utc), end.astimezone(timezone.utc), zone_name, end_is_explicit, is_window)]
 
 
 def parse_text_slots(text: str, received_at: datetime | None = None) -> list[ExtractedSlot]:
@@ -821,13 +844,11 @@ def parse_text_slots(text: str, received_at: datetime | None = None) -> list[Ext
     slots: list[ExtractedSlot] = []
     seen: set[tuple[datetime, datetime]] = set()
     for position, date_end, year, month, day in candidates:
-        slot = _slot_from_date_and_nearby_times(source, position, date_end, year, month, day, reference)
-        if slot is None:
-            continue
-        key = (slot.start_at, slot.end_at)
-        if key not in seen:
-            slots.append(slot)
-            seen.add(key)
+        for slot in _slot_from_date_and_nearby_times(source, position, date_end, year, month, day, reference):
+            key = (slot.start_at, slot.end_at)
+            if key not in seen:
+                slots.append(slot)
+                seen.add(key)
     return _drop_end_time_phantoms(slots)
 
 
@@ -2672,6 +2693,16 @@ def explicit_message_slots(email: EmailMessage) -> list[ExtractedSlot]:
     ics_slots = parse_ics_slots(full)
     if ics_slots:
         return ics_slots
+    # Reply subjects can preserve the appointment from the previous round
+    # (for example ``Accepted: ... Oct 21``) while the new body asks about a
+    # later round on Oct 23.  The body is the sender's current scheduling
+    # statement, so use it on its own when it contains a complete slot.  Keep
+    # the combined subject/body parse below as a fallback for providers that
+    # put the date in the subject and only the clock in the body.
+    body = (email.body_text or "").strip() or (email.body_html or "").strip() or (email.snippet or "")
+    body_slots = parse_text_slots(_without_quoted_history(body), email.received_at)
+    if body_slots:
+        return body_slots
     fresh = _without_quoted_history(full)
     return parse_text_slots(fresh, email.received_at)
 
@@ -2840,6 +2871,14 @@ def message_appointment_slots(email: EmailMessage) -> list[ExtractedSlot]:
     ics_slots = parse_ics_slots(full)
     if ics_slots:
         return ics_slots
+    # Prefer a complete appointment written in the current body over an old
+    # appointment retained in a reply subject.  A subject-only date remains a
+    # fallback below when the body cannot form a complete slot by itself.
+    body = (email.body_text or "").strip() or (email.body_html or "").strip() or (email.snippet or "")
+    body_fresh = _without_quoted_history(body)
+    body_slots = parse_text_slots(body_fresh, email.received_at)
+    if body_slots:
+        return _prefer_specific_slots(body_slots)
     fresh = _without_quoted_history(full)
     reference = as_utc(email.received_at)
     fresh_slots = parse_text_slots(fresh, reference)
@@ -4559,10 +4598,17 @@ def _hide_availability(
             .all()
         )
     seen: set[int] = set()
+    booked_at = as_utc(confirmed.source_received_at)
     for event in candidates:
         if event.id in seen:
             continue
         seen.add(event.id)
+        offered_at = as_utc(event.source_received_at)
+        # Backfill can reprocess an old confirmation after a later interview
+        # round has already asked for new availability. Related-thread links
+        # do not make that future offer part of the completed appointment.
+        if booked_at and offered_at and offered_at > booked_at:
+            continue
         event.is_visible = False
         event.superseded_by_event_id = confirmed.id
         db.flush()
@@ -4671,8 +4717,15 @@ def repair_calendar_attendee_response_labels(db: Session, mailbox_id: int | None
             method, _status, _events, _has_start = _first_calendar(_calendar_text(email))
             if method != "REPLY":
                 continue
-        email.label = EmailLabel.INTERVIEW_INVITATION.value
-        email.interview_subtype = None
+            # A decline that still carries a reply body (asking about times) is a
+            # live reschedule, so keep it an open invitation.
+            email.label = EmailLabel.INTERVIEW_INVITATION.value
+            email.interview_subtype = None
+        else:
+            # A bodyless decline cancels that appointment without rejecting the
+            # application (the outcome reset below keeps it active).
+            email.label = EmailLabel.INTERVIEW_SCHEDULED.value
+            email.interview_subtype = "cancellation"
         email.calendar_processed_hash = None
         email.calendar_processing_error = None
         outcomes = _email_calendar_events(db).filter(CalendarEvent.outcome_source_email_id == email.id).all()
@@ -4687,12 +4740,7 @@ def repair_calendar_attendee_response_labels(db: Session, mailbox_id: int | None
     return repaired
 
 
-def is_passed_outcome(email: EmailMessage) -> bool:
-    """Return whether a positive outcome message advances this application."""
-    if email.label == EmailLabel.OFFER.value:
-        return True
-    if email.label != EmailLabel.INTERVIEW_FOLLOW_UP.value:
-        return False
+def _has_positive_outcome_language(email: EmailMessage) -> bool:
     text = " ".join([email.subject or "", email.snippet or "", email.body_text or ""]).lower()
     positive_patterns = (
         r"\byou (?:have )?passed\b",
@@ -4703,6 +4751,13 @@ def is_passed_outcome(email: EmailMessage) -> bool:
         r"\bcongratulations\b.{0,120}\bnext (?:round|stage)\b",
     )
     return any(re.search(pattern, text, re.I) for pattern in positive_patterns)
+
+
+def is_passed_outcome(email: EmailMessage) -> bool:
+    """Return whether a positive outcome message advances this application."""
+    if email.label == EmailLabel.OFFER.value:
+        return True
+    return email.label == EmailLabel.INTERVIEW_FOLLOW_UP.value and _has_positive_outcome_language(email)
 
 
 def _event_received_at(event: CalendarEvent) -> datetime:
@@ -6238,8 +6293,10 @@ def _quote_clock_matches(event: CalendarEvent, text: str) -> bool:
 
 def _slots_from_fresh_offer(email: EmailMessage) -> list[ExtractedSlot]:
     """Times this message offers, ignoring the quoted thread's send clock."""
-    fresh = _without_quoted_history(_calendar_text(email))
-    slots = parse_text_slots(fresh, email.received_at)
+    # Use the same body-first precedence as live extraction. Otherwise this
+    # maintenance pass can recreate a stale appointment retained in a reply
+    # subject immediately after live processing correctly ignored it.
+    slots = explicit_message_slots(email)
     kept: list[ExtractedSlot] = []
     for slot in slots:
         prior = next(
@@ -6828,6 +6885,21 @@ async def _process_calendar_email(
         email.calendar_processing_error = None
         return changed
 
+    # A request to schedule the next round is also evidence that an earlier,
+    # already-finished interview for this application was passed.  Keep the
+    # new request in the normal availability path below, while updating only
+    # confirmed appointments that ended before this message arrived.
+    if email.label == EmailLabel.INTERVIEW_INVITATION.value and _has_positive_outcome_language(email):
+        progressed_at = as_utc(email.received_at) or datetime.now(timezone.utc)
+        for target in _outcome_events(db, email):
+            if target.kind != "confirmed" or (as_utc(target.end_at) or as_utc(target.start_at)) > progressed_at:
+                continue
+            target.application_status = "passed"
+            target.outcome_source_email_id = email.id
+            target.outcome_at = progressed_at
+            _link_event_email(db, target, email.id)
+            changed = True
+
     related_emails = _related_interview_emails(db, email)
     is_reschedule = (
         email.label == EmailLabel.INTERVIEW_SCHEDULED.value
@@ -6967,6 +7039,24 @@ async def _process_calendar_email(
             _apply_common(event, email, slot, access, details, db)
             event.kind = "availability"
             event.interview_status = None
+            if event.superseded_by_event_id is not None:
+                replacement = db.get(CalendarEvent, event.superseded_by_event_id)
+                offered_at = as_utc(email.received_at)
+                replacement_at = as_utc(replacement.source_received_at) if replacement is not None else None
+                replacement_end = as_utc(replacement.end_at) if replacement is not None else None
+                if (
+                    replacement is not None
+                    and replacement.kind == "confirmed"
+                    and offered_at is not None
+                    and replacement_at is not None
+                    and offered_at > replacement_at
+                    and replacement_end is not None
+                    and slot.start_at >= replacement_end
+                ):
+                    # The offer belongs to a later round. Repair a stale edge
+                    # left by an older backfill that treated every related
+                    # availability message as fulfilled by this booking.
+                    event.superseded_by_event_id = None
             # An older invitation can be refreshed after its confirmation.
             # Do not resurrect an offer that was already superseded.
             event.is_visible = event.superseded_by_event_id is None

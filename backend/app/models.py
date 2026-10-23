@@ -499,6 +499,11 @@ class ServiceHeartbeat(Base):
     instance_id: Mapped[str] = mapped_column(String(160))
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    # Self-reported component health for this replica: "healthy", or a degraded
+    # state such as "recovering" while a consumer rebuilds a dropped broker
+    # connection. Liveness (last_seen_at) alone cannot tell a working replica
+    # from one whose consume loop silently stalled, so the replica reports it.
+    status: Mapped[str] = mapped_column(String(16), default="healthy")
 
 
 class SyncRuntimeStatus(Base):

@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from app.config import get_settings
 from app.services.calendar_backfill import backfill_calendar_events
 from app.services.command_consumers import classification_command_loop
 from app.services.email_event_consumer import email_event_consumer_loop
@@ -17,19 +16,18 @@ from app.workers.runtime import run_service
 async def _recovery_loop(stop_event: asyncio.Event) -> None:
     """Recover work committed before this service started.
 
-    RabbitMQ handles the live path in production. Without a broker (mainly local
-    development), the durable ``classification_pending`` flag is the queue and
-    is scanned periodically so the sync service never performs AI work.
+    RabbitMQ handles the live notification path. The durable
+    ``classification_pending`` flag remains the source of truth and is scanned
+    periodically even when RabbitMQ is enabled, so work accepted immediately
+    before a worker crash cannot be stranded forever.
     """
     while not stop_event.is_set():
+        await start_all_pending_reclassify()
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=15)
             return
         except TimeoutError:
-            await start_all_pending_reclassify()
-        if get_settings().rabbitmq_enabled:
-            await stop_event.wait()
-            return
+            pass
 
 
 async def _backfill_loop(stop_event: asyncio.Event) -> None:

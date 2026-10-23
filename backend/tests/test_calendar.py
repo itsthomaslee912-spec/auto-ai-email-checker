@@ -664,7 +664,10 @@ def test_bodyless_calendar_decline_is_not_an_application_rejection():
         assert repair_calendar_attendee_response_labels(db, mailbox_id) == 1
         db.commit()
 
-        assert declined.label == EmailLabel.INTERVIEW_INVITATION.value
+        # A bodyless decline cancels the appointment without rejecting the
+        # application: the outcome is cleared and the status stays active.
+        assert declined.label == EmailLabel.INTERVIEW_SCHEDULED.value
+        assert declined.interview_subtype == "cancellation"
         assert event.application_status == "active"
         assert event.outcome_source_email_id is None
         assert event.outcome_at is None
@@ -1067,6 +1070,98 @@ def test_confirmed_event_in_same_thread_resolves_companyless_pending_request():
             [mailbox_id],
             now=datetime(2026, 10, 20, 22, 0, tzinfo=timezone.utc),
         ) == []
+
+
+def test_new_round_body_time_overrides_completed_appointment_in_reply_subject():
+    """A reply subject describes history; the fresh body describes this round.
+
+    Lam Research's next-round request retained the accepted Oct 21 screening
+    call in its subject but offered Oct 23 in the body.  The historical subject
+    must not create a second available-time chip.
+    """
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        confirmation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="lam-screening-invite",
+            thread_id="lam-screening-thread",
+            folder="inbox",
+            subject="Mark Wei - Screening call for Sr. Cloud Engineer role",
+            sender="Kavitha Madhur <recruiter@lamresearch.com>",
+            received_at=datetime(2026, 10, 20, 18, 56, tzinfo=timezone.utc),
+            body_text="""BEGIN:VCALENDAR
+BEGIN:VEVENT
+DTSTART;TZID=America/Chicago:20261021T153000
+DTEND;TZID=America/Chicago:20261021T160000
+STATUS:CONFIRMED
+END:VEVENT
+END:VCALENDAR""",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="Lam Research Corporation",
+            job_role="Sr. Cloud Engineer",
+        )
+        request = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="lam-next-round",
+            thread_id="lam-thread",
+            folder="inbox",
+            subject=(
+                "Re: Accepted: Mark Wei - Screening call for Sr. Cloud Engineer role "
+                "@ Wed Oct 21, 2026 3:30pm - 4pm (CDT)"
+            ),
+            sender="Kavitha Madhur <recruiter@lamresearch.com>",
+            received_at=datetime(2026, 10, 21, 22, 31, tzinfo=timezone.utc),
+            body_text=(
+                "Hi Mark,\n\nThe hiring manager is interested in moving forward "
+                "with an hour-long virtual interview. He is available between "
+                "1:30 - 2:30 pm PST on Friday 10/23. Could you please confirm "
+                "your availability?"
+            ),
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="Lam Research Corporation",
+            job_role="Sr. Cloud Engineer",
+        )
+        db.add_all([confirmation, request])
+        db.flush()
+        assert asyncio.run(process_calendar_email(db, confirmation, use_ai=False)) is True
+        db.flush()
+        completed = db.query(CalendarEvent).filter(CalendarEvent.kind == "confirmed").one()
+
+        assert asyncio.run(process_calendar_email(db, request, use_ai=False)) is True
+        db.flush()
+
+        visible = db.query(CalendarEvent).filter(
+            CalendarEvent.mailbox_id == mailbox_id,
+            CalendarEvent.is_visible.is_(True),
+        ).all()
+        assert len(visible) == 2, [
+            (event.kind, event.start_at, event.end_at, event.source_email_id)
+            for event in visible
+        ]
+        available = next(event for event in visible if event.kind == "availability")
+        assert available.start_at == datetime(2026, 10, 23, 20, 30, tzinfo=timezone.utc)
+        assert available.end_at == datetime(2026, 10, 23, 21, 30, tzinfo=timezone.utc)
+        assert completed.kind == "confirmed"
+        assert completed.application_status == "passed"
+        assert completed.outcome_source_email_id == request.id
+
+        # A mailbox backfill can encounter the old invite again after the new
+        # round. It must not close the later availability.
+        assert asyncio.run(process_calendar_email(db, confirmation, force=True, use_ai=False)) is True
+        db.flush()
+        assert available.is_visible is True
+        assert available.superseded_by_event_id is None
+
+        # Existing databases may already contain that stale supersession edge.
+        # Reprocessing the newer request repairs it without a data-specific rule.
+        available.is_visible = False
+        available.superseded_by_event_id = completed.id
+        db.flush()
+        assert asyncio.run(process_calendar_email(db, request, force=True, use_ai=False)) is True
+        db.flush()
+        assert available.is_visible is True
+        assert available.superseded_by_event_id is None
 
 
 def test_superseded_availability_link_resolves_companyless_cross_thread_invitation():
@@ -2573,6 +2668,40 @@ Thursday, October 22, 2026
             datetime(2026, 10, 22, 17, 45, tzinfo=timezone.utc),
             datetime(2026, 10, 22, 20, 0, tzinfo=timezone.utc),
         )
+    ]
+
+
+def test_agenda_segments_split_across_a_long_break_into_separate_blocks():
+    """A multi-hour gap between agenda segments is two commitments, not one.
+
+    Enveloping first-start to last-end across a 3h15m break produced a bogus
+    1:45 PM - 7:00 PM block; the morning and evening sessions each get a block.
+    """
+    text = """Hi Jordan,
+
+Your interview has been rescheduled. See the updated agenda below.
+
+Agenda:
+Thursday, October 22, 2026
+
+- 1:45 PM - 2:45 PM (EDT) - Interview: Technical - Systems Design
+  - Ben Neigher
+- ----- 3h 15m Break -----
+- 6:00 PM - 7:00 PM (EDT) - Interview: Domain Knowledge
+  - Anushadevi Mohan
+"""
+
+    slots = parse_text_slots(text, datetime(2026, 10, 21, 17, 46, tzinfo=timezone.utc))
+
+    assert [(slot.start_at, slot.end_at) for slot in slots] == [
+        (
+            datetime(2026, 10, 22, 17, 45, tzinfo=timezone.utc),
+            datetime(2026, 10, 22, 18, 45, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(2026, 10, 22, 22, 0, tzinfo=timezone.utc),
+            datetime(2026, 10, 22, 23, 0, tzinfo=timezone.utc),
+        ),
     ]
 
 

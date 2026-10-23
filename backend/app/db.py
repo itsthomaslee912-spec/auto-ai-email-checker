@@ -325,6 +325,15 @@ def init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS ix_mailbox_jobs_lease "
                 "ON mailbox_job_states (job_type, state, lease_expires_at)"
             ))
+        if "service_heartbeats" in tables:
+            heartbeat_cols = {c["name"] for c in inspect(conn).get_columns("service_heartbeats")}
+            if "status" not in heartbeat_cols:
+                conn.execute(text(
+                    "ALTER TABLE service_heartbeats ADD COLUMN status VARCHAR(16) DEFAULT 'healthy'"
+                ))
+                conn.execute(text(
+                    "UPDATE service_heartbeats SET status = 'healthy' WHERE status IS NULL"
+                ))
         if "classify_corrections" in tables:
             correction_cols = {c["name"] for c in inspect(conn).get_columns("classify_corrections")}
             if "evaluation_holdout" not in correction_cols:

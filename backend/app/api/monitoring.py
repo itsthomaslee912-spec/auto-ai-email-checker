@@ -55,11 +55,18 @@ def monitoring_snapshot(db: Session = Depends(get_db)) -> dict:
         rows = [row for row in heartbeat_rows if row.service_name == service_name]
         fresh = [row for row in rows if as_utc(row.last_seen_at) and as_utc(row.last_seen_at) >= cutoff]
         latest = max((as_utc(row.last_seen_at) for row in rows), default=None)
+        if fresh:
+            # A replica that is alive but self-reports a degraded component (for
+            # example a consumer rebuilding a dropped broker channel) surfaces as
+            # that state rather than a misleading "healthy".
+            status = "recovering" if any((row.status or "healthy") == "recovering" for row in fresh) else "healthy"
+        else:
+            status = "stale" if rows else "offline"
         services.append({
             "name": service_name,
             "label": label,
             "description": description,
-            "status": "healthy" if fresh else ("stale" if rows else "offline"),
+            "status": status,
             "replicas": len(fresh),
             "last_seen_at": latest.isoformat() if latest else None,
         })

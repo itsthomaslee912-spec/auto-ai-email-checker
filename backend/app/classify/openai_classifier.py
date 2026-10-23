@@ -612,6 +612,15 @@ def infer_interview_subtype(subject: str, sender: str, body_text: str, snippet: 
         " ",
         text,
     )
+    # A bodyless "Declined: <event>" calendar RSVP is the candidate declining
+    # that appointment; treat it as a cancellation so the booked slot is removed
+    # rather than left on the calendar or shown as still needing a reply.
+    if (
+        re.match(r"^\s*declined\s*:", subject or "", re.I)
+        and not (body_text or "").strip()
+        and not (snippet or "").strip()
+    ):
+        return "cancellation"
     if re.search(r"\b(interview|meeting)\b.{0,100}\b(cancelled|canceled)\b|\b(cancelled|canceled)\b.{0,100}\b(interview|meeting)\b", text):
         return "cancellation"
     if re.search(r"\b(reschedul\w*|moved to|new date)\b", text):
@@ -916,6 +925,11 @@ def apply_label_guards(
         and not (body_text or "").strip()
         and not (snippet or "").strip()
     ):
+        # A candidate's bodyless "Declined:" RSVP cancels that interview; it is
+        # never the employer rejecting the application. "Tentative:" stays a
+        # live invitation the candidate may still confirm.
+        if re.match(r"^\s*declined\s*:", subject or "", re.I):
+            return EmailLabel.INTERVIEW_SCHEDULED.value
         return EmailLabel.INTERVIEW_INVITATION.value
     if label in (EmailLabel.INTERVIEW_INVITATION.value, EmailLabel.INTERVIEW_SCHEDULED.value) and (
         _is_pre_interview_screen(text) or _is_true_screening(text)

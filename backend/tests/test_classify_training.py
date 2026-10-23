@@ -499,6 +499,62 @@ def test_pending_classification_publishes_completion_when_label_is_unchanged(mon
         assert db.get(EmailMessage, email_id).classification_pending is False
 
 
+def test_pending_reclassify_falls_back_when_local_ai_times_out(monkeypatch):
+    from app.services import ai_backend, reclassify
+
+    SessionLocal = _session_factory()
+    with SessionLocal() as db:
+        email = _seed_email(db, label=EmailLabel.OTHER.value)
+        email.classification_pending = True
+        db.commit()
+        mailbox_id = email.mailbox_id
+        email_id = email.id
+
+    calls = []
+
+    async def timeout_then_heuristic(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("force_openai"):
+            raise TimeoutError("local model stalled")
+        return SimpleNamespace(
+            label=EmailLabel.APPLICATION_CONFIRMATION.value,
+            category_subtype=None,
+            interview_subtype=None,
+            confidence=0.55,
+            response_id=None,
+        )
+
+    monkeypatch.setattr("app.db.SessionLocal", SessionLocal)
+    monkeypatch.setattr(reclassify, "classify_email", timeout_then_heuristic)
+    monkeypatch.setattr(reclassify, "get_ai_backend", lambda: SimpleNamespace(provider="ollama"))
+    monkeypatch.setattr(reclassify, "publish", AsyncMock())
+    ai_backend._ai_call_gate = None
+    reclassify._mailbox_gate = None
+
+    asyncio.run(reclassify._run_reclassify_job(mailbox_id, pending_only=True))
+
+    assert calls[0]["force_openai"] is True
+    assert calls[1]["use_openai"] is False
+    with SessionLocal() as db:
+        stored = db.get(EmailMessage, email_id)
+        assert stored.classification_pending is False
+        assert stored.label == EmailLabel.APPLICATION_CONFIRMATION.value
+
+
+def test_mailbox_gate_does_not_serialize_complete_mailbox_jobs():
+    from app.services import reclassify
+
+    reclassify._mailbox_gate = None
+
+    async def acquire_two_slots():
+        gate = reclassify._mailbox_gate_semaphore()
+        async with gate:
+            async with gate:
+                return True
+
+    assert asyncio.run(asyncio.wait_for(acquire_two_slots(), timeout=0.1)) is True
+
+
 def test_prompt_loader_falls_back_to_seed(monkeypatch):
     invalidate_prompt_cache()
     monkeypatch.setattr("app.classify.prompt_store._load_from_db", lambda: None)

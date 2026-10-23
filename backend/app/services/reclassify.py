@@ -23,13 +23,20 @@ _cancel_requested: set[int] = set()
 _rerun_requested: dict[int, bool] = {}
 _job_lock = asyncio.Lock()
 _mailbox_gate: asyncio.Semaphore | None = None
+_MAX_ACTIVE_MAILBOX_JOBS = 32
 
 
 def _mailbox_gate_semaphore() -> asyncio.Semaphore:
-    """Only one mailbox reclassifies at a time so Ollama and health stay healthy."""
+    """Bound bookkeeping jobs without serializing whole mailboxes.
+
+    The shared AI gate already limits model calls to one. Serializing complete
+    mailbox passes here let a full reclassification with thousands of rows
+    starve fresh pending-only jobs for hours, and also defeated the AI gate's
+    per-call scheduling.
+    """
     global _mailbox_gate
     if _mailbox_gate is None:
-        _mailbox_gate = asyncio.Semaphore(1)
+        _mailbox_gate = asyncio.Semaphore(_MAX_ACTIVE_MAILBOX_JOBS)
     return _mailbox_gate
 
 
@@ -177,6 +184,12 @@ async def start_all_pending_reclassify() -> list[dict[str, Any]]:
         db.close()
     started: list[dict[str, Any]] = []
     for mailbox_id in ids:
+        # Observe an in-flight pass instead of requesting a redundant rerun on
+        # every recovery scan while that pass is still active.
+        if mailbox_id in _running:
+            while mailbox_id in _running:
+                await asyncio.sleep(1)
+            continue
         started.append(await start_mailbox_reclassify(mailbox_id, pending_only=True))
         while mailbox_id in _running:
             await asyncio.sleep(1)
@@ -278,6 +291,7 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
         async def classify_row(
             row: Any,
         ) -> tuple[int, str, Any, tuple[str, str] | None, bool] | None:
+            ai_priority = "live" if pending_only else "background"
             try:
                 if getattr(get_settings(), "email_classification_mode", "hybrid").strip().lower() == "ai_only":
                     correction_examples = []
@@ -291,12 +305,13 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                     )
                 # A fresh context manager per call: the shared gate is a
                 # priority queue, not a reusable semaphore object. A
-                # reclassify pass is always background priority so it never
-                # delays a live webhook classification arriving meanwhile.
+                # Imported pending mail is live work and jumps ahead of an
+                # older full-mailbox reclassification. Manual/full passes stay
+                # in the background tier.
                 # extract_company_role below acquires the same gate itself,
                 # so it must not be nested inside this one or the two would
                 # deadlock each other over the single slot.
-                async with ai_call_semaphore("background"):
+                async with ai_call_semaphore(ai_priority):
                     result = await classify_email(
                         subject=row.subject or "",
                         sender=row.sender or "",
@@ -307,23 +322,48 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                         correction_examples=correction_examples,
                         force_openai=True,
                     )
-                should_extract = result.label in OUTCOME_LABELS and (
-                    result.label != row.label
-                    or (result.label in BACKFILL_LABELS and not row.outcome_extracted)
-                )
-                extracted: tuple[str, str] | None = None
-                if should_extract:
+            except Exception:
+                logger.exception("Reclassify failed for email %s", row.id)
+                if getattr(get_settings(), "email_classification_mode", "hybrid").strip().lower() == "ai_only":
+                    return None
+                # Match live-ingest behavior: a temporarily unavailable local
+                # model must not strand a download-only email forever. The
+                # deterministic classifier still gives it a usable category.
+                try:
+                    result = await classify_email(
+                        subject=row.subject or "",
+                        sender=row.sender or "",
+                        body_text=row.body_text or "",
+                        snippet=row.snippet or "",
+                        folder=row.folder or "inbox",
+                        account_email=account_email,
+                        correction_examples=correction_examples,
+                        use_openai=False,
+                    )
+                except Exception:
+                    logger.exception("Heuristic fallback failed for email %s", row.id)
+                    return None
+
+            should_extract = result.label in OUTCOME_LABELS and (
+                result.label != row.label
+                or (result.label in BACKFILL_LABELS and not row.outcome_extracted)
+            )
+            extracted: tuple[str, str] | None = None
+            if should_extract:
+                try:
                     extracted = await extract_company_role(
                         subject=row.subject or "",
                         sender=row.sender or "",
                         body_text=row.body_text or "",
                         snippet=row.snippet or "",
-                        priority="background",
+                        priority=ai_priority,
                     )
-                return row.id, row.label, result, extracted, should_extract
-            except Exception:
-                logger.exception("Reclassify failed for email %s", row.id)
-                return None
+                except Exception:
+                    # Company/role is optional enrichment. Preserve the label
+                    # and clear classification_pending even when extraction is
+                    # temporarily unavailable; the outcome backfill retries it.
+                    logger.exception("Outcome extraction failed for email %s", row.id)
+            return row.id, row.label, result, extracted, should_extract
 
         def apply_outcome(
             email_id: int,

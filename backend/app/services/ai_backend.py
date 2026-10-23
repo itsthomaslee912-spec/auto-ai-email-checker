@@ -123,6 +123,10 @@ class AiBackend:
                 api_key="ollama",
                 base_url=f"{self.base_url.rstrip('/')}/v1",
                 timeout=180.0,
+                # The pending-row recovery loop already provides durable
+                # retries. SDK retries multiply a single local-model timeout
+                # into a nine-minute stall before the worker can fall back.
+                max_retries=0,
             )
         if self.provider == "gemini":
             return AsyncOpenAI(

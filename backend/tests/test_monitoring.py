@@ -73,3 +73,39 @@ def test_monitoring_snapshot_reports_services_and_counts():
     assert snapshot["metrics"]["users"] == 1
     assert snapshot["metrics"]["active_mailboxes"] == 1
     assert all(service["status"] == "healthy" for service in snapshot["services"])
+
+
+def test_monitoring_reports_recovering_when_a_replica_self_reports():
+    session_factory = _database()
+    with session_factory() as db:
+        db.add(User(external_id="monitor-admin", email="admin@example.com", is_admin=True))
+        now = datetime.now(timezone.utc)
+        for service_name in (
+            "email-api",
+            "sync-worker",
+            "classification-worker",
+            "event-relay",
+            "notification-service",
+        ):
+            db.add(ServiceHeartbeat(
+                service_name=service_name,
+                instance_id=f"test:{service_name}",
+                started_at=now,
+                last_seen_at=now,
+                # The classification worker is alive but its consumer is rebuilding
+                # a dropped broker channel.
+                status="recovering" if service_name == "classification-worker" else "healthy",
+            ))
+        db.commit()
+
+        token = current_user_is_admin.set(True)
+        try:
+            snapshot = monitoring_snapshot(db)
+        finally:
+            current_user_is_admin.reset(token)
+
+    worker = next(s for s in snapshot["services"] if s["name"] == "classification-worker")
+    assert worker["status"] == "recovering"
+    assert worker["replicas"] == 1
+    # A self-reported degraded component pulls the platform out of "healthy".
+    assert snapshot["overall_status"] == "degraded"

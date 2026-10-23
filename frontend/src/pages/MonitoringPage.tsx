@@ -79,6 +79,11 @@ function StatusDot({ status }: { status: string }) {
   return <span className={`monitor-status-dot status-${status}`} aria-hidden="true" />;
 }
 
+const STATUS_LABELS: Record<string, string> = { recovering: "reconnecting" };
+function statusText(status: string): string {
+  return STATUS_LABELS[status] ?? status;
+}
+
 /* ---- Dashboard (classic) view ---- */
 
 function ServiceCard({ service }: { service: MonitoringService }) {
@@ -91,7 +96,7 @@ function ServiceCard({ service }: { service: MonitoringService }) {
         <div><h3>{service.label}</h3><p>{service.description}</p></div>
       </div>
       <div className="monitor-service-meta">
-        <span className="monitor-status"><StatusDot status={service.status} />{service.status}</span>
+        <span className="monitor-status"><StatusDot status={service.status} />{statusText(service.status)}</span>
         <span>{service.replicas} live {service.replicas === 1 ? "replica" : "replicas"}</span>
         <span>{relativeTime(service.last_seen_at)}</span>
       </div>
@@ -433,7 +438,9 @@ export default function MonitoringPage({ active }: { active: boolean }) {
 
               <div className="arch-slot arch-slot-classification">
                 <ArchNode live={liveStage("classification")} icon="classify" title="Classification worker" subtitle="Consumes imports · writes AI labels and calendar"
-                  status={svc("classification-worker")?.status ?? "offline"} meta={nodeMeta(svc("classification-worker"))} />
+                  status={svc("classification-worker")?.status ?? "offline"}
+                  statusLabel={statusText(svc("classification-worker")?.status ?? "offline")}
+                  meta={svc("classification-worker")?.status === "recovering" ? "rebuilding broker channel" : nodeMeta(svc("classification-worker"))} />
               </div>
               <ArchConnector className="arch-route-classify" label="email.imported.v1" detail="durable work queue" direction="left" count={snapshot.metrics.pending_classification} live={liveEdge("rabbitmq", "classification")} />
               <div className="arch-slot arch-slot-rabbitmq">

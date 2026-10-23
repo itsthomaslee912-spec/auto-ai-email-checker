@@ -542,6 +542,8 @@ Please reply with your availability.
         )
         == EmailLabel.INTERVIEW_INVITATION.value
     )
+    # A bodyless "Declined:" RSVP is the candidate cancelling that appointment,
+    # never the employer rejecting the application.
     assert (
         apply_label_guards(
             EmailLabel.REJECTED_CLOSED.value,
@@ -550,7 +552,7 @@ Please reply with your availability.
             body_text="",
             snippet="",
         )
-        == EmailLabel.INTERVIEW_INVITATION.value
+        == EmailLabel.INTERVIEW_SCHEDULED.value
     )
     assert (
         apply_label_guards(
@@ -561,6 +563,26 @@ Please reply with your availability.
             snippet="",
         )
         == EmailLabel.INTERVIEW_INVITATION.value
+    )
+
+
+def test_bodyless_decline_is_a_cancellation_subtype():
+    from app.classify.openai_classifier import infer_interview_subtype
+
+    # A bare "Declined:" RSVP cancels the appointment.
+    assert (
+        infer_interview_subtype("Declined: Kenneth and Alex Kim", "kchung121@outlook.com", "", "")
+        == "cancellation"
+    )
+    # A decline that still negotiates a time is a live reschedule, not a cancel.
+    assert (
+        infer_interview_subtype(
+            "Declined: Fivecast intro call",
+            "nicole@fivecast.test",
+            "Please reply with your availability for the week.",
+            "",
+        )
+        != "cancellation"
     )
 
 
