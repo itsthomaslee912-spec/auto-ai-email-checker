@@ -107,6 +107,11 @@ _SCHEDULE_TOKEN_RE = re.compile(
     r"https://[^\s<>\"']+/schedule/(?P<token>[a-z0-9-]{12,})(?=[/?.#\s<>\"']|$)",
     re.I,
 )
+_GREENHOUSE_AVAILABILITY_IDENTITY_RE = re.compile(
+    r"https://(?:[a-z0-9-]+\.)?greenhouse\.io/availability/"
+    r"(?P<token>[a-z0-9_-]{16,})(?=[/?.#\s<>\"']|$)",
+    re.I,
+)
 _MICROSOFT_BOOKINGS_IDENTITY_RE = re.compile(
     r"https://(?:outlook\.office(?:365)?\.com)/(?:owa/calendar|book)/"
     r"(?P<token>[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+)",
@@ -1222,7 +1227,11 @@ def _schedule_tokens(text: str) -> set[str]:
     decoded = html.unescape(text or "")
     return {
         match.group("token").casefold()
-        for pattern in (_SCHEDULE_TOKEN_RE, _MICROSOFT_BOOKINGS_IDENTITY_RE)
+        for pattern in (
+            _SCHEDULE_TOKEN_RE,
+            _GREENHOUSE_AVAILABILITY_IDENTITY_RE,
+            _MICROSOFT_BOOKINGS_IDENTITY_RE,
+        )
         for match in pattern.finditer(decoded)
     }
 
@@ -5958,9 +5967,19 @@ def hide_superseded_identity_bookings(db: Session, mailbox_id: int | None = None
                 continue
             if not roles_compatible(left.job_role, right.job_role):
                 continue
-            left_freshness = _event_freshness(db, left)
-            right_freshness = _event_freshness(db, right)
-            fresher = left if left_freshness >= right_freshness else right
+            # Both rows can inherit the same newest update through the durable
+            # event-email links. In that case their aggregate freshness ties;
+            # prefer the row whose own source is newer instead of whichever row
+            # happened to be returned first by the database.
+            def reschedule_recency(event: CalendarEvent) -> tuple[datetime, datetime, int]:
+                return (
+                    _event_freshness(db, event),
+                    as_utc(event.source_received_at)
+                    or datetime.min.replace(tzinfo=timezone.utc),
+                    event.id,
+                )
+
+            fresher = max((left, right), key=reschedule_recency)
             older = right if fresher.id == left.id else left
             # The newer appointment itself must carry the reschedule signal.
             # An older round that happened to be rescheduled in the past must

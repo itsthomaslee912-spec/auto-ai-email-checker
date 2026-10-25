@@ -4048,6 +4048,105 @@ def test_apology_for_own_confusion_does_not_unbook_the_interview():
     assert leaves_interview_unbooked(mixed_up) is False
 
 
+def test_greenhouse_time_change_retires_old_cross_thread_booking_when_links_overlap():
+    """A Greenhouse update may arrive in a new thread after both calendar rows
+    have inherited the same linked messages. The update's own source timestamp
+    must break the resulting freshness tie and its availability token proves
+    that both clocks belong to one appointment.
+    """
+    from app.services.calendar_extract import hide_superseded_identity_bookings
+
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        availability_url = (
+            "https://app3.greenhouse.io/availability/"
+            "cf418a99c3cca1a1219106a9e8dadc10?utm_source=AvailabilityRequest"
+        )
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="ridgeline-invitation",
+            thread_id="ridgeline-invitation-thread",
+            subject="Your application at Ridgeline",
+            sender="recruiter@ridgelineapps.com",
+            received_at=datetime(2026, 10, 21, 18, 8, tzinfo=timezone.utc),
+            body_text=f"Enter your availability: {availability_url}",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="Ridgeline",
+            job_role="Senior Staff AI Data Platform Engineer",
+        )
+        original = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="ridgeline-original",
+            thread_id="ridgeline-original-thread",
+            subject="Ridgeline Phone Interview Confirmation",
+            sender="recruiter@ridgelineapps.com",
+            received_at=datetime(2026, 10, 21, 19, 8, tzinfo=timezone.utc),
+            body_text="Your interview is set for October 27 at 2:30 PM.",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+            company="Ridgeline",
+            job_role="Senior Staff AI Data Platform Engineer",
+        )
+        update = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="ridgeline-update",
+            thread_id="ridgeline-update-thread",
+            subject="UPDATE: Ridgeline Interview for October 27 at 5:00 PM",
+            sender="recruiter@ridgelineapps.com",
+            received_at=datetime(2026, 10, 23, 17, 10, tzinfo=timezone.utc),
+            body_text="There has been an update. Your interview is now at 5:00 PM.",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="time_change",
+            company="Ridgeline",
+            job_role="Senior Staff AI Data Platform Engineer",
+        )
+        db.add_all([invitation, original, update])
+        db.flush()
+        old_event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=original.id,
+            source_thread_id=original.thread_id,
+            kind="confirmed",
+            origin="email",
+            company="Ridgeline",
+            job_role="Senior Staff AI Data Platform Engineer",
+            start_at=datetime(2026, 10, 27, 18, 30, tzinfo=timezone.utc),
+            end_at=datetime(2026, 10, 27, 19, 0, tzinfo=timezone.utc),
+            source_received_at=original.received_at,
+            interview_status="confirmation",
+            is_visible=True,
+        )
+        new_event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=update.id,
+            source_thread_id=update.thread_id,
+            kind="confirmed",
+            origin="email",
+            company="Ridgelineapps",
+            job_role="Senior Staff AI Data Platform Engineer",
+            start_at=datetime(2026, 10, 27, 21, 0, tzinfo=timezone.utc),
+            end_at=datetime(2026, 10, 27, 21, 30, tzinfo=timezone.utc),
+            source_received_at=update.received_at,
+            interview_status="confirmation",
+            is_visible=True,
+        )
+        db.add_all([old_event, new_event])
+        db.flush()
+        db.add_all(
+            CalendarEventEmail(event_id=event.id, email_id=email.id)
+            for event in (old_event, new_event)
+            for email in (invitation, update)
+        )
+        db.commit()
+
+        assert hide_superseded_identity_bookings(db, mailbox_id) == 1
+        db.commit()
+
+        assert db.get(CalendarEvent, old_event.id).is_visible is False
+        assert db.get(CalendarEvent, old_event.id).superseded_by_event_id == new_event.id
+        assert db.get(CalendarEvent, new_event.id).is_visible is True
+
+
 def test_reschedule_to_a_new_day_hides_the_prior_booking():
     from app.services.calendar_extract import hide_superseded_identity_bookings
 
@@ -4579,7 +4678,7 @@ def test_email_conversation_returns_thread_messages_in_order_without_marking_rea
         assert all(db.get(EmailMessage, item_id).is_read is False for item_id in ids)
 
 
-def test_calendar_event_emails_include_source_thread_and_outcome_newest_first():
+def test_calendar_event_emails_include_explicit_links_and_outcome_newest_first():
     factory, (mailbox_id, _) = _database()
     with factory() as db:
         invitation = EmailMessage(mailbox_id=mailbox_id, provider_message_id="event-invite", thread_id="event-thread", subject="Choose an interview time", sender="recruiter@example.com", received_at=datetime(2026, 10, 1, 14, tzinfo=timezone.utc), body_text="Invitation", label=EmailLabel.INTERVIEW_INVITATION.value)
@@ -4590,6 +4689,8 @@ def test_calendar_event_emails_include_source_thread_and_outcome_newest_first():
         db.flush()
         event = CalendarEvent(mailbox_id=mailbox_id, source_email_id=confirmation.id, outcome_source_email_id=outcome.id, kind="confirmed", origin="email", title="Interview", start_at=datetime(2026, 10, 5, 14, tzinfo=timezone.utc), end_at=datetime(2026, 10, 5, 15, tzinfo=timezone.utc), is_visible=True)
         db.add(event)
+        db.flush()
+        db.add(CalendarEventEmail(event_id=event.id, email_id=invitation.id))
         db.commit()
         event_id = event.id
         expected_ids = [outcome.id, confirmation.id, invitation.id]
@@ -4598,6 +4699,28 @@ def test_calendar_event_emails_include_source_thread_and_outcome_newest_first():
     assert response.status_code == 200
     assert [item["id"] for item in response.json()] == expected_ids
     assert all("body_text" in item for item in response.json())
+
+
+def test_calendar_event_emails_do_not_expand_to_unlinked_messages_in_same_thread():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        confirmation = EmailMessage(mailbox_id=mailbox_id, provider_message_id="round-two-confirm", thread_id="reused-recruiter-thread", subject="Second interview confirmed", sender="recruiter@example.com", received_at=datetime(2026, 10, 2, 14, tzinfo=timezone.utc), body_text="Your second interview is confirmed.", label=EmailLabel.INTERVIEW_SCHEDULED.value)
+        unrelated = EmailMessage(mailbox_id=mailbox_id, provider_message_id="application-receipt", thread_id="reused-recruiter-thread", subject="Application received", sender="recruiter@example.com", received_at=datetime(2026, 9, 20, 14, tzinfo=timezone.utc), body_text="We received your application.", label=EmailLabel.APPLICATION_CONFIRMATION.value)
+        db.add_all([confirmation, unrelated])
+        db.flush()
+        event = CalendarEvent(mailbox_id=mailbox_id, source_email_id=confirmation.id, source_thread_id=confirmation.thread_id, kind="confirmed", origin="email", title="Second interview", start_at=datetime(2026, 10, 5, 14, tzinfo=timezone.utc), end_at=datetime(2026, 10, 5, 15, tzinfo=timezone.utc), is_visible=True)
+        db.add(event)
+        db.flush()
+        # Simulate an over-broad association persisted by an older repair run.
+        db.add(CalendarEventEmail(event_id=event.id, email_id=unrelated.id))
+        db.commit()
+        event_id = event.id
+        confirmation_id = confirmation.id
+
+    response = _client(factory).get(f"/api/calendar-events/{event_id}/emails")
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()] == [confirmation_id]
 
 
 def test_manual_calendar_event_never_exposes_legacy_email_associations():

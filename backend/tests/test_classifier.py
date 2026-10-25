@@ -27,6 +27,37 @@ def test_ada_accommodation_disclaimer_is_not_a_scheduled_interview_reminder():
     ) == EmailLabel.APPLICATION_CONFIRMATION.value
 
 
+def test_confirmed_ics_interview_beats_embedded_job_description_markers():
+    body = """Your virtual interview with Boston Scientific is Confirmed!
+Here are the details for your upcoming 30 minute virtual interview.
+BEGIN:VCALENDAR
+METHOD:REQUEST
+BEGIN:VEVENT
+DTSTART:20261027T190000Z
+DTEND:20261027T193000Z
+DESCRIPTION:Interview Details - Senior Platform Engineer - Enterprise AI
+https://jobs.example.com/job-invite/635682/
+LOCATION:https://oli.vi/example
+SUMMARY:Your virtual interview with Boston Scientific
+STATUS:CONFIRMED
+END:VEVENT
+END:VCALENDAR
+"""
+    assert _heuristic_label(
+        "Your virtual interview with Boston Scientific",
+        "Olivia from Boston Scientific <scheduler@example.com>",
+        body,
+        "Your virtual interview is Confirmed!",
+    ) == EmailLabel.INTERVIEW_SCHEDULED.value
+    assert apply_label_guards(
+        EmailLabel.RECRUITMENT_ALERT.value,
+        subject="Your virtual interview with Boston Scientific",
+        sender="Olivia from Boston Scientific <scheduler@example.com>",
+        body_text=body,
+        snippet="Your virtual interview is Confirmed!",
+    ) == EmailLabel.INTERVIEW_SCHEDULED.value
+
+
 def test_should_we_move_forward_with_other_candidates_is_not_a_rejection():
     """"Should we decide to move forward with other candidates, we'll also let
     you know" is a conditional future outcome in an application receipt, not
@@ -348,6 +379,29 @@ def test_explicit_closed_or_paused_application_overrides_receipt_language():
 def test_job_digest_footer_actions_do_not_become_application_actions():
     body = """You joined the AGFA Talent Community. Your Job Agent matched the following jobs at careers.agfa.com. Update your preferences or reset your password to access your profile and agents."""
     assert _heuristic_label("New jobs posted from careers.agfa.com", "", body, "") == EmailLabel.RECRUITMENT_ALERT.value
+
+
+def test_appcast_new_job_matches_template_is_a_recruitment_alert_without_ai():
+    body = """We found new opportunities for you.
+
+New opportunities at Sherwin-Williams today.
+Here are today's latest job matches at Sherwin-Williams. Be one of the first to apply.
+Oakland, CA — Full Time — Customer Service Specialist
+Apply Now
+"""
+    assert _heuristic_label(
+        "Mark: New job matches for you at Sherwin-Williams.",
+        "Careers at Sherwin-Williams <sherwin-williams@hiring.appcast.io>",
+        body,
+        "We found new opportunities for you.",
+    ) == EmailLabel.RECRUITMENT_ALERT.value
+    assert apply_label_guards(
+        EmailLabel.OTHER.value,
+        subject="Mark: New job matches for you at Sherwin-Williams.",
+        sender="Careers at Sherwin-Williams <sherwin-williams@hiring.appcast.io>",
+        body_text=body,
+        snippet="We found new opportunities for you.",
+    ) == EmailLabel.RECRUITMENT_ALERT.value
 
 
 CLOUDBEDS = """Hi Jordan,

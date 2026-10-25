@@ -86,40 +86,9 @@ async def _consume_once(settings, stop_event: asyncio.Event) -> None:
         logger.info("Email RabbitMQ consumer started")
         async with queue.iterator() as messages:
             while not stop_event.is_set():
-                next_message = asyncio.create_task(messages.__anext__())
-                stopped = asyncio.create_task(stop_event.wait())
-                done, _pending = await asyncio.wait(
-                    (next_message, stopped),
-                    timeout=STALL_CHECK_SECONDS,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if stopped in done:
-                    next_message.cancel()
-                    await asyncio.gather(next_message, return_exceptions=True)
+                message = await _next_message(messages, channel, queue_name, stop_event)
+                if message is None:
                     return
-                if next_message not in done:
-                    # No delivery within the window. If work is waiting, the
-                    # channel has silently stalled; rebuild it. An empty queue
-                    # is just an idle period, so keep waiting.
-                    next_message.cancel()
-                    await asyncio.gather(next_message, stopped, return_exceptions=True)
-                    waiting = await _queue_depth(channel, queue_name)
-                    if waiting > 0:
-                        raise _ConsumerStalled(
-                            f"{waiting} message(s) waiting but none delivered in {STALL_CHECK_SECONDS}s"
-                        )
-                    continue
-                stopped.cancel()
-                await asyncio.gather(stopped, return_exceptions=True)
-                try:
-                    message = next_message.result()
-                except StopAsyncIteration:
-                    # The iterator was closed while we were waiting — the
-                    # underlying channel dropped (connect_robust transparently
-                    # reconnected the socket but did not re-register the
-                    # consumer, leaving the iterator permanently idle). Raise
-                    # so the outer loop rebuilds the connection from scratch.
-                    raise _ConsumerStalled("Queue iterator closed; consumer detached")
                 try:
                     await _handle_message(message)
                 except Exception:
@@ -129,6 +98,42 @@ async def _consume_once(settings, stop_event: asyncio.Event) -> None:
     finally:
         await connection.close()
         logger.info("Email RabbitMQ consumer stopped")
+
+
+async def _next_message(messages, channel, queue_name: str, stop_event: asyncio.Event):
+    """Wait for a delivery while retaining the broker read across idle probes.
+
+    Cancelling ``QueueIterator.__anext__`` can unregister aio-pika's consumer.
+    Keep one read alive while probing so an idle queue cannot detach itself.
+    """
+    delivery = asyncio.create_task(messages.__anext__())
+    try:
+        while True:
+            stopped = asyncio.create_task(stop_event.wait())
+            done, _pending = await asyncio.wait(
+                (delivery, stopped),
+                timeout=STALL_CHECK_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stopped in done:
+                return None
+            stopped.cancel()
+            await asyncio.gather(stopped, return_exceptions=True)
+            if delivery in done:
+                try:
+                    return delivery.result()
+                except StopAsyncIteration:
+                    raise _ConsumerStalled("Queue iterator closed; consumer detached")
+
+            waiting = await _queue_depth(channel, queue_name)
+            if waiting > 0:
+                raise _ConsumerStalled(
+                    f"{waiting} message(s) waiting but none delivered in {STALL_CHECK_SECONDS}s"
+                )
+    finally:
+        if not delivery.done():
+            delivery.cancel()
+            await asyncio.gather(delivery, return_exceptions=True)
 
 
 async def _queue_depth(channel, queue_name: str) -> int:

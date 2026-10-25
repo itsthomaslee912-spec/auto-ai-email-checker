@@ -833,7 +833,7 @@ function MonthDayAgenda({
   onCreate: (() => void) | null;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
-  const [box, setBox] = useState<{ left: number; top: number; maxHeight: number; width: number } | null>(null);
+  const [box, setBox] = useState<{ left: number; top?: number; bottom?: number; maxHeight: number; width: number } | null>(null);
   const place = useCallback(() => {
     const cell = document.querySelector<HTMLElement>(`[data-month-day="${day.toISOString()}"]`);
     if (!cell) return;
@@ -845,8 +845,12 @@ function MonthDayAgenda({
     const spaceAbove = rect.top - gap - 12;
     const preferBelow = spaceBelow >= 200 || spaceBelow >= spaceAbove;
     const maxHeight = Math.max(168, Math.min(420, preferBelow ? spaceBelow : spaceAbove));
-    const top = preferBelow ? rect.bottom + gap : Math.max(12, rect.top - gap - maxHeight);
-    setBox((current) => current && current.left === left && current.top === top && current.maxHeight === maxHeight && current.width === width ? current : { left, top, maxHeight, width });
+    // Below the cell, anchor the panel's top edge. Above the cell, anchor its
+    // bottom edge so a short list sits next to the clicked day instead of
+    // being offset by the maximum permitted height.
+    const top = preferBelow ? rect.bottom + gap : undefined;
+    const bottom = preferBelow ? undefined : window.innerHeight - rect.top + gap;
+    setBox((current) => current && current.left === left && current.top === top && current.bottom === bottom && current.maxHeight === maxHeight && current.width === width ? current : { left, top, bottom, maxHeight, width });
   }, [day]);
   useLayoutEffect(() => {
     place();
@@ -873,7 +877,7 @@ function MonthDayAgenda({
       role="dialog"
       aria-label={`${monthDayLabel(day)} interviews`}
       tabIndex={-1}
-      style={{ left: box.left, top: box.top, width: box.width, maxHeight: box.maxHeight }}
+      style={{ left: box.left, top: box.top, bottom: box.bottom, width: box.width, maxHeight: box.maxHeight }}
     >
       <header>
         <div>
@@ -1499,6 +1503,11 @@ export default function CalendarPage({
     }, calendarMotionDelay(220));
   };
   const showEventDetails = (event: CalendarEvent) => {
+    // The month agenda belongs to the day that opened it. Once a chip (or an
+    // item inside that agenda) is selected, leaving the old agenda mounted
+    // makes it look anchored to the newly selected event's day even though it
+    // still contains the previous day's events.
+    setMonthDay(null);
     if (selected?.id === event.id && !detailsClosing) {
       closeEventDetails();
       return;

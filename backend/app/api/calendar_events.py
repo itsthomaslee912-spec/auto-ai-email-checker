@@ -5,12 +5,12 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, or_
+from sqlalchemy import func
 from sqlalchemy.orm import Session, contains_eager, defer
 
 from app.auth.session import mailbox_scope
 from app.db import get_db
-from app.models import CalendarEvent, CalendarEventEmail, EmailMessage, MailboxConnection
+from app.models import CalendarEvent, CalendarEventEmail, EmailLabel, EmailMessage, MailboxConnection
 from app.realtime.sse import publish
 from app.schemas import (
     CalendarEventCreateIn,
@@ -225,39 +225,49 @@ def list_calendar_event_emails(event_id: int, db: Session = Depends(get_db)) -> 
     )
     related_events = [event, *superseded_events]
     related_event_ids = {item.id for item in related_events}
-    linked_ids = {
+    direct_ids = {
         email_id
         for item in related_events
         for email_id in (item.source_email_id, item.outcome_source_email_id)
         if email_id is not None
     }
-    linked_ids.update(
+    joined_ids = {
         row[0]
         for row in db.query(CalendarEventEmail.email_id)
         .filter(CalendarEventEmail.event_id.in_(related_event_ids))
         .all()
-    )
-
-    thread_ids = {item.source_thread_id for item in related_events if item.source_thread_id}
-    if linked_ids:
-        thread_ids.update(
+    }
+    calendar_labels = {
+        EmailLabel.INTERVIEW_INVITATION.value,
+        EmailLabel.INTERVIEW_AVAILABILITY.value,
+        EmailLabel.INTERVIEW_SCHEDULED.value,
+        EmailLabel.INTERVIEW_FOLLOW_UP.value,
+        EmailLabel.OFFER.value,
+        EmailLabel.REJECTED_CLOSED.value,
+    }
+    # Some older repair passes persisted every message in a provider thread.
+    # Keep the event's authoritative source/outcome, but only accept additional
+    # join-table history when it is calendar/interview mail.
+    linked_ids = set(direct_ids)
+    if joined_ids:
+        linked_ids.update(
             row[0]
-            for row in db.query(EmailMessage.thread_id)
+            for row in db.query(EmailMessage.id)
             .filter(
                 EmailMessage.mailbox_id == event.mailbox_id,
-                EmailMessage.id.in_(linked_ids),
-                EmailMessage.thread_id.is_not(None),
+                EmailMessage.id.in_(joined_ids),
+                EmailMessage.label.in_(calendar_labels),
             )
             .all()
-            if row[0]
         )
 
-    associations = []
-    if thread_ids:
-        associations.append(EmailMessage.thread_id.in_(thread_ids))
-    if linked_ids:
-        associations.append(EmailMessage.id.in_(linked_ids))
-    if not associations:
+    # Provider thread IDs identify a mailbox conversation, not a calendar
+    # appointment. A recruiter can reuse one thread for an application,
+    # several interview rounds, and follow-ups. Expanding a valid event link
+    # to the whole thread therefore leaks unrelated messages into the chip.
+    # CalendarEventEmail is the durable, appointment-level association; the
+    # source/outcome columns are retained for legacy rows.
+    if not linked_ids:
         return []
 
     return (
@@ -265,7 +275,7 @@ def list_calendar_event_emails(event_id: int, db: Session = Depends(get_db)) -> 
         .options(defer(EmailMessage.body_html))
         .filter(
             EmailMessage.mailbox_id == event.mailbox_id,
-            or_(*associations),
+            EmailMessage.id.in_(linked_ids),
         )
         .order_by(
             func.coalesce(EmailMessage.received_at, EmailMessage.created_at).desc(),

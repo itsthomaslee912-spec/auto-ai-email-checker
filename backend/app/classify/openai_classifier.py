@@ -177,6 +177,8 @@ def _label_from_facts(label: str, facts: dict[str, object], direction: str) -> s
 
 def _infer_category_subtype(label: str, text: str) -> str | None:
     if label == EmailLabel.RECRUITMENT_ALERT.value:
+        if _is_recruitment_digest(text):
+            return "job_digest"
         if re.search(r"\b(job alert|job digest|jobs? (?:for|you may|that might))\b", text):
             return "job_digest"
         if re.search(r"\btalent community\b", text):
@@ -652,6 +654,12 @@ def _ics_books_one_appointment(text: str) -> bool:
 
 
 def _is_scheduled_interview(text: str) -> bool:
+    # Provider calendar payloads often embed the job title, careers URL, and
+    # fields such as LOCATION/SUMMARY. Those strings resemble a recruiter job
+    # description structurally, but a single REQUEST/PUBLISH VEVENT with a
+    # DTSTART is authoritative evidence of a booked appointment.
+    if _ics_books_one_appointment(text):
+        return True
     if _looks_like_cold_jd_blast(text) or _is_application_received(text):
         return False
     # A recorded/async video-interview task (myInterview, HireVue-style) has no
@@ -670,8 +678,6 @@ def _is_scheduled_interview(text: str) -> bool:
         " ",
         text,
     )
-    if _ics_books_one_appointment(text):
-        return True
     if re.search(r"\bbook time with me\b.{0,180}\band\b", text):
         return True
     if re.search(r"(?:^|\n)\s*confirmed\s*:.{0,200}\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", text):
@@ -735,6 +741,9 @@ def _is_application_action_required(text: str) -> bool:
 def _is_recruitment_digest(text: str) -> bool:
     """High-confidence automated job digest, before footer account actions."""
     return any(re.search(pattern, text) for pattern in (
+        r"\bnew job matches for you\b",
+        r"\bwe found new opportunities for you\b.{0,240}\b(?:latest\s+)?job matches\b",
+        r"\bhere are today(?:'|’)?s latest job matches\b",
         r"\bnew jobs? (?:posted|added|matching|that match)\b",
         r"\bjob agent\b.{0,100}\bmatched the following jobs\b",
         r"\btalent community\b.{0,180}\b(?:matched the following jobs|job openings become available)\b",

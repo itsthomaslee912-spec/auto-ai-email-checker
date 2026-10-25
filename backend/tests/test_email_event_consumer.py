@@ -152,3 +152,36 @@ def test_stop_async_iteration_triggers_consumer_stalled(monkeypatch):
         pass
 
     assert raised == [True], "StopAsyncIteration from task result must be catchable"
+
+
+def test_idle_probe_keeps_pending_broker_read_alive(monkeypatch):
+    """An empty idle probe must not unregister aio-pika's queue consumer."""
+    import asyncio
+
+    cancelled = []
+    probes = []
+
+    class _Messages:
+        async def __anext__(self):
+            try:
+                await asyncio.sleep(0.03)
+                return "delivered-after-idle-probe"
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+
+    async def queue_depth(_channel, _queue_name):
+        probes.append(True)
+        return 0
+
+    monkeypatch.setattr(email_event_consumer, "STALL_CHECK_SECONDS", 0.01)
+    monkeypatch.setattr(email_event_consumer, "_queue_depth", queue_depth)
+
+    async def run():
+        return await email_event_consumer._next_message(
+            _Messages(), object(), "queue", asyncio.Event()
+        )
+
+    assert asyncio.run(run()) == "delivered-after-idle-probe"
+    assert probes
+    assert cancelled == []
