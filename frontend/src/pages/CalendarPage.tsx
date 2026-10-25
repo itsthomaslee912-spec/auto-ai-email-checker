@@ -126,6 +126,54 @@ function wallDateFromInput(value: string) {
 function startOfDay(date: Date) { return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())); }
 function addDays(date: Date, amount: number) { const next = new Date(date); next.setUTCDate(next.getUTCDate() + amount); return next; }
 function startOfWeek(date: Date) { const out = startOfDay(date); out.setUTCDate(out.getUTCDate() - ((out.getUTCDay() + 6) % 7)); return out; }
+type UsHoliday = { id: string; name: string; date: Date; observed: boolean };
+function nthWeekdayOfMonth(year: number, month: number, weekday: number, occurrence: number) {
+  const first = new Date(Date.UTC(year, month, 1));
+  return new Date(Date.UTC(year, month, 1 + ((weekday - first.getUTCDay() + 7) % 7) + (occurrence - 1) * 7));
+}
+function lastWeekdayOfMonth(year: number, month: number, weekday: number) {
+  const last = new Date(Date.UTC(year, month + 1, 0));
+  return addDays(last, -((last.getUTCDay() - weekday + 7) % 7));
+}
+function usFederalHolidaysForYear(year: number): UsHoliday[] {
+  const holidays: UsHoliday[] = [];
+  const add = (name: string, date: Date, observed = false) => holidays.push({
+    id: `${date.toISOString().slice(0, 10)}-${name}-${observed ? "observed" : "actual"}`,
+    name: observed ? `${name} (observed)` : name,
+    date,
+    observed,
+  });
+  const fixed = (name: string, month: number, day: number) => {
+    const date = new Date(Date.UTC(year, month, day));
+    add(name, date);
+    if (date.getUTCDay() === 6) add(name, addDays(date, -1), true);
+    if (date.getUTCDay() === 0) add(name, addDays(date, 1), true);
+  };
+  fixed("New Year's Day", 0, 1);
+  add("Birthday of Martin Luther King, Jr.", nthWeekdayOfMonth(year, 0, 1, 3));
+  add("Washington's Birthday", nthWeekdayOfMonth(year, 1, 1, 3));
+  add("Memorial Day", lastWeekdayOfMonth(year, 4, 1));
+  fixed("Juneteenth National Independence Day", 5, 19);
+  fixed("Independence Day", 6, 4);
+  add("Labor Day", nthWeekdayOfMonth(year, 8, 1, 1));
+  add("Columbus Day", nthWeekdayOfMonth(year, 9, 1, 2));
+  fixed("Veterans Day", 10, 11);
+  add("Thanksgiving Day", nthWeekdayOfMonth(year, 10, 4, 4));
+  fixed("Christmas Day", 11, 25);
+  return holidays;
+}
+function usFederalHolidays(start: Date, end: Date) {
+  const firstYear = start.getUTCFullYear() - 1;
+  const lastYear = end.getUTCFullYear() + 1;
+  const unique = new Map<string, UsHoliday>();
+  for (let year = firstYear; year <= lastYear; year += 1) {
+    for (const holiday of usFederalHolidaysForYear(year)) {
+      if (holiday.date < start || holiday.date >= end) continue;
+      unique.set(holiday.id, holiday);
+    }
+  }
+  return [...unique.values()].sort((a, b) => a.date.getTime() - b.date.getTime() || a.name.localeCompare(b.name));
+}
 function endExclusive(start: Date, view: ViewMode) {
   if (view === "day") return addDays(startOfDay(start), 1);
   if (view === "week") return addDays(startOfWeek(start), 7);
@@ -815,9 +863,14 @@ function monthDayLabel(day: Date) {
   return new Intl.DateTimeFormat(undefined, { timeZone: "UTC", weekday: "long", month: "short", day: "numeric" }).format(day);
 }
 
+function HolidayChip({ holiday }: { holiday: UsHoliday }) {
+  return <div className="calendar-holiday" title={`U.S. federal holiday: ${holiday.name}`} aria-label={`U.S. federal holiday, ${holiday.name}`}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m8 1.6 1.85 3.75 4.14.6-3 2.92.71 4.12L8 11.04 4.3 13l.71-4.13-3-2.92 4.14-.6L8 1.6Z" /></svg><strong>{holiday.name}</strong></div>;
+}
+
 function MonthDayAgenda({
   day,
   events,
+  holidays,
   timeZone,
   colorFor,
   onClose,
@@ -826,6 +879,7 @@ function MonthDayAgenda({
 }: {
   day: Date;
   events: CalendarEvent[];
+  holidays: UsHoliday[];
   timeZone: string;
   colorFor: (event: CalendarEvent) => string;
   onClose: () => void;
@@ -882,11 +936,12 @@ function MonthDayAgenda({
       <header>
         <div>
           <strong>{monthDayLabel(day)}</strong>
-          <span>{ordered.length === 0 ? "No interviews" : `${ordered.length} interview${ordered.length === 1 ? "" : "s"}`}</span>
+          <span>{ordered.length === 0 && holidays.length === 0 ? "Nothing scheduled" : `${ordered.length + holidays.length} calendar item${ordered.length + holidays.length === 1 ? "" : "s"}`}</span>
         </div>
         <button type="button" onClick={onClose} aria-label="Close day">×</button>
       </header>
-      {ordered.length === 0 ? <p className="month-day-agenda-empty">Nothing is scheduled for this day.</p> : <ul>
+      {ordered.length === 0 && holidays.length === 0 ? <p className="month-day-agenda-empty">Nothing is scheduled for this day.</p> : <ul>
+        {holidays.map((holiday) => <li className="month-day-agenda-holiday" key={holiday.id}><HolidayChip holiday={holiday} /></li>)}
         {ordered.map((event) => {
           const status = cardStatus(event);
           return <li key={event.id}>
@@ -1139,6 +1194,7 @@ const MONTH_CHIP_GAP = 6;
 const MonthDayCell = memo(function MonthDayCell({
   day,
   events,
+  holidays,
   today,
   outside,
   selected,
@@ -1151,6 +1207,7 @@ const MonthDayCell = memo(function MonthDayCell({
 }: {
   day: Date;
   events: CalendarEvent[];
+  holidays: UsHoliday[];
   today: boolean;
   outside: boolean;
   selected: boolean;
@@ -1162,12 +1219,13 @@ const MonthDayCell = memo(function MonthDayCell({
   onOpen: (day: Date) => void;
 }) {
   const eventsRef = useRef<HTMLDivElement>(null);
-  const [visibleCount, setVisibleCount] = useState(() => Math.min(events.length, 3));
+  const itemCount = events.length + holidays.length;
+  const [visibleCount, setVisibleCount] = useState(() => Math.min(itemCount, 3));
   useLayoutEffect(() => {
     const area = eventsRef.current;
     if (!area) return;
     const update = () => {
-      const sample = area.querySelector<HTMLElement>(":scope > .calendar-event");
+      const sample = area.querySelector<HTMLElement>(":scope > .calendar-event, :scope > .calendar-holiday");
       const row = (sample?.offsetHeight ?? 26) + MONTH_CHIP_GAP;
       const next = Math.max(1, Math.floor((area.clientHeight + MONTH_CHIP_GAP) / row));
       setVisibleCount((current) => current === next ? current : next);
@@ -1176,12 +1234,13 @@ const MonthDayCell = memo(function MonthDayCell({
     const observer = new ResizeObserver(update);
     observer.observe(area);
     return () => observer.disconnect();
-  }, [events.length]);
-  const hidden = Math.max(0, events.length - visibleCount);
-  const shown = hidden > 0 ? events.slice(0, visibleCount) : events;
+  }, [itemCount]);
+  const items = [...holidays.map((holiday) => ({ kind: "holiday" as const, holiday })), ...events.map((event) => ({ kind: "event" as const, event }))];
+  const hidden = Math.max(0, items.length - visibleCount);
+  const shown = hidden > 0 ? items.slice(0, visibleCount) : items;
   return <div className={`calendar-day ${today ? "today" : ""} ${outside ? "outside" : ""} ${selected ? "is-selected" : ""}`} data-month-day={day.toISOString()} onClick={() => onToggle(day)}>
     <div className="calendar-day-heading"><strong>{day.getUTCDate()}</strong>{today && <em>Today</em>}</div>
-    <div className="calendar-day-events" ref={eventsRef}>{shown.map((event) => <EventCard event={event} color={colorFor(event.mailbox_id)} timeZone={timeZone} compact selected={selectedEventId === event.id} onSelect={onSelectEvent} key={event.id} />)}</div>
+    <div className="calendar-day-events" ref={eventsRef}>{shown.map((item) => item.kind === "holiday" ? <HolidayChip holiday={item.holiday} key={item.holiday.id} /> : <EventCard event={item.event} color={colorFor(item.event.mailbox_id)} timeZone={timeZone} compact selected={selectedEventId === item.event.id} onSelect={onSelectEvent} key={item.event.id} />)}</div>
     {hidden > 0 && <button className="calendar-day-more" type="button" onClick={(event) => { event.stopPropagation(); onOpen(day); }}>+{hidden} more</button>}
   </div>;
 });
@@ -1441,6 +1500,8 @@ export default function CalendarPage({
   const activeMailboxes = useMemo(() => mailboxes.filter((mailbox) => mailbox.is_active), [mailboxes]);
   const allCalendarsShown = activeMailboxes.every((mailbox) => !hiddenMailboxIds.includes(mailbox.id));
   const dayGroups = useMemo(() => groupEventsByDay(shownEvents, days, timeZone), [shownEvents, days, timeZone]);
+  const holidays = useMemo(() => usFederalHolidays(start, end), [start, end]);
+  const holidaysByDay = useMemo(() => days.map((day) => holidays.filter((holiday) => sameDay(holiday.date, day))), [days, holidays]);
   const selectCalendarEventRef = useRef<(event: CalendarEvent) => void>(() => {});
   const selectCalendarEvent = useCallback((event: CalendarEvent) => selectCalendarEventRef.current(event), []);
   const toggleMonthDay = useCallback((day: Date) => {
@@ -1634,6 +1695,7 @@ export default function CalendarPage({
             key={day.toISOString()}
             day={day}
             events={dayGroups[dayIndex].all}
+            holidays={holidaysByDay[dayIndex] ?? []}
             today={sameDay(day, nowInTimeZone)}
             outside={day.getUTCMonth() !== anchor.getUTCMonth()}
             selected={monthDay != null && sameDay(day, monthDay)}
@@ -1648,6 +1710,7 @@ export default function CalendarPage({
         {monthDay && <MonthDayAgenda
           day={monthDay}
           events={dayGroups[days.findIndex((day) => sameDay(day, monthDay))]?.all ?? []}
+          holidays={holidaysByDay[days.findIndex((day) => sameDay(day, monthDay))] ?? []}
           timeZone={timeZone}
           colorFor={(event) => mailboxColor(event.mailbox_id)}
           onClose={() => setMonthDay(null)}
@@ -1661,7 +1724,7 @@ export default function CalendarPage({
             <div className="calendar-time-corner" />
             {days.map((day) => { const today = sameDay(day, nowInTimeZone); const weekday = new Intl.DateTimeFormat(undefined, { timeZone: "UTC", weekday: "short" }).format(day); const month = new Intl.DateTimeFormat(undefined, { timeZone: "UTC", month: "short" }).format(day); return <div className={`calendar-time-day-heading ${today ? "today" : ""}`} key={day.toISOString()}><span>{weekCrossesMonth ? `${weekday} ${month}` : weekday}</span><strong>{day.getUTCDate()}</strong></div>; })}
             <div className="calendar-all-day-label">all-day</div>
-          {days.map((day, dayIndex) => <div className="calendar-all-day-cell" key={`all-day-${day.toISOString()}`}>{dayGroups[dayIndex]?.allDay.map((event) => <EventCard event={event} color={mailboxColor(event.mailbox_id)} timeZone={timeZone} compact selected={selectedEventId === event.id} onSelect={selectCalendarEvent} key={event.id} />)}</div>)}
+          {days.map((day, dayIndex) => <div className="calendar-all-day-cell" key={`all-day-${day.toISOString()}`}>{holidaysByDay[dayIndex]?.map((holiday) => <HolidayChip holiday={holiday} key={holiday.id} />)}{dayGroups[dayIndex]?.allDay.map((event) => <EventCard event={event} color={mailboxColor(event.mailbox_id)} timeZone={timeZone} compact selected={selectedEventId === event.id} onSelect={selectCalendarEvent} key={event.id} />)}</div>)}
           </div>
           <div className="calendar-time-body">
             <div className="calendar-time-axis">{HOURS.map((hour) => <span key={hour} style={{ top: `${hour * hourHeight}px` }}>{hourLabel(hour)}</span>)}</div>

@@ -383,6 +383,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [selected, setSelected] = useState<EmailDetail | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
+  const [mobileReaderOpen, setMobileReaderOpen] = useState(false);
   const [tableDialogOpen, setTableDialogOpen] = useState(false);
   const [syncMenuOpen, setSyncMenuOpen] = useState(false);
   const [calendarRefreshKey, setCalendarRefreshKey] = useState(0);
@@ -405,8 +406,15 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("appearance");
   const [sidebarSections, setSidebarSections] = useState({ inbox: true, categories: true });
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
-    try { return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1"; } catch { return false; }
+    try { return window.matchMedia("(max-width: 720px)").matches || localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1"; } catch { return false; }
   });
+  useEffect(() => {
+    const phoneLayout = window.matchMedia("(max-width: 720px)");
+    const collapseForPhone = () => { if (phoneLayout.matches) setSidebarCollapsed(true); };
+    collapseForPhone();
+    phoneLayout.addEventListener("change", collapseForPhone);
+    return () => phoneLayout.removeEventListener("change", collapseForPhone);
+  }, []);
   const [resizing, setResizing] = useState<"accounts" | "list" | null>(null);
   const [replyOpen, setReplyOpen] = useState(false);
   const [replyText, setReplyText] = useState("");
@@ -1213,18 +1221,21 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   function openSettings(section: SettingsSection = "appearance") {
     const adminOnly = section === "ai" || section === "training";
     setSettingsSection(adminOnly && !sessionUser.is_admin ? "appearance" : section);
+    setMobileReaderOpen(false);
     setSettingsOpen(true);
   }
 
   function openMonitoring() {
     if (!sessionUser.is_admin) return;
     setSettingsOpen(false);
+    setMobileReaderOpen(false);
     setActivePage("monitoring");
   }
 
   function openStatistics() {
     if (!sessionUser.is_admin) return;
     setSettingsOpen(false);
+    setMobileReaderOpen(false);
     setActivePage("statistics");
   }
 
@@ -1526,6 +1537,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
 
   function openCalendar() {
     setCalendarMounted(true);
+    setMobileReaderOpen(false);
     setActivePage("calendar");
   }
 
@@ -1681,6 +1693,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
 
   async function onOpenEmail(id: number) {
     setActivePage("inbox");
+    setMobileReaderOpen(true);
     const request = ++detailGen.current;
     const target = emails.find((item) => item.id === id);
     const shouldMarkRead = Boolean(target && !target.is_read);
@@ -1819,6 +1832,17 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     ++detailGen.current;
     setTableDialogOpen(false);
     setLoadingDetail(false);
+  }
+
+  function closeMobileReader() {
+    ++detailGen.current;
+    setMobileReaderOpen(false);
+    setTableDialogOpen(false);
+    setSelectedId(null);
+    setSelected(null);
+    setLoadingDetail(false);
+    setReplyOpen(false);
+    setCategoryPickerOpen(false);
   }
 
   useEffect(() => {
@@ -2007,6 +2031,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   }
 
   function selectMailboxFolder(id: number | null, nextFolder: "all" | MailFolder) {
+    setMobileReaderOpen(false);
     setActivePage("inbox");
     scrollRef.current?.scrollTo(0, 0);
     if (selectedMailboxId === id && folder === nextFolder) {
@@ -2024,6 +2049,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
 
   function chooseReadingPane(next: ReadingPane) {
     setTableDialogOpen(false);
+    setMobileReaderOpen(false);
     setReadingPane(next);
     saveReadingPane(next);
   }
@@ -2519,7 +2545,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   return (
     <div
       ref={shellRef}
-      className={`app-shell view-${viewMode} reading-${readingPane.replace("_", "-")}${activePage === "calendar" ? " calendar-open" : ""}${activePage === "monitoring" || activePage === "statistics" ? " monitoring-open" : ""}${activePage === "statistics" ? " statistics-open" : ""}${tableDialogOpen ? " table-dialog-open" : ""}${sidebarCollapsed ? " sidebar-collapsed" : ""}${resizing ? ` is-resizing resizing-${resizing}` : ""}`}
+      className={`app-shell view-${viewMode} reading-${readingPane.replace("_", "-")}${activePage === "calendar" ? " calendar-open" : ""}${activePage === "monitoring" || activePage === "statistics" ? " monitoring-open" : ""}${activePage === "statistics" ? " statistics-open" : ""}${activePage === "inbox" && mobileReaderOpen && selectedId != null && (readingPane !== "no_split" || tableDialogOpen) ? " mobile-reader-open" : ""}${tableDialogOpen ? " table-dialog-open" : ""}${sidebarCollapsed ? " sidebar-collapsed" : ""}${resizing ? ` is-resizing resizing-${resizing}` : ""}`}
       style={
         {
           "--accounts-w": sidebarCollapsed ? "3.55rem" : `${accountsW}px`,
@@ -2938,6 +2964,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         aria-modal={activePage === "inbox" && readingPane === "no_split" && tableDialogOpen ? true : undefined}
         aria-label={activePage === "calendar" ? "Calendar" : readingPane === "no_split" && tableDialogOpen ? selected?.subject || "Email" : undefined}
       >
+        {activePage === "inbox" && mobileReaderOpen && selectedId != null && (readingPane !== "no_split" || tableDialogOpen) && <header className="mobile-reader-toolbar"><button type="button" onClick={closeMobileReader} aria-label="Back to messages"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7M8 12h11" /></svg><span>Messages</span></button></header>}
         {calendarMounted && (
           <div className={`calendar-page-host${activePage === "calendar" ? "" : " is-hidden"}`} hidden={activePage !== "calendar"} aria-hidden={activePage !== "calendar"}>
             <CalendarPage

@@ -4667,6 +4667,10 @@ button:active:not(:disabled) {
 .calendar-day-events { min-height: 0; flex: 1; display: grid; align-content: start; gap: .35rem; overflow: hidden; }
 .calendar-day-more { flex: 0 0 auto; margin-top: .28rem; padding: .16rem .45rem; border: 0; border-radius: 999px; background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); font: inherit; font-size: .68rem; font-weight: 750; line-height: 1.2; text-align: left; cursor: pointer; }
 .calendar-day-more:hover { background: color-mix(in srgb, var(--accent) 26%, transparent); }
+.calendar-holiday { min-width: 0; width: 100%; display: flex; align-items: center; gap: .3rem; padding: .28rem .42rem; border: 1px solid color-mix(in srgb, #3b82f6 42%, var(--calendar-border)); border-radius: 8px; background: color-mix(in srgb, #3b82f6 18%, var(--calendar-control)); color: color-mix(in srgb, #60a5fa 72%, var(--ink)); font-size: .71rem; line-height: 1.15; }
+.calendar-holiday svg { width: .72rem; height: .72rem; flex: 0 0 auto; fill: currentColor; }
+.calendar-holiday strong { min-width: 0; overflow: hidden; font-size: .7rem; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
+html[data-theme="light"] .calendar-holiday { background: color-mix(in srgb, #2563eb 10%, var(--calendar-control)); color: #1d4ed8; }
 .month-day-agenda { position: fixed; z-index: 40; display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--calendar-border); border-radius: 14px; background: var(--surface-glass); color: var(--ink); box-shadow: var(--shadow-md); outline: none; backdrop-filter: blur(18px) saturate(130%); }
 .month-day-agenda header, .month-day-agenda footer { display: flex; align-items: center; justify-content: space-between; gap: .6rem; padding: .7rem .75rem; }
 .month-day-agenda header { border-bottom: 1px solid var(--calendar-border-soft); }
@@ -4678,6 +4682,7 @@ button:active:not(:disabled) {
 .month-day-agenda ul { min-height: 0; margin: 0; padding: .35rem; overflow: auto; list-style: none; display: grid; gap: .2rem; }
 .month-day-agenda li button { width: 100%; display: flex; align-items: center; gap: .55rem; padding: .45rem .5rem; border: 0; border-radius: 10px; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
 .month-day-agenda li button:hover, .month-day-agenda li button:focus-visible { background: var(--calendar-hover); outline: none; }
+.month-day-agenda .month-day-agenda-holiday { padding: .2rem .3rem; }
 .month-day-agenda-swatch { width: .55rem; height: 1.7rem; flex: 0 0 auto; border-radius: 99px; }
 .month-day-agenda-copy { min-width: 0; flex: 1; display: grid; gap: .08rem; }
 .month-day-agenda-copy strong, .month-day-agenda-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -4788,7 +4793,7 @@ html[data-theme="light"] .calendar-event-hover-card .calendar-hover-status.statu
 .calendar-time-day-heading strong { display: grid; place-items: center; width: 2.2rem; height: 2.2rem; border-radius: 50%; color: var(--ink); font-size: 1.05rem; }
 .calendar-time-day-heading.today strong { background: var(--accent); color: white; }
 .calendar-all-day-label { position: sticky; left: 0; z-index: 2; display: flex; align-items: center; justify-content: flex-end; padding-right: .55rem; background: var(--calendar-panel); color: var(--muted); font-size: .68rem; }
-.calendar-all-day-cell { min-width: 0; min-height: 2rem; padding: .2rem; border-left: 1px solid var(--calendar-border); overflow: hidden; }
+.calendar-all-day-cell { min-width: 0; min-height: 2rem; padding: .2rem; border-left: 1px solid var(--calendar-border); overflow: hidden; display: grid; align-content: start; gap: .2rem; }
 .calendar-all-day-cell .calendar-event { padding-block: .22rem; }
 .calendar-time-body { display: grid; grid-template-columns: var(--time-axis-w) minmax(0,1fr); }
 .calendar-time-axis { position: sticky; left: 0; z-index: 6; height: var(--day-height); background: var(--calendar-panel); color: var(--ink); font-size: .65rem; font-weight: 700; }
@@ -5788,6 +5793,51 @@ html[data-theme="light"] .source-email-status.status-position-closed { color: #3
   background: var(--surface-glass);
   box-shadow: var(--shadow-md);
   backdrop-filter: blur(22px);
+}
+
+/* At tablet and narrow-laptop widths there is not enough horizontal room for
+   the mailbox tree, message list, and reader. Keep the mailbox rail at the
+   left and stack the list above the reader. This must follow the desktop
+   reading-pane rules so their later cascade cannot restore five columns. */
+@media (min-width: 721px) and (max-width: 980px) {
+  .app-shell:not(.calendar-open):not(.monitoring-open).reading-right,
+  .app-shell:not(.calendar-open):not(.monitoring-open).reading-below {
+    grid-template-columns: min(220px, var(--accounts-w)) var(--accounts-gap, 6px) minmax(0, 1fr);
+    grid-template-rows: minmax(180px, 42%) minmax(240px, 1fr);
+  }
+
+  .app-shell:not(.calendar-open):not(.monitoring-open).reading-right .pane-accounts,
+  .app-shell:not(.calendar-open):not(.monitoring-open).reading-below .pane-accounts {
+    grid-column: 1;
+    grid-row: 1 / -1;
+  }
+
+  .app-shell:not(.calendar-open):not(.monitoring-open).reading-right .accounts-splitter,
+  .app-shell:not(.calendar-open):not(.monitoring-open).reading-below .accounts-splitter {
+    display: block;
+    grid-column: 2;
+    grid-row: 1 / -1;
+  }
+
+  .app-shell:not(.calendar-open):not(.monitoring-open).reading-right .pane-list,
+  .app-shell:not(.calendar-open):not(.monitoring-open).reading-below .pane-list {
+    grid-column: 3;
+    grid-row: 1;
+    border-right: 0;
+  }
+
+  .app-shell:not(.calendar-open):not(.monitoring-open).reading-right .reader-splitter,
+  .app-shell:not(.calendar-open):not(.monitoring-open).reading-below .reader-splitter {
+    display: none;
+  }
+
+  .app-shell:not(.calendar-open):not(.monitoring-open).reading-right .pane-reader,
+  .app-shell:not(.calendar-open):not(.monitoring-open).reading-below .pane-reader {
+    display: flex;
+    grid-column: 3;
+    grid-row: 2;
+    border-top: 1px solid var(--line);
+  }
 }
 
 @media (max-width: 720px) {
@@ -8505,6 +8555,136 @@ html[data-theme="light"] .system-alert-backdrop {
   .mail-alert-foot { flex-wrap: wrap; }
   .mail-alert-foot > span { flex-basis: 100%; }
   .mail-alert-when { display: none; }
+}
+
+/* Phone layout: keep navigation compact and show one working surface at a
+   time. The older breakpoint stacked the sidebar, list, and reader into a
+   document taller than the viewport, which made Android navigation and
+   scrolling appear broken. */
+.mobile-reader-toolbar { display: none; }
+@media (max-width: 720px) {
+  .app-shell,
+  .app-shell.view-table,
+  .app-shell.calendar-open,
+  .app-shell.view-table.calendar-open,
+  .app-shell.monitoring-open,
+  .app-shell.view-table.monitoring-open,
+  .app-shell.statistics-open,
+  .app-shell.view-table.statistics-open,
+  .app-shell:not(.calendar-open):not(.monitoring-open).reading-right,
+  .app-shell:not(.calendar-open):not(.monitoring-open).reading-below,
+  .app-shell:not(.calendar-open):not(.monitoring-open).reading-no-split {
+    width: 100vw;
+    height: 100dvh;
+    min-height: 0;
+    grid-template-columns: 3.55rem minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+    overflow: hidden;
+  }
+
+  .app-shell > .pane-accounts,
+  .app-shell.calendar-open > .pane-accounts,
+  .app-shell.monitoring-open > .pane-accounts,
+  .app-shell.statistics-open > .pane-accounts {
+    grid-column: 1;
+    grid-row: 1;
+    width: 3.55rem;
+    height: 100dvh;
+    max-height: none;
+    z-index: 45;
+  }
+
+  .app-shell > .pane-accounts:not(.is-collapsed) {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: min(19rem, 88vw);
+    max-height: none;
+    box-shadow: 18px 0 48px color-mix(in srgb, #000 55%, transparent);
+  }
+
+  .app-shell > .accounts-splitter,
+  .app-shell > .reader-splitter { display: none !important; }
+
+  .app-shell > .pane-list,
+  .app-shell.view-table > .pane-list,
+  .app-shell:not(.calendar-open):not(.monitoring-open).reading-right > .pane-list,
+  .app-shell:not(.calendar-open):not(.monitoring-open).reading-below > .pane-list,
+  .app-shell:not(.calendar-open):not(.monitoring-open).reading-no-split > .pane-list {
+    display: flex;
+    grid-column: 2;
+    grid-row: 1;
+    width: auto;
+    height: 100dvh;
+    min-height: 0;
+  }
+
+  .app-shell > .pane-reader { display: none; }
+  .app-shell.mobile-reader-open > .pane-reader {
+    position: fixed;
+    z-index: 100;
+    inset: 0;
+    width: 100vw;
+    height: 100dvh;
+    display: flex;
+    border: 0;
+    border-radius: 0;
+    background: var(--bg);
+    transform: none;
+  }
+
+  .mobile-reader-toolbar {
+    min-height: calc(3.25rem + env(safe-area-inset-top));
+    flex: 0 0 auto;
+    display: flex;
+    align-items: flex-end;
+    padding: env(safe-area-inset-top) .65rem .45rem;
+    border-bottom: 1px solid var(--line);
+    background: var(--bg-pane);
+  }
+  .mobile-reader-toolbar button {
+    min-height: 2.35rem;
+    display: inline-flex;
+    align-items: center;
+    gap: .35rem;
+    padding: 0 .65rem;
+    border: 0;
+    border-radius: 9px;
+    background: transparent;
+    color: var(--accent);
+    font: inherit;
+    font-size: .82rem;
+    font-weight: 720;
+  }
+  .mobile-reader-toolbar button:active { background: var(--bg-hover); }
+  .mobile-reader-toolbar svg { width: 1.05rem; height: 1.05rem; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+
+  .app-shell.calendar-open > .pane-reader,
+  .app-shell.view-table.calendar-open > .pane-reader {
+    position: static;
+    grid-column: 2;
+    grid-row: 1;
+    width: auto;
+    height: 100dvh;
+    display: flex;
+    border: 0;
+  }
+  .app-shell.calendar-open .calendar-grid.month { grid-template-columns: repeat(7, minmax(5.75rem, 1fr)); }
+  .app-shell.calendar-open .calendar-toolbar { padding-top: max(.55rem, env(safe-area-inset-top)); }
+
+  .app-shell > .monitoring-page,
+  .app-shell > .statistics-page {
+    grid-column: 2;
+    grid-row: 1;
+    width: auto;
+    height: 100dvh;
+    min-height: 0;
+    overflow: auto;
+  }
+
+  .reader-article { min-height: 0; overflow: hidden; }
+  .mail-alert-backdrop,
+  .dialog-backdrop,
+  .modal-backdrop { padding: max(.6rem, env(safe-area-inset-top)) .6rem max(.6rem, env(safe-area-inset-bottom)); }
 }
 @media (prefers-reduced-motion: reduce) {
   .mail-alert, .mail-alert-backdrop, .mail-alert-count { animation: none; }
