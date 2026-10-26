@@ -97,6 +97,21 @@ const LIST_W_KEY = "email-checker-list-w";
 const LIST_H_KEY = "email-checker-list-h";
 const ACCOUNTS_ORDER_KEY = "email-checker-accounts-order";
 
+type QuickReplyKind = "interview_follow_up" | "reschedule_interview";
+
+const QUICK_REPLY_OPTIONS: { id: QuickReplyKind; label: string; description: string }[] = [
+  {
+    id: "interview_follow_up",
+    label: "Interview follow-up",
+    description: "Thank the interviewer and reaffirm your interest.",
+  },
+  {
+    id: "reschedule_interview",
+    label: "Reschedule interview",
+    description: "Ask for a different interview time politely.",
+  },
+];
+
 function loadStoredWidth(key: string, fallback: number, min: number): number {
   try {
     const n = Number(localStorage.getItem(key));
@@ -419,6 +434,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   const [replyOpen, setReplyOpen] = useState(false);
   const [replyText, setReplyText] = useState("");
   const [replyInstruction, setReplyInstruction] = useState("");
+  const [quickRepliesOpen, setQuickRepliesOpen] = useState(false);
   const [replyFiles, setReplyFiles] = useState<File[]>([]);
   const [scheduleAt, setScheduleAt] = useState("");
   const [sendingReply, setSendingReply] = useState(false);
@@ -452,6 +468,8 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   const conversationScrollRef = useRef<HTMLDivElement>(null);
   const readerCloseRef = useRef<HTMLButtonElement>(null);
   const syncMenuRef = useRef<HTMLDivElement>(null);
+  const quickReplyMenuRef = useRef<HTMLDivElement>(null);
+  const replyTextareaRef = useRef<HTMLTextAreaElement>(null);
   const didMountFilters = useRef(false);
   // Mailbox navigation starts its own load so the list (including date-group
   // counts) is refreshed from the clicked scope immediately.
@@ -1896,6 +1914,22 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     };
   }, [syncMenuOpen]);
 
+  useEffect(() => {
+    if (!quickRepliesOpen) return;
+    const closeOnPointerDown = (event: globalThis.PointerEvent) => {
+      if (!quickReplyMenuRef.current?.contains(event.target as Node)) setQuickRepliesOpen(false);
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setQuickRepliesOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnPointerDown);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnPointerDown);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [quickRepliesOpen]);
+
   function onMessageListKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (viewMode === "table" && readingPane === "no_split" && event.key === "Enter" && event.target === event.currentTarget && selectedId != null) {
       event.preventDefault();
@@ -1985,7 +2019,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
           : firstAddress(selected.sender);
         await sendEmail({ mailbox_id: replyMailbox.id, to_address: toAddress, subject: /^re:/i.test(selected.subject) ? selected.subject : `Re: ${selected.subject}`, body_text: replyText, attachments: await filePayload(replyFiles), reply_to_email_id: selected.id });
         setBanner(scheduleAt ? "Reply scheduled and sent." : "Reply sent. It is now in Sent.");
-        setReplyOpen(false); setReplyText(""); setReplyInstruction(""); setReplyFiles([]); setScheduleAt("");
+        setReplyOpen(false); setQuickRepliesOpen(false); setReplyText(""); setReplyInstruction(""); setReplyFiles([]); setScheduleAt("");
         if (folder === "sent") void loadFirstPage();
       } catch (err) { setBanner(err instanceof Error ? err.message : "Could not send reply"); }
       finally { setSendingReply(false); }
@@ -2001,6 +2035,21 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     try { setReplyText((await createAiReply(selected.id, replyInstruction.trim())).body_text); }
     catch (err) { setBanner(err instanceof Error ? err.message : "Could not create AI draft"); }
     finally { setAiDrafting(false); }
+  }
+
+  function applyQuickReply(kind: QuickReplyKind) {
+    const signature = sessionUser.display_name?.trim() || sessionUser.email.split("@")[0];
+    const body = kind === "interview_follow_up"
+      ? `Hi,\n\nThank you again for taking the time to speak with me about this opportunity. I enjoyed learning more about the role and the team, and I remain very interested in moving forward.\n\nPlease let me know if I can provide any additional information.\n\nBest regards,\n${signature}`
+      : `Hi,\n\nThank you for arranging the interview. Unfortunately, I need to reschedule our meeting. Would it be possible to choose another time? I am happy to work around your availability.\n\nI apologize for the inconvenience and appreciate your understanding.\n\nBest regards,\n${signature}`;
+    setReplyText(body);
+    setQuickRepliesOpen(false);
+    window.requestAnimationFrame(() => {
+      const textarea = replyTextareaRef.current;
+      if (!textarea) return;
+      textarea.focus();
+      textarea.setSelectionRange(body.length, body.length);
+    });
   }
 
   function chooseSchedulePreset(daysFromToday: number, hour: number) {
@@ -3127,7 +3176,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
               {laterThread.map((message) => renderThreadMessage(message))}
               {!replyOpen && (
                 <div className="reply-action-row">
-                  <button type="button" className="reply-pill" onClick={() => { setScheduleAt(""); setReplyInstruction(""); setReplyOpen(true); }}>
+                  <button type="button" className="reply-pill" onClick={() => { setScheduleAt(""); setReplyInstruction(""); setQuickRepliesOpen(false); setReplyOpen(true); }}>
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 8 4 12l5 4" /><path d="M4 12h9.5a5.5 5.5 0 0 1 5.5 5.5V19" /></svg>
                     <span>Reply</span>
                   </button>
@@ -3139,9 +3188,31 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                     <strong>Reply</strong>
                     <span>From {replyMailbox?.email_address ?? "selected account"} to {selected.folder === "sent" && selected.recipients ? selected.recipients : selected.sender}</span>
                   </header>
-                  <textarea autoFocus value={replyText} onChange={(event) => setReplyText(event.target.value)} placeholder="Write your reply" />
+                  <textarea ref={replyTextareaRef} autoFocus value={replyText} onChange={(event) => setReplyText(event.target.value)} placeholder="Write your reply" />
                   <form className="reply-ai-prompt" onSubmit={(event) => { event.preventDefault(); void draftAiReply(); }}>
-                    <span aria-hidden="true">✦</span>
+                    <div className="reply-quick-replies" ref={quickReplyMenuRef}>
+                      <button
+                        type="button"
+                        className="reply-template-trigger"
+                        aria-label="Open quick reply templates"
+                        aria-haspopup="menu"
+                        aria-expanded={quickRepliesOpen}
+                        onClick={() => setQuickRepliesOpen((open) => !open)}
+                      >
+                        <span aria-hidden="true">✦</span>
+                      </button>
+                      {quickRepliesOpen && (
+                        <div className="reply-template-menu" role="menu" aria-label="Quick reply templates">
+                          <div className="reply-template-heading">Quick replies</div>
+                          {QUICK_REPLY_OPTIONS.map((option) => (
+                            <button key={option.id} type="button" role="menuitem" onClick={() => applyQuickReply(option.id)}>
+                              <span className="reply-template-icon" aria-hidden="true">{option.id === "interview_follow_up" ? "↗" : "↻"}</span>
+                              <span><strong>{option.label}</strong><small>{option.description}</small></span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                     <input
                       aria-label="Describe your reply"
                       value={replyInstruction}
@@ -3150,7 +3221,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                       maxLength={2000}
                       disabled={aiDrafting}
                     />
-                    <button type="submit" disabled={aiDrafting} aria-label="Generate reply from description">
+                    <button type="submit" className="reply-ai-generate" disabled={aiDrafting} aria-label="Generate reply from description">
                       {aiDrafting ? "Drafting…" : "Generate"}
                     </button>
                   </form>
@@ -3160,7 +3231,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                       <label className="reply-attach">📎 <span>Attach</span><input type="file" multiple onChange={(event) => setReplyFiles(Array.from(event.target.files ?? []))} /></label>
                       {replyFiles.length > 0 && <span>{replyFiles.map((file) => file.name).join(", ")}</span>}
                     </div>
-                    <button className="reply-delete" type="button" aria-label="Delete reply draft" onClick={() => { setReplyOpen(false); setReplyText(""); setReplyInstruction(""); setReplyFiles([]); setScheduleAt(""); }}>🗑</button>
+                    <button className="reply-delete" type="button" aria-label="Delete reply draft" onClick={() => { setReplyOpen(false); setQuickRepliesOpen(false); setReplyText(""); setReplyInstruction(""); setReplyFiles([]); setScheduleAt(""); }}>🗑</button>
                   </footer>
                 </section>
               )}

@@ -49,6 +49,10 @@ function decodeMailText(value: string) {
 
 const CALENDAR_TIME_ZONE_KEY = "calendar-time-zone";
 const CALENDAR_STATUS_VIEW_KEY = "calendar-status-view";
+const CALENDAR_PANEL_WIDTH_KEY = "calendar-panel-width";
+const CALENDAR_PANEL_MIN = 352;
+const CALENDAR_PANEL_MAX = 640;
+const CALENDAR_BOARD_MIN = 420;
 const CALENDAR_RANGE_CACHE = new Map<string, CalendarEvent[]>();
 const CALENDAR_RANGE_INFLIGHT = new Map<string, Promise<CalendarEvent[]>>();
 const CALENDAR_RANGE_CACHE_LIMIT = 12;
@@ -61,6 +65,14 @@ const CALENDAR_STATUS_FILTERS: { value: CalendarStatusFilter; label: string }[] 
 ];
 const SYSTEM_TIME_ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 const calendarMotionDelay = (duration: number) => typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? 0 : duration;
+const defaultCalendarPanelWidth = () => Math.round(Math.min(512, Math.max(CALENDAR_PANEL_MIN, window.innerWidth * .32)));
+const loadCalendarPanelWidth = () => {
+  try {
+    const value = Number(localStorage.getItem(CALENDAR_PANEL_WIDTH_KEY));
+    if (Number.isFinite(value) && value >= CALENDAR_PANEL_MIN) return Math.min(CALENDAR_PANEL_MAX, Math.round(value));
+  } catch { /* ignore unavailable storage */ }
+  return defaultCalendarPanelWidth();
+};
 const TIME_ZONES = (() => {
   const intl = Intl as typeof Intl & { supportedValuesOf?: (key: "timeZone") => string[] };
   const supported = intl.supportedValuesOf?.("timeZone") ?? [
@@ -1284,12 +1296,18 @@ export default function CalendarPage({
   const [statusSaving, setStatusSaving] = useState(false); const [statusError, setStatusError] = useState("");
   const [dragSelection, setDragSelection] = useState<DragSelection | null>(null);
   const [hourHeight, setHourHeight] = useState(HOUR_HEIGHT);
+  const [panelWidth, setPanelWidth] = useState(loadCalendarPanelWidth);
+  const [panelResizing, setPanelResizing] = useState(false);
   const refreshRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
   const detailsCloseTimer = useRef<number | null>(null);
   const sidebarCloseTimer = useRef<number | null>(null);
   const timelineRef = useRef<HTMLElement | null>(null);
   const timelineHeaderRef = useRef<HTMLDivElement | null>(null);
+  const calendarMainRef = useRef<HTMLDivElement | null>(null);
+  const panelResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+  const panelWidthRef = useRef(panelWidth);
+  panelWidthRef.current = panelWidth;
   const dragRef = useRef<{ dayIndex: number; anchorMinutes: number } | null>(null);
   const start = useMemo(() => rangeStart(anchor, view), [anchor, view]);
   const end = useMemo(() => view === "month" ? addDays(start, 42) : endExclusive(start, view), [start, view]);
@@ -1667,7 +1685,51 @@ export default function CalendarPage({
   const title = periodTitle(anchor, days, view);
   const weekCrossesMonth = view !== "month" && (days[0].getUTCMonth() !== days[days.length - 1].getUTCMonth() || days[0].getUTCFullYear() !== days[days.length - 1].getUTCFullYear());
 
-  return <main className={`calendar-workspace ${sidebarOpen ? "sidebar-open" : ""} ${sidebarClosing ? "sidebar-closing" : ""} ${detailsClosing ? "details-closing" : ""}`}>
+  const clampPanelWidth = (width: number) => {
+    const available = calendarMainRef.current?.getBoundingClientRect().width ?? window.innerWidth;
+    const maximum = Math.max(CALENDAR_PANEL_MIN, Math.min(CALENDAR_PANEL_MAX, available - CALENDAR_BOARD_MIN - 6));
+    return Math.round(Math.min(maximum, Math.max(CALENDAR_PANEL_MIN, width)));
+  };
+
+  const beginPanelResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    panelResizeRef.current = { startX: event.clientX, startWidth: panelWidth };
+    setPanelResizing(true);
+  };
+
+  const updatePanelResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const drag = panelResizeRef.current;
+    if (!drag) return;
+    const next = clampPanelWidth(drag.startWidth - (event.clientX - drag.startX));
+    panelWidthRef.current = next;
+    setPanelWidth(next);
+  };
+
+  const finishPanelResize = () => {
+    if (!panelResizeRef.current) return;
+    panelResizeRef.current = null;
+    setPanelResizing(false);
+    try { localStorage.setItem(CALENDAR_PANEL_WIDTH_KEY, String(panelWidthRef.current)); } catch { /* ignore unavailable storage */ }
+  };
+
+  const resizePanelWithKeyboard = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const next = clampPanelWidth(panelWidth + (event.key === "ArrowLeft" ? 24 : -24));
+    panelWidthRef.current = next;
+    setPanelWidth(next);
+    try { localStorage.setItem(CALENDAR_PANEL_WIDTH_KEY, String(next)); } catch { /* ignore unavailable storage */ }
+  };
+
+  const resetPanelWidth = () => {
+    const next = clampPanelWidth(defaultCalendarPanelWidth());
+    panelWidthRef.current = next;
+    setPanelWidth(next);
+    try { localStorage.setItem(CALENDAR_PANEL_WIDTH_KEY, String(next)); } catch { /* ignore unavailable storage */ }
+  };
+
+  return <main className={`calendar-workspace ${sidebarOpen ? "sidebar-open" : ""} ${sidebarClosing ? "sidebar-closing" : ""} ${detailsClosing ? "details-closing" : ""} ${panelResizing ? "panel-resizing" : ""}`}>
     <header className="calendar-toolbar">
       <div className="calendar-title-group"><button className="calendar-back" type="button" onClick={onClose} aria-label="Back to inbox" data-tooltip="Back to inbox" data-tooltip-placement="bottom"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5 8 12l7 7M8 12h11" /></svg></button><h1><strong>{title.primary}</strong>{title.secondary && <span>{title.secondary}</span>}</h1></div>
       <div className="calendar-nav"><button type="button" onClick={() => move(-1)} aria-label="Previous period">‹</button><button className="calendar-today" type="button" onClick={() => setAnchor(startOfDay(wallDateForInstant(new Date(), timeZone)))}>Today</button><button type="button" onClick={() => move(1)} aria-label="Next period">›</button></div>
@@ -1685,7 +1747,7 @@ export default function CalendarPage({
         }}
       />
     )}
-    <div className={`calendar-main ${selected ? "has-details" : ""}`}>
+    <div ref={calendarMainRef} className={`calendar-main ${selected ? "has-details" : ""}`} style={{ "--calendar-details-width": `${panelWidth}px` } as React.CSSProperties}>
       <div className="calendar-board">
       {view === "month" ? (
         <>
@@ -1751,6 +1813,23 @@ export default function CalendarPage({
       {!loading && refreshing && <CalendarLoading soft />}
       </div>
       {(selected || sidebarOpen || sidebarClosing) && <button className="calendar-panel-scrim" type="button" aria-label="Close calendar panel" onClick={selected ? closeEventDetails : toggleSidebar} />}
+      {(selected || sidebarOpen || sidebarClosing) && <button
+        className="calendar-panel-splitter"
+        type="button"
+        role="separator"
+        aria-label="Resize calendar side panel"
+        aria-orientation="vertical"
+        aria-valuemin={CALENDAR_PANEL_MIN}
+        aria-valuemax={CALENDAR_PANEL_MAX}
+        aria-valuenow={panelWidth}
+        title="Drag to resize; double-click to reset"
+        onPointerDown={beginPanelResize}
+        onPointerMove={updatePanelResize}
+        onPointerUp={finishPanelResize}
+        onPointerCancel={finishPanelResize}
+        onKeyDown={resizePanelWithKeyboard}
+        onDoubleClick={resetPanelWidth}
+      />}
       {selected ? <aside className={`calendar-details ${detailsClosing ? "is-closing" : ""}`} aria-label="Event details" key={`details-${selected.id}`}>
         <header className="details-sticky">
           <button className="details-close" type="button" onClick={closeEventDetails} aria-label="Close event details"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg></button>
