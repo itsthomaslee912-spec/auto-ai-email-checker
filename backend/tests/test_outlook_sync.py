@@ -92,7 +92,7 @@ def test_outlook_list_recent_without_get_token_reuses_static_token():
     assert seen_tokens == ["Bearer fixed-token"] * 5
 
 
-def test_outlook_message_queries_request_read_state():
+def test_outlook_list_queries_request_read_state_and_get_fetches_derived_fields():
     selects: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -113,7 +113,10 @@ def test_outlook_message_queries_request_read_state():
         outlook_module.httpx.AsyncClient = original
 
     assert len(selects) == 6
-    assert all("isRead" in select.split(",") for select in selects)
+    # A single-message fetch intentionally omits $select so Graph returns
+    # eventMessageRequest fields such as startDateTime and endDateTime.
+    assert selects[0] == ""
+    assert all("isRead" in select.split(",") for select in selects[1:])
 
 
 def test_outlook_get_message_retries_transient_connection_failure(monkeypatch):

@@ -14,7 +14,7 @@ from app.classify.correction_retrieval import CorrectionExample, format_retrieve
 from app.models import EmailLabel
 from app.schemas import ClassificationResult
 from app.config import get_settings
-from app.services.ai_backend import AiBackend, get_ai_backend, get_escalation_backend, has_saved_ai_settings
+from app.services.ai_backend import AiBackend, close_ai_client, get_ai_backend, has_saved_ai_settings
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +141,18 @@ def _parse_strict_ai_result(content: str) -> tuple[str, float | None, str | None
         raise ValueError("Classifier returned an invalid interview subtype")
     category = data.get("category_subtype")
     if category is not None and category not in CATEGORY_SUBTYPES.get(label, set()):
-        raise ValueError("Classifier returned an invalid category subtype")
+        # The primary category is still usable when a local model invents an
+        # optional subtype (for example ``next_steps``). Rejecting the whole
+        # response leaves the durable row pending forever and retries the same
+        # deterministic Ollama output on every worker scan. AI-only mode still
+        # honors the selected model's label; only unsupported metadata is
+        # discarded.
+        logger.warning(
+            "Ignoring invalid classifier category_subtype=%r for label=%s",
+            category,
+            label,
+        )
+        category = None
     return label, confidence, subtype, category
 
 
@@ -825,7 +836,7 @@ def _heuristic_label(
     if _is_application_action_required(primary_text):
         return EmailLabel.APPLICATION_ACTION_REQUIRED.value
     if direction == "outgoing" and not _ics_books_one_appointment(text) and re.search(
-        r"\b(i(?:'m| am)? available|my availability|works for me|i can do|times? (?:that )?work for me|reschedule)\b",
+        r"\b(i(?:'m| am)? available|my availability|works (?:well )?for me|i can do|times? (?:that )?work for me|reschedule)\b",
         primary_text,
     ):
         return EmailLabel.INTERVIEW_AVAILABILITY.value
@@ -975,7 +986,8 @@ async def classify_email(
     else:
         backend = AiBackend("openai", settings.openai_model, settings.openai_api_key)
 
-    # Heuristic-only path (fallback or tests). Live/Sync use OpenAI + guards.
+    # Heuristic-only path (legacy fallback or tests). Live/sync use the
+    # provider selected in AI settings; they never switch providers here.
     if not force_openai and not use_openai:
         if ai_only:
             raise RuntimeError("AI-only classification requires an available AI provider")
@@ -1030,37 +1042,13 @@ async def classify_email(
             confidence=0.45 if heuristic else None,
             response_id=None,
         )
+    finally:
+        await close_ai_client(client)
     content = response.choices[0].message.content or "{}"
     if ai_only:
         label, confidence, subtype, category_subtype = _parse_strict_ai_result(content)
     else:
         label, confidence = _parse_label(content)
-    # Escalate only uncertain/conflicting local decisions when a stronger paid
-    # backend is already configured. Most mail remains entirely local.
-    escalation = get_escalation_backend(backend.provider)
-    if escalation is not None and (
-        confidence is None
-        or confidence < 0.62
-        or (heuristic is not None and heuristic != label)
-    ):
-        try:
-            reviewed = await escalation.client().chat.completions.create(
-                model=escalation.model,
-                temperature=0,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": with_interview_subtype_rules(get_active_system_prompt())},
-                    {"role": "user", "content": user_content + f"\n\nLocal preliminary result to review:\n{content}"},
-                ],
-            )
-            content = reviewed.choices[0].message.content or content
-            if ai_only:
-                label, confidence, subtype, category_subtype = _parse_strict_ai_result(content)
-            else:
-                label, confidence = _parse_label(content)
-            response = reviewed
-        except Exception:
-            logger.exception("Ambiguous classification escalation failed; keeping local result")
     if not ai_only:
         subtype = _parse_interview_subtype(content)
     if not ai_only:

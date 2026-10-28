@@ -419,6 +419,18 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                 if was_pending:
                     email.classification_pending = False
                 needs_calendar = previous_label in CALENDAR_LABELS or email.label in CALENDAR_LABELS or email.folder == "sent"
+                if needs_calendar and (label_changed or outcome_changed or was_pending):
+                    # Fast sync stores a download-only message as ``other``.
+                    # Calendar backfill can inspect that temporary version
+                    # before AI enrichment finishes and persist a hash for it.
+                    # Pending catch-up intentionally leaves calendar work to
+                    # the backfill loop, so invalidate that old projection
+                    # whenever enrichment changes (or finalizes) a calendar
+                    # candidate. Otherwise the newly scheduled interview is
+                    # treated as already processed and never gets a chip.
+                    email.calendar_processed_hash = None
+                    email.calendar_processed_at = None
+                    email.calendar_processing_error = None
                 if label_changed or outcome_changed or was_pending:
                     db.commit()
                     from app.api.emails import invalidate_email_list_caches

@@ -478,6 +478,48 @@ def test_outlook_delta_tracks_each_folder_and_keeps_cursor_on_failure(monkeypatc
     engine.dispose()
 
 
+def test_outlook_delta_baselines_missing_folder_without_refetching_old_history(monkeypatch):
+    engine, db, mailbox = _mailbox(Provider.MICROSOFT)
+    mailbox.full_sync_completed = True
+    mailbox.last_sync_completed_at = datetime(2026, 10, 26, 18, 0, tzinfo=timezone.utc)
+    mailbox.sync_cursor = json.dumps({
+        "inbox": "https://graph.microsoft.com/v1.0/inbox/done",
+    })
+    db.commit()
+    monkeypatch.setattr(mailbox_sync, "ensure_microsoft_access_token", AsyncMock(return_value="token"))
+    monkeypatch.setattr(mailbox_sync, "_publish_progress", AsyncMock())
+
+    async def delta(_token, folder, cursor):
+        if folder == "inbox":
+            return {"value": [], "@odata.deltaLink": cursor}
+        return {
+            "value": [
+                {"id": f"{folder}-old", "receivedDateTime": "2026-10-25T12:00:00Z"},
+                {"id": f"{folder}-new", "receivedDateTime": "2026-10-26T18:05:00Z"},
+            ],
+            "@odata.deltaLink": f"https://graph.microsoft.com/v1.0/{folder}/done",
+        }
+
+    monkeypatch.setattr(mailbox_sync, "outlook_list_delta", delta)
+    get_message = AsyncMock(side_effect=lambda _token, mid, **_kwargs: {
+        "id": mid,
+        "receivedDateTime": "2026-10-26T18:05:00Z",
+    })
+    monkeypatch.setattr(mailbox_sync, "outlook_get_message", get_message)
+    monkeypatch.setattr(mailbox_sync, "normalize_outlook_message", lambda raw: raw)
+    ingest = AsyncMock(return_value=object())
+    monkeypatch.setattr(mailbox_sync, "ingest_normalized_message", ingest)
+
+    asyncio.run(mailbox_sync._incremental_outlook(db, mailbox))
+
+    fetched_ids = [call.args[1] for call in get_message.await_args_list]
+    assert fetched_ids == [f"{folder}-new" for folder in mailbox_sync.OUTLOOK_FOLDERS if folder != "inbox"]
+    assert all(not mid.endswith("-old") for mid in fetched_ids)
+    assert set(json.loads(mailbox.sync_cursor)) == set(mailbox_sync.OUTLOOK_FOLDERS)
+    db.close()
+    engine.dispose()
+
+
 def test_sync_uses_saved_cursor_and_full_rescan_bypasses_it(monkeypatch):
     engine, db, mailbox = _mailbox(Provider.GOOGLE)
     mailbox.sync_cursor = "100"

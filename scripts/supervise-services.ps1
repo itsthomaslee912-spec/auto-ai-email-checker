@@ -37,6 +37,8 @@ $frontendRestartDelay = 0
 $startupGraceSeconds = 90
 $backendFailureThreshold = 30
 $backendSourceVersion = ""
+$workerHeartbeatMaxAgeSeconds = 60
+$workerHeartbeatStartupGraceSeconds = 90
 
 function Write-SupervisorLog([string]$Message) {
     Add-Content -LiteralPath (Join-Path $Logs "supervisor.log") `
@@ -107,6 +109,54 @@ function Start-BackendWorker([string]$Name, [string]$Module) {
         -RedirectStandardError (Join-Path $Logs "$Name-error.log")
 }
 
+function Get-WorkerHeartbeatPath([string]$Name) {
+    return Join-Path ([System.IO.Path]::GetTempPath()) "$Name-heartbeat"
+}
+
+function Test-WorkerHeartbeat($Process, [string]$Name) {
+    if (-not $Process -or $Process.HasExited) { return $false }
+    $runningSeconds = ((Get-Date) - $Process.StartTime).TotalSeconds
+    $heartbeatPath = Get-WorkerHeartbeatPath $Name
+    if (-not (Test-Path -LiteralPath $heartbeatPath)) {
+        return $runningSeconds -lt $workerHeartbeatStartupGraceSeconds
+    }
+    $heartbeat = Get-Item -LiteralPath $heartbeatPath -ErrorAction SilentlyContinue
+    if (-not $heartbeat) {
+        return $runningSeconds -lt $workerHeartbeatStartupGraceSeconds
+    }
+    # An old heartbeat file must not make a newly launched worker look ready.
+    if ($heartbeat.LastWriteTimeUtc -lt $Process.StartTime.ToUniversalTime()) {
+        return $runningSeconds -lt $workerHeartbeatStartupGraceSeconds
+    }
+    return (([datetime]::UtcNow - $heartbeat.LastWriteTimeUtc).TotalSeconds -le $workerHeartbeatMaxAgeSeconds)
+}
+
+function Stop-ServiceProcessTree($Process) {
+    if (-not $Process -or $Process.HasExited) { return }
+    # The virtualenv launcher creates a child python.exe. Stop-Process only
+    # kills the launcher and can leave the real worker orphaned, so terminate
+    # this narrowly scoped worker tree as one unit.
+    & taskkill.exe /PID $Process.Id /T /F *> $null
+}
+
+function Ensure-BackendWorker($Process, [string]$Name, [string]$Module) {
+    if ($Process -and -not $Process.HasExited -and -not (Test-WorkerHeartbeat $Process $Name)) {
+        $heartbeatPath = Get-WorkerHeartbeatPath $Name
+        $lastSeen = if (Test-Path -LiteralPath $heartbeatPath) {
+            (Get-Item -LiteralPath $heartbeatPath).LastWriteTime.ToString("s")
+        } else {
+            "never"
+        }
+        Write-SupervisorLog "$Name heartbeat is stale (last seen $lastSeen); restarting process tree"
+        Stop-ServiceProcessTree $Process
+        $Process = $null
+    }
+    if (-not $Process -or $Process.HasExited) {
+        return Start-BackendWorker $Name $Module
+    }
+    return $Process
+}
+
 function Start-Frontend {
     Write-SupervisorLog "Starting frontend on [::]:5173"
     return Start-Process -FilePath $Node `
@@ -136,7 +186,7 @@ try {
                     $notificationServiceProcess
                 )) {
                     if ($worker -and -not $worker.HasExited) {
-                        Stop-Process -Id $worker.Id -Force -ErrorAction SilentlyContinue
+                        Stop-ServiceProcessTree $worker
                     }
                 }
                 $syncWorkerProcess = $null
@@ -172,18 +222,10 @@ try {
             }
         }
 
-        if (-not $syncWorkerProcess -or $syncWorkerProcess.HasExited) {
-            $syncWorkerProcess = Start-BackendWorker "sync-worker" "app.workers.sync"
-        }
-        if (-not $classificationWorkerProcess -or $classificationWorkerProcess.HasExited) {
-            $classificationWorkerProcess = Start-BackendWorker "classification-worker" "app.workers.classification"
-        }
-        if (-not $eventRelayProcess -or $eventRelayProcess.HasExited) {
-            $eventRelayProcess = Start-BackendWorker "event-relay" "app.workers.event_relay"
-        }
-        if (-not $notificationServiceProcess -or $notificationServiceProcess.HasExited) {
-            $notificationServiceProcess = Start-BackendWorker "notification-service" "app.workers.notification"
-        }
+        $syncWorkerProcess = Ensure-BackendWorker $syncWorkerProcess "sync-worker" "app.workers.sync"
+        $classificationWorkerProcess = Ensure-BackendWorker $classificationWorkerProcess "classification-worker" "app.workers.classification"
+        $eventRelayProcess = Ensure-BackendWorker $eventRelayProcess "event-relay" "app.workers.event_relay"
+        $notificationServiceProcess = Ensure-BackendWorker $notificationServiceProcess "notification-service" "app.workers.notification"
 
         if ($frontendProcess -and $frontendProcess.HasExited) {
             $frontendRestartDelay = Get-RestartDelay $frontendRestartDelay $frontendStartedAt
@@ -228,7 +270,7 @@ try {
         $frontendProcess
     )) {
         if ($process -and -not $process.HasExited) {
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            Stop-ServiceProcessTree $process
         }
     }
     Remove-Item -LiteralPath (Join-Path $Runtime "service-supervisor.pid") -Force -ErrorAction SilentlyContinue

@@ -12,7 +12,7 @@ from app.classify.prompt_store import activate_prompt_text
 from app.models import ClassifyCorrection, ClassifyPromptVersion, EmailLabel
 from app.schemas import ClassifyPromptStatusOut, ClassifyPromptUpdateOut
 from app.config import get_settings
-from app.services.ai_backend import AiBackend, get_ai_backend, has_saved_ai_settings
+from app.services.ai_backend import AiBackend, close_ai_client, get_ai_backend, has_saved_ai_settings
 
 logger = logging.getLogger(__name__)
 
@@ -275,6 +275,8 @@ async def update_prompt_from_corrections(db: Session) -> ClassifyPromptUpdateOut
         logger.exception("%s prompt update failed; applying deterministic corrections", backend.provider)
         new_prompt = _merge_rules(current, _fallback_examples(rows))
         source = f"{backend.provider}_fallback"
+    finally:
+        await close_ai_client(client)
 
     db.query(ClassifyPromptVersion).filter(ClassifyPromptVersion.is_active.is_(True)).update(
         {ClassifyPromptVersion.is_active: False}

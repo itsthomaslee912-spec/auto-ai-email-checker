@@ -88,9 +88,9 @@ class Settings(BaseSettings):
     # Route long-running commands to their owning worker and persist progress.
     # Tests and embedded legacy deployments can leave this disabled.
     distributed_runtime: bool = False
-    # ``ai_only`` disables semantic regex heuristics and model-result guards.
-    # ``hybrid`` preserves the existing desktop fallback during migration.
-    email_classification_mode: str = "hybrid"
+    # The selected provider is authoritative by default. ``hybrid`` remains an
+    # explicit opt-in for installations that want deterministic fallback rules.
+    email_classification_mode: str = "ai_only"
 
     @property
     def rabbitmq_enabled(self) -> bool:

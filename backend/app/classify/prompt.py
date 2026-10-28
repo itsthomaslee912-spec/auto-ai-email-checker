@@ -41,6 +41,8 @@ def build_classify_prompt() -> str:
             "- Rejection or closed hiring process overrides application thank-you wording.",
             "- Administrative application steps are application_action_required; screening questions and candidate evaluation are screening or assessment.",
             "- An invitation to book is interview_invitation. This includes a recruiter proposing any live call — a phone screen, recruiter screen, or intro chat — and asking the candidate to pick a time, suggest availability, or use a scheduling link; only an asynchronous task with no live call (questionnaire, chatbot, recorded video screen) is screening. The candidate's own message that sends, updates, or manages available times, including a reschedule proposal before a booking, is interview_availability. A confirmed time, calendar invite, reminder, reschedule of an already booked interview, time change, or cancellation is interview_scheduled.",
+            "- HARD PRECEDENCE RULE: when the current Subject begins with or explicitly says REMINDER and names a live interview or meeting, output label interview_scheduled and interview_subtype reminder. Apply this even when the date/time is omitted and confirmed_datetime would otherwise be false. Body or button text such as confirm your availability, confirm agenda, or confirm meeting time acknowledges the existing appointment; it is not an invitation to choose or propose a new time. Example: Subject 'REMINDER | Company virtual interview - confirm meeting time' with body 'confirm your availability for the meeting' => interview_scheduled/reminder.",
+            "- HARD OUTGOING AVAILABILITY RULE: when Direction is outgoing and the candidate's current message primarily accepts, proposes, or updates a date/time for a recruiting call, output interview_availability. Phrases such as 'Thursday at 4pm works well for me', 'that time works for me', and 'I am available Tuesday' are sufficient even when the short reply does not repeat the words interview or availability. A recruiting subject such as a role's 'Next Steps' supplies the interview context.",
             "- Future or conditional interview language in an application receipt is not an invitation. Phrases such as 'if your background is a fit, we will reach out to set up a call', 'qualified candidates will be contacted', or 'we plan to schedule interviews in the coming weeks' remain application_confirmation. Use interview_invitation only when this message currently invites or asks the candidate to schedule, choose, book, or provide availability.",
             "- A cancelled interview is interview_scheduled unless the email also says the candidacy or role is closed.",
             "- Follow-up means after the interview; an explicit offer or rejection takes precedence.",
@@ -83,5 +85,17 @@ def with_interview_subtype_rules(prompt: str) -> str:
             line
             for line in SYSTEM_PROMPT.splitlines()
             if line.startswith("- Future or conditional interview language")
+        )
+    if "HARD PRECEDENCE RULE" not in prompt:
+        prompt += "\n" + next(
+            line
+            for line in SYSTEM_PROMPT.splitlines()
+            if line.startswith("- HARD PRECEDENCE RULE")
+        )
+    if "HARD OUTGOING AVAILABILITY RULE" not in prompt:
+        prompt += "\n" + next(
+            line
+            for line in SYSTEM_PROMPT.splitlines()
+            if line.startswith("- HARD OUTGOING AVAILABILITY RULE")
         )
     return prompt

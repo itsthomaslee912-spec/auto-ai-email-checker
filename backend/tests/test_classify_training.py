@@ -499,6 +499,52 @@ def test_pending_classification_publishes_completion_when_label_is_unchanged(mon
         assert db.get(EmailMessage, email_id).classification_pending is False
 
 
+def test_pending_interview_classification_invalidates_temporary_calendar_hash(monkeypatch):
+    """Backfill may inspect download-only mail before its final AI label exists.
+
+    Once pending classification turns that message into a scheduled interview,
+    the temporary hash must be cleared so calendar backfill processes it again.
+    """
+    from app.services import ai_backend, reclassify
+
+    SessionLocal = _session_factory()
+    with SessionLocal() as db:
+        email = _seed_email(db, label=EmailLabel.OTHER.value)
+        email.classification_pending = True
+        email.calendar_processed_hash = "temporary-other-projection"
+        email.calendar_processed_at = datetime.now(timezone.utc)
+        email.calendar_processing_error = "temporary error"
+        db.commit()
+        mailbox_id = email.mailbox_id
+        email_id = email.id
+
+    async def classify_as_scheduled(**_kwargs):
+        return SimpleNamespace(
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            category_subtype=None,
+            interview_subtype="calendar_invite",
+            confidence=1.0,
+            response_id="scheduled-response",
+        )
+
+    monkeypatch.setattr("app.db.SessionLocal", SessionLocal)
+    monkeypatch.setattr(reclassify, "classify_email", classify_as_scheduled)
+    monkeypatch.setattr(reclassify, "get_ai_backend", lambda: SimpleNamespace(provider="test"))
+    monkeypatch.setattr(reclassify, "publish", AsyncMock())
+    ai_backend._ai_call_gate = None
+    reclassify._mailbox_gate = None
+
+    asyncio.run(reclassify._run_reclassify_job(mailbox_id, pending_only=True))
+
+    with SessionLocal() as db:
+        stored = db.get(EmailMessage, email_id)
+        assert stored.classification_pending is False
+        assert stored.label == EmailLabel.INTERVIEW_SCHEDULED.value
+        assert stored.calendar_processed_hash is None
+        assert stored.calendar_processed_at is None
+        assert stored.calendar_processing_error is None
+
+
 def test_pending_reclassify_falls_back_when_local_ai_times_out(monkeypatch):
     from app.services import ai_backend, reclassify
 
@@ -527,6 +573,13 @@ def test_pending_reclassify_falls_back_when_local_ai_times_out(monkeypatch):
     monkeypatch.setattr("app.db.SessionLocal", SessionLocal)
     monkeypatch.setattr(reclassify, "classify_email", timeout_then_heuristic)
     monkeypatch.setattr(reclassify, "get_ai_backend", lambda: SimpleNamespace(provider="ollama"))
+    # This test covers the legacy, explicitly opted-in hybrid fallback. The
+    # application default is AI-only, where a model failure remains pending.
+    monkeypatch.setattr(
+        reclassify,
+        "get_settings",
+        lambda: SimpleNamespace(email_classification_mode="hybrid", distributed_runtime=False),
+    )
     monkeypatch.setattr(reclassify, "publish", AsyncMock())
     ai_backend._ai_call_gate = None
     reclassify._mailbox_gate = None

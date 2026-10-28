@@ -7,12 +7,14 @@ import re
 from sqlalchemy.orm import Session
 
 from app.models import EmailLabel, EmailMessage
-from app.services.ai_backend import ai_call_semaphore, get_ai_backend
+from app.services.ai_backend import ai_call_semaphore, close_ai_client, get_ai_backend
 from app.services.calendar_extract import (
+    _company_named_in_message,
     candidate_own_name,
     clean_company_name,
     companies_match,
     employer_instead_of_sender_domain,
+    extract_interviewer,
     job_role_or_empty,
     mailbox_candidate_name,
 )
@@ -111,6 +113,8 @@ async def extract_company_role(
     except Exception:
         logger.exception("%s company/role extraction failed", backend.provider)
         return None
+    finally:
+        await close_ai_client(client)
     content = response.choices[0].message.content or "{}"
     return parse_company_role(content)
 
@@ -138,6 +142,16 @@ async def apply_outcome(
         return False
     company, role = extracted
     company = clean_company_name(employer_instead_of_sender_domain(email, company))
+    interviewer = extract_interviewer(
+        "\n".join((email.subject or "", email.snippet or "", email.body_text or "")),
+        email.sender or "",
+    )
+    sender_supported = clean_company_name(_company_named_in_message(email))
+    if company and interviewer and companies_match(company, interviewer):
+        # A weak model can promote "interview with <person>" into company.
+        # When the subject repeats the sender-domain brand, that corroborated
+        # employer is deterministic and stronger than the person's name.
+        company = sender_supported
     # The prompt tells the model never to use the candidate's own name as the
     # employer, but a weak local model can still do it (e.g. a quoted "From:
     # Jordan Meeker <...>" reply makes the model echo "Jordan Meeker" back as

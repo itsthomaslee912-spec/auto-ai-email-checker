@@ -697,12 +697,21 @@ async def _sync_outlook_delta(db: Session, mailbox: MailboxConnection) -> None:
     cursors = _outlook_cursors(mailbox)
     imported = int(_jobs.get(mailbox.id, {}).get("imported", 0))
     listed = int(_jobs.get(mailbox.id, {}).get("listed", 0))
+    existing = await _existing_ids(db, mailbox.id)
+    # A mailbox can predate a newly tracked Outlook folder (Sent Items was
+    # added after Inbox, Junk, Deleted Items, and Archive).  Such a mailbox is
+    # already fully bootstrapped but has no cursor for the new folder.  Treat
+    # its last successful sync as the history baseline: import messages newer
+    # than it, but do not issue thousands of GETs for old mail merely to reach
+    # the folder's first deltaLink.
+    baseline_at = as_utc(mailbox.last_sync_completed_at)
     # Reuse one connection pool for all changed messages. Creating a fresh
     # AsyncClient per item repeatedly negotiates TCP/TLS and was both slow and
     # prone to ConnectTimeout during large Outlook delta pages.
     async with httpx.AsyncClient(timeout=30) as graph_client:
         for folder in OUTLOOK_FOLDERS:
             cursor = cursors.get(folder)
+            initializing_folder = cursor is None and mailbox.full_sync_completed
             while True:
                 if _should_stop(mailbox.id):
                     return
@@ -715,6 +724,24 @@ async def _sync_outlook_delta(db: Session, mailbox: MailboxConnection) -> None:
                     if not mid or item.get("@removed"):
                         continue
                     listed += 1
+                    if str(mid) in existing:
+                        continue
+                    if initializing_folder:
+                        received_at = None
+                        received_raw = item.get("receivedDateTime")
+                        if received_raw:
+                            try:
+                                received_at = as_utc(
+                                    datetime.fromisoformat(
+                                        str(received_raw).replace("Z", "+00:00")
+                                    )
+                                )
+                            except (TypeError, ValueError):
+                                received_at = None
+                        if baseline_at is not None and (
+                            received_at is None or received_at <= baseline_at
+                        ):
+                            continue
                     try:
                         raw = await outlook_get_message(token, str(mid), client=graph_client)
                     except HTTPException as exc:
@@ -725,6 +752,7 @@ async def _sync_outlook_delta(db: Session, mailbox: MailboxConnection) -> None:
                     email = await ingest_normalized_message(db, mailbox, normalize_outlook_message(raw), download_only=True, priority="background")
                     if email:
                         imported += 1
+                        existing.add(str(mid))
                     await asyncio.sleep(0)
                 next_cursor = page.get("@odata.nextLink") or page.get("@odata.deltaLink")
                 if not next_cursor:

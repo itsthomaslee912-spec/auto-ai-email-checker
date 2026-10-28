@@ -1,5 +1,17 @@
-from app.classify.openai_classifier import apply_label_guards, _heuristic_label, _is_scheduled_interview, _is_true_rejection, message_direction
+from app.classify.openai_classifier import apply_label_guards, _heuristic_label, _is_scheduled_interview, _is_true_rejection, _parse_strict_ai_result, message_direction
 from app.models import EmailLabel
+
+
+def test_ai_only_keeps_valid_label_when_optional_category_subtype_is_invalid():
+    label, confidence, interview_subtype, category_subtype = _parse_strict_ai_result(
+        '{"label":"application_confirmation","confidence":0.91,'
+        '"interview_subtype":null,"category_subtype":"next_steps"}'
+    )
+
+    assert label == EmailLabel.APPLICATION_CONFIRMATION.value
+    assert confidence == 0.91
+    assert interview_subtype is None
+    assert category_subtype is None
 
 
 def test_ada_accommodation_disclaimer_is_not_a_scheduled_interview_reminder():
@@ -556,6 +568,39 @@ def test_runtime_prompt_adds_conditional_interview_rule_to_saved_prompt():
 
     upgraded = with_interview_subtype_rules("Classify recruiting email. interview_subtype facts category_subtype")
     assert "Future or conditional interview language" in upgraded
+
+
+def test_runtime_prompt_adds_reminder_confirmation_rule_to_saved_prompt():
+    from app.classify.prompt import with_interview_subtype_rules
+
+    upgraded = with_interview_subtype_rules(
+        "Classify recruiting email. interview_subtype facts category_subtype "
+        "interview_availability Future or conditional interview language"
+    )
+    assert "HARD PRECEDENCE RULE" in upgraded
+    assert "confirm meeting time" in upgraded
+
+
+def test_runtime_prompt_adds_short_outgoing_availability_rule():
+    from app.classify.prompt import with_interview_subtype_rules
+
+    upgraded = with_interview_subtype_rules(
+        "Classify recruiting email. interview_subtype facts category_subtype "
+        "interview_availability Future or conditional interview language "
+        "HARD PRECEDENCE RULE"
+    )
+    assert "HARD OUTGOING AVAILABILITY RULE" in upgraded
+    assert "works well for me" in upgraded
+
+
+def test_short_outgoing_slot_acceptance_is_interview_availability():
+    assert _heuristic_label(
+        "Re: Remedy Scientific: Senior Software Engineer Role - Next Steps",
+        "candidate@example.com",
+        "Thursday 10/29 at 4pm PT works well for me.",
+        "",
+        direction="outgoing",
+    ) == EmailLabel.INTERVIEW_AVAILABILITY.value
 
 
 def test_booked_calendar_request_is_scheduled_and_a_decline_is_not():

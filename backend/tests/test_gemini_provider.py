@@ -68,6 +68,60 @@ def test_selected_gemini_backend_is_used_for_classification(monkeypatch):
     assert result.confidence == 0.91
 
 
+def test_selected_ollama_backend_never_calls_openai_and_closes_client(monkeypatch):
+    captured: dict[str, object] = {}
+    closed = []
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                id="ollama-response",
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                    "label": "other",
+                    "confidence": 0.88,
+                    "interview_subtype": None,
+                    "category_subtype": None,
+                })))],
+            )
+
+    class FakeClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        async def close(self):
+            closed.append(True)
+
+    backend = SimpleNamespace(
+        provider="ollama",
+        model="local-test",
+        api_key="ollama",
+        client=FakeClient,
+    )
+    monkeypatch.setattr("app.classify.openai_classifier.has_saved_ai_settings", lambda: True)
+    monkeypatch.setattr("app.classify.openai_classifier.get_ai_backend", lambda: backend)
+    monkeypatch.setattr("app.classify.openai_classifier.get_active_system_prompt", lambda: "Classify this email.")
+    monkeypatch.setattr(
+        "app.classify.openai_classifier.get_settings",
+        lambda: SimpleNamespace(email_classification_mode="ai_only"),
+    )
+    monkeypatch.setattr(
+        "app.classify.openai_classifier.AsyncOpenAI",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("OpenAI client should not be used")),
+    )
+
+    result = asyncio.run(classify_email(
+        subject="Hello",
+        sender="person@example.com",
+        body_text="A generic message.",
+        snippet="A generic message.",
+    ))
+
+    assert captured["model"] == "local-test"
+    assert result.label == "other"
+    assert closed == [True]
+
+
 def test_gemini_settings_are_saved_without_exposing_the_key(monkeypatch):
     monkeypatch.setattr(ai_settings, "require_admin", lambda: None)
     engine = create_engine(

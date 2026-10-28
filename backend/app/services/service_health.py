@@ -101,7 +101,13 @@ async def service_heartbeat_loop(
     _health_loop = asyncio.get_running_loop()
     while not stop_event.is_set():
         if heartbeat_path is not None:
-            heartbeat_path.write_text("")
+            try:
+                heartbeat_path.write_text("")
+            except OSError:
+                # A transient temp-file lock must not terminate the service.
+                # The database heartbeat can still report liveness, while the
+                # supervisor will retry its file probe on the next interval.
+                logger.exception("Could not update %s heartbeat file", service_name)
         try:
             await asyncio.to_thread(record_service_heartbeat, service_name)
         except Exception:

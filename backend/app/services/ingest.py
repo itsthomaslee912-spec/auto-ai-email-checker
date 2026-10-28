@@ -78,18 +78,30 @@ async def ingest_normalized_message(
                 content_changed = True
         if changed:
             if content_changed:
-                # Make the changed content visible to the calendar processor;
-                # process_calendar_email will preserve label corrections.
-                db.flush()
-                try:
-                    # Keep a single malformed legacy item from invalidating the
-                    # provider-content refresh or the rest of a bulk repair.
-                    with db.begin_nested():
-                        await process_calendar_email(
-                            db, existing, force=True, use_ai=not download_only, priority=priority,
-                        )
-                except Exception:
-                    logger.exception("Calendar refresh failed during existing-message ingest email_id=%s", existing.id)
+                if download_only:
+                    # Provider sync must only download and commit. Running a
+                    # full calendar reconciliation here repeatedly scanned the
+                    # whole mailbox for each changed Gmail history item, which
+                    # blocked the sync worker heartbeat and caused the 300s
+                    # webhook / 600s mailbox timeout loop. These durable flags
+                    # hand enrichment to the classification and calendar
+                    # workers after the provider cursor has safely advanced.
+                    existing.classification_pending = True
+                    existing.calendar_processed_hash = None
+                    existing.calendar_processing_error = None
+                else:
+                    # Make the changed content visible to the calendar processor;
+                    # process_calendar_email will preserve label corrections.
+                    db.flush()
+                    try:
+                        # Keep a single malformed legacy item from invalidating the
+                        # provider-content refresh or the rest of a bulk repair.
+                        with db.begin_nested():
+                            await process_calendar_email(
+                                db, existing, force=True, use_ai=True, priority=priority,
+                            )
+                    except Exception:
+                        logger.exception("Calendar refresh failed during existing-message ingest email_id=%s", existing.id)
             db.commit()
             from app.api.emails import invalidate_email_list_caches
 

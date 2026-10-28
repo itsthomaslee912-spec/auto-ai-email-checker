@@ -97,7 +97,7 @@ def test_download_only_queues_other_without_ai_processing(tmp_path, monkeypatch)
     engine.dispose()
 
 
-def test_existing_message_refreshes_calendar_attachment_content(tmp_path, monkeypatch):
+def test_download_only_existing_refresh_defers_calendar_and_classification(tmp_path, monkeypatch):
     engine = create_engine(f"sqlite:///{tmp_path / 'refresh.db'}", connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     Session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -112,11 +112,8 @@ def test_existing_message_refreshes_calendar_attachment_content(tmp_path, monkey
         db.add(email)
         db.commit()
 
-        calls = []
-
-        async def process(_db, refreshed, *, force=False, use_ai=True, priority="live"):
-            calls.append((refreshed.id, refreshed.body_text, force, use_ai))
-            return True
+        async def process(*_args, **_kwargs):
+            raise AssertionError("download-only sync must not run calendar reconciliation")
 
         monkeypatch.setattr("app.services.ingest.process_calendar_email", process)
         result = asyncio.run(ingest_normalized_message(db, mailbox, {
@@ -131,7 +128,8 @@ def test_existing_message_refreshes_calendar_attachment_content(tmp_path, monkey
         db.refresh(email)
         assert email.thread_id == "thread-new"
         assert "BEGIN:VCALENDAR" in email.body_text
-        assert calls == [(email.id, email.body_text, True, False)]
+        assert email.classification_pending is True
+        assert email.calendar_processed_hash is None
     engine.dispose()
 
 
@@ -235,12 +233,16 @@ def test_existing_message_keeps_provider_refresh_when_calendar_repair_fails(tmp_
             raise RuntimeError("legacy repair failed")
 
         monkeypatch.setattr("app.services.ingest.process_calendar_email", fail_repair)
+        async def classify(**_kwargs):
+            return ClassificationResult(label=EmailLabel.INTERVIEW_SCHEDULED.value)
+
+        monkeypatch.setattr("app.services.ingest.classify_email", classify)
         result = asyncio.run(ingest_normalized_message(db, mailbox, {
             "provider_message_id": "calendar-message",
             "subject": "Interview",
             "sender": "recruiter@example.com",
             "body_text": "Complete provider content",
-        }, download_only=True))
+        }))
 
         assert result is None
         db.refresh(email)

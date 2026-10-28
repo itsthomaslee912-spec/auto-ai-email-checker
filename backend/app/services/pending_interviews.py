@@ -76,12 +76,36 @@ def _same_role(left: str | None, right: str | None) -> bool:
     return roles_compatible(left, right)
 
 
+def _subject_company_role(message: EmailMessage | _MailRef) -> tuple[str, str]:
+    """Recover explicit Lever-style identity when extracted metadata is stale.
+
+    Booking confirmations commonly arrive in a new provider thread.  In that
+    case company/role are the only stable join keys, and a bad extraction on
+    the invitation must not leave an already-booked interview pending.  The
+    subject form is unambiguous: ``...: [Candidate] Role at Company``.
+    """
+    subject = (message.subject or "").strip()
+    match = re.search(
+        r":\s*(?:\[[^\]]+\]\s*)?(?P<role>[^:\n]{2,160}?)\s+at\s+"
+        r"(?P<company>[^|\n]{2,120}?)\s*$",
+        subject,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return (message.company or "").strip(), (message.job_role or "").strip()
+    company = match.group("company").strip(" -:,.\t")
+    role = match.group("role").strip(" -:,.\t")
+    return company or (message.company or "").strip(), role or (message.job_role or "").strip()
+
+
 def _same_interview(left: EmailMessage, right: EmailMessage) -> bool:
     if left.mailbox_id != right.mailbox_id:
         return False
     if left.thread_id and left.thread_id == right.thread_id:
         return True
-    return bool(left.company) and companies_match(left.company, right.company) and _same_role(left.job_role, right.job_role)
+    left_company, left_role = _subject_company_role(left)
+    right_company, right_role = _subject_company_role(right)
+    return bool(left_company) and companies_match(left_company, right_company) and _same_role(left_role, right_role)
 
 
 @dataclass(frozen=True)
@@ -162,6 +186,7 @@ def _booked_by_event(
     linked_email_ids: dict[int, set[int]],
 ) -> bool:
     received = as_utc(request.received_at)
+    request_company, request_role = _subject_company_role(request)
     for event in events:
         if event.mailbox_id != request.mailbox_id:
             continue
@@ -186,11 +211,11 @@ def _booked_by_event(
         # prevents a booked interview from remaining in "needs attention".
         if request.thread_id and event.source_thread_id == request.thread_id:
             return True
-        if not request.company:
+        if not request_company:
             continue
         if booked_at is None or received is None or booked_at <= received:
             continue
-        if companies_match(event.company, request.company) and _same_role(event.job_role, request.job_role):
+        if companies_match(event.company, request_company) and _same_role(event.job_role, request_role):
             return True
     return False
 

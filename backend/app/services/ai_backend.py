@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import heapq
+import inspect
 import itertools
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -170,16 +171,16 @@ def has_saved_ai_settings() -> bool:
         return False
 
 
-def get_escalation_backend(active_provider: str) -> AiBackend | None:
-    """Return configured OpenAI as an ambiguity-only fallback for local AI."""
-    if active_provider != "ollama":
-        return None
-    defaults = get_settings()
-    try:
-        with SessionLocal() as db:
-            saved = db.get(AiSettings, 1)
-            key = decrypt_token(saved.openai_key_enc) if saved and saved.openai_key_enc else defaults.openai_api_key
-            model = saved.openai_model if saved else defaults.openai_model
-    except OperationalError:
-        key, model = defaults.openai_api_key, defaults.openai_model
-    return AiBackend("openai", model, key) if key else None
+async def close_ai_client(client: object) -> None:
+    """Close a per-request SDK client without constraining test doubles.
+
+    AI calls intentionally honor exactly one selected provider.  Each call gets
+    its own client, so it must also close that client or long reclassification
+    passes leave dozens of idle sockets behind.
+    """
+    close = getattr(client, "close", None)
+    if close is None:
+        return
+    result = close()
+    if inspect.isawaitable(result):
+        await result

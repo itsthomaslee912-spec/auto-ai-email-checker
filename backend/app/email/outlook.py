@@ -167,7 +167,11 @@ async def outlook_list_delta(
     params = None
     if not delta_link:
         params = {
-            "$select": "id",
+            # receivedDateTime lets an already-bootstrapped mailbox establish
+            # a newly-added folder cursor without re-downloading that folder's
+            # entire history.  Recent messages are still fetched by the sync
+            # service, while older rows form the baseline only.
+            "$select": "id,receivedDateTime",
             "$top": "50",
         }
     async with httpx.AsyncClient(timeout=30) as client:
@@ -197,9 +201,6 @@ async def outlook_get_message(
             "GET",
             f"{GRAPH}/me/messages/{message_id}",
             headers={"Authorization": f"Bearer {access_token}"},
-            params={
-                "$select": "id,subject,from,toRecipients,receivedDateTime,bodyPreview,body,conversationId,parentFolderId,isRead",
-            },
         )
 
     if client is None:
@@ -306,6 +307,60 @@ async def outlook_attach_folder(access_token: str, raw: dict) -> dict:
     return raw
 
 
+def _outlook_event_calendar(raw: dict) -> str:
+    """Preserve structured meeting times that Graph omits from the body.
+
+    Event-message start/end fields live on ``eventMessageRequest`` rather than
+    the base ``message`` type. Selecting only base fields silently discarded
+    them, leaving calendar extraction dependent on prose or AI even though
+    Outlook had already supplied the authoritative appointment clock.
+    """
+
+    start = raw.get("startDateTime") or {}
+    end = raw.get("endDateTime") or {}
+    start_value = str(start.get("dateTime") or "").strip()
+    end_value = str(end.get("dateTime") or "").strip()
+    if not start_value or not end_value:
+        return ""
+
+    def ics_datetime(value: str, zone: str) -> str:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return ""
+        stamp = parsed.strftime("%Y%m%dT%H%M%S")
+        if zone.casefold() in {"utc", "etc/utc", "gmt"}:
+            return f":{stamp}Z"
+        return f";TZID={zone}:{stamp}" if zone else f":{stamp}"
+
+    start_line = ics_datetime(start_value, str(start.get("timeZone") or ""))
+    end_line = ics_datetime(end_value, str(end.get("timeZone") or ""))
+    if not start_line or not end_line:
+        return ""
+
+    meeting_type = str(raw.get("meetingMessageType") or "").casefold()
+    cancelled = meeting_type in {"meetingcancelled", "meetingcanceled", "cancelled", "canceled"}
+    method = "CANCEL" if cancelled else "REQUEST"
+    subject = str(raw.get("subject") or "").replace("\n", " ").replace("\r", " ")
+    location = str((raw.get("location") or {}).get("displayName") or "").replace("\n", " ").replace("\r", " ")
+    lines = [
+        "BEGIN:VCALENDAR",
+        f"METHOD:{method}",
+        "VERSION:2.0",
+        "BEGIN:VEVENT",
+        f"DTSTART{start_line}",
+        f"DTEND{end_line}",
+    ]
+    if subject:
+        lines.append(f"SUMMARY:{subject}")
+    if location:
+        lines.append(f"LOCATION:{location}")
+    if cancelled:
+        lines.append("STATUS:CANCELLED")
+    lines.extend(("END:VEVENT", "END:VCALENDAR"))
+    return "\n".join(lines)
+
+
 def normalize_outlook_message(raw: dict) -> dict:
     sender_obj = ((raw.get("from") or {}).get("emailAddress") or {})
     sender = sender_obj.get("address") or sender_obj.get("name") or ""
@@ -338,6 +393,14 @@ def normalize_outlook_message(raw: dict) -> dict:
         body_text = _strip_html(content)
     else:
         body_text = content
+
+    calendar = _outlook_event_calendar(raw)
+    if calendar:
+        # Keep the structured block inside the storage limit even for a long
+        # HTML invitation. The visible prose remains first for classification;
+        # calendar extraction scans the full stored text for VCALENDAR.
+        available = max(0, 20000 - len(calendar) - 2)
+        body_text = f"{body_text[:available]}\n\n{calendar}"
 
     snippet = (raw.get("bodyPreview") or body_text[:280]).strip()
     from app.email.folders import folder_from_outlook_well_known, normalize_folder

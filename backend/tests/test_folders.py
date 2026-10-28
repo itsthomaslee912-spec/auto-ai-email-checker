@@ -110,6 +110,27 @@ def test_normalize_outlook_message_keeps_unread_state():
     assert normalize_outlook_message(raw)["is_read"] is False
 
 
+def test_normalize_outlook_meeting_request_preserves_structured_calendar_time():
+    raw = {
+        "@odata.type": "#microsoft.graph.eventMessageRequest",
+        "id": "o-meeting",
+        "subject": "Platform Engineer - Thomas Lee",
+        "meetingMessageType": "meetingRequest",
+        "startDateTime": {"dateTime": "2026-10-27T22:00:00.0000000", "timeZone": "UTC"},
+        "endDateTime": {"dateTime": "2026-10-27T22:30:00.0000000", "timeZone": "UTC"},
+        "location": {"displayName": "Microsoft Teams Meeting"},
+        "from": {"emailAddress": {"address": "recruiter@msci.com"}},
+        "body": {"contentType": "text", "content": "Join the Teams meeting."},
+    }
+
+    normalized = normalize_outlook_message(raw)
+
+    assert "METHOD:REQUEST" in normalized["body_text"]
+    assert "DTSTART:20261027T220000Z" in normalized["body_text"]
+    assert "DTEND:20261027T223000Z" in normalized["body_text"]
+    assert "SUMMARY:Platform Engineer - Thomas Lee" in normalized["body_text"]
+
+
 def _session_factory():
     engine = create_engine(
         "sqlite://",

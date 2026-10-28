@@ -30,6 +30,19 @@ function splitMixedPlainHtml(value: string): { html: string; text: string } {
   };
 }
 
+function isIncompleteQuotedHtml(html: string, text: string): boolean {
+  if (!html || !text || text.length < 200) return false;
+  const visible = new DOMParser().parseFromString(html, "text/html").body.textContent
+    ?.replace(/\s+/g, " ")
+    .trim() || "";
+  // Outlook event messages can expose a tiny malformed HTML fragment that
+  // contains only the quoted candidate reply while their plain-text body has
+  // the actual invitation/confirmation. Do not let that quote replace the
+  // complete message in the reader.
+  const quoteOnly = /(?:^|\s)(?:on\s.{0,160}\s)?wrote\s*:/i.test(visible);
+  return quoteOnly && visible.length * 2 < text.replace(/\s+/g, " ").trim().length;
+}
+
 const PALETTE = {
   dark: { page: "#171b24", ink: "#eef2f7" },
   light: { page: "#ffffff", ink: "#1b2433" },
@@ -247,9 +260,13 @@ export default function EmailBody({ html, text, snippet }: Props) {
   const sourceHtml = (html || "").trim();
   const sourceText = (text || "").trim();
   const fallback = (snippet || "").trim();
+  const preferCompleteText = useMemo(
+    () => isIncompleteQuotedHtml(sourceHtml, sourceText),
+    [sourceHtml, sourceText],
+  );
 
   const htmlToRender = useMemo(() => {
-    if (sourceHtml) {
+    if (sourceHtml && !preferCompleteText) {
       const mixed = splitMixedPlainHtml(sourceHtml);
       return mixed.html || sourceHtml;
     }
@@ -258,7 +275,7 @@ export default function EmailBody({ html, text, snippet }: Props) {
     if (mixed.html) return mixed.html;
     if (looksLikeHtml(sourceText)) return sourceText;
     return "";
-  }, [sourceHtml, sourceText]);
+  }, [sourceHtml, sourceText, preferCompleteText]);
 
   // Large HTML walks the whole document to fix theme colors. Paint the snippet
   // first, then fit colors after the reader header is on screen.

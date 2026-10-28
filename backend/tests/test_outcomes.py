@@ -419,3 +419,35 @@ def test_new_applied_mail_extracts_company_and_role():
     assert stored.job_role == "Product Engineer"
     assert stored.outcome_extracted is True
     db.close()
+
+
+def test_interviewer_name_from_ai_is_replaced_by_subject_and_sender_company():
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    box = _seed_mailbox(db, email_address="kenneth@example.com")
+    email = _add_email(
+        db,
+        box.id,
+        label=EmailLabel.INTERVIEW_SCHEDULED.value,
+        received_at=datetime(2026, 10, 26, 16, 7, 31),
+        provider_message_id="nextiva-confirmation",
+        subject="Nextiva Video Interview Confirmation | Staff AI Engineer",
+    )
+    email.sender = "delaney.dopp@nextiva.com"
+    email.body_text = (
+        "You're confirmed for your video interview for the Staff AI Engineer position at Nextiva. "
+        "Interviewers: Sarannithish KS\nPlease join Microsoft Teams at the scheduled time."
+    )
+    db.commit()
+
+    async def run() -> None:
+        extract = AsyncMock(return_value=("Sarannithish KS", "Staff AI Engineer"))
+        with patch("app.classify.outcome_extract.extract_company_role", extract):
+            assert await apply_outcome(db, email) is True
+        db.commit()
+
+    asyncio.run(run())
+
+    assert email.company == "Nextiva"
+    assert email.job_role == "Staff AI Engineer"
+    db.close()
