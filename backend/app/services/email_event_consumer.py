@@ -58,11 +58,16 @@ def _mark_consumed(event_id: str) -> None:
 async def _handle_message(message) -> None:
     envelope = json.loads(message.body.decode("utf-8"))
     event_id = str(envelope["event_id"])
-    if not _already_consumed(event_id):
+    # These idempotency checks use synchronous SQLAlchemy sessions. During a
+    # broker burst, buffered deliveries can otherwise execute this entire
+    # handler repeatedly without a genuine event-loop yield. Enough messages
+    # then freeze the heartbeat and make the supervisor kill a healthy worker
+    # as "stale". Keep blocking database I/O on the thread pool.
+    if not await asyncio.to_thread(_already_consumed, event_id):
         payload = envelope.get("payload") or {}
         if payload.get("classification_pending", True):
             await _classify_mailbox(int(payload["mailbox_id"]))
-        _mark_consumed(event_id)
+        await asyncio.to_thread(_mark_consumed, event_id)
     await message.ack()
 
 

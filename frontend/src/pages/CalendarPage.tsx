@@ -260,6 +260,31 @@ function cachedDateTime(timeZone: string, options: Intl.DateTimeFormatOptions, v
 function formatDateTime(value: string, timeZone: string) {
   return cachedDateTime(timeZone, { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }, new Date(value));
 }
+
+const INTERVIEW_CSV_HEADERS = ["profileEmail", "companyName", "jobTitle", "interviewDate", "interviewType"] as const;
+
+function csvCell(value: string) {
+  return /[",\r\n]/.test(value) ? `"${value.replaceAll('"', '""')}"` : value;
+}
+
+function interviewDateForCsv(value: string, timeZone: string) {
+  const parts = partsInTimeZone(new Date(value), timeZone);
+  const pad = (number: number) => String(number).padStart(2, "0");
+  return `${parts.year}-${pad(parts.month)}-${pad(parts.day)}`;
+}
+
+function interviewCsv(events: CalendarEvent[], timeZone: string) {
+  const rows = [...events]
+    .sort((a, b) => new Date(a.start_at).getTime() - new Date(b.start_at).getTime() || a.id - b.id)
+    .map((event) => [
+      event.email_account,
+      event.company,
+      event.role,
+      interviewDateForCsv(event.start_at, timeZone),
+      "Intro",
+    ].map(csvCell).join(","));
+  return [INTERVIEW_CSV_HEADERS.join(","), ...rows].join("\r\n");
+}
 function formatClock(value: string, timeZone: string) {
   return cachedDateTime(timeZone, { hour: "numeric", minute: "2-digit" }, new Date(value));
 }
@@ -1109,7 +1134,7 @@ function PendingInterviewsAlert({ items, timeZone, mailboxColor, onJump }: {
   );
 }
 
-function ScheduledInterviewChart({ accounts }: { accounts: AccountInterviewCount[] }) {
+function ScheduledInterviewChart({ accounts, exportCount, onExport }: { accounts: AccountInterviewCount[]; exportCount: number; onExport: () => void }) {
   const [hoveredId, setHoveredId] = useState<number | null>(null);
   const total = accounts.reduce((sum, account) => sum + account.count, 0);
   const activeAccounts = accounts.filter((account) => account.count > 0);
@@ -1132,7 +1157,13 @@ function ScheduledInterviewChart({ accounts }: { accounts: AccountInterviewCount
     <div className="interview-chart-card">
       <header className="interview-chart-header">
         <h2>Scheduled interviews</h2>
-        <span>This view</span>
+        <div className="interview-chart-actions">
+          <span>This view</span>
+          <button type="button" disabled={exportCount === 0} onClick={onExport} title={exportCount ? `Export ${exportCount} interview${exportCount === 1 ? "" : "s"} to CSV` : "No email-created interviews to export in this view"}>
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8m-3-3 3 3 3-3M3 12.5v1h10v-1" /></svg>
+            Export CSV
+          </button>
+        </div>
       </header>
       <div className="interview-donut" role="img" aria-label={ariaSummary}>
         <svg viewBox="0 0 100 100" aria-hidden="true">
@@ -1536,6 +1567,22 @@ export default function CalendarPage({
     color: accountColor(mailbox),
     count: shownEvents.filter((event) => event.mailbox_id === mailbox.id && event.kind === "confirmed").length,
   })), [shownEvents, mailboxes, hiddenMailboxIds]);
+  const exportableInterviews = useMemo(
+    () => shownEvents.filter((event) => event.kind === "confirmed" && event.origin === "email"),
+    [shownEvents],
+  );
+  const exportInterviews = useCallback(() => {
+    if (!exportableInterviews.length) return;
+    const blob = new Blob(["\ufeff", interviewCsv(exportableInterviews, timeZone)], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "interviews.csv";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }, [exportableInterviews, timeZone]);
   const nextMeeting = useMemo(() => shownEvents.filter((event) => event.kind === "confirmed" && new Date(event.end_at).getTime() > Date.now()).sort((a, b) => new Date(a.start_at).getTime() - new Date(b.start_at).getTime())[0] ?? null, [shownEvents]);
   const nowInTimeZone = wallDateForInstant(new Date(), timeZone);
   const move = (amount: number) => setAnchor((date) => { const out = new Date(date); if (view === "month") out.setUTCMonth(out.getUTCMonth() + amount); else out.setUTCDate(out.getUTCDate() + amount * (view === "week" ? 7 : 1)); return out; });
@@ -1923,7 +1970,7 @@ export default function CalendarPage({
           <div className="mini-days">{miniMonthDays.map((day) => <button type="button" className={`${day.getUTCMonth() !== anchor.getUTCMonth() ? "outside" : ""} ${view === "week" && day >= start && day < end ? "in-range" : ""} ${sameDay(day, anchor) ? "selected" : ""} ${sameDay(day, nowInTimeZone) ? "today" : ""}`} key={day.toISOString()} onClick={() => setAnchor(day)}>{day.getUTCDate()}</button>)}</div>
         </section>
         <section className="calendar-next-meeting"><h2>Next meeting</h2>{nextMeeting ? <button type="button" className="next-meeting-card" onClick={() => showEventDetails(nextMeeting)}><span className="next-meeting-logo" style={{ "--account-color": mailboxColor(nextMeeting.mailbox_id) } as React.CSSProperties}>{eventInitials(nextMeeting)}</span><span><strong>{nextMeeting.title}</strong><small>{startsIn(nextMeeting.start_at)}</small></span></button> : <p>No upcoming meetings in this view.</p>}</section>
-        <ScheduledInterviewChart accounts={scheduledInterviewsByAccount} />
+        <ScheduledInterviewChart accounts={scheduledInterviewsByAccount} exportCount={exportableInterviews.length} onExport={exportInterviews} />
         <section className="calendar-legend">
           <header>
             <h2>Calendars</h2>

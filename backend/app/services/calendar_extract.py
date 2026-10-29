@@ -1068,10 +1068,17 @@ def join_url_is_complete(url: str | None) -> bool:
     return _INCOMPLETE_JOIN_QUERY_RE.search(urlparse(raw).query or "") is None
 
 
-def _assign_join_url(event: CalendarEvent, url: str | None) -> None:
+def _assign_join_url(
+    event: CalendarEvent, url: str | None, *, authoritative: bool = False,
+) -> None:
     candidate = (url or "").strip()
     current = (event.meeting_url or "").strip()
-    if join_url_is_complete(candidate) and not join_url_is_complete(current):
+    if authoritative and join_url_is_complete(candidate):
+        # A newly booked invite can replace the link from an earlier proposed
+        # slot. Both URLs may be syntactically complete, but only the current
+        # confirmation is authoritative for the appointment being projected.
+        event.meeting_url = candidate
+    elif join_url_is_complete(candidate) and not join_url_is_complete(current):
         event.meeting_url = candidate
     elif not current and is_video_join_url(candidate):
         event.meeting_url = candidate
@@ -1974,7 +1981,7 @@ _INTERVIEW_STAGE_RE = re.compile(
             (?:microsoft|ms)\s+teams|
             final|panel|loop|take[\s-]?home|coding|system\s*design|
             role\s*alignment|intro(?:ductory|duction)?|initial|first|second|
-            third|next|screening|agent|ai
+            third|next|screening|candidate|agent|ai
         )
         \s+
     )?
@@ -2014,7 +2021,7 @@ def is_interview_stage_label(role: str | None) -> bool:
     ):
         return True
     if re.fullmatch(
-        r"(?:(?:software|technical)\s+)?system\s+design|coding|behavioral|behavioural|domain\s+knowledge",
+        r"(?:(?:software|technical)\s+)?system\s+design|coding|behavioral|behavioural|domain\s+knowledge|role\s+(?:sync|alignment)",
         key,
     ):
         return True
@@ -2034,6 +2041,34 @@ def job_role_or_empty(role: str | None) -> str:
         or role.casefold() in {"job", "job posting", "opening", "opportunity", "position", "role"}
         or is_interview_stage_label(role)
     ) else role
+
+
+_RECRUITING_STAFF_ROLE_RE = re.compile(
+    r"^(?:(?:senior|sr|lead|principal|staff|technical|corporate|executive|campus|university)\s+)*"
+    r"(?:recruiter|sourcer|recruiting\s+(?:coordinator|manager|lead|partner)|"
+    r"talent\s+acquisition\s+(?:recruiter|specialist|partner|manager|lead))$",
+    re.I,
+)
+
+
+def _is_recruiting_staff_role(role: str | None) -> bool:
+    """True for likely recruiting-team signature titles.
+
+    These are filtered only when the same interview history also contains a
+    different candidate-facing role, so genuine recruiter applications remain
+    valid when no other job title is present.
+    """
+    return bool(_RECRUITING_STAFF_ROLE_RE.fullmatch((role or "").strip()))
+
+
+def _candidate_role_rows(messages: list[EmailMessage]) -> list[tuple[str, EmailMessage]]:
+    rows = [
+        (role, item)
+        for item in messages
+        if (role := job_role_or_empty(item.job_role))
+    ]
+    non_staff = [row for row in rows if not _is_recruiting_staff_role(row[0])]
+    return non_staff or rows
 
 
 def roles_compatible(left: str | None, right: str | None) -> bool:
@@ -2699,13 +2734,14 @@ def _known_role(messages: list[EmailMessage]) -> str:
     applications) must not have one silently picked as if it were the one
     this thread is about; see _open_role_for_employer's same ambiguity rule.
     """
-    roles = [role for item in messages if (role := job_role_or_empty(item.job_role))]
+    role_rows = _candidate_role_rows(messages)
+    roles = [role for role, _item in role_rows]
     if not roles:
         return ""
     anchor = roles[-1]
     if any(not _same_job_family(role, anchor) for role in roles[:-1]):
         return ""
-    return _fullest_job_title(roles, [item.subject or "" for item in messages])
+    return _fullest_job_title(roles, [item.subject or "" for _role, item in role_rows])
 
 
 def _email_context(emails: list[EmailMessage]) -> str:
@@ -3415,7 +3451,14 @@ def _apply_details(
     if access.meeting_type != "unspecified":
         event.meeting_type = access.meeting_type
     event.meeting_provider = clean_meeting_provider(access.provider or event.meeting_provider)
-    _assign_join_url(event, access.url)
+    _assign_join_url(
+        event,
+        access.url,
+        authoritative=(
+            email.label == EmailLabel.INTERVIEW_SCHEDULED.value
+            and email.interview_subtype in {None, "confirmation", "calendar_invite", "reschedule", "time_change"}
+        ),
+    )
     event.phone_number = access.phone_number or event.phone_number
     event.phone_access_code = access.access_code or event.phone_access_code
     _normalize_meeting_access_fields(event)
@@ -5676,10 +5719,7 @@ def _consensus_linked_role(messages: list[EmailMessage]) -> str:
     deliberately left unchanged.
     """
     families: list[list[tuple[str, EmailMessage]]] = []
-    for message in messages:
-        role = job_role_or_empty(message.job_role)
-        if not role:
-            continue
+    for role, message in _candidate_role_rows(messages):
         family = next(
             (items for items in families if _same_job_family(items[0][0], role)),
             None,
@@ -5709,7 +5749,8 @@ def repair_conflicting_calendar_roles(db: Session, mailbox_id: int | None = None
         query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
     repaired = 0
     for event in query.all():
-        role = _consensus_linked_role(_linked_messages(db, event))
+        messages = _linked_messages(db, event)
+        role = _consensus_linked_role(messages)
         current = job_role_or_empty(event.job_role)
         if not role or role.casefold() == current.casefold():
             continue
@@ -5718,6 +5759,9 @@ def repair_conflicting_calendar_roles(db: Session, mailbox_id: int | None = None
         event.job_role = role
         if event.origin == "email":
             event.title = f"{event.company} — {role}" if event.company else role
+        for message in messages:
+            if _is_recruiting_staff_role(message.job_role):
+                message.job_role = role
         repaired += 1
     if repaired:
         db.flush()

@@ -124,6 +124,40 @@ def test_handle_message_acks_after_job_is_accepted(monkeypatch):
     assert acked == [True]
 
 
+def test_handle_message_moves_idempotency_database_work_off_event_loop(monkeypatch):
+    import asyncio
+    import threading
+
+    database_threads = []
+    loop_thread = []
+
+    class _FakeMsg:
+        body = b'{"event_id": "e-thread", "payload": {"mailbox_id": 2}}'
+
+        async def ack(self):
+            loop_thread.append(threading.get_ident())
+
+    def already_consumed(_event_id):
+        database_threads.append(threading.get_ident())
+        return False
+
+    def mark_consumed(_event_id):
+        database_threads.append(threading.get_ident())
+
+    async def accept_job(_mailbox_id):
+        loop_thread.append(threading.get_ident())
+
+    monkeypatch.setattr(email_event_consumer, "_already_consumed", already_consumed)
+    monkeypatch.setattr(email_event_consumer, "_mark_consumed", mark_consumed)
+    monkeypatch.setattr(email_event_consumer, "_classify_mailbox", accept_job)
+
+    asyncio.run(email_event_consumer._handle_message(_FakeMsg()))
+
+    assert len(database_threads) == 2
+    assert loop_thread
+    assert all(thread_id != loop_thread[0] for thread_id in database_threads)
+
+
 def test_stop_async_iteration_triggers_consumer_stalled(monkeypatch):
     """If the queue iterator closes (channel dropped by connect_robust), the
     consumer should raise _ConsumerStalled so the outer loop reconnects."""

@@ -4902,9 +4902,14 @@ html[data-theme="light"] .calendar-event-hover-card .calendar-hover-status.statu
 .next-meeting-card > span:last-child { min-width: 0; display: grid; gap: .2rem; }.next-meeting-card strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .82rem; }.next-meeting-card small { color: var(--muted); font-size: .68rem; }
 .calendar-interview-summary { margin-top: 1.4rem; }
 .interview-chart-card { display: grid; gap: .85rem; padding: .9rem .85rem .75rem; border: 1px solid var(--calendar-border); border-radius: 14px; background: linear-gradient(180deg, color-mix(in srgb, var(--calendar-control) 100%, white 2%), var(--calendar-control)); box-shadow: inset 0 1px 0 color-mix(in srgb, white 5%, transparent), 0 6px 18px color-mix(in srgb, #000 10%, transparent); }
-.interview-chart-header { display: flex; align-items: baseline; justify-content: space-between; gap: .5rem; }
+.interview-chart-header { display: flex; align-items: center; justify-content: space-between; gap: .5rem; }
 .interview-chart-header h2 { margin: 0; color: var(--ink); font-size: .78rem; font-weight: 750; }
 .interview-chart-header span { color: var(--muted); font-size: .64rem; font-weight: 600; }
+.interview-chart-actions { display: flex; align-items: center; gap: .45rem; }
+.interview-chart-actions button { display: inline-flex; align-items: center; gap: .28rem; min-height: 1.7rem; padding: .24rem .48rem; border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--calendar-border)); border-radius: 7px; background: color-mix(in srgb, var(--accent) 10%, var(--calendar-control)); color: var(--accent); font: inherit; font-size: .62rem; font-weight: 750; cursor: pointer; }
+.interview-chart-actions button:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 62%, var(--calendar-border)); background: color-mix(in srgb, var(--accent) 17%, var(--calendar-control)); }
+.interview-chart-actions button:disabled { opacity: .42; cursor: not-allowed; }
+.interview-chart-actions button svg { width: .72rem; height: .72rem; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
 .interview-donut { position: relative; width: 7.4rem; aspect-ratio: 1; justify-self: center; }
 .interview-donut svg { width: 100%; height: 100%; overflow: visible; transform: rotate(-90deg); }
 .interview-donut-track { fill: none; stroke: var(--calendar-border-soft); stroke-width: 11; }

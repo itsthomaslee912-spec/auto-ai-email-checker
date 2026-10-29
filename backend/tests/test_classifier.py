@@ -1,3 +1,5 @@
+import pytest
+
 from app.classify.openai_classifier import apply_label_guards, _heuristic_label, _is_scheduled_interview, _is_true_rejection, _parse_strict_ai_result, message_direction
 from app.models import EmailLabel
 
@@ -12,6 +14,35 @@ def test_ai_only_keeps_valid_label_when_optional_category_subtype_is_invalid():
     assert confidence == 0.91
     assert interview_subtype is None
     assert category_subtype is None
+
+
+def test_ai_only_keeps_valid_label_when_optional_interview_subtype_is_invalid():
+    label, confidence, interview_subtype, category_subtype = _parse_strict_ai_result(
+        '{"label":"application_confirmation","confidence":0.91,'
+        '"interview_subtype":"next_steps","category_subtype":null}'
+    )
+
+    assert label == EmailLabel.APPLICATION_CONFIRMATION.value
+    assert confidence == 0.91
+    assert interview_subtype is None
+    assert category_subtype is None
+
+
+def test_ai_only_drops_invented_subtype_from_scheduled_interview():
+    label, confidence, interview_subtype, _ = _parse_strict_ai_result(
+        '{"label":"interview_scheduled","confidence":0.8,'
+        '"interview_subtype":"meeting","category_subtype":null}'
+    )
+
+    assert label == EmailLabel.INTERVIEW_SCHEDULED.value
+    assert confidence == 0.8
+    assert interview_subtype is None
+
+
+@pytest.mark.parametrize("content", ['{}', '{"confidence":0.9}', '{"label":"other"}'])
+def test_ai_only_rejects_fieldless_or_incomplete_results(content):
+    with pytest.raises(ValueError):
+        _parse_strict_ai_result(content)
 
 
 def test_ada_accommodation_disclaimer_is_not_a_scheduled_interview_reminder():

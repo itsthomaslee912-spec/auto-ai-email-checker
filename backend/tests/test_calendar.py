@@ -16,7 +16,7 @@ from sqlalchemy.pool import StaticPool
 from app.api import calendar_events, emails
 from app.db import Base, get_db
 from app.models import CalendarEvent, CalendarEventEmail, EmailLabel, EmailMessage, MailboxConnection, Provider, User
-from app.services.calendar_extract import InterviewDetails, MeetingAccess, _absorb_calendar_event, _parse_ai_slot, _resolve_video_landing_page, _without_quoted_history, candidate_reschedule_proposal_slots, clean_company_name, clean_meeting_provider, collapse_duplicate_calendar_events, companies_match, employer_instead_of_sender_domain, explicit_hiring_employer, extract_calendar_details, extract_interviewer, extract_meeting_access, fuller_company_name, hide_open_reschedules, is_interview_stage_label, job_role_or_empty, leaves_interview_unbooked, message_appointment_slots, message_is_booked_appointment, needs_calendar_event_repair, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details, repair_availability_window_appointments, repair_calendar_attendee_response_labels, repair_conflicting_calendar_roles, repair_interview_stage_roles, repair_meeting_join_urls, repair_meeting_landing_urls, repair_mixed_thread_appointments, repair_phantom_availability_slots, repair_placeholder_calendar_fields, repair_quoted_option_bookings
+from app.services.calendar_extract import InterviewDetails, MeetingAccess, _absorb_calendar_event, _assign_join_url, _parse_ai_slot, _resolve_video_landing_page, _without_quoted_history, candidate_reschedule_proposal_slots, clean_company_name, clean_meeting_provider, collapse_duplicate_calendar_events, companies_match, employer_instead_of_sender_domain, explicit_hiring_employer, extract_calendar_details, extract_interviewer, extract_meeting_access, fuller_company_name, hide_open_reschedules, is_interview_stage_label, job_role_or_empty, leaves_interview_unbooked, message_appointment_slots, message_is_booked_appointment, needs_calendar_event_repair, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details, repair_availability_window_appointments, repair_calendar_attendee_response_labels, repair_conflicting_calendar_roles, repair_interview_stage_roles, repair_meeting_join_urls, repair_meeting_landing_urls, repair_mixed_thread_appointments, repair_phantom_availability_slots, repair_placeholder_calendar_fields, repair_quoted_option_bookings
 
 
 def _database():
@@ -77,6 +77,29 @@ def test_named_video_provider_is_preserved_without_a_direct_join_url():
     )
 
     assert access == MeetingAccess("video", "Google Meet")
+
+
+def test_authoritative_booking_replaces_complete_availability_join_link():
+    event = CalendarEvent(
+        mailbox_id=1,
+        kind="confirmed",
+        origin="email",
+        title="MSCI — Platform Engineer",
+        start_at=datetime(2026, 11, 3, 18, tzinfo=timezone.utc),
+        end_at=datetime(2026, 11, 3, 19, tzinfo=timezone.utc),
+        meeting_url="https://teams.microsoft.com/meet/old-slot?p=old",
+    )
+
+    _assign_join_url(
+        event,
+        "https://teams.microsoft.com/meet/booked-slot?p=current",
+        authoritative=True,
+    )
+    assert event.meeting_url == "https://teams.microsoft.com/meet/booked-slot?p=current"
+
+    # Non-authoritative enrichment must not replace the booked link later.
+    _assign_join_url(event, "https://teams.microsoft.com/meet/unrelated?p=other")
+    assert event.meeting_url == "https://teams.microsoft.com/meet/booked-slot?p=current"
 
 
 def test_absorbing_a_duplicate_with_the_real_join_link_fixes_type_and_clock():
@@ -720,6 +743,50 @@ def test_linked_role_consensus_beats_one_cross_thread_calendar_invite_typo():
 
         assert event.job_role == "Sr. Software Engineer"
         assert event.title == "CarParts.com — Sr. Software Engineer"
+
+
+def test_linked_candidate_role_beats_recruiter_signature_title():
+    factory, (mailbox_id, _) = _database()
+    start = datetime(2026, 10, 28, 20, 0, tzinfo=timezone.utc)
+    with factory() as db:
+        messages = [
+            EmailMessage(
+                mailbox_id=mailbox_id,
+                provider_message_id=f"adusa-role-{index}",
+                thread_id="adusa-application",
+                subject="Connect on Principal Role" if index == 4 else "Re: ADUSA Application",
+                sender="Chase Wiggs <chase.wiggs@adusa.com>",
+                received_at=start - timedelta(hours=5 - index),
+                label=EmailLabel.INTERVIEW_SCHEDULED.value,
+                company="Ahold Delhaize",
+                job_role="Principal Platform Engineer" if index < 2 else "Senior Technical Recruiter",
+            )
+            for index in range(5)
+        ]
+        db.add_all(messages)
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=messages[-1].id,
+            kind="confirmed",
+            origin="email",
+            title="Ahold Delhaize — Senior Technical Recruiter",
+            company="Ahold Delhaize",
+            job_role="Senior Technical Recruiter",
+            start_at=start,
+            end_at=start + timedelta(minutes=30),
+        )
+        db.add(event)
+        db.flush()
+        db.add_all(CalendarEventEmail(event_id=event.id, email_id=message.id) for message in messages)
+        db.commit()
+
+        assert repair_conflicting_calendar_roles(db, mailbox_id) == 1
+        db.commit()
+
+        assert event.job_role == "Principal Platform Engineer"
+        assert event.title == "Ahold Delhaize — Principal Platform Engineer"
+        assert all(message.job_role == "Principal Platform Engineer" for message in messages)
 
 
 def test_linked_role_consensus_does_not_guess_from_weak_conflicting_evidence():
@@ -7320,9 +7387,14 @@ def test_interview_stage_labels_are_not_job_roles():
     assert is_interview_stage_label("Phone Screen")
     assert is_interview_stage_label("Technical Interview")
     assert is_interview_stage_label("Final Round")
+    assert is_interview_stage_label("Role Sync")
+    assert is_interview_stage_label("Role Alignment")
+    assert is_interview_stage_label("Candidate chat")
     assert not is_interview_stage_label("Staff Software Engineer")
     assert not is_interview_stage_label("Senior Recruiter")
     assert job_role_or_empty("Recruiter Screen") == ""
+    assert job_role_or_empty("Role Sync") == ""
+    assert job_role_or_empty("Candidate chat") == ""
     assert job_role_or_empty("Staff/Senior Staff Software Engineer, Product Engineering") == (
         "Staff/Senior Staff Software Engineer, Product Engineering"
     )

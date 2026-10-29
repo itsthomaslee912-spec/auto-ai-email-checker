@@ -545,6 +545,71 @@ def test_pending_interview_classification_invalidates_temporary_calendar_hash(mo
         assert stored.calendar_processing_error is None
 
 
+def test_pending_interview_projects_deterministic_calendar_event_immediately(monkeypatch):
+    """Fast-import enrichment must not wait for the mailbox backfill."""
+    from app.services import ai_backend, reclassify
+
+    SessionLocal = _session_factory()
+    with SessionLocal() as db:
+        email = _seed_email(db, label=EmailLabel.OTHER.value)
+        email.classification_pending = True
+        email.subject = "Interview with MSCI Inc. for Platform Engineer position"
+        email.body_text = """BEGIN:VCALENDAR
+METHOD:REQUEST
+VERSION:2.0
+BEGIN:VEVENT
+DTSTART:20261103T180000Z
+DTEND:20261103T190000Z
+SUMMARY:Interview with MSCI Inc. for Platform Engineer position
+END:VEVENT
+END:VCALENDAR"""
+        db.commit()
+        mailbox_id = email.mailbox_id
+        email_id = email.id
+
+    async def classify_as_scheduled(**_kwargs):
+        return SimpleNamespace(
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            category_subtype=None,
+            interview_subtype="calendar_invite",
+            confidence=1.0,
+            response_id="scheduled-response",
+        )
+
+    async def create_calendar_event(db, email, *, force=False, use_ai=True, priority="live"):
+        assert force is True
+        assert use_ai is False
+        start = datetime(2026, 11, 3, 18, tzinfo=timezone.utc)
+        db.add(CalendarEvent(
+            mailbox_id=email.mailbox_id,
+            source_email_id=email.id,
+            kind="confirmed",
+            origin="email",
+            title="MSCI — Platform Engineer",
+            start_at=start,
+            end_at=start + timedelta(hours=1),
+            is_visible=True,
+        ))
+        return True
+
+    publish = AsyncMock()
+    monkeypatch.setattr("app.db.SessionLocal", SessionLocal)
+    monkeypatch.setattr(reclassify, "classify_email", classify_as_scheduled)
+    monkeypatch.setattr(reclassify, "process_calendar_email", create_calendar_event)
+    monkeypatch.setattr(reclassify, "get_ai_backend", lambda: SimpleNamespace(provider="test"))
+    monkeypatch.setattr(reclassify, "publish", publish)
+    ai_backend._ai_call_gate = None
+    reclassify._mailbox_gate = None
+
+    asyncio.run(reclassify._run_reclassify_job(mailbox_id, pending_only=True))
+
+    with SessionLocal() as db:
+        event = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == email_id).one()
+        assert event.kind == "confirmed"
+        assert event.start_at == datetime(2026, 11, 3, 18, tzinfo=timezone.utc)
+    assert any(call.args[0] == "calendar.changed" for call in publish.await_args_list)
+
+
 def test_pending_reclassify_falls_back_when_local_ai_times_out(monkeypatch):
     from app.services import ai_backend, reclassify
 
@@ -594,6 +659,146 @@ def test_pending_reclassify_falls_back_when_local_ai_times_out(monkeypatch):
         assert stored.label == EmailLabel.APPLICATION_CONFIRMATION.value
 
 
+def test_full_reclassify_prioritizes_pending_imports(monkeypatch):
+    """Fresh pending mail must jump ahead of a historical mailbox pass."""
+    from app.services import ai_backend, reclassify
+
+    SessionLocal = _session_factory()
+    with SessionLocal() as db:
+        pending = _seed_email(db, label=EmailLabel.OTHER.value)
+        pending.subject = "Fresh pending interview"
+        pending.classification_pending = True
+        historical = EmailMessage(
+            mailbox_id=pending.mailbox_id,
+            provider_message_id="newer-historical-row",
+            subject="Newer historical email",
+            sender="sender@example.com",
+            snippet="ordinary mail",
+            body_text="ordinary mail",
+            label=EmailLabel.OTHER.value,
+            human_corrected=False,
+            classification_pending=False,
+        )
+        db.add(historical)
+        db.commit()
+        mailbox_id = pending.mailbox_id
+        pending_id = pending.id
+
+    classified_subjects = []
+
+    async def classify_as_other(**kwargs):
+        classified_subjects.append(kwargs["subject"])
+        return SimpleNamespace(
+            label=EmailLabel.OTHER.value,
+            category_subtype=None,
+            interview_subtype=None,
+            confidence=1.0,
+            response_id="test-response",
+        )
+
+    monkeypatch.setattr("app.db.SessionLocal", SessionLocal)
+    monkeypatch.setattr(reclassify, "classify_email", classify_as_other)
+    monkeypatch.setattr(reclassify, "get_ai_backend", lambda: SimpleNamespace(provider="test"))
+    monkeypatch.setattr(reclassify, "publish", AsyncMock())
+    ai_backend._ai_call_gate = None
+    reclassify._mailbox_gate = None
+
+    asyncio.run(reclassify._run_reclassify_job(mailbox_id, pending_only=False))
+
+    assert classified_subjects[0] == "Fresh pending interview"
+    with SessionLocal() as db:
+        assert db.get(EmailMessage, pending_id).classification_pending is False
+
+
+def test_pending_recovery_starts_all_mailboxes_without_waiting(monkeypatch):
+    from app.services import reclassify
+
+    SessionLocal = _session_factory()
+    with SessionLocal() as db:
+        first = _seed_email(db, label=EmailLabel.OTHER.value)
+        first.classification_pending = True
+        second_user = User(external_id="second-user")
+        db.add(second_user)
+        db.flush()
+        second_mailbox = MailboxConnection(
+            user_id=second_user.id,
+            provider=Provider.GOOGLE.value,
+            email_address="second@example.com",
+            access_token_enc="x",
+            refresh_token_enc="",
+            is_active=True,
+        )
+        db.add(second_mailbox)
+        db.flush()
+        db.add(EmailMessage(
+            mailbox_id=second_mailbox.id,
+            provider_message_id="second-pending",
+            subject="Second pending email",
+            sender="sender@example.com",
+            label=EmailLabel.OTHER.value,
+            classification_pending=True,
+        ))
+        db.commit()
+        expected = {first.mailbox_id, second_mailbox.id}
+
+    started = []
+
+    async def start_without_finishing(mailbox_id, *, pending_only=False):
+        assert pending_only is True
+        started.append(mailbox_id)
+        reclassify._running.add(mailbox_id)
+        return {"mailbox_id": mailbox_id, "state": "running"}
+
+    monkeypatch.setattr("app.db.SessionLocal", SessionLocal)
+    monkeypatch.setattr(reclassify, "start_mailbox_reclassify", start_without_finishing)
+    reclassify._running.clear()
+    try:
+        result = asyncio.run(asyncio.wait_for(reclassify.start_all_pending_reclassify(), timeout=0.2))
+    finally:
+        reclassify._running.clear()
+
+    assert set(started) == expected
+    assert {item["mailbox_id"] for item in result} == expected
+
+
+def test_pending_reclassify_defers_optional_outcome_extraction(monkeypatch):
+    from app.services import ai_backend, reclassify
+
+    SessionLocal = _session_factory()
+    with SessionLocal() as db:
+        email = _seed_email(db, label=EmailLabel.OTHER.value)
+        email.classification_pending = True
+        db.commit()
+        mailbox_id = email.mailbox_id
+        email_id = email.id
+
+    async def classify_as_application(**_kwargs):
+        return SimpleNamespace(
+            label=EmailLabel.APPLICATION_CONFIRMATION.value,
+            category_subtype=None,
+            interview_subtype=None,
+            confidence=1.0,
+            response_id="application-response",
+        )
+
+    extract = AsyncMock(return_value=("Example", "Engineer"))
+    monkeypatch.setattr("app.db.SessionLocal", SessionLocal)
+    monkeypatch.setattr(reclassify, "classify_email", classify_as_application)
+    monkeypatch.setattr(reclassify, "extract_company_role", extract)
+    monkeypatch.setattr(reclassify, "get_ai_backend", lambda: SimpleNamespace(provider="test"))
+    monkeypatch.setattr(reclassify, "publish", AsyncMock())
+    ai_backend._ai_call_gate = None
+    reclassify._mailbox_gate = None
+
+    asyncio.run(reclassify._run_reclassify_job(mailbox_id, pending_only=True))
+
+    extract.assert_not_awaited()
+    with SessionLocal() as db:
+        stored = db.get(EmailMessage, email_id)
+        assert stored.classification_pending is False
+        assert stored.label == EmailLabel.APPLICATION_CONFIRMATION.value
+
+
 def test_mailbox_gate_does_not_serialize_complete_mailbox_jobs():
     from app.services import reclassify
 
@@ -606,6 +811,36 @@ def test_mailbox_gate_does_not_serialize_complete_mailbox_jobs():
                 return True
 
     assert asyncio.run(asyncio.wait_for(acquire_two_slots(), timeout=0.1)) is True
+
+
+def test_duplicate_reclassify_request_does_not_query_durable_status(monkeypatch):
+    """Buffered broker events must not perform blocking DB status reads."""
+    from app.services import reclassify
+
+    mailbox_id = 987654
+    reclassify._running.add(mailbox_id)
+    reclassify._jobs[mailbox_id] = {
+        "mailbox_id": mailbox_id,
+        "state": "running",
+        "processed": 3,
+        "total": 10,
+    }
+    monkeypatch.setattr(
+        reclassify,
+        "get_reclassify_status",
+        lambda _mailbox_id: (_ for _ in ()).throw(AssertionError("durable status queried")),
+    )
+    try:
+        status = asyncio.run(
+            reclassify.start_mailbox_reclassify(mailbox_id, pending_only=True)
+        )
+    finally:
+        reclassify._running.discard(mailbox_id)
+        reclassify._jobs.pop(mailbox_id, None)
+        reclassify._rerun_requested.pop(mailbox_id, None)
+
+    assert status["state"] == "running"
+    assert status["processed"] == 3
 
 
 def test_prompt_loader_falls_back_to_seed(monkeypatch):
@@ -853,6 +1088,86 @@ def test_classify_email_uses_db_prompt_not_seed(monkeypatch):
     assert "Unique marker from the SQLite active prompt" in system
     assert system != SYSTEM_PROMPT
     invalidate_prompt_cache()
+
+
+def test_ai_only_classification_bounds_output_and_does_not_duplicate_body(monkeypatch):
+    monkeypatch.setattr("app.classify.openai_classifier.has_saved_ai_settings", lambda: False)
+    captured = {}
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                id="resp_bounded",
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                    "label": "other",
+                    "confidence": 0.9,
+                })))],
+            )
+
+    monkeypatch.setattr(
+        "app.classify.openai_classifier.get_settings",
+        lambda: SimpleNamespace(
+            openai_api_key="sk-test",
+            openai_model="gpt-4o-mini",
+            email_classification_mode="ai_only",
+        ),
+    )
+    monkeypatch.setattr(
+        "app.classify.openai_classifier.AsyncOpenAI",
+        lambda **_kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+    )
+
+    marker = "UNIQUE-BODY-MARKER"
+    asyncio.run(classify_email(
+        subject="Test",
+        sender="sender@example.com",
+        body_text=marker,
+        snippet="short preview",
+    ))
+
+    assert captured["max_tokens"] == 3072
+    assert captured["messages"][1]["content"].count(marker) == 1
+    assert "duplicate omitted" in captured["messages"][1]["content"]
+
+
+def test_ai_only_keeps_visible_message_after_large_css_prefix(monkeypatch):
+    monkeypatch.setattr("app.classify.openai_classifier.has_saved_ai_settings", lambda: False)
+    captured = {}
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                id="resp_css_prefix",
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                    "label": "screening",
+                    "confidence": 0.95,
+                })))],
+            )
+
+    monkeypatch.setattr(
+        "app.classify.openai_classifier.get_settings",
+        lambda: SimpleNamespace(
+            openai_api_key="sk-test",
+            openai_model="gpt-4o-mini",
+            email_classification_mode="ai_only",
+        ),
+    )
+    monkeypatch.setattr(
+        "app.classify.openai_classifier.AsyncOpenAI",
+        lambda **_kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+    )
+
+    marker = "VISIBLE-AI-INTERVIEW-INVITATION"
+    asyncio.run(classify_email(
+        subject="Next step",
+        sender="recruiter@example.com",
+        body_text=(".email-rule { color: #333; }\n" * 140) + marker,
+        snippet="Application update",
+    ))
+
+    assert marker in captured["messages"][1]["content"]
 
 
 def test_prompt_update_preserves_taxonomy_when_model_returns_rules_only(monkeypatch):

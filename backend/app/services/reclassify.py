@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -13,7 +14,7 @@ from app.models import CalendarEvent, EmailLabel, EmailMessage, MailboxConnectio
 from app.realtime.sse import publish
 from app.schemas import EmailOut
 from app.services.ai_backend import AI_CALL_CONCURRENCY, ai_call_semaphore, get_ai_backend
-from app.services.calendar_extract import CALENDAR_LABELS, clean_company_name, employer_instead_of_sender_domain, process_calendar_email
+from app.services.calendar_extract import CALENDAR_LABELS, clean_company_name, employer_instead_of_sender_domain, message_appointment_slots, message_cancels_appointment, process_calendar_email
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,21 @@ async def start_mailbox_reclassify(mailbox_id: int, *, pending_only: bool = Fals
                 mailbox_id,
                 _rerun_requested[mailbox_id],
             )
-            return get_reclassify_status(mailbox_id)
+            # This path is hit once per imported-email event during bursts.
+            # The durable status lookup performs synchronous database I/O and
+            # used to block the classification event loop repeatedly, freezing
+            # its heartbeat until the supervisor killed it as stale. The local
+            # job is authoritative while it is running; durable progress is
+            # still persisted by _publish_progress on every completed batch.
+            return dict(current or {
+                "mailbox_id": mailbox_id,
+                "state": "running",
+                "updated": 0,
+                "processed": 0,
+                "failed": 0,
+                "total": 0,
+                "message": "Reclassification already running",
+            })
         _cancel_requested.discard(mailbox_id)
         _rerun_requested.pop(mailbox_id, None)
         _running.add(mailbox_id)
@@ -161,8 +176,10 @@ async def start_all_active_reclassify() -> list[dict[str, Any]]:
 async def start_all_pending_reclassify() -> list[dict[str, Any]]:
     """Resume fast-import emails that still need an AI category.
 
-    Mailboxes run one after another so a local model is not flooded and the
-    API stays responsive for health checks while classification finishes.
+    Start each mailbox without waiting for the previous mailbox to finish.
+    The shared priority AI gate still permits only one local-model request at
+    a time, while independent mailbox jobs can persist completed work and a
+    slow row no longer prevents recovery scans for every other mailbox.
     """
     from app.db import SessionLocal
 
@@ -184,15 +201,11 @@ async def start_all_pending_reclassify() -> list[dict[str, Any]]:
         db.close()
     started: list[dict[str, Any]] = []
     for mailbox_id in ids:
-        # Observe an in-flight pass instead of requesting a redundant rerun on
-        # every recovery scan while that pass is still active.
+        # An in-flight pass continuously prioritizes its own pending rows. A
+        # later recovery scan will pick up mail that arrived after its snapshot.
         if mailbox_id in _running:
-            while mailbox_id in _running:
-                await asyncio.sleep(1)
             continue
         started.append(await start_mailbox_reclassify(mailbox_id, pending_only=True))
-        while mailbox_id in _running:
-            await asyncio.sleep(1)
     return started
 
 
@@ -218,16 +231,15 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
             await publish("reclassify.done", get_reclassify_status(mailbox_id))
             return
 
-        query_filters = [
-            EmailMessage.mailbox_id == mailbox_id,
-            EmailMessage.human_corrected.is_not(True),
-        ]
-        if pending_only:
-            query_filters.append(EmailMessage.classification_pending.is_(True))
-
-        def load_rows() -> list[SimpleNamespace]:
+        def load_rows(*, only_pending: bool) -> list[SimpleNamespace]:
             lookup = SessionLocal()
             try:
+                query_filters = [
+                    EmailMessage.mailbox_id == mailbox_id,
+                    EmailMessage.human_corrected.is_not(True),
+                ]
+                if only_pending:
+                    query_filters.append(EmailMessage.classification_pending.is_(True))
                 loaded = (
                     lookup.query(
                         EmailMessage.id,
@@ -238,9 +250,13 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                         EmailMessage.label,
                         EmailMessage.outcome_extracted,
                         EmailMessage.folder,
+                        EmailMessage.classification_pending,
                     )
                     .filter(*query_filters)
-                    .order_by(EmailMessage.id.desc())
+                    .order_by(
+                        EmailMessage.classification_pending.desc(),
+                        EmailMessage.id.desc(),
+                    )
                     .all()
                 )
                 return [
@@ -253,13 +269,14 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                         label=row.label,
                         outcome_extracted=row.outcome_extracted,
                         folder=row.folder,
+                        classification_pending=bool(row.classification_pending),
                     )
                     for row in loaded
                 ]
             finally:
                 lookup.close()
 
-        rows = await asyncio.to_thread(load_rows)
+        rows = await asyncio.to_thread(load_rows, only_pending=pending_only)
         def load_context():
             lookup = SessionLocal()
             try:
@@ -291,7 +308,7 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
         async def classify_row(
             row: Any,
         ) -> tuple[int, str, Any, tuple[str, str] | None, bool] | None:
-            ai_priority = "live" if pending_only else "background"
+            ai_priority = "live" if (pending_only or row.classification_pending) else "background"
             try:
                 if getattr(get_settings(), "email_classification_mode", "hybrid").strip().lower() == "ai_only":
                     correction_examples = []
@@ -344,7 +361,11 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                     logger.exception("Heuristic fallback failed for email %s", row.id)
                     return None
 
-            should_extract = result.label in OUTCOME_LABELS and (
+            # Pending import only needs its category to become usable. Company
+            # and role extraction is optional and may consume a second 180s
+            # Ollama request; defer that work to outcome_backfill so the
+            # durable pending flag clears as soon as classification succeeds.
+            should_extract = not row.classification_pending and result.label in OUTCOME_LABELS and (
                 result.label != row.label
                 or (result.label in BACKFILL_LABELS and not row.outcome_extracted)
             )
@@ -457,11 +478,14 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                     "label": email.label,
                     "folder": email.folder,
                     "previous_label": previous_label,
+                    "was_pending": was_pending,
                 }
             finally:
                 db.close()
 
-        async def maybe_update_calendar(applied: dict[str, Any]) -> bool:
+        async def maybe_update_calendar(
+            applied: dict[str, Any], *, deterministic_only: bool = False,
+        ) -> bool:
             if not applied.get("needs_calendar"):
                 return False
             db = SessionLocal()
@@ -470,7 +494,18 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                 if email is None:
                     return False
                 if email.label in CALENDAR_LABELS or email.folder == "sent":
-                    changed = await process_calendar_email(db, email, force=True, priority="background")
+                    if (
+                        deterministic_only
+                        and not message_appointment_slots(email)
+                        and not message_cancels_appointment(email)
+                    ):
+                        # No deterministic appointment to project. Leave the
+                        # invalidated hash for the normal backfill/model path.
+                        return False
+                    process_kwargs = {"use_ai": False} if deterministic_only else {}
+                    changed = await process_calendar_email(
+                        db, email, force=True, priority="background", **process_kwargs,
+                    )
                     # Calendar extraction mutates events and the email's
                     # processed hash but does not own the transaction. Without
                     # this commit, closing the short-lived worker session rolls
@@ -487,9 +522,30 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
             finally:
                 db.close()
 
-        # Small batches so progress moves even when the model is slow.
+        # Small batches so progress moves even when the model is slow. A full
+        # historical pass continuously re-reads pending rows so mail imported
+        # after its original snapshot jumps ahead of the backlog.
         batch_size = AI_CALL_CONCURRENCY
-        for start in range(0, total, batch_size):
+        remaining = list(rows)
+        known_ids = {row.id for row in remaining}
+        pending_retry_after: dict[int, float] = {}
+        while True:
+            if not pending_only:
+                fresh_pending = await asyncio.to_thread(load_rows, only_pending=True)
+                now = time.monotonic()
+                urgent = [
+                    row for row in fresh_pending
+                    if now >= pending_retry_after.get(row.id, 0.0)
+                ]
+                if urgent:
+                    urgent_ids = {row.id for row in urgent}
+                    new_ids = urgent_ids - known_ids
+                    if new_ids:
+                        total += len(new_ids)
+                        known_ids.update(new_ids)
+                    remaining = urgent + [row for row in remaining if row.id not in urgent_ids]
+            if not remaining:
+                break
             if _should_stop(mailbox_id):
                 job = _set_job(
                     mailbox_id,
@@ -502,12 +558,14 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                 )
                 await publish("reclassify.done", dict(job))
                 return
-            chunk = rows[start : start + batch_size]
+            chunk, remaining = remaining[:batch_size], remaining[batch_size:]
             outcomes = await asyncio.gather(*(classify_row(row) for row in chunk))
-            for outcome in outcomes:
+            for row, outcome in zip(chunk, outcomes):
                 processed += 1
                 if outcome is None:
                     failed += 1
+                    if row.classification_pending and not pending_only:
+                        pending_retry_after[row.id] = time.monotonic() + 15.0
                     continue
                 email_id, previous_label, result, extracted, should_extract = outcome
                 applied = await asyncio.to_thread(
@@ -522,12 +580,20 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                     updated += 1
                 if applied.get("payload"):
                     await publish("email.classified", applied["payload"])
-                # Pending catch-up must stay non-blocking; calendar backfill picks
-                # up newly labeled mail afterward. Full reclassify still refreshes
-                # calendar immediately.
-                if not pending_only and await maybe_update_calendar(applied):
+                # Fast-import catch-up must not wait for another model call, but
+                # deterministic ICS/text parsing is cheap and should project a
+                # booked interview immediately. Deferring every pending message
+                # to the mailbox backfill left fresh invitations invisible while
+                # that loop worked through an older backlog.
+                if await maybe_update_calendar(
+                    applied,
+                    deterministic_only=bool(applied.get("was_pending")),
+                ):
                     await publish("calendar.changed", {"action": "reclassified", "mailbox_id": mailbox_id})
                 await asyncio.sleep(0)
+            # Preserve the existing progress formatter while the worklist can
+            # grow dynamically with newly imported pending messages.
+            start = processed - len(chunk)
             await _publish_progress(
                 mailbox_id,
                 updated=updated,

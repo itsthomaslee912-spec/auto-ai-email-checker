@@ -135,10 +135,18 @@ function extractCode(body: string): ApplicationCopyAction | null {
   const candidates: CodeCandidate[] = [];
   const seen = new Set<string>();
 
-  for (const line of body.split("\n")) {
-    const token = line.trim();
-    if (token && token === line.trim() && !/\s/.test(token)) {
-      addCandidate(candidates, token, 100, seen);
+  // A bare one-word line is not enough evidence that the word is a code.
+  // Email signatures and templates routinely put brand names such as
+  // "BlackBerry" on their own line, and camel-cased names otherwise look like
+  // letter-only access codes. Only consider a standalone token when the two
+  // preceding lines explicitly identify it as a code.
+  const lines = body.split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    const token = lines[index].trim();
+    if (!token || /\s/.test(token)) continue;
+    const context = lines.slice(Math.max(0, index - 2), index).join(" ");
+    if (/\b(?:verification|security|login|access|one[- ]time|otp|authentication)?\s*(?:code|pin|passcode|token)\b/i.test(context)) {
+      addCandidate(candidates, token, 80, seen);
     }
   }
 
@@ -183,6 +191,8 @@ const LINK_PATH_HINTS = [
   "verify",
   "verification",
   "validate",
+  "activate",
+  "activation",
   "confirm",
   "password",
   "reset",
@@ -196,7 +206,7 @@ const LINK_PATH_HINTS = [
 
 function linkLabel(url: string): string {
   const lower = url.toLowerCase();
-  if (/(verify|verification|validate|confirm|token|magic|auth)/.test(lower)) return "Verification link";
+  if (/(verify|verification|validate|activate|activation|confirm|token|magic|auth)/.test(lower)) return "Verification link";
   if (/(password|reset)/.test(lower)) return "Password reset link";
   if (/(greenhouse|workday|myworkday|smartrecruiters|icims|lever|ashby)/.test(lower)) return "Application link";
   return "Action link";
