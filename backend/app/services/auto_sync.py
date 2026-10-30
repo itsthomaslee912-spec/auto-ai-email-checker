@@ -213,8 +213,11 @@ def get_auto_sync_status(db: Session) -> dict:
     from app.auth.session import mailbox_scope
 
     interval = max(30, get_settings().auto_sync_interval_seconds)
-    mailboxes = db.query(MailboxConnection).filter(mailbox_scope()).all()
+    # Probe ngrok before beginning the request's database transaction.  The
+    # local agent may take a few seconds to answer, and holding a pooled
+    # connection during that network wait needlessly starves the API.
     ngrok = get_ngrok_status()
+    mailboxes = db.query(MailboxConnection).filter(mailbox_scope()).all()
     problems = []
     syncing = False
     webhook_accounts = 0
@@ -230,7 +233,16 @@ def get_auto_sync_status(db: Session) -> dict:
         reason = polling_reason(mailbox, ngrok)
         if reason:
             polling_accounts += 1
-        job = get_sync_status(mailbox.id)
+        if _distributed():
+            # Reuse the request's session.  Opening a second SessionLocal for
+            # every mailbox can deadlock the pool when several browser tabs
+            # poll this endpoint at once: every request holds its outer
+            # connection while waiting for an inner one.
+            from app.services.job_queue import get_status
+
+            job = get_status(db, mailbox.id, "sync")
+        else:
+            job = get_sync_status(mailbox.id)
         job_state = job["state"]
         job_updated_at = None
         try:

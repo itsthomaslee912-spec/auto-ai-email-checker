@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import html
 import json
 import logging
 import re
+from datetime import timedelta
 
 from sqlalchemy.orm import Session
 
@@ -82,12 +84,112 @@ def parse_company_role(content: str) -> tuple[str, str]:
     return clean_company_name(_clean_field(data.get("company"))), job_role_or_empty(_clean_field(data.get("role")))
 
 
+def _visible_html_text(value: str) -> str:
+    """Reduce an HTML email to the visible text used for outcome extraction."""
+    text = re.sub(r"(?is)<(?:style|script)[^>]*>.*?</(?:style|script)>", " ", value or "")
+    text = re.sub(r"(?i)<br\s*/?>|</(?:p|div|td|tr|li|h[1-6])\s*>", "\n", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html.unescape(text).replace("\u200b", "")
+    return re.sub(r"[ \t\r\f\v]+", " ", text).strip()
+
+
+_LINKEDIN_OPPORTUNITY_RE = re.compile(
+    r"\b(?:about|for)\s+(?:an?\s+)?"
+    r"(?P<role>[A-Za-z][A-Za-z0-9 /&+.,'()-]{2,100}?)\s+role\s+at\s+"
+    r"(?P<company>[A-Z][A-Za-z0-9&'.,() -]{1,100}?)"
+    r"(?=[.!?\n]|,?\s+(?:they|the\s+team|where|which)\b)",
+    re.I,
+)
+
+
+def _linkedin_opportunity(email: EmailMessage) -> tuple[str, str] | None:
+    if "linkedin.com" not in (email.sender or "").casefold():
+        return None
+    visible = _visible_html_text(email.body_html or "")
+    match = _LINKEDIN_OPPORTUNITY_RE.search(visible)
+    if not match:
+        return None
+    company = clean_company_name(_clean_field(match.group("company")))
+    role = job_role_or_empty(_clean_field(match.group("role")))
+    return (company, role) if company and role else None
+
+
+def _linkedin_subject(value: str | None) -> str:
+    subject = re.sub(r"^\s*message\s+replied\s*:\s*", "", value or "", flags=re.I)
+    subject = re.sub(r"^(?:\s*(?:re|fwd?)\s*:\s*)+", "", subject, flags=re.I)
+    return " ".join(subject.casefold().split())
+
+
+def _related_linkedin_outcome(db: Session, email: EmailMessage) -> tuple[str, str] | None:
+    """Find the earlier InMail that a LinkedIn scheduling reply answers."""
+    if "linkedin.com" not in (email.sender or "").casefold():
+        return None
+    subject = _linkedin_subject(email.subject)
+    if not subject or not re.match(r"^\s*message\s+replied\s*:", email.subject or "", re.I):
+        return None
+    query = db.query(EmailMessage).filter(
+        EmailMessage.mailbox_id == email.mailbox_id,
+        EmailMessage.id != email.id,
+        EmailMessage.sender.ilike("%linkedin.com%"),
+    )
+    if email.received_at is not None:
+        query = query.filter(
+            EmailMessage.received_at <= email.received_at,
+            EmailMessage.received_at >= email.received_at - timedelta(days=30),
+        )
+    candidates = query.order_by(EmailMessage.received_at.desc(), EmailMessage.id.desc()).limit(50).all()
+    for candidate in candidates:
+        if _linkedin_subject(candidate.subject) != subject:
+            continue
+        deterministic = _linkedin_opportunity(candidate)
+        company, role = deterministic or (
+            clean_company_name(candidate.company),
+            job_role_or_empty(candidate.job_role),
+        )
+        if company and role:
+            return company, role
+    return None
+
+
+def resolve_company_role(
+    db: Session,
+    email: EmailMessage,
+    company: str,
+    role: str,
+) -> tuple[str, str]:
+    """Validate model output and apply stronger deterministic conversation evidence."""
+    deterministic = _linkedin_opportunity(email)
+    if deterministic is not None:
+        company, role = deterministic
+    else:
+        related = _related_linkedin_outcome(db, email)
+        if related is not None:
+            company, role = related
+
+    company = clean_company_name(employer_instead_of_sender_domain(email, company))
+    role = job_role_or_empty(role)
+    interviewer = extract_interviewer(
+        "\n".join((email.subject or "", email.snippet or "", email.body_text or "")),
+        email.sender or "",
+    )
+    sender_supported = clean_company_name(_company_named_in_message(email))
+    if company and interviewer and companies_match(company, interviewer):
+        company = sender_supported
+    name = candidate_own_name(email)
+    if not name and email.mailbox_id:
+        name = mailbox_candidate_name(db, email.mailbox_id)
+    if company and name and companies_match(company, name):
+        company = ""
+    return company, role
+
+
 async def extract_company_role(
     *,
     subject: str,
     sender: str,
     body_text: str,
     snippet: str,
+    body_html: str = "",
     priority: str = "live",
 ) -> tuple[str, str] | None:
     """Return company and role, or None when extraction did not run or failed."""
@@ -96,9 +198,9 @@ async def extract_company_role(
         return None
 
     client = backend.client()
-    user_content = (
-        f"From: {sender}\nSubject: {subject}\nSnippet: {snippet}\n\nBody:\n{(body_text or '')[:6000]}"
-    )
+    html_text = _visible_html_text(body_html)
+    evidence = "\n\n".join(part for part in (body_text or "", html_text) if part.strip())
+    user_content = f"From: {sender}\nSubject: {subject}\nSnippet: {snippet}\n\nBody:\n{evidence[:12000]}"
     try:
         async with ai_call_semaphore(priority):
             response = await client.chat.completions.create(
@@ -136,36 +238,14 @@ async def apply_outcome(
         sender=email.sender or "",
         body_text=email.body_text or "",
         snippet=email.snippet or "",
+        body_html=email.body_html or "",
         priority=priority,
     )
     if extracted is None:
         return False
-    company, role = extracted
-    company = clean_company_name(employer_instead_of_sender_domain(email, company))
-    interviewer = extract_interviewer(
-        "\n".join((email.subject or "", email.snippet or "", email.body_text or "")),
-        email.sender or "",
-    )
-    sender_supported = clean_company_name(_company_named_in_message(email))
-    if company and interviewer and companies_match(company, interviewer):
-        # A weak model can promote "interview with <person>" into company.
-        # When the subject repeats the sender-domain brand, that corroborated
-        # employer is deterministic and stronger than the person's name.
-        company = sender_supported
-    # The prompt tells the model never to use the candidate's own name as the
-    # employer, but a weak local model can still do it (e.g. a quoted "From:
-    # Jordan Meeker <...>" reply makes the model echo "Jordan Meeker" back as
-    # the company). Reject it defensively rather than trust instruction-following.
-    # The reliable name<->address pairing that proves this often lives in a
-    # different thread than the one being classified, so fall back to a
-    # mailbox-wide search when this message alone doesn't carry it.
-    name = candidate_own_name(email)
-    if not name and email.mailbox_id:
-        name = mailbox_candidate_name(db, email.mailbox_id)
-    if company and name and companies_match(company, name):
-        company = ""
+    company, role = resolve_company_role(db, email, *extracted)
     email.company = company
-    email.job_role = job_role_or_empty(role)
+    email.job_role = role
     email.outcome_extracted = True
     db.add(email)
     return True

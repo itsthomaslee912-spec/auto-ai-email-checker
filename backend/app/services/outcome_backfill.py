@@ -4,7 +4,7 @@ import asyncio
 import logging
 from collections import defaultdict
 
-from app.classify.outcome_extract import BACKFILL_LABELS, extract_company_role
+from app.classify.outcome_extract import BACKFILL_LABELS, extract_company_role, resolve_company_role
 from app.models import EmailMessage
 from app.services.ai_backend import get_ai_backend
 
@@ -24,7 +24,7 @@ async def backfill_outcomes(stop_event: asyncio.Event) -> None:
 
     from app.db import SessionLocal
 
-    def load_pending() -> dict[int, list[tuple[int, str, str, str, str]]]:
+    def load_pending() -> dict[int, list[tuple[int, str, str, str, str, str]]]:
         db = SessionLocal()
         try:
             rows = (
@@ -36,7 +36,7 @@ async def backfill_outcomes(stop_event: asyncio.Event) -> None:
                 .order_by(EmailMessage.mailbox_id.asc(), EmailMessage.id.asc())
                 .all()
             )
-            grouped: dict[int, list[tuple[int, str, str, str, str]]] = defaultdict(list)
+            grouped: dict[int, list[tuple[int, str, str, str, str, str]]] = defaultdict(list)
             for row in rows:
                 grouped[row.mailbox_id].append(
                     (
@@ -45,6 +45,7 @@ async def backfill_outcomes(stop_event: asyncio.Event) -> None:
                         row.sender or "",
                         row.body_text or "",
                         row.snippet or "",
+                        row.body_html or "",
                     )
                 )
             return grouped
@@ -66,9 +67,9 @@ async def backfill_outcomes(stop_event: asyncio.Event) -> None:
     saved = 0
 
     async def extract_one(
-        item: tuple[int, str, str, str, str],
+        item: tuple[int, str, str, str, str, str],
     ) -> tuple[int, tuple[str, str] | None]:
-        email_id, subject, sender, body_text, snippet = item
+        email_id, subject, sender, body_text, snippet, body_html = item
         async with semaphore:
             if stop_event.is_set():
                 return email_id, None
@@ -77,6 +78,7 @@ async def backfill_outcomes(stop_event: asyncio.Event) -> None:
                 sender=sender,
                 body_text=body_text,
                 snippet=snippet,
+                body_html=body_html,
             )
             return email_id, extracted
 
@@ -102,7 +104,7 @@ async def backfill_outcomes(stop_event: asyncio.Event) -> None:
                         continue
                     if email.label not in BACKFILL_LABELS:
                         continue
-                    company, role = extracted
+                    company, role = resolve_company_role(write_db, email, *extracted)
                     email.company = company
                     email.job_role = role
                     email.outcome_extracted = True

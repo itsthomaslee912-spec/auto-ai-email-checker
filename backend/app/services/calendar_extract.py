@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parseaddr
 from urllib.parse import urlparse
+from weakref import WeakValueDictionary
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -25,6 +26,25 @@ from app.services.ai_backend import ai_call_semaphore, close_ai_client, get_ai_b
 from app.timeutil import as_utc
 
 logger = logging.getLogger(__name__)
+
+# Calendar enrichment can wait minutes for a local model.  Serialize duplicate
+# work in memory instead of holding a PostgreSQL row lock during that network
+# wait.  The weak registry releases locks once an email is no longer active.
+_calendar_email_locks: WeakValueDictionary[tuple[int, int], asyncio.Lock] = WeakValueDictionary()
+
+
+def _calendar_email_lock(email_id: int) -> asyncio.Lock:
+    # Calendar backfill owns a separate event loop in a worker thread. asyncio
+    # synchronization primitives cannot safely wake waiters on another loop;
+    # sharing one lock by email ID across those loops stranded calendar repair
+    # indefinitely. Serialize within each loop and let database uniqueness
+    # constraints handle the rare overlap between live work and backfill.
+    key = (id(asyncio.get_running_loop()), email_id)
+    lock = _calendar_email_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _calendar_email_locks[key] = lock
+    return lock
 
 CALENDAR_LABELS = {
     EmailLabel.INTERVIEW_INVITATION.value,
@@ -2519,21 +2539,37 @@ def correct_sender_domain_employers(db: Session, mailbox_id: int | None = None) 
             source_brand = sender_domain_brand(source)
             current = (event.company or source.company or "").strip()
             source_received = as_utc(source.received_at)
+            _, source_sender = parseaddr(source.sender or "")
+            source_sender = _normalized_address(source_sender)
             invitations = [
                 item
                 for item in emails
                 if item.id != source.id
                 and item.label == EmailLabel.INTERVIEW_INVITATION.value
                 and (item.company or "").strip()
-                and source_tokens.intersection(_schedule_tokens(_message_text(item)))
                 and roles_compatible(event.job_role, item.job_role)
                 and (
                     source_received is None
                     or as_utc(item.received_at) is None
                     or as_utc(item.received_at) <= source_received
                 )
+                and (
+                    source_tokens.intersection(_schedule_tokens(_message_text(item)))
+                    or (
+                        source_sender
+                        and _normalized_address(parseaddr(item.sender or "")[1]) == source_sender
+                    )
+                )
             ]
-            if source_brand and companies_match(current, source_brand) and invitations:
+            same_sender_invitation = any(
+                source_sender
+                and _normalized_address(parseaddr(item.sender or "")[1]) == source_sender
+                for item in invitations
+            )
+            if invitations and (
+                (source_brand and companies_match(current, source_brand))
+                or same_sender_invitation
+            ):
                 invitation = max(
                     invitations,
                     key=lambda item: (
@@ -3237,6 +3273,63 @@ def _parse_ai_slot(item: object) -> ExtractedSlot | None:
     )
 
 
+def _prior_interview_timezone(
+    db: Session,
+    email: EmailMessage,
+    messages: list[EmailMessage],
+) -> str | None:
+    """Reuse a recent zone only for the same thread or company-and-role identity.
+
+    Recruiters often omit the timezone in a follow-up availability list after
+    earlier interviews established it. Without this conservative inheritance,
+    an explicit candidate reply such as "November 3: 9:00 AM works for me"
+    cannot be projected deterministically and disappears from the calendar.
+    """
+    received = as_utc(email.received_at)
+    query = db.query(CalendarEvent).filter(
+        CalendarEvent.mailbox_id == email.mailbox_id,
+        CalendarEvent.origin == "email",
+        CalendarEvent.source_timezone.is_not(None),
+        CalendarEvent.source_timezone != "",
+    )
+    if received is not None:
+        query = query.filter(
+            CalendarEvent.source_received_at <= received,
+            CalendarEvent.source_received_at >= received - timedelta(days=120),
+        )
+    events = query.order_by(
+        CalendarEvent.source_received_at.desc(),
+        CalendarEvent.id.desc(),
+    ).limit(100).all()
+
+    if email.thread_id:
+        same_thread = next(
+            (event for event in events if event.source_thread_id == email.thread_id),
+            None,
+        )
+        if same_thread is not None:
+            return normalize_time_zone_name(same_thread.source_timezone) or same_thread.source_timezone
+
+    companies = [item.company for item in messages if (item.company or "").strip()]
+    roles = [job_role_or_empty(item.job_role) for item in messages if job_role_or_empty(item.job_role)]
+    if not companies or not roles:
+        return None
+    matching = next(
+        (
+            event
+            for event in events
+            if (event.company or "").strip()
+            and any(companies_match(event.company, company) for company in companies)
+            and job_role_or_empty(event.job_role)
+            and any(roles_compatible(event.job_role, role) for role in roles)
+        ),
+        None,
+    )
+    if matching is None:
+        return None
+    return normalize_time_zone_name(matching.source_timezone) or matching.source_timezone
+
+
 async def extract_calendar_details(
     email: EmailMessage,
     related_emails: list[EmailMessage] | None = None,
@@ -3258,10 +3351,20 @@ async def extract_calendar_details(
     # ran that same regex pass on this message (e.g. the reschedule check)
     # can pass its result in as `known_slots` to skip doing it twice.
     slots = _prefer_specific_slots(known_slots) if known_slots is not None else message_appointment_slots(email)
+    inherited_zone = None
+    if not slots and db is not None:
+        inherited_zone = _prior_interview_timezone(db, email, messages)
+        if inherited_zone:
+            slots = parse_text_slots(
+                f"{current_text}\nAll times displayed in {inherited_zone}",
+                email.received_at,
+            )
     # Organizer ICS often uses their mailbox TZ (e.g. GMT Standard Time / London)
     # while the thread negotiated "8am in Venice, CA". Keep the UTC instant from
     # ICS, but label the meeting in the city/zone the candidate agreed to.
-    meeting_zone = _meeting_zone_from_messages(messages)
+    # A same-company-and-role calendar event is stronger evidence than a city
+    # name or unrelated location appearing in the surrounding email thread.
+    meeting_zone = None if inherited_zone else _meeting_zone_from_messages(messages)
     if slots:
         slots = [
             ExtractedSlot(
@@ -4212,6 +4315,38 @@ def _matching_interview_invitation(db: Session, email: EmailMessage) -> EmailMes
         return None
     received = as_utc(email.received_at)
     window_start = received - timedelta(days=120) if received else None
+    organizer_addresses = _organizer_addresses(email)
+    if organizer_addresses and message_is_booked_appointment(email):
+        # Query the small exact-identity set first. Loading every message in a
+        # large mailbox just to find the recruiter several rows back can stall
+        # live calendar extraction for tens of seconds.
+        identity_candidates = (
+            db.query(EmailMessage)
+            .filter(
+                EmailMessage.mailbox_id == email.mailbox_id,
+                EmailMessage.id != email.id,
+                EmailMessage.label.in_(interview_labels),
+                EmailMessage.folder.notin_({"sent", "spam", "trash"}),
+                *([EmailMessage.received_at >= window_start] if window_start else []),
+                or_(*[
+                    EmailMessage.sender.ilike(f"%{address}%")
+                    for address in organizer_addresses
+                ]),
+            )
+            .order_by(EmailMessage.received_at.desc(), EmailMessage.id.desc())
+            .limit(20)
+            .all()
+        )
+        same_sender = next(
+            (
+                row
+                for row in identity_candidates
+                if _normalized_address(parseaddr(row.sender or "")[1]) in organizer_addresses
+            ),
+            None,
+        )
+        if same_sender is not None:
+            return same_sender
     candidates = (
         db.query(EmailMessage)
         .filter(
@@ -7238,6 +7373,25 @@ async def process_calendar_email(
         return await _process_calendar_email(db, email, force=force, use_ai=use_ai, priority=priority)
     if email.label in CALENDAR_LABELS:
         return await _process_calendar_email(db, email, force=force, use_ai=use_ai, priority=priority)
+    if (
+        email.folder not in {"sent", "spam", "trash"}
+        and message_is_booked_appointment(email)
+    ):
+        # Calendly/Google may send the actual booking in a separate thread with
+        # a generic title such as "Jordan Meeker and Bonnie Chen". Match its
+        # organizer to the earlier interview invitation so a deterministic ICS
+        # booking does not wait behind the AI classification queue.
+        invitation = _matching_interview_invitation(db, email)
+        if invitation is not None:
+            email.label = EmailLabel.INTERVIEW_SCHEDULED.value
+            email.interview_subtype = "calendar_invite"
+            if not (email.company or "").strip() and invitation.company:
+                email.company = invitation.company
+            if not job_role_or_empty(email.job_role) and job_role_or_empty(invitation.job_role):
+                email.job_role = invitation.job_role
+            return await _process_calendar_email(
+                db, email, force=force, use_ai=use_ai, priority=priority,
+            )
     if misfiled_interview_booking(email):
         subtype = "reminder" if re.search(r"\breminder\b", email.subject or "", re.I) else "confirmation"
         if not email.human_corrected:
@@ -7282,12 +7436,27 @@ async def _process_calendar_email(
     use_ai: bool,
     priority: str = "live",
 ) -> bool:
+    async with _calendar_email_lock(email.id):
+        return await _process_calendar_email_locked(
+            db, email, force=force, use_ai=use_ai, priority=priority,
+        )
+
+
+async def _process_calendar_email_locked(
+    db: Session,
+    email: EmailMessage,
+    *,
+    force: bool,
+    use_ai: bool,
+    priority: str = "live",
+) -> bool:
     if email.label not in CALENDAR_LABELS:
         return False
-    # Classification, startup backfill, and webhook sync can encounter the same
-    # message concurrently. Serializing by source email keeps event creation
-    # idempotent under the source/slot unique constraint.
-    db.query(EmailMessage.id).filter(EmailMessage.id == email.id).with_for_update().one()
+    # Do not acquire SELECT ... FOR UPDATE here. Calendar extraction can wait
+    # on the local AI model, and retaining that row lock blocked unrelated
+    # calendar cleanup transactions for many minutes. The per-email asyncio
+    # lock above serializes this process; database uniqueness constraints remain
+    # the final guard if two service replicas ever overlap.
     digest = email_calendar_hash(email)
     if not force and email.calendar_processed_hash == digest:
         return False

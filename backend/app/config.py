@@ -44,10 +44,18 @@ class Settings(BaseSettings):
     database_url: str
     # Tune per replica so concurrent requests reuse warm PostgreSQL
     # connections without allowing a scaled deployment to exhaust the server.
-    database_pool_size: int = 12
-    database_max_overflow: int = 12
+    # Native development runs five database-using processes.  Keep their
+    # aggregate worst-case pool below PostgreSQL's usual 100-connection limit.
+    database_pool_size: int = 5
+    database_max_overflow: int = 3
     database_pool_timeout_seconds: float = 5.0
     database_pool_recycle_seconds: int = 300
+    # Fail one blocked statement instead of allowing a lock chain to consume
+    # every API and worker connection indefinitely.
+    database_lock_timeout_seconds: float = 15.0
+    # AI enrichment should normally release its transaction promptly. This is
+    # a final guard against an abandoned session retaining locks/connections.
+    database_idle_transaction_timeout_seconds: float = 300.0
     token_encryption_key: str = ""
     webhook_base_url: str = "http://localhost:8000"
     frontend_origin: str = "http://localhost:5173"

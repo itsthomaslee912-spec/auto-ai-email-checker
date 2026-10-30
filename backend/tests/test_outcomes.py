@@ -451,3 +451,62 @@ def test_interviewer_name_from_ai_is_replaced_by_subject_and_sender_company():
     assert email.company == "Nextiva"
     assert email.job_role == "Staff AI Engineer"
     db.close()
+
+
+def test_linkedin_reply_inherits_explicit_opportunity_from_original_inmail():
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    box = _seed_mailbox(db, email_address="thomas@example.com")
+    original = _add_email(
+        db,
+        box.id,
+        label=EmailLabel.SCREENING.value,
+        received_at=datetime(2026, 10, 29, 12, 59, 24),
+        provider_message_id="linkedin-original",
+        subject="Thomas, can we speak?",
+    )
+    original.sender = "inmail-hit-reply@linkedin.com"
+    original.body_text = "Thomas Lee\n\nTom Crowle\n\nHey Thomas,"
+    original.body_html = (
+        "<html><body><style>.hidden { color: red; }</style>"
+        "<div>Hey Thomas, Your experience stood out, and I wanted to reach out "
+        "about a Platform Engineering role at Citadel Securities. They build "
+        "the cloud platforms behind Citadel's research.</div>"
+        "<div>This email was intended for Thomas Lee (Senior Platform Engineer)</div>"
+        "</body></html>"
+    )
+    reply = _add_email(
+        db,
+        box.id,
+        label=EmailLabel.INTERVIEW_INVITATION.value,
+        received_at=datetime(2026, 10, 29, 13, 46, 17),
+        provider_message_id="linkedin-reply",
+        subject="Message replied: Thomas, can we speak?",
+    )
+    reply.sender = "hit-reply@linkedin.com"
+    reply.body_text = (
+        "Tom Crowle\n\nIt would be great to discuss this further. "
+        "Schedule a call: https://calendly.com/tom-grep-tech/30min"
+    )
+    reply.body_html = "<div>It would be great to discuss this further.</div>"
+    db.commit()
+
+    async def run() -> None:
+        # Simulate the weak model outputs that caused the production bug. The
+        # explicit original InMail and its conversation link are authoritative.
+        extract = AsyncMock(side_effect=[
+            ("Grep Technology Partners", "Senior Platform Engineer"),
+            ("", "Staff Software Engineer, Reliability"),
+        ])
+        with patch("app.classify.outcome_extract.extract_company_role", extract):
+            assert await apply_outcome(db, original, force=True) is True
+            assert await apply_outcome(db, reply, force=True) is True
+        db.commit()
+
+    asyncio.run(run())
+
+    assert original.company == "Citadel Securities"
+    assert original.job_role == "Platform Engineering"
+    assert reply.company == "Citadel Securities"
+    assert reply.job_role == "Platform Engineering"
+    db.close()

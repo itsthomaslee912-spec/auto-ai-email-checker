@@ -8,7 +8,7 @@ from typing import Any
 
 from app.classify.openai_classifier import classify_email, infer_interview_subtype
 from app.classify.correction_retrieval import load_correction_corpus, retrieve_relevant_corrections
-from app.classify.outcome_extract import BACKFILL_LABELS, OUTCOME_LABELS, extract_company_role
+from app.classify.outcome_extract import BACKFILL_LABELS, OUTCOME_LABELS, extract_company_role, resolve_company_role
 from app.config import get_settings
 from app.models import CalendarEvent, EmailLabel, EmailMessage, MailboxConnection
 from app.realtime.sse import publish
@@ -126,6 +126,7 @@ async def start_mailbox_reclassify(mailbox_id: int, *, pending_only: bool = Fals
         job = _set_job(
             mailbox_id,
             state="running",
+            pending_only=pending_only,
             updated=0,
             processed=0,
             failed=0,
@@ -212,6 +213,7 @@ async def start_all_pending_reclassify() -> list[dict[str, Any]]:
 async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) -> None:
     from app.db import SessionLocal
 
+    stopped_by_request = False
     async with _mailbox_gate_semaphore():
       try:
         def mailbox_exists() -> bool:
@@ -246,6 +248,7 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                         EmailMessage.subject,
                         EmailMessage.sender,
                         EmailMessage.body_text,
+                        EmailMessage.body_html,
                         EmailMessage.snippet,
                         EmailMessage.label,
                         EmailMessage.outcome_extracted,
@@ -265,6 +268,7 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                         subject=row.subject,
                         sender=row.sender,
                         body_text=row.body_text,
+                        body_html=row.body_html,
                         snippet=row.snippet,
                         label=row.label,
                         outcome_extracted=row.outcome_extracted,
@@ -377,6 +381,7 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                         sender=row.sender or "",
                         body_text=row.body_text or "",
                         snippet=row.snippet or "",
+                        body_html=row.body_html or "",
                         priority=ai_priority,
                     )
                 except Exception:
@@ -426,11 +431,11 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                     email.openai_response_id = result.response_id
                 outcome_changed = False
                 if should_extract and extracted is not None and email.label in OUTCOME_LABELS:
-                    company, role = extracted
+                    company, role = resolve_company_role(db, email, *extracted)
                     # A recruiter at gkrouse@google.com hiring for Tapestry is not a
                     # Google interview — without this, a reclassify can leave the
                     # recruiting agency's own domain stored as the employer.
-                    email.company = clean_company_name(employer_instead_of_sender_domain(email, company))
+                    email.company = company
                     email.job_role = role
                     email.outcome_extracted = True
                     outcome_changed = True
@@ -547,6 +552,7 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
             if not remaining:
                 break
             if _should_stop(mailbox_id):
+                stopped_by_request = True
                 job = _set_job(
                     mailbox_id,
                     state="stopped",
@@ -621,5 +627,8 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
         _running.discard(mailbox_id)
         _cancel_requested.discard(mailbox_id)
         rerun_pending_only = _rerun_requested.pop(mailbox_id, None)
-        if rerun_pending_only is not None:
+        # Reclaimed duplicate commands may have queued a rerun while this pass
+        # was active. A user stop is authoritative and must not immediately
+        # launch that queued pass again.
+        if rerun_pending_only is not None and not stopped_by_request:
             asyncio.create_task(start_mailbox_reclassify(mailbox_id, pending_only=rerun_pending_only))

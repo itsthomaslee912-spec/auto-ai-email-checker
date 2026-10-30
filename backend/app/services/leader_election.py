@@ -45,6 +45,10 @@ async def leader_elected_loops(
                 acquired = bool(connection.execute(
                     text("SELECT pg_try_advisory_lock(:key)"), {"key": lock_key}
                 ).scalar())
+                # Session advisory locks survive commit. End the implicit
+                # transaction so the elected worker does not remain "idle in
+                # transaction" for its entire lifetime.
+                connection.commit()
             else:
                 # Local SQLite has one process and therefore no competing replica.
                 acquired = True
@@ -83,6 +87,7 @@ async def leader_elected_loops(
                 if not tasks:
                     raise RuntimeError(f"All leader tasks exited for {election_name}")
                 connection.execute(text("SELECT 1"))
+                connection.commit()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -99,6 +104,7 @@ async def leader_elected_loops(
                 if acquired and connection.dialect.name == "postgresql":
                     try:
                         connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": lock_key})
+                        connection.commit()
                     except Exception:
                         pass
                 connection.close()

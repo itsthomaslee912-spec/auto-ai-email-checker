@@ -49,19 +49,36 @@ def monitoring_snapshot(db: Session = Depends(get_db)) -> dict:
     require_admin()
     now = datetime.now(timezone.utc)
     cutoff = now - STALE_AFTER
-    heartbeat_rows = db.query(ServiceHeartbeat).all()
+    service_names = tuple(SERVICE_DETAILS)
+    # Heartbeats are retained across process restarts.  Loading the entire
+    # history made this endpoint progressively slower (and amplified pool
+    # pressure) even though only fresh replicas and the latest timestamp are
+    # needed for the UI.
+    heartbeat_rows = db.query(ServiceHeartbeat).filter(
+        ServiceHeartbeat.service_name.in_(service_names),
+        ServiceHeartbeat.last_seen_at >= cutoff,
+    ).all()
+    latest_heartbeats = {
+        service_name: as_utc(last_seen_at)
+        for service_name, last_seen_at in db.query(
+            ServiceHeartbeat.service_name,
+            func.max(ServiceHeartbeat.last_seen_at),
+        ).filter(
+            ServiceHeartbeat.service_name.in_(service_names)
+        ).group_by(ServiceHeartbeat.service_name).all()
+    }
     services = []
     for service_name, (label, description) in SERVICE_DETAILS.items():
         rows = [row for row in heartbeat_rows if row.service_name == service_name]
         fresh = [row for row in rows if as_utc(row.last_seen_at) and as_utc(row.last_seen_at) >= cutoff]
-        latest = max((as_utc(row.last_seen_at) for row in rows), default=None)
+        latest = latest_heartbeats.get(service_name)
         if fresh:
             # A replica that is alive but self-reports a degraded component (for
             # example a consumer rebuilding a dropped broker channel) surfaces as
             # that state rather than a misleading "healthy".
             status = "recovering" if any((row.status or "healthy") == "recovering" for row in fresh) else "healthy"
         else:
-            status = "stale" if rows else "offline"
+            status = "stale" if latest else "offline"
         services.append({
             "name": service_name,
             "label": label,

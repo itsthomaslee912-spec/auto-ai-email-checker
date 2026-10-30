@@ -103,3 +103,42 @@ def test_expired_worker_lease_returns_job_to_queue(monkeypatch):
         assert recovered.state == "starting"
         assert recovered.claimed_by == job_queue.INSTANCE_ID
         assert recovered.attempts == 2
+
+
+def test_pending_reclassify_mode_survives_lease_recovery(monkeypatch):
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    session_factory = sessionmaker(bind=engine)
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(job_queue, "SessionLocal", session_factory)
+
+    with session_factory() as db:
+        user = User(external_id="pending-reclassify-mode")
+        db.add(user)
+        db.flush()
+        mailbox = MailboxConnection(
+            user_id=user.id,
+            provider=Provider.GOOGLE.value,
+            email_address="pending@example.com",
+            access_token_enc="x",
+            is_active=True,
+        )
+        db.add(mailbox)
+        db.commit()
+        mailbox_id = mailbox.id
+
+    job_queue.persist(mailbox_id, "reclassify", {
+        "mailbox_id": mailbox_id,
+        "state": "running",
+        "pending_only": True,
+        "processed": 0,
+        "total": 2,
+        "message": "Classifying queued emails",
+    })
+    with session_factory() as db:
+        row = db.query(MailboxJobState).one()
+        row.lease_expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        db.commit()
+
+    assert job_queue.claim("reclassify") == [(mailbox_id, {"pending_only": True})]

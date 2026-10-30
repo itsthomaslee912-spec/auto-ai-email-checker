@@ -20,6 +20,17 @@ engine_kwargs: dict = {"pool_pre_ping": True, "pool_timeout": 10}
 if database_url.get_backend_name() == "sqlite":
     connect_args = {"check_same_thread": False, "timeout": 60}
 else:
+    if database_url.get_backend_name() == "postgresql":
+        lock_timeout_ms = max(100, int(settings.database_lock_timeout_seconds * 1000))
+        idle_transaction_timeout_ms = max(
+            1000, int(settings.database_idle_transaction_timeout_seconds * 1000)
+        )
+        connect_args = {
+            "options": (
+                f"-c lock_timeout={lock_timeout_ms} "
+                f"-c idle_in_transaction_session_timeout={idle_transaction_timeout_ms}"
+            )
+        }
     # Drop connections older than this so a restarted PostgreSQL is picked up
     # instead of leaving requests stuck on a dead socket.
     engine_kwargs["pool_recycle"] = max(30, settings.database_pool_recycle_seconds)

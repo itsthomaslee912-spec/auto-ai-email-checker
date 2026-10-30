@@ -116,6 +116,15 @@ def persist(mailbox_id: int, job_type: str, status: dict[str, Any]) -> None:
             db.add(row)
         row.state = str(status.get("state") or "idle")
         row.progress = json.dumps(status, default=str, separators=(",", ":"))
+        # Pending-email recovery starts directly inside the classification
+        # worker rather than through enqueue(). Persist its mode explicitly so
+        # a worker restart/expired lease cannot reinterpret missing options as
+        # a full historical mailbox reclassification.
+        if job_type == "reclassify" and "pending_only" in status:
+            row.options = json.dumps(
+                {"pending_only": bool(status["pending_only"])},
+                separators=(",", ":"),
+            )
         row.updated_at = datetime.now(timezone.utc)
         if row.state in {"starting", "running"}:
             row.claimed_by = INSTANCE_ID

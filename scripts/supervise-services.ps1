@@ -35,7 +35,7 @@ $frontendFailures = 0
 $backendRestartDelay = 0
 $frontendRestartDelay = 0
 $startupGraceSeconds = 90
-$backendFailureThreshold = 30
+$backendFailureThreshold = 3
 $backendSourceVersion = ""
 $workerHeartbeatMaxAgeSeconds = 60
 $workerHeartbeatStartupGraceSeconds = 90
@@ -90,9 +90,9 @@ function Get-BackendSourceVersion {
 function Start-Backend {
     Write-SupervisorLog "Starting backend on 127.0.0.1:8000"
     $arguments = @("-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000")
-    if ($Reload) {
-        $arguments += @("--reload", "--reload-dir", (Join-Path $Backend "app"))
-    }
+    # The supervisor already watches backend source and restarts the complete
+    # service tree. Uvicorn's second reload parent can survive a parent-only
+    # restart on Windows and keep port 8000 occupied with stale code.
     return Start-Process -FilePath $Python `
         -ArgumentList $arguments `
         -WorkingDirectory $Backend -WindowStyle Hidden -PassThru `
@@ -178,7 +178,11 @@ try {
             $currentSourceVersion = Get-BackendSourceVersion
             if ($currentSourceVersion -ne $backendSourceVersion) {
                 $backendSourceVersion = $currentSourceVersion
-                Write-SupervisorLog "Backend source changed; restarting worker services"
+                Write-SupervisorLog "Backend source changed; restarting API and worker services"
+                if ($backendProcess -and -not $backendProcess.HasExited) {
+                    Stop-ServiceProcessTree $backendProcess
+                }
+                $backendProcess = $null
                 foreach ($worker in @(
                     $syncWorkerProcess,
                     $classificationWorkerProcess,
@@ -215,7 +219,7 @@ try {
             $backendFailures++
             if ($backendFailures -ge $backendFailureThreshold) {
                 Write-SupervisorLog "Backend unhealthy; restarting PID $($backendProcess.Id)"
-                Stop-Process -Id $backendProcess.Id -Force -ErrorAction SilentlyContinue
+                Stop-ServiceProcessTree $backendProcess
                 $backendProcess = $null
                 $backendFailures = 0
                 $backendRestartDelay = Get-GrownDelay $backendRestartDelay

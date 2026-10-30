@@ -16,7 +16,23 @@ from sqlalchemy.pool import StaticPool
 from app.api import calendar_events, emails
 from app.db import Base, get_db
 from app.models import CalendarEvent, CalendarEventEmail, EmailLabel, EmailMessage, MailboxConnection, Provider, User
-from app.services.calendar_extract import InterviewDetails, MeetingAccess, _absorb_calendar_event, _assign_join_url, _parse_ai_slot, _resolve_video_landing_page, _without_quoted_history, candidate_reschedule_proposal_slots, clean_company_name, clean_meeting_provider, collapse_duplicate_calendar_events, companies_match, employer_instead_of_sender_domain, explicit_hiring_employer, extract_calendar_details, extract_interviewer, extract_meeting_access, fuller_company_name, hide_open_reschedules, is_interview_stage_label, job_role_or_empty, leaves_interview_unbooked, message_appointment_slots, message_is_booked_appointment, needs_calendar_event_repair, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details, repair_availability_window_appointments, repair_calendar_attendee_response_labels, repair_conflicting_calendar_roles, repair_interview_stage_roles, repair_meeting_join_urls, repair_meeting_landing_urls, repair_mixed_thread_appointments, repair_phantom_availability_slots, repair_placeholder_calendar_fields, repair_quoted_option_bookings
+from app.services.calendar_extract import InterviewDetails, MeetingAccess, _absorb_calendar_event, _assign_join_url, _calendar_email_lock, _parse_ai_slot, _resolve_video_landing_page, _without_quoted_history, candidate_reschedule_proposal_slots, clean_company_name, clean_meeting_provider, collapse_duplicate_calendar_events, companies_match, employer_instead_of_sender_domain, explicit_hiring_employer, extract_calendar_details, extract_interviewer, extract_meeting_access, fuller_company_name, hide_open_reschedules, is_interview_stage_label, job_role_or_empty, leaves_interview_unbooked, message_appointment_slots, message_is_booked_appointment, needs_calendar_event_repair, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details, repair_availability_window_appointments, repair_calendar_attendee_response_labels, repair_conflicting_calendar_roles, repair_interview_stage_roles, repair_meeting_join_urls, repair_meeting_landing_urls, repair_mixed_thread_appointments, repair_phantom_availability_slots, repair_placeholder_calendar_fields, repair_quoted_option_bookings
+
+
+def test_calendar_email_locks_are_scoped_to_their_event_loop():
+    async def get_lock():
+        return _calendar_email_lock(42)
+
+    first_loop = asyncio.new_event_loop()
+    second_loop = asyncio.new_event_loop()
+    try:
+        first = first_loop.run_until_complete(get_lock())
+        second = second_loop.run_until_complete(get_lock())
+    finally:
+        first_loop.close()
+        second_loop.close()
+
+    assert first is not second
 
 
 def _database():
@@ -6025,6 +6041,86 @@ def test_sent_reply_without_interview_in_subject_still_creates_availability():
         assert reply.company == "bet365"
 
 
+def test_sent_availability_inherits_prior_company_role_timezone_when_omitted():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        prior_source = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="autozone-prior-confirmation",
+            thread_id="autozone-prior-thread",
+            folder="inbox",
+            subject="AutoZone interview confirmed",
+            sender="shipra.khandelwal@autozone.com",
+            received_at=datetime(2026, 10, 26, 13, tzinfo=timezone.utc),
+            body_text="Your interview is confirmed for October 27 at 12:00 PM CDT.",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+            company="AutoZone",
+            job_role="Systems Engineer",
+        )
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="autozone-next-round",
+            thread_id="autozone-next-round-thread",
+            folder="inbox",
+            subject="AutoZone",
+            sender="shipra.khandelwal@autozone.com",
+            received_at=datetime(2026, 10, 29, 13, 33, tzinfo=timezone.utc),
+            body_text=(
+                "The team would like to move forward with the next round of interviews. "
+                "Tuesday, November 3: 9:00 AM-10:00 AM or 12:00 PM-1:00 PM. "
+                "Please let me know which option works best for you."
+            ),
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="AutoZone",
+            job_role="Systems Engineer",
+        )
+        reply = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="autozone-candidate-reply",
+            thread_id="autozone-next-round-thread",
+            folder="sent",
+            subject="RE: AutoZone",
+            sender="candidate@example.com",
+            received_at=datetime(2026, 10, 29, 13, 41, tzinfo=timezone.utc),
+            body_text=(
+                "Hi Shipra, Thanks for the update. Tuesday, November 3: "
+                "9:00 AM-10:00 AM works well for me. Best, Thomas"
+            ),
+            label=EmailLabel.INTERVIEW_AVAILABILITY.value,
+            job_role="Systems Engineer",
+        )
+        db.add_all([prior_source, invitation, reply])
+        db.flush()
+        prior = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=prior_source.id,
+            source_thread_id=prior_source.thread_id,
+            source_received_at=prior_source.received_at,
+            source_timezone="America/Chicago",
+            kind="confirmed",
+            origin="email",
+            title="AutoZone — Systems Engineer",
+            company="AutoZone",
+            job_role="Systems Engineer",
+            start_at=datetime(2026, 10, 27, 17, tzinfo=timezone.utc),
+            end_at=datetime(2026, 10, 27, 18, tzinfo=timezone.utc),
+            is_visible=True,
+        )
+        db.add(prior)
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, reply, use_ai=False)) is True
+        event = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == reply.id).one()
+        assert event.kind == "availability"
+        assert event.is_visible is True
+        assert event.start_at == datetime(2026, 11, 3, 15, tzinfo=timezone.utc)
+        assert event.end_at == datetime(2026, 11, 3, 16, tzinfo=timezone.utc)
+        assert event.source_timezone == "America/Chicago"
+        assert event.company == "AutoZone"
+        assert event.job_role == "Systems Engineer"
+
+
 def test_today_city_times_use_the_city_timezone_not_utc():
     received = datetime(2026, 10, 6, 8, 14, tzinfo=timezone.utc)
     venice = parse_text_slots(
@@ -7943,3 +8039,119 @@ END:VCALENDAR""",
         calendar_extract._mailbox_candidate_name_cache.clear()
         calendar_extract._mailbox_candidate_name_checked_at.clear()
         engine.dispose()
+
+
+def test_generic_calendar_booking_matches_prior_interview_invitation_by_sender():
+    """A separate Google invite from the recruiter must not remain `other`."""
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    try:
+        with factory() as db:
+            user = User(external_id="separate-booking-user")
+            db.add(user)
+            db.flush()
+            mailbox = MailboxConnection(
+                user_id=user.id, provider=Provider.GOOGLE.value,
+                email_address="candidate@example.com", display_name="Candidate",
+                access_token_enc="x", refresh_token_enc="", is_active=True,
+            )
+            db.add(mailbox)
+            db.flush()
+            invitation = EmailMessage(
+                mailbox_id=mailbox.id, provider_message_id="shakudo-invitation",
+                thread_id="shakudo-recruiter-thread",
+                subject="Interview with Shakudo for Principal Engineer",
+                sender="Bonnie Chen <bonnie@shakudo.io>",
+                received_at=datetime(2026, 10, 29, 20, 29, tzinfo=timezone.utc),
+                body_text="Please book a 15 minute interview using my Calendly link.",
+                label=EmailLabel.INTERVIEW_INVITATION.value,
+                company="Shakudo", job_role="Principal Engineer",
+            )
+            booking = EmailMessage(
+                mailbox_id=mailbox.id, provider_message_id="shakudo-calendar-booking",
+                thread_id="google-calendar-thread",
+                subject=("Invitation from an unknown sender: Candidate and Bonnie Chen @ "
+                         "Mon Nov 2, 2026 3:30pm - 3:45pm (CST)"),
+                sender="Bonnie Chen <bonnie@shakudo.io>",
+                received_at=datetime(2026, 10, 29, 20, 33, tzinfo=timezone.utc),
+                body_text="""BEGIN:VCALENDAR
+METHOD:REQUEST
+BEGIN:VEVENT
+DTSTART;TZID=America/Chicago:20261102T153000
+DTEND;TZID=America/Chicago:20261102T154500
+SUMMARY:Candidate and Bonnie Chen
+ORGANIZER;CN=Bonnie Chen:mailto:bonnie@shakudo.io
+URL:https://meet.google.com/abc-defg-hij
+END:VEVENT
+END:VCALENDAR""",
+                label=EmailLabel.OTHER.value,
+            )
+            db.add_all([invitation, booking])
+            db.commit()
+
+            assert asyncio.run(process_calendar_email(db, booking, use_ai=False)) is True
+            db.commit()
+
+            db.refresh(booking)
+            assert booking.label == EmailLabel.INTERVIEW_SCHEDULED.value
+            assert booking.interview_subtype == "calendar_invite"
+            assert booking.company == "Shakudo"
+            assert booking.job_role == "Principal Engineer"
+            event = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == booking.id).one()
+            assert event.kind == "confirmed"
+            assert event.company == "Shakudo"
+            assert event.job_role == "Principal Engineer"
+            assert event.start_at == datetime(2026, 11, 2, 21, 30, tzinfo=timezone.utc)
+    finally:
+        engine.dispose()
+
+
+def test_same_sender_vendor_booking_keeps_the_employer_from_linked_invitation():
+    """A mobility/recruiting vendor is the organizer, not the hiring company."""
+    from app.models import CalendarEventEmail
+    from app.services.calendar_extract import correct_sender_domain_employers
+
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id, provider_message_id="adusa-relocation-invitation",
+            thread_id="relocation-email", subject="ADUSA Relocation - Mark Wei",
+            sender="Denise Houston <dhouston@weichertwm.com>",
+            received_at=datetime(2026, 10, 29, 22, 24, tzinfo=timezone.utc),
+            body_text=("Congratulations on your new position with ADUSA - Retail Business. "
+                       "Book time to review your relocation benefits."),
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="ADUSA – Retail Business", job_role="Principal Platform Engineer",
+        )
+        booking = EmailMessage(
+            mailbox_id=mailbox_id, provider_message_id="weichert-booking",
+            thread_id="bookings-calendar", subject="Mark Wei - 30 minutes meeting",
+            sender="Denise Houston <dhouston@weichertwm.com>",
+            received_at=datetime(2026, 10, 29, 23, 27, tzinfo=timezone.utc),
+            body_text="This meeting was scheduled from the bookings page of Denise Houston.",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            company="Weichert Services, Inc.", job_role="Principal Platform Engineer",
+        )
+        db.add_all([invitation, booking])
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id, source_email_id=booking.id, source_thread_id=booking.thread_id,
+            kind="confirmed", is_visible=True, origin="email",
+            title="Weichert Services, Inc. — Principal Platform Engineer",
+            company="Weichert Services, Inc.", job_role="Principal Platform Engineer",
+            start_at=datetime(2026, 11, 3, 19, 0, tzinfo=timezone.utc),
+            end_at=datetime(2026, 11, 3, 19, 30, tzinfo=timezone.utc),
+        )
+        db.add(event)
+        db.flush()
+        db.add_all([
+            CalendarEventEmail(event_id=event.id, email_id=invitation.id),
+            CalendarEventEmail(event_id=event.id, email_id=booking.id),
+        ])
+        db.flush()
+
+        assert correct_sender_domain_employers(db, mailbox_id) == 1
+        assert event.company == "ADUSA – Retail Business"
+        assert event.title == "ADUSA – Retail Business — Principal Platform Engineer"
+        assert booking.company == "ADUSA – Retail Business"

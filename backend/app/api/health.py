@@ -3,7 +3,7 @@ from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from app.auth.session import require_user
-from app.db import get_db
+from app.db import SessionLocal, get_db
 from app.config import get_settings
 from app.models import OutboxEvent
 from app.schemas import HealthOut
@@ -31,9 +31,12 @@ def auto_sync_status(db: Session = Depends(get_db)) -> dict:
 
 
 @router.post("/api/auto-sync/check", dependencies=[Depends(require_user)])
-async def auto_sync_check(db: Session = Depends(get_db)) -> dict:
+async def auto_sync_check() -> dict:
+    # A manual check may run provider requests for several mailboxes.  Do not
+    # hold an otherwise idle request-scoped connection for that whole period.
     await run_auto_sync_check()
-    return get_auto_sync_status(db)
+    with SessionLocal() as db:
+        return get_auto_sync_status(db)
 
 
 @router.get("/api/health/events", dependencies=[Depends(require_user)])

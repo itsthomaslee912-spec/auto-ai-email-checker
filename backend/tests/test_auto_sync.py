@@ -443,6 +443,40 @@ def test_auto_sync_status_distinguishes_no_account_stopped_and_failure(monkeypat
     engine.dispose()
 
 
+def test_distributed_auto_sync_status_reuses_request_session(monkeypatch):
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(
+        auto_sync,
+        "get_settings",
+        lambda: SimpleNamespace(auto_sync_interval_seconds=120, distributed_runtime=True),
+    )
+    monkeypatch.setattr(auto_sync, "_load_runtime_status", lambda: (now, None))
+
+    with session_factory() as db:
+        user = User(external_id="distributed-status")
+        db.add(user)
+        db.flush()
+        db.add(MailboxConnection(
+            user_id=user.id,
+            provider="google",
+            email_address="distributed@example.com",
+            access_token_enc="x",
+            is_active=True,
+        ))
+        db.commit()
+
+        status = auto_sync.get_auto_sync_status(db)
+
+    assert status["state"] == "active"
+    assert status["mailboxes"][0]["state"] == "idle"
+    engine.dispose()
+
+
 def test_transient_network_error_does_not_raise_a_problem(monkeypatch):
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import HTTPException
@@ -109,3 +109,28 @@ def test_monitoring_reports_recovering_when_a_replica_self_reports():
     assert worker["replicas"] == 1
     # A self-reported degraded component pulls the platform out of "healthy".
     assert snapshot["overall_status"] == "degraded"
+
+
+def test_monitoring_uses_old_heartbeat_only_for_latest_timestamp():
+    session_factory = _database()
+    with session_factory() as db:
+        db.add(User(external_id="monitor-admin", email="admin@example.com", is_admin=True))
+        old = datetime.now(timezone.utc) - timedelta(days=3)
+        db.add(ServiceHeartbeat(
+            service_name="sync-worker",
+            instance_id="retired:sync-worker",
+            started_at=old,
+            last_seen_at=old,
+        ))
+        db.commit()
+
+        token = current_user_is_admin.set(True)
+        try:
+            snapshot = monitoring_snapshot(db)
+        finally:
+            current_user_is_admin.reset(token)
+
+    worker = next(s for s in snapshot["services"] if s["name"] == "sync-worker")
+    assert worker["status"] == "stale"
+    assert worker["replicas"] == 0
+    assert worker["last_seen_at"] == old.isoformat()
