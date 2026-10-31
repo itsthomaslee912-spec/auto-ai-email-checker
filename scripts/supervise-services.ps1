@@ -134,9 +134,32 @@ function Test-WorkerHeartbeat($Process, [string]$Name) {
 function Stop-ServiceProcessTree($Process) {
     if (-not $Process -or $Process.HasExited) { return }
     # The virtualenv launcher creates a child python.exe. Stop-Process only
-    # kills the launcher and can leave the real worker orphaned, so terminate
-    # this narrowly scoped worker tree as one unit.
-    & taskkill.exe /PID $Process.Id /T /F *> $null
+    # kills the launcher and can leave the real worker orphaned. Resolve this
+    # narrowly scoped tree once, then stop descendants before their parent.
+    # taskkill writes a non-terminable child to stderr; with the supervisor's
+    # ErrorActionPreference=Stop that routine race used to kill the supervisor
+    # itself during every source reload.
+    $allProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $targetIds = [System.Collections.Generic.List[int]]::new()
+    $frontier = @([int]$Process.Id)
+    while ($frontier.Count -gt 0) {
+        $parents = @($frontier)
+        $frontier = @(
+            $allProcesses |
+                Where-Object { $parents -contains [int]$_.ParentProcessId } |
+                ForEach-Object { [int]$_.ProcessId }
+        )
+        foreach ($childId in $frontier) {
+            if (-not $targetIds.Contains($childId)) { $targetIds.Add($childId) }
+        }
+    }
+    $targetIds.Reverse()
+    $targetIds.Add([int]$Process.Id)
+    foreach ($targetId in $targetIds) {
+        if ($targetId -ne $PID) {
+            Stop-Process -Id $targetId -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Ensure-BackendWorker($Process, [string]$Name, [string]$Module) {

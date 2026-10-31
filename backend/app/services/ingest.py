@@ -13,7 +13,10 @@ from app.models import EmailLabel, EmailMessage, MailboxConnection
 from app.realtime.sse import publish
 from app.schemas import EmailOut
 from app.services.ai_backend import ai_call_semaphore
-from app.services.calendar_extract import process_calendar_email
+from app.services.calendar_extract import (
+    collapse_duplicate_calendar_events_post_commit,
+    process_calendar_email,
+)
 from app.config import get_settings
 from app.services.event_bus import enqueue, event_envelope
 from app.timeutil import as_utc
@@ -41,6 +44,7 @@ async def ingest_normalized_message(
     )
     if existing is not None:
         changed = False
+        calendar_changed = False
         content_changed = False
         folder = normalize_folder(normalized.get("folder"))
         if existing.folder != folder:
@@ -97,12 +101,14 @@ async def ingest_normalized_message(
                         # Keep a single malformed legacy item from invalidating the
                         # provider-content refresh or the rest of a bulk repair.
                         with db.begin_nested():
-                            await process_calendar_email(
+                            calendar_changed = await process_calendar_email(
                                 db, existing, force=True, use_ai=True, priority=priority,
                             )
                     except Exception:
                         logger.exception("Calendar refresh failed during existing-message ingest email_id=%s", existing.id)
             db.commit()
+            if calendar_changed:
+                await collapse_duplicate_calendar_events_post_commit(existing.mailbox_id)
             from app.api.emails import invalidate_email_list_caches
 
             invalidate_email_list_caches()
@@ -210,6 +216,11 @@ async def ingest_normalized_message(
             except Exception:
                 logger.exception("Calendar extraction failed during ingest email_id=%s", email.id)
         db.commit()
+        if calendar_changed:
+            calendar_changed = (
+                await collapse_duplicate_calendar_events_post_commit(email.mailbox_id)
+                or calendar_changed
+            )
         from app.api.emails import invalidate_email_list_caches
 
         invalidate_email_list_caches()

@@ -18,11 +18,10 @@ from app.services.ai_backend import AiBackend, close_ai_client, get_ai_backend, 
 
 logger = logging.getLogger(__name__)
 
-# Local reasoning models may spend part of this budget before emitting the
-# JSON response. 256 tokens was too small for gemma4:26b: Ollama returned an
-# empty content field with finish_reason="length", which was then mistaken for
-# a valid `other` classification.
-CLASSIFICATION_MAX_OUTPUT_TOKENS = 3072
+# Some Ollama reasoning models do not honor the OpenAI-compatible ``think``
+# override for complex prompts. Leave enough room for their internal work and
+# the final short JSON object; a lower bound caused every row to be retried.
+CLASSIFICATION_MAX_OUTPUT_TOKENS = 4096
 VALID_LABELS = {label.value for label in EmailLabel}
 VALID_INTERVIEW_SUBTYPES = {"confirmation", "calendar_invite", "reminder", "reschedule", "time_change", "cancellation"}
 CATEGORY_SUBTYPES = {
@@ -142,9 +141,17 @@ def _parse_strict_ai_result(content: str) -> tuple[str, float | None, str | None
         raise ValueError("Classifier response is missing confidence")
     label = normalize_label(str(data["label"]))
     confidence_value = data.get("confidence")
-    confidence = float(confidence_value) if confidence_value is not None else None
-    if confidence is not None and not 0 <= confidence <= 1:
-        raise ValueError("Classifier confidence must be between 0 and 1")
+    if confidence_value is None:
+        raise ValueError("Classifier confidence must be a positive number")
+    try:
+        confidence = float(confidence_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Classifier confidence must be a positive number") from exc
+    if not 0 < confidence <= 1:
+        # A zero-confidence label is an explicit admission that the model did
+        # not classify the message. Persisting it as ``other`` clears the
+        # durable pending flag and makes the failure look authoritative.
+        raise ValueError("Classifier confidence must be greater than 0 and at most 1")
     subtype = data.get("interview_subtype")
     if subtype is not None and (
         label != EmailLabel.INTERVIEW_SCHEDULED.value
@@ -743,20 +750,23 @@ def _is_scheduled_interview(text: str) -> bool:
     ))
 
 
-def _is_application_action_required(text: str) -> bool:
-    # A candidate-portal access code or identity check is inherently an
-    # administrative step on an application, even when the message itself
-    # never says "application" (e.g. a bare ADP/Workday verification code).
-    account_access_patterns = (
+def _is_verification_code_action(text: str) -> bool:
+    """A one-time account code that the candidate must enter to continue."""
+    return any(re.search(pattern, text) for pattern in (
         r"\bverification code\b",
         r"\bsecurity code\b",
-        r"\baccess code\b",
         r"\bconfirm your identity\b",
         r"\bmultifactor authentication\b",
         r"\b(?:enter|use|copy and paste) this code\b",
         r"\bconfirm your email address and complete setup for your candidate\b",
-    )
-    if any(re.search(p, text) for p in account_access_patterns):
+    ))
+
+
+def _is_application_action_required(text: str) -> bool:
+    # A candidate-portal access code or identity check is inherently an
+    # administrative step on an application, even when the message itself
+    # never says "application" (e.g. a bare ADP/Workday verification code).
+    if _is_verification_code_action(text):
         return True
     if not re.search(r"\b(application|candidate|profile|resume|cv|job portal|workday)\b", text):
         return False
@@ -979,6 +989,26 @@ def apply_label_guards(
     return label
 
 
+def deterministic_ai_only_classification(
+    *,
+    subject: str,
+    sender: str,
+    body_text: str,
+    snippet: str,
+) -> ClassificationResult | None:
+    """Return high-certainty AI-only classifications that need no model call."""
+    if not _is_verification_code_action(
+        _primary_message_text(subject, sender, body_text, snippet)
+    ):
+        return None
+    return ClassificationResult(
+        label=EmailLabel.APPLICATION_ACTION_REQUIRED.value,
+        category_subtype="profile_account_setup",
+        confidence=0.99,
+        response_id=None,
+    )
+
+
 async def classify_email(
     *,
     subject: str,
@@ -1002,6 +1032,21 @@ async def classify_email(
         if ai_only
         else _primary_message_text(subject, sender, body_text, snippet)
     )
+    # AI-only normally honors the selected model without semantic overrides.
+    # Verification codes are the deliberate exception: entering the code is
+    # an objectively required account/application step, and multiple local
+    # models have returned ``other`` with confidence 0 even when an identical
+    # human correction is present in the prompt. Resolve this high-certainty
+    # case before spending an AI call or clearing it as an authoritative
+    # zero-confidence result.
+    deterministic = deterministic_ai_only_classification(
+        subject=subject,
+        sender=sender,
+        body_text=body_text,
+        snippet=snippet,
+    ) if ai_only else None
+    if deterministic is not None:
+        return deterministic
     if has_saved_ai_settings():
         backend = get_ai_backend()
     else:
@@ -1055,18 +1100,25 @@ async def classify_email(
         f"{format_retrieved_corrections(correction_examples or [])}"
     )
     try:
-        response = await client.chat.completions.create(
-            model=backend.model,
-            temperature=0,
+        request_options = {
+            "model": backend.model,
+            "temperature": 0,
             # The response is four small JSON fields. Bounding generation keeps
-            # a local reasoning model from monopolizing the only AI slot until
-            # the 180-second transport timeout.
-            max_tokens=CLASSIFICATION_MAX_OUTPUT_TOKENS,
-            response_format={"type": "json_object"},
-            messages=[
+            # a malformed local response from monopolizing the only AI slot.
+            "max_tokens": CLASSIFICATION_MAX_OUTPUT_TOKENS,
+            "response_format": {"type": "json_object"},
+            "messages": [
                 {"role": "system", "content": with_interview_subtype_rules(get_active_system_prompt())},
                 {"role": "user", "content": user_content},
             ],
+        }
+        if backend.provider == "ollama":
+            # This task needs a constrained JSON decision, not a long reasoning
+            # trace. gemma4 otherwise consumes thousands of hidden thinking
+            # tokens and can truncate the actual JSON before it is complete.
+            request_options["extra_body"] = {"think": False}
+        response = await client.chat.completions.create(
+            **request_options,
         )
     except Exception:
         logger.exception("%s classification failed", backend.provider)

@@ -203,7 +203,9 @@ async def _backfill_calendar_events(
                 if stop_event.is_set():
                     break
                 try:
-                    if collapse_duplicate_calendar_events(db, mailbox_id):
+                    if collapse_duplicate_calendar_events(
+                        db, mailbox_id, commit_between_stages=True,
+                    ):
                         pending_mailboxes.add(mailbox_id)
                     db.commit()
                 except Exception:

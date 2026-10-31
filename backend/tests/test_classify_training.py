@@ -1126,9 +1126,36 @@ def test_ai_only_classification_bounds_output_and_does_not_duplicate_body(monkey
         snippet="short preview",
     ))
 
-    assert captured["max_tokens"] == 3072
+    assert captured["max_tokens"] == 4096
     assert captured["messages"][1]["content"].count(marker) == 1
     assert "duplicate omitted" in captured["messages"][1]["content"]
+
+
+def test_ai_only_verification_code_uses_action_required_guard_without_model(monkeypatch):
+    monkeypatch.setattr(
+        "app.classify.openai_classifier.get_settings",
+        lambda: SimpleNamespace(
+            openai_api_key="sk-test",
+            openai_model="gpt-4o-mini",
+            email_classification_mode="ai_only",
+        ),
+    )
+    monkeypatch.setattr(
+        "app.classify.openai_classifier.AsyncOpenAI",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("AI must not be called")),
+    )
+
+    result = asyncio.run(classify_email(
+        subject="Your Verification Code",
+        sender="Halvik <hello@send.applicantemails.com>",
+        body_text="496714 is your verification code.",
+        snippet="496714 is your verification code.",
+    ))
+
+    assert result.label == EmailLabel.APPLICATION_ACTION_REQUIRED.value
+    assert result.category_subtype == "profile_account_setup"
+    assert result.confidence == 0.99
+    assert result.response_id is None
 
 
 def test_ai_only_keeps_visible_message_after_large_css_prefix(monkeypatch):

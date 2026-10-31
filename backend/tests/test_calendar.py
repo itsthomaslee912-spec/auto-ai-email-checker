@@ -16,7 +16,7 @@ from sqlalchemy.pool import StaticPool
 from app.api import calendar_events, emails
 from app.db import Base, get_db
 from app.models import CalendarEvent, CalendarEventEmail, EmailLabel, EmailMessage, MailboxConnection, Provider, User
-from app.services.calendar_extract import InterviewDetails, MeetingAccess, _absorb_calendar_event, _assign_join_url, _calendar_email_lock, _parse_ai_slot, _resolve_video_landing_page, _without_quoted_history, candidate_reschedule_proposal_slots, clean_company_name, clean_meeting_provider, collapse_duplicate_calendar_events, companies_match, employer_instead_of_sender_domain, explicit_hiring_employer, extract_calendar_details, extract_interviewer, extract_meeting_access, fuller_company_name, hide_open_reschedules, is_interview_stage_label, job_role_or_empty, leaves_interview_unbooked, message_appointment_slots, message_is_booked_appointment, needs_calendar_event_repair, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details, repair_availability_window_appointments, repair_calendar_attendee_response_labels, repair_conflicting_calendar_roles, repair_interview_stage_roles, repair_meeting_join_urls, repair_meeting_landing_urls, repair_mixed_thread_appointments, repair_phantom_availability_slots, repair_placeholder_calendar_fields, repair_quoted_option_bookings
+from app.services.calendar_extract import InterviewDetails, MeetingAccess, _absorb_calendar_event, _assign_join_url, _calendar_email_lock, _parse_ai_slot, _resolve_video_landing_page, _without_quoted_history, authoritative_reschedule_slots, candidate_reschedule_proposal_slots, clean_company_name, clean_meeting_provider, collapse_duplicate_calendar_events, companies_match, employer_instead_of_sender_domain, explicit_hiring_employer, extract_calendar_details, extract_interviewer, extract_meeting_access, fuller_company_name, hide_open_reschedules, is_interview_stage_label, job_role_or_empty, leaves_interview_unbooked, message_appointment_slots, message_is_booked_appointment, needs_calendar_event_repair, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details, repair_availability_window_appointments, repair_calendar_attendee_response_labels, repair_conflicting_calendar_roles, repair_interview_stage_roles, repair_meeting_join_urls, repair_meeting_landing_urls, repair_mixed_thread_appointments, repair_phantom_availability_slots, repair_placeholder_calendar_fields, repair_quoted_option_bookings
 
 
 def test_calendar_email_locks_are_scoped_to_their_event_loop():
@@ -1866,6 +1866,46 @@ END:VCALENDAR""")
     assert slots[0].end_at == datetime(2026, 10, 5, 14, 30, tzinfo=timezone.utc)
 
 
+def test_provider_calendar_source_repairs_default_end_from_explicit_dtend():
+    from app.services.calendar_extract import repair_provider_calendar_sources
+
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        invite = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="qxo-explicit-end",
+            thread_id="qxo-explicit-end-thread",
+            subject="QXO AI Technical Screen",
+            sender="scheduler@qxo.com",
+            received_at=datetime(2026, 10, 29, 20, 55, tzinfo=timezone.utc),
+            body_text=(
+                "BEGIN:VCALENDAR\nBEGIN:VEVENT\n"
+                "DTSTART:20261103T180000Z\nDTEND:20261103T190000Z\n"
+                "END:VEVENT\nEND:VCALENDAR"
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            company="QXO",
+        )
+        db.add(invite)
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=invite.id,
+            source_thread_id=invite.thread_id,
+            kind="confirmed",
+            origin="email",
+            company="QXO",
+            start_at=datetime(2026, 11, 3, 18, tzinfo=timezone.utc),
+            end_at=datetime(2026, 11, 3, 18, 30, tzinfo=timezone.utc),
+            is_visible=True,
+        )
+        db.add(event)
+        db.commit()
+
+        assert repair_provider_calendar_sources(db, mailbox_id) == 1
+        assert event.end_at == datetime(2026, 11, 3, 19, tzinfo=timezone.utc)
+
+
 @pytest.mark.parametrize(
     ("text", "start", "end"),
     [
@@ -1912,6 +1952,32 @@ def test_compact_bare_hour_range_shares_trailing_meridiem():
         )
     ]
     assert slots[0].end_is_explicit is True
+
+
+def test_same_start_repeated_in_pacific_and_eastern_defaults_to_thirty_minutes():
+    slots = parse_text_slots(
+        "Please hold Thursday 11/5 starting at 9am PT/12pm ET. I'll follow up soon.",
+        datetime(2026, 10, 30, 20, 14, tzinfo=timezone.utc),
+    )
+
+    assert len(slots) == 1
+    assert slots[0].start_at == datetime(2026, 11, 5, 17, 0, tzinfo=timezone.utc)
+    assert slots[0].end_at == datetime(2026, 11, 5, 17, 30, tzinfo=timezone.utc)
+    assert slots[0].source_timezone == "America/Los_Angeles"
+    assert slots[0].end_is_explicit is False
+
+
+def test_same_start_repeated_in_parenthesized_timezone_defaults_to_thirty_minutes():
+    slots = parse_text_slots(
+        "I can give you a call next Tuesday (11/3) at 2 pm PST (5 pm EST).",
+        datetime(2026, 10, 30, 20, 41, tzinfo=timezone.utc),
+    )
+
+    assert len(slots) == 1
+    assert slots[0].start_at == datetime(2026, 11, 3, 22, 0, tzinfo=timezone.utc)
+    assert slots[0].end_at == datetime(2026, 11, 3, 22, 30, tzinfo=timezone.utc)
+    assert slots[0].source_timezone == "America/Los_Angeles"
+    assert slots[0].end_is_explicit is False
 
 
 def test_human_readable_time_without_timezone_is_not_guessed():
@@ -4523,6 +4589,71 @@ def test_existing_reschedule_without_a_new_time_is_hidden_on_repair():
         assert hide_open_reschedules(db) == 1
         assert event.is_visible is False
         assert event.interview_status == "reschedule"
+
+
+def test_delayed_old_reschedule_cannot_hide_a_newer_confirmed_booking():
+    """Pending/backfill order must not outrank provider chronology."""
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        old_reschedule = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="multiply-old-reschedule",
+            thread_id="multiply-thread",
+            subject=("Re: Accepted: Mark and Alex Kim @ Fri Oct 30, 2026 "
+                     "10am - 10:25am (PDT)"),
+            sender="Max Rademacher <max@multiplylabs.com>",
+            received_at=datetime(2026, 10, 26, 16, 38, tzinfo=timezone.utc),
+            body_text=("Would you be available to meet Monday morning? Apologies for the "
+                       "short notice, something came up with the kids."),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="reschedule",
+            company="Multiply Labs",
+            job_role="Staff Infrastructure Engineer",
+        )
+        booking = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="multiply-new-booking",
+            thread_id="multiply-calendar-thread",
+            subject="Invitation: Technical Screen @ Thu Oct 29, 2026 1:30pm CDT",
+            sender="Max Rademacher <max@multiplylabs.com>",
+            received_at=datetime(2026, 10, 26, 16, 55, tzinfo=timezone.utc),
+            body_text="Technical Screen\nThursday Oct 29, 2026 1:30pm - 2:30pm CDT",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="Multiply Labs",
+            job_role="Staff Infrastructure Engineer",
+        )
+        db.add_all([old_reschedule, booking])
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=booking.id,
+            source_thread_id=booking.thread_id,
+            source_received_at=booking.received_at,
+            kind="confirmed",
+            origin="email",
+            title="Multiply Labs — Staff Infrastructure Engineer",
+            company="Multiply Labs",
+            job_role="Staff Infrastructure Engineer",
+            start_at=datetime(2026, 10, 29, 18, 30, tzinfo=timezone.utc),
+            end_at=datetime(2026, 10, 29, 19, 30, tzinfo=timezone.utc),
+            interview_status="calendar_invite",
+            is_visible=True,
+        )
+        db.add(event)
+        db.flush()
+        # Reproduce a broad historical link plus out-of-order processing.
+        db.add_all([
+            CalendarEventEmail(event_id=event.id, email_id=old_reschedule.id),
+            CalendarEventEmail(event_id=event.id, email_id=booking.id),
+        ])
+        db.flush()
+
+        assert asyncio.run(
+            process_calendar_email(db, old_reschedule, force=True, use_ai=False)
+        ) is False
+        assert event.is_visible is True
+        assert event.interview_status == "calendar_invite"
 
 
 def test_reschedule_that_names_a_new_time_or_confirms_the_booking_stays_visible():
@@ -8155,3 +8286,136 @@ def test_same_sender_vendor_booking_keeps_the_employer_from_linked_invitation():
         assert event.company == "ADUSA – Retail Business"
         assert event.title == "ADUSA – Retail Business — Principal Platform Engineer"
         assert booking.company == "ADUSA – Retail Business"
+
+
+def test_post_commit_calendar_cleanup_uses_isolated_checkpointed_session(monkeypatch):
+    """Live duplicate cleanup must not reuse the projection transaction."""
+    from app.services import calendar_extract
+
+    class CleanupSession:
+        def __init__(self):
+            self.commits = 0
+            self.rollbacks = 0
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.closed = True
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    cleanup_db = CleanupSession()
+    captured = {}
+
+    monkeypatch.setattr("app.db.SessionLocal", lambda: cleanup_db)
+    monkeypatch.setattr(calendar_extract, "_collapse_due", lambda _mailbox_id: True)
+
+    def fake_collapse(db, mailbox_id, *, commit_between_stages=False):
+        captured.update(
+            db=db,
+            mailbox_id=mailbox_id,
+            commit_between_stages=commit_between_stages,
+        )
+        return True
+
+    monkeypatch.setattr(calendar_extract, "collapse_duplicate_calendar_events", fake_collapse)
+
+    assert asyncio.run(
+        calendar_extract.collapse_duplicate_calendar_events_post_commit(17)
+    ) is True
+    assert captured == {
+        "db": cleanup_db,
+        "mailbox_id": 17,
+        "commit_between_stages": True,
+    }
+    assert cleanup_db.commits == 1
+    assert cleanup_db.rollbacks == 0
+    assert cleanup_db.closed is True
+
+
+def test_deshaw_reply_to_accepted_invite_with_availability_ask_returns_no_slots():
+    """A 'would you be available?' reply to an accepted D. E. Shaw invite must not
+    extract the old subject time as a confirmed reschedule slot."""
+    email = SimpleNamespace(
+        subject=(
+            "Re: Accepted: D. E. Shaw Generative AI Technical Interview "
+            "@ Fri Oct 30, 2026 10:00am–10:30am (EDT)"
+        ),
+        body_text=(
+            "Would you be available Monday morning instead? "
+            "Apologies for the short notice, something came up."
+        ),
+        snippet="Would you be available Monday morning?",
+        body_html="",
+        received_at=datetime(2026, 10, 28, 15, tzinfo=timezone.utc),
+        interview_subtype="reschedule",
+    )
+    slots = authoritative_reschedule_slots(email)
+    assert slots == []
+
+
+def test_mathworks_reschedule_with_availability_ask_leaves_interview_unbooked():
+    """'Could you be available?' in a reschedule body means the slot is gone,
+    not that the interview is still confirmed at the old time."""
+    email = SimpleNamespace(
+        subject=(
+            "Re: MathWorks Senior Observability Engineer Interview "
+            "@ Tue Nov 3, 2026 2:00pm–3:00pm (EST)"
+        ),
+        body_text="Could you be available at a different time this week?",
+        snippet="Could you be available at a different time?",
+        body_html="",
+        received_at=datetime(2026, 10, 30, tzinfo=timezone.utc),
+        interview_subtype="reschedule",
+    )
+    assert leaves_interview_unbooked(email) is True
+
+
+def test_mathworks_between_time_range_is_availability_window():
+    """'Between 2:00 PM and 4:00 PM' in an availability request is a window,
+    not a booked interview slot."""
+    received = datetime(2026, 10, 28, tzinfo=timezone.utc)
+    slots = parse_text_slots(
+        "Could you be available on Monday November 2 between 2:00 PM and 4:00 PM EST?",
+        received,
+    )
+    assert len(slots) == 1
+    assert slots[0].is_availability_window is True
+    assert slots[0].start_at == datetime(2026, 11, 2, 19, tzinfo=timezone.utc)
+    assert slots[0].end_at == datetime(2026, 11, 2, 21, tzinfo=timezone.utc)
+
+
+def test_mathworks_teams_meeting_link_is_extracted():
+    """A Teams join URL in a MathWorks invite is detected and returned."""
+    access = extract_meeting_access(
+        "MathWorks — Senior Observability Engineer\n"
+        "Join Microsoft Teams Meeting\n"
+        "https://teams.microsoft.com/meet/36304861417217?p=abcdefgh\n"
+        "Meeting ID: 363 048 614 17217"
+    )
+    assert access.meeting_type == "video"
+    assert access.provider == "Microsoft Teams"
+    assert access.url is not None
+    assert "teams.microsoft.com" in access.url
+
+
+def test_deshaw_confirmed_from_range_is_not_an_availability_window():
+    """'confirmed from 12:00 PM to 3:00 PM' is the interview block itself.
+    A 'from X to Y' range should only be a window when no confirmation language
+    precedes it — otherwise the 3-hour block gets incorrectly suppressed by
+    _prefer_specific_slots in favour of a shorter incidental clock in the email."""
+    received = datetime(2026, 10, 30, tzinfo=timezone.utc)
+    slots = parse_text_slots(
+        "Your interview is confirmed on Thursday November 5, from 12:00 PM to 3:00 PM EST.",
+        received,
+    )
+    assert len(slots) == 1
+    assert slots[0].is_availability_window is False
+    assert slots[0].start_at == datetime(2026, 11, 5, 17, tzinfo=timezone.utc)
+    assert slots[0].end_at == datetime(2026, 11, 5, 20, tzinfo=timezone.utc)

@@ -6,7 +6,11 @@ import time
 from types import SimpleNamespace
 from typing import Any
 
-from app.classify.openai_classifier import classify_email, infer_interview_subtype
+from app.classify.openai_classifier import (
+    classify_email,
+    deterministic_ai_only_classification,
+    infer_interview_subtype,
+)
 from app.classify.correction_retrieval import load_correction_corpus, retrieve_relevant_corrections
 from app.classify.outcome_extract import BACKFILL_LABELS, OUTCOME_LABELS, extract_company_role, resolve_company_role
 from app.config import get_settings
@@ -14,7 +18,15 @@ from app.models import CalendarEvent, EmailLabel, EmailMessage, MailboxConnectio
 from app.realtime.sse import publish
 from app.schemas import EmailOut
 from app.services.ai_backend import AI_CALL_CONCURRENCY, ai_call_semaphore, get_ai_backend
-from app.services.calendar_extract import CALENDAR_LABELS, clean_company_name, employer_instead_of_sender_domain, message_appointment_slots, message_cancels_appointment, process_calendar_email
+from app.services.calendar_extract import (
+    CALENDAR_LABELS,
+    clean_company_name,
+    collapse_duplicate_calendar_events_post_commit,
+    employer_instead_of_sender_domain,
+    message_appointment_slots,
+    message_cancels_appointment,
+    process_calendar_email,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -314,7 +326,8 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
         ) -> tuple[int, str, Any, tuple[str, str] | None, bool] | None:
             ai_priority = "live" if (pending_only or row.classification_pending) else "background"
             try:
-                if getattr(get_settings(), "email_classification_mode", "hybrid").strip().lower() == "ai_only":
+                ai_only = getattr(get_settings(), "email_classification_mode", "hybrid").strip().lower() == "ai_only"
+                if ai_only:
                     correction_examples = []
                 else:
                     correction_examples = retrieve_relevant_corrections(
@@ -332,17 +345,24 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                 # extract_company_role below acquires the same gate itself,
                 # so it must not be nested inside this one or the two would
                 # deadlock each other over the single slot.
-                async with ai_call_semaphore(ai_priority):
-                    result = await classify_email(
-                        subject=row.subject or "",
-                        sender=row.sender or "",
-                        body_text=row.body_text or "",
-                        snippet=row.snippet or "",
-                        folder=row.folder or "inbox",
-                        account_email=account_email,
-                        correction_examples=correction_examples,
-                        force_openai=True,
-                    )
+                result = deterministic_ai_only_classification(
+                    subject=row.subject or "",
+                    sender=row.sender or "",
+                    body_text=row.body_text or "",
+                    snippet=row.snippet or "",
+                ) if ai_only else None
+                if result is None:
+                    async with ai_call_semaphore(ai_priority):
+                        result = await classify_email(
+                            subject=row.subject or "",
+                            sender=row.sender or "",
+                            body_text=row.body_text or "",
+                            snippet=row.snippet or "",
+                            folder=row.folder or "inbox",
+                            account_email=account_email,
+                            correction_examples=correction_examples,
+                            force_openai=True,
+                        )
             except Exception:
                 logger.exception("Reclassify failed for email %s", row.id)
                 if getattr(get_settings(), "email_classification_mode", "hybrid").strip().lower() == "ai_only":
@@ -516,6 +536,11 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                     # this commit, closing the short-lived worker session rolls
                     # the calendar update back even though the UI is notified.
                     db.commit()
+                    if changed:
+                        changed = (
+                            await collapse_duplicate_calendar_events_post_commit(email.mailbox_id)
+                            or changed
+                        )
                 else:
                     sourced = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == email.id).all()
                     for event in sourced:

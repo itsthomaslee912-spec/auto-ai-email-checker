@@ -1,6 +1,7 @@
 import pytest
 
-from app.classify.openai_classifier import apply_label_guards, _heuristic_label, _is_scheduled_interview, _is_true_rejection, _parse_strict_ai_result, message_direction
+from app.classify.openai_classifier import apply_label_guards, _heuristic_label, _is_scheduled_interview, _is_true_rejection, _parse_strict_ai_result, deterministic_ai_only_classification, message_direction
+from app.classify.prompt import SYSTEM_PROMPT, with_interview_subtype_rules
 from app.models import EmailLabel
 
 
@@ -43,6 +44,48 @@ def test_ai_only_drops_invented_subtype_from_scheduled_interview():
 def test_ai_only_rejects_fieldless_or_incomplete_results(content):
     with pytest.raises(ValueError):
         _parse_strict_ai_result(content)
+
+
+@pytest.mark.parametrize("confidence", [0, 0.0, "0", None])
+def test_ai_only_rejects_zero_or_null_confidence(confidence):
+    import json
+
+    with pytest.raises(ValueError, match="confidence"):
+        _parse_strict_ai_result(json.dumps({"label": "other", "confidence": confidence}))
+
+
+def test_prompt_requires_positive_confidence_and_upgrades_saved_contract():
+    assert '"confidence":0.0-1.0' not in SYSTEM_PROMPT
+    upgraded = with_interview_subtype_rules(
+        'Return one JSON object only: {"label":"<allowed slug>","confidence":0.0-1.0}'
+    )
+    assert '"confidence":0.0-1.0' not in upgraded
+    assert "Confidence must be a number greater than 0" in upgraded
+
+
+def test_verification_code_has_deterministic_ai_only_result():
+    result = deterministic_ai_only_classification(
+        subject="Your verification code",
+        sender="security@example.com",
+        body_text="Enter verification code 123456 to confirm your account.",
+        snippet="",
+    )
+    assert result is not None
+    assert result.label == EmailLabel.APPLICATION_ACTION_REQUIRED.value
+    assert result.confidence == 0.99
+
+
+def test_meeting_access_code_is_not_treated_as_account_verification():
+    result = deterministic_ai_only_classification(
+        subject="Your interview with ADP",
+        sender="do-not-reply@candidatecare.com",
+        body_text=(
+            "BEGIN:VCALENDAR STATUS:CONFIRMED SUMMARY:Interview - Lead Security Engineer "
+            "DTSTART:20261006T183000Z Join meeting. Meeting number (access code): 23329522030"
+        ),
+        snippet="",
+    )
+    assert result is None
 
 
 def test_ada_accommodation_disclaimer_is_not_a_scheduled_interview_reminder():

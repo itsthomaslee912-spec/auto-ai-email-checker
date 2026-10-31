@@ -49,7 +49,11 @@ from app.models import (
     email_search_document_sql,
 )
 from app.realtime.sse import publish
-from app.services.calendar_extract import CALENDAR_LABELS, process_calendar_email
+from app.services.calendar_extract import (
+    CALENDAR_LABELS,
+    collapse_duplicate_calendar_events_post_commit,
+    process_calendar_email,
+)
 from app.schemas import (
     AiReplyIn,
     AiReplyOut,
@@ -814,6 +818,11 @@ async def _apply_label_side_effects(email_id: int, previous_label: str, new_labe
                     event.is_visible = False
                 calendar_changed = bool(sourced)
             db.commit()
+            if calendar_changed:
+                calendar_changed = (
+                    await collapse_duplicate_calendar_events_post_commit(email.mailbox_id)
+                    or calendar_changed
+                )
         return email.mailbox_id if calendar_changed else None
     except Exception:
         logger.exception("Label side effects failed email_id=%s", email_id)

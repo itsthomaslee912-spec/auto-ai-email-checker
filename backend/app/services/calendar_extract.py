@@ -565,6 +565,47 @@ def _clock_parts(match: re.Match[str]) -> tuple[int, int]:
     return hour, minute
 
 
+def _is_alternate_timezone_restatement(
+    source: str,
+    first: re.Match[str],
+    second: re.Match[str],
+    year: int,
+    month: int,
+    day: int,
+) -> bool:
+    """Return true for one instant repeated in two zones: ``9am PT/12pm ET``."""
+    aliases = "|".join(
+        re.escape(alias)
+        for alias in sorted(TIME_ZONE_ALIASES, key=len, reverse=True)
+        if " " not in alias
+    )
+    between = source[first.end() : second.start()]
+    first_zone_match = re.fullmatch(
+        rf"\s*(?P<zone>{aliases})\s*(?:/|\||\bor\b|\()\s*",
+        between,
+        re.I,
+    )
+    second_zone_match = re.match(
+        rf"\s*(?P<zone>{aliases})\b",
+        source[second.end() : second.end() + 16],
+        re.I,
+    )
+    if first_zone_match is None or second_zone_match is None:
+        return False
+    first_name = TIME_ZONE_ALIASES.get(first_zone_match.group("zone").upper())
+    second_name = TIME_ZONE_ALIASES.get(second_zone_match.group("zone").upper())
+    if not first_name or not second_name or first_name == second_name:
+        return False
+    try:
+        first_hour, first_minute = _clock_parts(first)
+        second_hour, second_minute = _clock_parts(second)
+        first_at = datetime(year, month, day, first_hour, first_minute, tzinfo=ZoneInfo(first_name))
+        second_at = datetime(year, month, day, second_hour, second_minute, tzinfo=ZoneInfo(second_name))
+    except (KeyError, TypeError, ValueError, ZoneInfoNotFoundError):
+        return False
+    return first_at.astimezone(timezone.utc) == second_at.astimezone(timezone.utc)
+
+
 def _duration_from_nearby_text(value: str) -> timedelta | None:
     for pattern in _DURATION_PATTERNS:
         match = pattern.search(value or "")
@@ -772,7 +813,13 @@ def _slot_from_date_and_nearby_times(
     if end_clock is not None:
         between_clocks = source[times[0].end() : end_clock.start()]
         # "October 2 at 12:00 PM - October 5 at 2:00 PM" is two offers, not 12:00–2:00.
-        if end_clock.start() - times[0].end() > 20 or any(pattern.search(between_clocks) for pattern in _DATE_PATTERNS):
+        if (
+            end_clock.start() - times[0].end() > 20
+            or any(pattern.search(between_clocks) for pattern in _DATE_PATTERNS)
+            or _is_alternate_timezone_restatement(
+                source, times[0], end_clock, year, month, day
+            )
+        ):
             end_clock = None
     used_end_time = end_clock or times[0]
     # Include "9am time in Tampa" / "8am in Venice, CA" city tails.
@@ -813,6 +860,9 @@ def _slot_from_date_and_nearby_times(
                     or re.fullmatch(r"\s*[-–—]\s*", between)
                 )
                 and re.search(r"\b(?:between|from|available|availability|free)\b", before, re.I)
+                # "confirmed from 12 PM to 3 PM" / "scheduled 12–3 PM" is the
+                # confirmed block itself, not a window the candidate picks from.
+                and not re.search(r"\b(?:confirmed|scheduled|booked)\b", before, re.I)
             )
     return [ExtractedSlot(start.astimezone(timezone.utc), end.astimezone(timezone.utc), zone_name, end_is_explicit, is_window)]
 
@@ -2900,9 +2950,27 @@ def authoritative_reschedule_slots(
     if ics_slots:
         return _prefer_specific_slots(ics_slots)
     subject_slots = _prefer_specific_slots(parse_text_slots(email.subject or "", email.received_at))
+    body = (email.body_text or "").strip() or (email.snippet or "")
+    body_fresh = _without_quoted_history(body)
+    body_slots = _prefer_specific_slots(parse_text_slots(body_fresh, email.received_at))
+    if (
+        subject_slots
+        and not body_slots
+        and re.match(r"^\s*(?:re|fwd?)\s*:", email.subject or "", re.I)
+        and re.search(
+            r"\b(?:would|could|can)\s+you\s+(?:be\s+)?available\b"
+            r"|\b(?:something|an emergency|a conflict)\s+(?:came|has come)\s+up\b"
+            r"|\bneed\s+to\s+reschedule\b",
+            body_fresh,
+            re.I,
+        )
+    ):
+        # Reply subjects preserve the appointment being replaced (for example
+        # "Re: Accepted ... Fri Oct 30 10am"). A body asking whether Monday
+        # works does not reconfirm that old subject time or book a new slot.
+        return []
     if subject_slots:
         return subject_slots
-    body = (email.body_text or "").strip() or (email.snippet or "")
     fresh = _without_quoted_history("\n".join([email.subject or "", body]))
     marked = "\n".join(match.group(0) for match in _CURRENT_RESCHEDULE_LINE_RE.finditer(fresh))
     marked_slots = _prefer_specific_slots(parse_text_slots(marked, email.received_at)) if marked else []
@@ -3093,9 +3161,32 @@ def leaves_interview_unbooked(
     """
     if email.interview_subtype not in {"reschedule", "time_change"}:
         return False
-    if known_slots if known_slots is not None else explicit_message_slots(email):
-        return False
+    if known_slots is not None:
+        if known_slots:
+            return False
+    else:
+        full = _calendar_text(email)
+        if parse_ics_slots(full):
+            return False
+        body = (email.body_text or "").strip() or (email.body_html or "").strip() or (email.snippet or "")
+        body_fresh = _without_quoted_history(body)
+        if parse_text_slots(body_fresh, email.received_at):
+            return False
+        # A reply subject echoes the old appointment time (for example
+        # "Re: Interview @ Tue Nov 3 2:00pm–3:00pm"). Treat that subject time
+        # as the removed slot, not a new confirmed one. Non-reply subjects may
+        # name a new time independently, so keep the combined check for those.
+        if not re.match(r"^\s*(?:re|fwd?)\s*:", email.subject or "", re.I):
+            fresh_combined = _without_quoted_history(full)
+            if parse_text_slots(fresh_combined, email.received_at):
+                return False
     fresh = _fresh_message_text(email)
+    if re.search(
+        r"\b(?:would|could|can)\s+you\s+(?:be\s+)?available\b",
+        fresh,
+        re.I,
+    ):
+        return True
     if _STILL_BOOKED_RE.search(fresh) or _CLOCK_OR_DATE_RE.search(fresh):
         return False
     return True
@@ -5511,13 +5602,20 @@ def _hide_open_reschedule(db: Session, email: EmailMessage, related_emails: list
     )
     changed = False
     for event in rows:
+        source_time = as_utc(event.source_received_at)
+        # Backfill and pending-AI recovery are intentionally asynchronous. An
+        # older "please reschedule" row can therefore be processed after a
+        # newer calendar invite has already booked the replacement. Never let
+        # that delayed old row hide an event whose authoritative source was
+        # received later (Multiply Labs: Oct 26 request followed by booking).
+        if source_time is not None and message_time is not None and source_time > message_time:
+            continue
         linked = (
             event.id in linked_event_ids
             or event.source_email_id in email_ids
             or (event.source_thread_id and event.source_thread_id in thread_ids)
         )
         if not linked:
-            source_time = as_utc(event.source_received_at)
             booked_before = source_time is None or message_time is None or source_time <= message_time
             linked = booked_before and any(
                 companies_match(event.company, company) and (event.job_role or "").strip().casefold() == role.casefold()
@@ -6737,7 +6835,32 @@ def repair_provider_calendar_sources(db: Session, mailbox_id: int | None = None)
     for event in query.all():
         source = db.get(EmailMessage, event.source_email_id)
         source_slots = parse_ics_slots(_calendar_text(source)) if source is not None else []
-        if source_slots and _slot_matches_event(event, source_slots):
+        event_start = as_utc(event.start_at)
+        matching_source = next(
+            (
+                slot
+                for slot in source_slots
+                if event_start is not None
+                and abs((slot.start_at - event_start).total_seconds()) <= 120
+            ),
+            None,
+        )
+        if matching_source is not None:
+            # A later text-only confirmation can repeat just the start and
+            # temporarily leave the default 30-minute end on the merged row.
+            # The provider invitation's explicit DTEND is authoritative.
+            event_end = as_utc(event.end_at)
+            if (
+                matching_source.end_is_explicit
+                and (
+                    event_end is None
+                    or abs((matching_source.end_at - event_end).total_seconds()) > 60
+                )
+            ):
+                event.end_at = matching_source.end_at
+                if matching_source.source_timezone:
+                    event.source_timezone = matching_source.source_timezone
+                repaired += 1
             continue
         candidates = [
             message
@@ -7162,66 +7285,103 @@ def repair_quoted_option_bookings(db: Session, mailbox_id: int | None = None) ->
     return repaired
 
 
-def collapse_duplicate_calendar_events(db: Session, mailbox_id: int | None = None) -> bool:
+def collapse_duplicate_calendar_events(
+    db: Session,
+    mailbox_id: int | None = None,
+    *,
+    commit_between_stages: bool = False,
+) -> bool:
     """Keep one visible chip for each scheduled interview and each open window."""
+    def checkpoint() -> None:
+        # Live cleanup runs after the source email projection has committed and
+        # uses its own session. Commit each repair stage as well: a large
+        # mailbox can take minutes to scan, and retaining an early email/event
+        # update until the final scan made provider sync time out on that row.
+        if commit_between_stages:
+            db.commit()
+
     changed = repair_calendar_attendee_response_labels(db, mailbox_id) > 0
+    checkpoint()
     if repair_cross_company_outcome_links(db, mailbox_id) > 0:
         changed = True
+    checkpoint()
     # Remove stale links before any field repair reads them. This applies to all
     # confirmed email events, not only Microsoft Bookings messages.
     if repair_calendar_event_email_links(db, mailbox_id) > 0:
         changed = True
+    checkpoint()
     if repair_mixed_thread_appointments(db, mailbox_id) > 0:
         changed = True
+    checkpoint()
     if repair_quoted_option_bookings(db, mailbox_id) > 0:
         changed = True
+    checkpoint()
     if repair_placeholder_calendar_fields(db, mailbox_id) > 0:
         changed = True
+    checkpoint()
     if repair_reminder_duplicates(db, mailbox_id) > 0:
         changed = True
+    checkpoint()
     if repair_phantom_availability_slots(db, mailbox_id) > 0:
         changed = True
+    checkpoint()
     if repair_phantom_end_slots(db, mailbox_id) > 0:
         changed = True
+    checkpoint()
     if repair_availability_window_appointments(db, mailbox_id) > 0:
         changed = True
+    checkpoint()
     if repair_corrupted_company_names(db, mailbox_id) > 0:
         changed = True
         companies_match.cache_clear()
+    checkpoint()
     if repair_candidate_name_as_company(db, mailbox_id) > 0:
         changed = True
         companies_match.cache_clear()
+    checkpoint()
     if repair_meeting_join_urls(db, mailbox_id) > 0:
         changed = True
+    checkpoint()
     if repair_interview_stage_roles(db, mailbox_id) > 0:
         changed = True
+    checkpoint()
     if repair_calendar_event_email_links(db, mailbox_id) > 0:
         changed = True
+    checkpoint()
     if repair_conflicting_calendar_roles(db, mailbox_id) > 0:
         changed = True
+    checkpoint()
     if correct_sender_domain_employers(db, mailbox_id) > 0:
         changed = True
         companies_match.cache_clear()
+    checkpoint()
     # Correcting a parent-tenant company can make the matching subsidiary's
     # application receipt discoverable; refresh once more and remove any
     # sibling-company receipt inherited from a provider-grouped thread.
     if repair_calendar_event_email_links(db, mailbox_id) > 0:
         changed = True
+    checkpoint()
     if promote_booked_availability(db, mailbox_id):
         changed = True
+    checkpoint()
     if hide_quote_clock_events(db, mailbox_id):
         changed = True
+    checkpoint()
     if hide_replaced_bookings(db, mailbox_id):
         changed = True
+    checkpoint()
     if restore_distinct_superseded_bookings(db, mailbox_id):
         changed = True
+    checkpoint()
     # Restoring a separate panel/session makes it eligible for authoritative
     # source repair. Recent/upcoming visible events keep this bounded during
     # startup maintenance.
     if repair_provider_calendar_sources(db, mailbox_id) > 0:
         changed = True
+    checkpoint()
     if hide_superseded_identity_bookings(db, mailbox_id):
         changed = True
+    checkpoint()
     query = _email_calendar_events(db).filter(CalendarEvent.is_visible.is_(True))
     if mailbox_id is not None:
         query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
@@ -7233,6 +7393,7 @@ def collapse_duplicate_calendar_events(db: Session, mailbox_id: int | None = Non
                 continue
             _absorb_calendar_event(db, survivor, duplicate)
             changed = True
+        checkpoint()
     for group in _cluster_events([event for event in visible if event.kind == "availability" and event.is_visible], _same_available_window):
         survivor = max(group, key=lambda event: (_event_received_at(event), event.id))
         for duplicate in group:
@@ -7240,9 +7401,11 @@ def collapse_duplicate_calendar_events(db: Session, mailbox_id: int | None = Non
                 continue
             _absorb_calendar_event(db, survivor, duplicate)
             changed = True
+        checkpoint()
     # A merge can add the decisive scheduling conversation to the survivor.
     if repair_conflicting_calendar_roles(db, mailbox_id) > 0:
         changed = True
+    checkpoint()
     confirmed = [
         event
         for event in _email_calendar_events(db)
@@ -7279,7 +7442,38 @@ def collapse_duplicate_calendar_events(db: Session, mailbox_id: int | None = Non
             .all()
         }
         changed = changed or before != after
+        checkpoint()
     return changed
+
+
+async def collapse_duplicate_calendar_events_post_commit(mailbox_id: int) -> bool:
+    """Run mailbox-wide cleanup after projection commits, in an isolated session.
+
+    The caller must commit its email/calendar projection before invoking this
+    helper. The cleanup session checkpoints each repair stage so an expensive
+    whole-mailbox scan never retains an earlier row update for its full run.
+    """
+    if defer_duplicate_collapse.get() or not _collapse_due(mailbox_id):
+        return False
+
+    def run() -> bool:
+        from app.db import SessionLocal
+
+        with SessionLocal() as cleanup_db:
+            try:
+                changed = collapse_duplicate_calendar_events(
+                    cleanup_db,
+                    mailbox_id,
+                    commit_between_stages=True,
+                )
+                cleanup_db.commit()
+                return changed
+            except Exception:
+                cleanup_db.rollback()
+                logger.exception("Post-commit calendar collapse failed mailbox_id=%s", mailbox_id)
+                return False
+
+    return await asyncio.to_thread(run)
 
 
 async def process_calendar_email(
@@ -7475,12 +7669,6 @@ async def _process_calendar_email_locked(
                 target.outcome_source_email_id = email.id
                 target.outcome_at = outcome_at
                 _link_event_email(db, target, email.id)
-            changed = True
-        if (
-            not defer_duplicate_collapse.get()
-            and _collapse_due(email.mailbox_id)
-            and await asyncio.to_thread(collapse_duplicate_calendar_events, db, email.mailbox_id)
-        ):
             changed = True
         email.calendar_processed_hash = digest
         email.calendar_processed_at = datetime.now(timezone.utc)
@@ -7785,13 +7973,6 @@ async def _process_calendar_email_locked(
             if event.is_visible and status != "cancellation":
                 if _hide_prior_bookings_replaced_by(db, email, event):
                     changed = True
-
-    if (
-        not defer_duplicate_collapse.get()
-        and _collapse_due(email.mailbox_id)
-        and await asyncio.to_thread(collapse_duplicate_calendar_events, db, email.mailbox_id)
-    ):
-        changed = True
 
     email.calendar_processed_hash = digest
     email.calendar_processed_at = datetime.now(timezone.utc)
