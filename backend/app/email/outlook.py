@@ -501,12 +501,17 @@ async def outlook_reply_message(
     access_token: str,
     message_id: str,
     *,
-    to_address: str,
+    to_addresses: list[str],
     body_text: str,
     attachments: list[dict] | None = None,
 ) -> None:
     """Reply inside the original conversation (Graph sets In-Reply-To/References and quotes the original)."""
-    message: dict = {"toRecipients": [{"emailAddress": {"address": to_address}}]}
+    message: dict = {
+        "toRecipients": [
+            {"emailAddress": {"address": address}}
+            for address in to_addresses
+        ]
+    }
     if attachments:
         message["attachments"] = [
             {"@odata.type": "#microsoft.graph.fileAttachment", "name": item["name"], "contentType": item["content_type"], "contentBytes": item["content_base64"]}
@@ -525,7 +530,7 @@ async def outlook_reply_message(
 async def outlook_send_message(
     access_token: str,
     *,
-    to_address: str,
+    to_addresses: list[str],
     subject: str,
     body_text: str,
     attachments: list[dict] | None = None,
@@ -534,7 +539,10 @@ async def outlook_send_message(
         "message": {
             "subject": subject,
             "body": {"contentType": "Text", "content": body_text},
-            "toRecipients": [{"emailAddress": {"address": to_address}}],
+            "toRecipients": [
+                {"emailAddress": {"address": address}}
+                for address in to_addresses
+            ],
             "attachments": [
                 {"@odata.type": "#microsoft.graph.fileAttachment", "name": item["name"], "contentType": item["content_type"], "contentBytes": item["content_base64"]}
                 for item in (attachments or [])

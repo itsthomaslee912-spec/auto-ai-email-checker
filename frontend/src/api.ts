@@ -74,7 +74,9 @@ export interface MonitoringSnapshot {
     users: number;
     active_mailboxes: number;
     emails: number;
+    classified_emails?: number;
     pending_classification: number;
+    human_feedback?: number;
   };
   queues: {
     active_mailbox_jobs: number;

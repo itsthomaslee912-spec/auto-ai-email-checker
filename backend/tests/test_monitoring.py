@@ -11,7 +11,7 @@ from sqlalchemy.pool import StaticPool
 from app.api.monitoring import monitoring_snapshot
 from app.auth.session import current_user_is_admin
 from app.db import Base
-from app.models import EmailMessage, MailboxConnection, ServiceHeartbeat, User
+from app.models import ClassifyCorrection, EmailMessage, MailboxConnection, ServiceHeartbeat, User
 
 
 def _database():
@@ -90,20 +90,25 @@ def test_monitoring_pending_count_excludes_human_corrected_rows():
         )
         db.add(mailbox)
         db.flush()
-        db.add_all([
-            EmailMessage(
-                mailbox_id=mailbox.id,
-                provider_message_id="actually-pending",
-                classification_pending=True,
-                human_corrected=False,
-            ),
-            EmailMessage(
-                mailbox_id=mailbox.id,
-                provider_message_id="manually-corrected",
-                classification_pending=True,
-                human_corrected=True,
-            ),
-        ])
+        pending = EmailMessage(
+            mailbox_id=mailbox.id,
+            provider_message_id="actually-pending",
+            classification_pending=True,
+            human_corrected=False,
+        )
+        corrected = EmailMessage(
+            mailbox_id=mailbox.id,
+            provider_message_id="manually-corrected",
+            classification_pending=True,
+            human_corrected=True,
+        )
+        db.add_all([pending, corrected])
+        db.flush()
+        db.add(ClassifyCorrection(
+            email_id=corrected.id,
+            previous_label="other",
+            corrected_label="screening",
+        ))
         db.commit()
 
         token = current_user_is_admin.set(True)
@@ -113,6 +118,8 @@ def test_monitoring_pending_count_excludes_human_corrected_rows():
             current_user_is_admin.reset(token)
 
     assert snapshot["metrics"]["pending_classification"] == 1
+    assert snapshot["metrics"]["classified_emails"] == 1
+    assert snapshot["metrics"]["human_feedback"] == 1
 
 
 def test_monitoring_reports_recovering_when_a_replica_self_reports():

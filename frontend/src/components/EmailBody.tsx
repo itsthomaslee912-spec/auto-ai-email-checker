@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 
 type AppTheme = "dark" | "light";
 
@@ -286,6 +286,8 @@ export default function EmailBody({ html, text, snippet }: Props) {
   );
   const frameKey = `${theme}\0${htmlToRender}`;
   const [framed, setFramed] = useState<{ key: string; html: string } | null>(null);
+  const [frameHeight, setFrameHeight] = useState<number | null>(null);
+  const frameResizeObserver = useRef<ResizeObserver | null>(null);
   useEffect(() => {
     if (!deferFit) return;
     let cancel = false;
@@ -303,6 +305,16 @@ export default function EmailBody({ html, text, snippet }: Props) {
   }, [deferFit, frameKey, htmlToRender, theme]);
   const framedHtml = immediateHtml || (framed?.key === frameKey ? framed.html : "");
 
+  useEffect(() => {
+    setFrameHeight(null);
+    frameResizeObserver.current?.disconnect();
+    frameResizeObserver.current = null;
+    return () => {
+      frameResizeObserver.current?.disconnect();
+      frameResizeObserver.current = null;
+    };
+  }, [frameKey]);
+
   const plainToRender = useMemo(() => {
     if (htmlToRender) return "";
     if (!sourceText) return fallback;
@@ -319,14 +331,33 @@ export default function EmailBody({ html, text, snippet }: Props) {
   }
 
   if (htmlToRender) {
+    const fittedStyle = frameHeight == null
+      ? undefined
+      : ({ "--email-body-content-height": `${frameHeight}px` } as CSSProperties);
     return (
-      <div className="email-body-scroll">
+      <div className={`email-body-scroll${frameHeight == null ? "" : " is-content-fitted"}`} style={fittedStyle}>
         <iframe
           className="email-body-frame"
           aria-label="Email body"
           sandbox="allow-same-origin"
           srcDoc={framedHtml}
           title="Email body"
+          onLoad={(event) => {
+            const doc = event.currentTarget.contentDocument;
+            const canvas = doc?.querySelector<HTMLElement>(".email-canvas");
+            const body = doc?.body;
+            if (!doc || !canvas || !body) return;
+            const measure = () => {
+              const bodyStyle = doc.defaultView?.getComputedStyle(body);
+              const verticalPadding = (Number.parseFloat(bodyStyle?.paddingTop || "0") || 0)
+                + (Number.parseFloat(bodyStyle?.paddingBottom || "0") || 0);
+              setFrameHeight(Math.ceil(Math.max(canvas.scrollHeight, canvas.getBoundingClientRect().height) + verticalPadding + 2));
+            };
+            measure();
+            frameResizeObserver.current?.disconnect();
+            frameResizeObserver.current = new ResizeObserver(measure);
+            frameResizeObserver.current.observe(canvas);
+          }}
         />
       </div>
     );

@@ -15,6 +15,7 @@ export type UiIconName =
   | "eye-off"
   | "chevron-left"
   | "chevron-right"
+  | "chevron-down"
   | "today"
   | "snooze"
   | "mute"
@@ -54,6 +55,7 @@ const ICONS: Record<UiIconName, ReactNode> = {
   "eye-off": <><path d="M4 5.5 19 19" /><path d="M9.2 9.4A3 3 0 0 0 14.6 15M7.2 7.6C5 9 3.2 12 3.2 12S6.4 17.5 12 17.5c1.3 0 2.5-.3 3.5-.8M10.2 6.7A9 9 0 0 1 12 6.5C18 6.5 21.5 12 21.5 12a16 16 0 0 1-2.2 2.8" /></>,
   "chevron-left": <path d="m14.5 6-5 6 5 6" />,
   "chevron-right": <path d="m9.5 6 5 6-5 6" />,
+  "chevron-down": <path d="m6 9.5 6 5 6-5" />,
   today: <><rect x="4" y="5" width="16" height="15" rx="2" /><path d="M8 3.5V7M16 3.5V7M4 10h16" /><circle cx="12" cy="15" r="1.3" /></>,
   snooze: <><circle cx="12" cy="13" r="7" /><path d="M12 10v3.2l2.2 1.4M9 4.5h4.5L9 8h4.5" /></>,
   mute: <path d="M4 10v4h3l4 3V7L7 10zM16 10l4 4M20 10l-4 4" />,

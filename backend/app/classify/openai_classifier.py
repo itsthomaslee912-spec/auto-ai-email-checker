@@ -14,7 +14,7 @@ from app.classify.correction_retrieval import CorrectionExample, format_retrieve
 from app.models import EmailLabel
 from app.schemas import ClassificationResult
 from app.config import get_settings
-from app.services.ai_backend import AiBackend, close_ai_client, get_ai_backend, has_saved_ai_settings
+from app.services.ai_backend import AiBackend, ai_call_semaphore, close_ai_client, get_ai_backend, has_saved_ai_settings
 
 logger = logging.getLogger(__name__)
 
@@ -1020,6 +1020,7 @@ async def classify_email(
     correction_examples: list[CorrectionExample] | None = None,
     force_openai: bool = False,
     use_openai: bool = True,
+    priority: str = "live",
 ) -> ClassificationResult:
     settings = get_settings()
     ai_only = getattr(settings, "email_classification_mode", "hybrid").strip().lower() == "ai_only"
@@ -1130,7 +1131,8 @@ async def classify_email(
     for attempt in range(max_attempts):
         client = backend.client() if backend.provider in {"ollama", "gemini"} else AsyncOpenAI(api_key=backend.api_key)
         try:
-            response = await client.chat.completions.create(**request_options)
+            async with ai_call_semaphore(priority, provider=backend.provider):
+                response = await client.chat.completions.create(**request_options)
             choice = response.choices[0]
             content = choice.message.content or ""
             if getattr(choice, "finish_reason", None) == "length":

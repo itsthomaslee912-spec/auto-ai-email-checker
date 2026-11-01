@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o-mini"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.8-flash"
+    # Cloud APIs can classify several independent emails concurrently. Local
+    # Ollama normally shares one GPU and stays serialized to avoid overload.
+    ai_cloud_concurrency: int = 4
+    ai_ollama_concurrency: int = 1
 
     google_client_id: str = ""
     google_client_secret: str = ""

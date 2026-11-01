@@ -202,7 +202,7 @@ async def extract_company_role(
     evidence = "\n\n".join(part for part in (body_text or "", html_text) if part.strip())
     user_content = f"From: {sender}\nSubject: {subject}\nSnippet: {snippet}\n\nBody:\n{evidence[:12000]}"
     try:
-        async with ai_call_semaphore(priority):
+        async with ai_call_semaphore(priority, provider=backend.provider):
             response = await client.chat.completions.create(
                 model=backend.model,
                 temperature=0,

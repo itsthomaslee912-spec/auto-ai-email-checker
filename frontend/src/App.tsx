@@ -9,6 +9,7 @@ import CategoryPicker, { type CategoryChoice } from "./components/CategoryPicker
 import SystemAlert, { type SystemIssue } from "./components/SystemAlert";
 import InterviewAlarm from "./components/InterviewAlarm";
 import InterviewEmailAlert from "./components/InterviewEmailAlert";
+import { UiIcon } from "./components/UiIcon";
 import SettingsPage, { type SettingsSection } from "./pages/SettingsPage";
 import CalendarPage, { warmCalendarCache } from "./pages/CalendarPage";
 import MonitoringPage from "./pages/MonitoringPage";
@@ -19,6 +20,7 @@ import {
   fetchAiStatus,
   fetchAutoSyncStatus,
   fetchClassifyPromptStatus,
+  fetchCalendarEvents,
   fetchEmailConversation,
   fetchEmailDetail,
   fetchEmails,
@@ -46,6 +48,7 @@ import {
   type EmailPage,
   type AiStatus,
   type AutoSyncStatus,
+  type CalendarEvent,
   type MailFolder,
   type Mailbox,
   type Provider,
@@ -97,9 +100,14 @@ const LIST_W_KEY = "email-checker-list-w";
 const LIST_H_KEY = "email-checker-list-h";
 const ACCOUNTS_ORDER_KEY = "email-checker-accounts-order";
 
-type QuickReplyKind = "interview_follow_up" | "reschedule_interview";
+type QuickReplyKind = "suggest_available_times" | "interview_follow_up" | "reschedule_interview";
 
 const QUICK_REPLY_OPTIONS: { id: QuickReplyKind; label: string; description: string }[] = [
+  {
+    id: "suggest_available_times",
+    label: "Suggest available times",
+    description: "Check your calendar and offer unique open interview slots.",
+  },
   {
     id: "interview_follow_up",
     label: "Interview follow-up",
@@ -247,9 +255,78 @@ function senderName(sender: string): string {
   return sender || "Unknown";
 }
 
-function firstAddress(value: string): string {
-  const first = value.split(",", 1)[0]?.trim() ?? "";
-  return (first.match(/<([^>]+)>/)?.[1] ?? first).trim();
+function extractEmailAddresses(value: string): string[] {
+  const matches = value.match(/[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) ?? [];
+  const seen = new Set<string>();
+  return matches.filter((address) => {
+    const key = address.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function replyGreetingName(value: string): string {
+  const display = senderName(value).replace(/^['"]|['"]$/g, "").trim();
+  if (!display) return "there";
+  if (display.includes("@")) {
+    const localName = display.split("@")[0]?.split(/[._-]+/)[0]?.trim() || "";
+    return localName ? localName.charAt(0).toUpperCase() + localName.slice(1).toLowerCase() : "there";
+  }
+  const ordered = display.includes(",")
+    ? display.split(",").slice(1).join(" ").trim()
+    : display;
+  return ordered.split(/\s+/)[0]?.replace(/[^\p{L}\p{N}'-]/gu, "") || "there";
+}
+
+function senderProfileName(mailbox: Mailbox | null | undefined, sessionUser: SessionUser): string {
+  const profileName = mailbox?.display_name?.trim() || sessionUser.display_name?.trim();
+  if (profileName) return profileName;
+  const localPart = (mailbox?.email_address || sessionUser.email).split("@")[0] || "";
+  return localPart
+    .split(/[._-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ") || "Regards";
+}
+
+function availableInterviewSlots(events: CalendarEvent[], now = new Date(), count = 3): Date[] {
+  const busy = events
+    .map((event) => ({ start: new Date(event.start_at).getTime(), end: new Date(event.end_at).getTime() }))
+    .filter((event) => Number.isFinite(event.start) && Number.isFinite(event.end) && event.end > event.start);
+  const suggestions: Date[] = [];
+  const seen = new Set<number>();
+  const candidateHours = [9.5, 11, 13.5, 15];
+
+  for (let offset = 1; offset <= 14 && suggestions.length < count; offset += 1) {
+    const day = new Date(now);
+    day.setDate(now.getDate() + offset);
+    day.setHours(0, 0, 0, 0);
+    if (day.getDay() === 0 || day.getDay() === 6) continue;
+
+    for (const hour of candidateHours) {
+      const start = new Date(day);
+      start.setHours(Math.floor(hour), hour % 1 ? 30 : 0, 0, 0);
+      const startMs = start.getTime();
+      const endMs = startMs + 30 * 60 * 1000;
+      if (seen.has(startMs) || busy.some((event) => event.start < endMs && event.end > startMs)) continue;
+      seen.add(startMs);
+      suggestions.push(start);
+      break;
+    }
+  }
+  return suggestions;
+}
+
+function formatAvailabilitySlot(slot: Date): string {
+  return new Intl.DateTimeFormat(undefined, {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(slot);
 }
 
 function initialsFrom(text: string): string {
@@ -432,6 +509,12 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   }, []);
   const [resizing, setResizing] = useState<"accounts" | "list" | null>(null);
   const [replyOpen, setReplyOpen] = useState(false);
+  const [replyExpanded, setReplyExpanded] = useState(false);
+  const [replySubjectText, setReplySubjectText] = useState("");
+  const [replyRecipients, setReplyRecipients] = useState<string[]>([]);
+  const [replyRecipientDraft, setReplyRecipientDraft] = useState("");
+  const [replyMailboxId, setReplyMailboxId] = useState<number | null>(null);
+  const [replySenderOpen, setReplySenderOpen] = useState(false);
   const [replyText, setReplyText] = useState("");
   const [replyInstruction, setReplyInstruction] = useState("");
   const [quickRepliesOpen, setQuickRepliesOpen] = useState(false);
@@ -469,6 +552,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   const readerCloseRef = useRef<HTMLButtonElement>(null);
   const syncMenuRef = useRef<HTMLDivElement>(null);
   const quickReplyMenuRef = useRef<HTMLDivElement>(null);
+  const replySenderMenuRef = useRef<HTMLDivElement>(null);
   const replyTextareaRef = useRef<HTMLTextAreaElement>(null);
   const didMountFilters = useRef(false);
   // Mailbox navigation starts its own load so the list (including date-group
@@ -1418,8 +1502,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
 
   const openMessage = useCallback((id: number) => {
     if (readingPaneRef.current === "no_split") {
-      if (viewModeRef.current === "table") selectTableEmailRef.current(id);
-      else openTableEmailRef.current(id);
+      openTableEmailRef.current(id);
     } else {
       void openEmailRef.current(id);
     }
@@ -1930,6 +2013,22 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     };
   }, [quickRepliesOpen]);
 
+  useEffect(() => {
+    if (!replySenderOpen) return;
+    const closeOnPointerDown = (event: globalThis.PointerEvent) => {
+      if (!replySenderMenuRef.current?.contains(event.target as Node)) setReplySenderOpen(false);
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setReplySenderOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnPointerDown);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnPointerDown);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [replySenderOpen]);
+
   function onMessageListKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (viewMode === "table" && readingPane === "no_split" && event.key === "Enter" && event.target === event.currentTarget && selectedId != null) {
       event.preventDefault();
@@ -2010,16 +2109,21 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   }
 
   async function sendReply() {
-    if (!selected || !replyMailbox || !replyText.trim()) return;
+    const draftRecipients = extractEmailAddresses(replyRecipientDraft);
+    if (replyRecipientDraft.trim() && draftRecipients.length === 0) {
+      setBanner("Enter a valid destination email address");
+      return;
+    }
+    const recipients = extractEmailAddresses([...replyRecipients, ...draftRecipients].join(", "));
+    const toAddress = recipients.join(", ");
+    const subject = replySubjectText.trim();
+    if (!selected || !replyMailbox || !replyText.trim() || recipients.length === 0 || !subject) return;
     const run = async () => {
       setSendingReply(true);
       try {
-        const toAddress = selected.folder === "sent" && selected.recipients
-          ? firstAddress(selected.recipients)
-          : firstAddress(selected.sender);
-        await sendEmail({ mailbox_id: replyMailbox.id, to_address: toAddress, subject: /^re:/i.test(selected.subject) ? selected.subject : `Re: ${selected.subject}`, body_text: replyText, attachments: await filePayload(replyFiles), reply_to_email_id: selected.id });
+        await sendEmail({ mailbox_id: replyMailbox.id, to_address: toAddress, subject, body_text: replyText, attachments: await filePayload(replyFiles), reply_to_email_id: selected.id });
         setBanner(scheduleAt ? "Reply scheduled and sent." : "Reply sent. It is now in Sent.");
-        setReplyOpen(false); setQuickRepliesOpen(false); setReplyText(""); setReplyInstruction(""); setReplyFiles([]); setScheduleAt("");
+        setReplyOpen(false); setReplyExpanded(false); setReplySubjectText(""); setReplyRecipients([]); setReplyRecipientDraft(""); setReplyMailboxId(null); setReplySenderOpen(false); setQuickRepliesOpen(false); setReplyText(""); setReplyInstruction(""); setReplyFiles([]); setScheduleAt("");
         if (folder === "sent") void loadFirstPage();
       } catch (err) { setBanner(err instanceof Error ? err.message : "Could not send reply"); }
       finally { setSendingReply(false); }
@@ -2037,19 +2141,69 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     finally { setAiDrafting(false); }
   }
 
-  function applyQuickReply(kind: QuickReplyKind) {
-    const signature = sessionUser.display_name?.trim() || sessionUser.email.split("@")[0];
-    const body = kind === "interview_follow_up"
-      ? `Hi,\n\nThank you again for taking the time to speak with me about this opportunity. I enjoyed learning more about the role and the team, and I remain very interested in moving forward.\n\nPlease let me know if I can provide any additional information.\n\nBest regards,\n${signature}`
-      : `Hi,\n\nThank you for arranging the interview. Unfortunately, I need to reschedule our meeting. Would it be possible to choose another time? I am happy to work around your availability.\n\nI apologize for the inconvenience and appreciate your understanding.\n\nBest regards,\n${signature}`;
-    setReplyText(body);
+  function closeReplyComposer() {
+    setReplyOpen(false);
+    setReplyExpanded(false);
+    setReplySubjectText("");
+    setReplyRecipients([]);
+    setReplyRecipientDraft("");
+    setReplyMailboxId(null);
+    setReplySenderOpen(false);
     setQuickRepliesOpen(false);
-    window.requestAnimationFrame(() => {
-      const textarea = replyTextareaRef.current;
-      if (!textarea) return;
-      textarea.focus();
-      textarea.setSelectionRange(body.length, body.length);
-    });
+    setReplyText("");
+    setReplyInstruction("");
+    setReplyFiles([]);
+    setScheduleAt("");
+  }
+
+  function addReplyRecipients(value = replyRecipientDraft): boolean {
+    const addresses = extractEmailAddresses(value);
+    if (!addresses.length) return false;
+    setReplyRecipients((current) => extractEmailAddresses([...current, ...addresses].join(", ")));
+    setReplyRecipientDraft("");
+    return true;
+  }
+
+  function removeReplyRecipient(address: string) {
+    setReplyRecipients((current) => current.filter((item) => item.toLowerCase() !== address.toLowerCase()));
+  }
+
+  async function applyQuickReply(kind: QuickReplyKind) {
+    if (!selected) return;
+    const recipientName = replyGreetingName(replyRecipient);
+    const signature = senderProfileName(replyMailbox, sessionUser);
+    let body = "";
+    setAiDrafting(true);
+    try {
+      if (kind === "suggest_available_times") {
+        const rangeStart = new Date();
+        const rangeEnd = new Date(rangeStart);
+        rangeEnd.setDate(rangeEnd.getDate() + 15);
+        const events = await fetchCalendarEvents(rangeStart.toISOString(), rangeEnd.toISOString());
+        const slots = availableInterviewSlots(events, rangeStart, 3);
+        if (!slots.length) {
+          setBanner("No open weekday interview times were found in the next two weeks");
+          return;
+        }
+        body = `Hi ${recipientName},\n\nThank you for reaching out. I would be happy to connect. Based on my calendar, I am available at the following times:\n\n${slots.map((slot) => `• ${formatAvailabilitySlot(slot)}`).join("\n")}\n\nPlease let me know which option works best for you. If none of these times are convenient, I would be glad to coordinate another time.\n\nBest regards,\n${signature}`;
+      } else if (kind === "interview_follow_up") {
+        body = `Hi ${recipientName},\n\nThank you again for taking the time to speak with me about this opportunity. I appreciated learning more about the role and the team, and our conversation strengthened my interest in the position.\n\nPlease let me know if I can provide any additional information. I look forward to hearing about the next steps.\n\nBest regards,\n${signature}`;
+      } else {
+        body = `Hi ${recipientName},\n\nThank you for arranging the interview. Unfortunately, I need to request a different meeting time. I apologize for any inconvenience this may cause.\n\nWould it be possible to reschedule? I am happy to work with your availability and find a time that is convenient for everyone.\n\nThank you for your understanding.\n\nBest regards,\n${signature}`;
+      }
+      setReplyText(body);
+      setQuickRepliesOpen(false);
+      window.requestAnimationFrame(() => {
+        const textarea = replyTextareaRef.current;
+        if (!textarea) return;
+        textarea.focus();
+        textarea.setSelectionRange(body.length, body.length);
+      });
+    } catch (err) {
+      setBanner(err instanceof Error ? err.message : "Could not prepare the quick reply");
+    } finally {
+      setAiDrafting(false);
+    }
   }
 
   function chooseSchedulePreset(daysFromToday: number, hour: number) {
@@ -2108,7 +2262,19 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   }
 
   const selectedMailbox = selectedMailboxId != null ? mailboxById.get(selectedMailboxId) : null;
-  const replyMailbox = selected ? mailboxById.get(selected.mailbox_id) ?? selectedMailbox : selectedMailbox;
+  const activeReplyMailboxes = orderedMailboxes.filter((mailbox) => mailbox.is_active);
+  const defaultReplyMailbox = selected
+    ? mailboxById.get(selected.mailbox_id) ?? selectedMailbox ?? activeReplyMailboxes[0]
+    : selectedMailbox ?? activeReplyMailboxes[0];
+  const replyMailbox = replyMailboxId != null
+    ? mailboxById.get(replyMailboxId) ?? defaultReplyMailbox
+    : defaultReplyMailbox;
+  const replyRecipient = selected
+    ? (selected.folder === "sent" && selected.recipients ? selected.recipients : selected.sender)
+    : "";
+  const replySubject = selected
+    ? (/^re:/i.test(selected.subject) ? selected.subject : `Re: ${selected.subject}`)
+    : "";
   const scopeUnread = useMemo(() => {
     if (selectedMailboxId == null) {
       return Object.values(mailboxUnreadCounts).reduce((sum, n) => sum + n, 0);
@@ -2791,7 +2957,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
       />
 
       {activePage === "monitoring" && sessionUser.is_admin && (
-        <MonitoringPage active />
+        <MonitoringPage active aiStatus={aiStatus} aiStatusOffline={aiStatusOffline} />
       )}
 
       {activePage === "statistics" && sessionUser.is_admin && (
@@ -2886,7 +3052,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         {loading && <p className="hint pad">Loading…</p>}
         {error && <p className="error pad">{error}</p>}
 
-        {viewMode === "table" && <p className="table-view-hint">{readingPane === "no_split" ? "Double-click an email to open it." : "Select an email to read it."}</p>}
+        {viewMode === "table" && <p className="table-view-hint">{readingPane === "no_split" ? "Select an email to open it." : "Select an email to read it."}</p>}
         {viewMode === "table" && (
           <div className="table-header table-columns" aria-hidden="true">
             <span>From</span>
@@ -3176,62 +3342,180 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
               {laterThread.map((message) => renderThreadMessage(message))}
               {!replyOpen && (
                 <div className="reply-action-row">
-                  <button type="button" className="reply-pill" onClick={() => { setScheduleAt(""); setReplyInstruction(""); setQuickRepliesOpen(false); setReplyOpen(true); }}>
+                  <button type="button" className="reply-pill" onClick={() => { setScheduleAt(""); setReplyInstruction(""); setQuickRepliesOpen(false); setReplyExpanded(false); setReplySubjectText(replySubject); setReplyRecipients(extractEmailAddresses(replyRecipient)); setReplyRecipientDraft(""); setReplyMailboxId(defaultReplyMailbox?.id ?? null); setReplyOpen(true); }}>
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 8 4 12l5 4" /><path d="M4 12h9.5a5.5 5.5 0 0 1 5.5 5.5V19" /></svg>
                     <span>Reply</span>
                   </button>
                 </div>
               )}
               {replyOpen && (
-                <section className="reply-composer" aria-label="Reply composer">
-                  <header>
-                    <strong>Reply</strong>
-                    <span>From {replyMailbox?.email_address ?? "selected account"} to {selected.folder === "sent" && selected.recipients ? selected.recipients : selected.sender}</span>
-                  </header>
-                  <textarea ref={replyTextareaRef} autoFocus value={replyText} onChange={(event) => setReplyText(event.target.value)} placeholder="Write your reply" />
-                  <form className="reply-ai-prompt" onSubmit={(event) => { event.preventDefault(); void draftAiReply(); }}>
-                    <div className="reply-quick-replies" ref={quickReplyMenuRef}>
+                <section className={`reply-composer${replyExpanded ? " is-expanded" : ""}`} aria-label="Reply composer">
+                  <header className="reply-compose-header">
+                    <div className="reply-compose-heading">
+                      <label className="reply-subject-field">
+                        <span className="reply-field-label">Subject</span>
+                        <input
+                          aria-label="Reply subject"
+                          value={replySubjectText}
+                          onChange={(event) => setReplySubjectText(event.target.value)}
+                          placeholder="Subject"
+                        />
+                      </label>
+                      <div className="reply-recipient-field">
+                        <span className="reply-field-label">To</span>
+                        <span className="reply-recipient-input">
+                          {replyRecipients.map((address) => (
+                            <span className="reply-recipient-chip" key={address} title={address}>
+                              <span>{address}</span>
+                              <button type="button" aria-label={`Remove ${address}`} onClick={() => removeReplyRecipient(address)}>×</button>
+                            </span>
+                          ))}
+                          <input
+                            type="text"
+                            aria-label="Add destination email"
+                            value={replyRecipientDraft}
+                            onChange={(event) => setReplyRecipientDraft(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" || event.key === "," || event.key === ";") {
+                                event.preventDefault();
+                                if (!addReplyRecipients()) setBanner("Enter a valid destination email address");
+                              } else if (event.key === "Backspace" && !replyRecipientDraft && replyRecipients.length) {
+                                setReplyRecipients((current) => current.slice(0, -1));
+                              }
+                            }}
+                            onBlur={() => { if (replyRecipientDraft.trim()) addReplyRecipients(); }}
+                            placeholder={replyRecipients.length ? "Add another email" : "recipient@example.com"}
+                            inputMode="email"
+                            autoComplete="email"
+                          />
+                        </span>
+                      </div>
+                    </div>
+                    <div className="reply-window-actions">
                       <button
                         type="button"
-                        className="reply-template-trigger"
-                        aria-label="Open quick reply templates"
-                        aria-haspopup="menu"
-                        aria-expanded={quickRepliesOpen}
-                        onClick={() => setQuickRepliesOpen((open) => !open)}
+                        aria-label={replyExpanded ? "Restore reply composer" : "Expand reply composer"}
+                        data-tooltip={replyExpanded ? "Restore" : "Expand"}
+                        onClick={() => setReplyExpanded((expanded) => !expanded)}
                       >
-                        <span aria-hidden="true">✦</span>
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                          {replyExpanded
+                            ? <><path d="M9 4v5H4M15 20v-5h5" /><path d="m4 9 5-5M20 15l-5 5" /></>
+                            : <><path d="M9 4H4v5M15 20h5v-5" /><path d="m4 4 5 5M20 20l-5-5" /></>}
+                        </svg>
                       </button>
-                      {quickRepliesOpen && (
-                        <div className="reply-template-menu" role="menu" aria-label="Quick reply templates">
-                          <div className="reply-template-heading">Quick replies</div>
-                          {QUICK_REPLY_OPTIONS.map((option) => (
-                            <button key={option.id} type="button" role="menuitem" onClick={() => applyQuickReply(option.id)}>
-                              <span className="reply-template-icon" aria-hidden="true">{option.id === "interview_follow_up" ? "↗" : "↻"}</span>
-                              <span><strong>{option.label}</strong><small>{option.description}</small></span>
-                            </button>
-                          ))}
-                        </div>
-                      )}
+                      <button type="button" aria-label="Close reply composer" data-tooltip="Close" onClick={closeReplyComposer}>
+                        <UiIcon name="close" />
+                      </button>
                     </div>
+                  </header>
+                  <textarea ref={replyTextareaRef} autoFocus value={replyText} onChange={(event) => setReplyText(event.target.value)} placeholder="Enter text" />
+                  <form className="reply-ai-prompt" onSubmit={(event) => { event.preventDefault(); void draftAiReply(); }}>
+                    <button type="submit" className="reply-ai-generate" disabled={aiDrafting} aria-label="Generate reply from description">
+                      <UiIcon name="spark" />
+                      {aiDrafting ? "Drafting…" : "Generate a reply"}
+                    </button>
                     <input
                       aria-label="Describe your reply"
                       value={replyInstruction}
                       onChange={(event) => setReplyInstruction(event.target.value)}
-                      placeholder="Describe your message"
+                      placeholder="Add instructions (optional)"
                       maxLength={2000}
                       disabled={aiDrafting}
                     />
-                    <button type="submit" className="reply-ai-generate" disabled={aiDrafting} aria-label="Generate reply from description">
-                      {aiDrafting ? "Drafting…" : "Generate"}
-                    </button>
                   </form>
+                  {replyFiles.length > 0 && (
+                    <div className="reply-attachments" aria-label="Attached files">
+                      {replyFiles.map((file) => <span key={`${file.name}-${file.size}`}>{file.name}</span>)}
+                    </div>
+                  )}
                   <footer>
                     <div className="reply-compose-actions">
-                      <div className="send-split"><button type="button" className="primary-btn" disabled={sendingReply || !replyText.trim() || !replyMailbox} onClick={() => { setScheduleAt(""); void sendReply(); }}>{sendingReply ? "Sending…" : "Send"}</button><button type="button" className="primary-btn send-menu" aria-label="Schedule send" disabled={sendingReply || !replyMailbox} onClick={() => setScheduleDialogOpen(true)}>◷</button></div>
-                      <label className="reply-attach">📎 <span>Attach</span><input type="file" multiple onChange={(event) => setReplyFiles(Array.from(event.target.files ?? []))} /></label>
-                      {replyFiles.length > 0 && <span>{replyFiles.map((file) => file.name).join(", ")}</span>}
+                      <div className="reply-quick-replies" ref={quickReplyMenuRef}>
+                        <button
+                          type="button"
+                          className="reply-footer-tool reply-template-trigger"
+                          aria-label="Open quick reply templates"
+                          aria-haspopup="menu"
+                          aria-expanded={quickRepliesOpen}
+                          onClick={() => setQuickRepliesOpen((open) => !open)}
+                        >
+                          <UiIcon name="spark" />
+                          <span>AI</span>
+                        </button>
+                        {quickRepliesOpen && (
+                          <div className="reply-template-menu" role="menu" aria-label="Quick reply templates">
+                            <div className="reply-template-heading">Quick replies</div>
+                            {QUICK_REPLY_OPTIONS.map((option) => (
+                              <button key={option.id} type="button" role="menuitem" onClick={() => void applyQuickReply(option.id)}>
+                                <span className="reply-template-icon" aria-hidden="true">{option.id === "suggest_available_times" ? "◷" : option.id === "interview_follow_up" ? "↗" : "↻"}</span>
+                                <span><strong>{option.label}</strong><small>{option.description}</small></span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <label className="reply-footer-tool reply-attach" data-tooltip="Attach files">
+                        <UiIcon name="paperclip" />
+                        <input type="file" multiple onChange={(event) => setReplyFiles(Array.from(event.target.files ?? []))} />
+                      </label>
+                      <button type="button" className="reply-footer-tool" aria-label="Schedule send" data-tooltip="Schedule send" disabled={sendingReply || !replyMailbox} onClick={() => setScheduleDialogOpen(true)}>
+                        <UiIcon name="clock" />
+                      </button>
                     </div>
-                    <button className="reply-delete" type="button" aria-label="Delete reply draft" onClick={() => { setReplyOpen(false); setQuickRepliesOpen(false); setReplyText(""); setReplyInstruction(""); setReplyFiles([]); setScheduleAt(""); }}>🗑</button>
+                    <div className="reply-send-actions">
+                      <div className="reply-sender-picker" ref={replySenderMenuRef}>
+                        <button
+                          type="button"
+                          className="reply-sender-trigger"
+                          aria-label="Sender email account"
+                          aria-haspopup="listbox"
+                          aria-expanded={replySenderOpen}
+                          disabled={sendingReply || activeReplyMailboxes.length === 0}
+                          onClick={() => setReplySenderOpen((open) => !open)}
+                        >
+                          <span>{replyMailbox?.email_address ?? "No registered account"}</span>
+                          <UiIcon name="chevron-down" />
+                        </button>
+                        {replySenderOpen && (
+                          <div className="reply-sender-menu" role="listbox" aria-label="Choose sender email account">
+                            <div className="reply-sender-menu-heading">Send from</div>
+                            {activeReplyMailboxes.map((mailbox) => {
+                              const selectedSender = mailbox.id === replyMailbox?.id;
+                              return (
+                                <button
+                                  type="button"
+                                  role="option"
+                                  aria-selected={selectedSender}
+                                  className={selectedSender ? "is-selected" : ""}
+                                  key={mailbox.id}
+                                  onClick={() => { setReplyMailboxId(mailbox.id); setReplySenderOpen(false); }}
+                                >
+                                  <span className={`reply-sender-provider is-${mailbox.provider}`} aria-hidden="true">
+                                    {mailbox.provider === "google" ? "G" : "M"}
+                                  </span>
+                                  <span className="reply-sender-account">
+                                    <strong>{mailbox.email_address}</strong>
+                                    <small>{mailbox.provider === "google" ? "Google" : "Microsoft"} account</small>
+                                  </span>
+                                  {selectedSender && <UiIcon name="check" />}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        className="reply-send-button"
+                        aria-label="Send reply"
+                        data-tooltip="Send reply"
+                        disabled={sendingReply || !replyText.trim() || !replySubjectText.trim() || (replyRecipients.length === 0 && extractEmailAddresses(replyRecipientDraft).length === 0) || !replyMailbox}
+                        onClick={() => { setScheduleAt(""); void sendReply(); }}
+                      >
+                        {sendingReply ? <span className="reply-send-spinner" aria-hidden="true" /> : <UiIcon name="send" />}
+                      </button>
+                    </div>
                   </footer>
                 </section>
               )}

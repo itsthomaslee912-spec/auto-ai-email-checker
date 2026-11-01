@@ -3633,7 +3633,7 @@ async def extract_calendar_details(
         return slots, access, details, bool(slots)
     client = backend.client()
     try:
-        async with ai_call_semaphore(priority):
+        async with ai_call_semaphore(priority, provider=backend.provider):
             response = await client.chat.completions.create(
                 model=backend.model,
                 temperature=0,

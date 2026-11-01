@@ -12,7 +12,6 @@ from app.email.folders import normalize_folder
 from app.models import EmailLabel, EmailMessage, MailboxConnection
 from app.realtime.sse import publish
 from app.schemas import EmailOut
-from app.services.ai_backend import ai_call_semaphore
 from app.services.calendar_extract import (
     collapse_duplicate_calendar_events_post_commit,
     process_calendar_email,
@@ -129,35 +128,31 @@ async def ingest_normalized_message(
                 snippet=normalized.get("snippet") or "",
             )
         try:
-            # Live classification uses the active SQLite prompt. Every AI call
-            # — live ingest, bulk sync, or background reclassify — shares one
-            # priority-ordered gate so a full mailbox import cannot flood a
-            # local model or delay a live webhook email behind its backlog.
-            async with ai_call_semaphore(priority):
-                classification = await classify_email(
-                    subject=normalized.get("subject") or "",
-                    sender=normalized.get("sender") or "",
-                    body_text=normalized.get("body_text") or "",
-                    snippet=normalized.get("snippet") or "",
-                    folder=normalize_folder(normalized.get("folder")),
-                    account_email=mailbox.email_address,
-                    correction_examples=correction_examples,
-                    force_openai=force_openai,
-                    use_openai=use_openai,
-                )
+            classification = await classify_email(
+                subject=normalized.get("subject") or "",
+                sender=normalized.get("sender") or "",
+                body_text=normalized.get("body_text") or "",
+                snippet=normalized.get("snippet") or "",
+                folder=normalize_folder(normalized.get("folder")),
+                account_email=mailbox.email_address,
+                correction_examples=correction_examples,
+                force_openai=force_openai,
+                use_openai=use_openai,
+                priority=priority,
+            )
         except Exception:
             logger.exception("Classification failed; using heuristic")
-            async with ai_call_semaphore(priority):
-                classification = await classify_email(
-                    subject=normalized.get("subject") or "",
-                    sender=normalized.get("sender") or "",
-                    body_text=normalized.get("body_text") or "",
-                    snippet=normalized.get("snippet") or "",
-                    folder=normalize_folder(normalized.get("folder")),
-                    account_email=mailbox.email_address,
-                    correction_examples=correction_examples,
-                    use_openai=False,
-                )
+            classification = await classify_email(
+                subject=normalized.get("subject") or "",
+                sender=normalized.get("sender") or "",
+                body_text=normalized.get("body_text") or "",
+                snippet=normalized.get("snippet") or "",
+                folder=normalize_folder(normalized.get("folder")),
+                account_email=mailbox.email_address,
+                correction_examples=correction_examples,
+                use_openai=False,
+                priority=priority,
+            )
 
     email = EmailMessage(
         mailbox_id=mailbox.id,

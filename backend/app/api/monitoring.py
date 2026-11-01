@@ -10,6 +10,7 @@ from app.auth.session import require_admin, require_user
 from app.config import get_settings
 from app.db import get_db
 from app.models import (
+    ClassifyCorrection,
     EmailMessage,
     MailboxConnection,
     MailboxJobState,
@@ -120,6 +121,15 @@ def monitoring_snapshot(db: Session = Depends(get_db)) -> dict:
     relay = next(item for item in services if item["name"] == "event-relay")
     rabbitmq_configured = get_settings().rabbitmq_enabled
 
+    email_count = int(db.query(func.count(EmailMessage.id)).scalar() or 0)
+    pending_classification = int(db.query(func.count(EmailMessage.id)).filter(
+        EmailMessage.classification_pending.is_(True),
+        # Human corrections are authoritative and the classification worker
+        # deliberately skips them. Do not report work it will never consume.
+        EmailMessage.human_corrected.is_not(True),
+    ).scalar() or 0)
+    feedback_count = int(db.query(func.count(ClassifyCorrection.id)).scalar() or 0)
+
     return {
         "generated_at": now.isoformat(),
         "overall_status": overall,
@@ -139,15 +149,10 @@ def monitoring_snapshot(db: Session = Depends(get_db)) -> dict:
         "metrics": {
             "users": int(db.query(func.count(User.id)).filter(User.email.is_not(None)).scalar() or 0),
             "active_mailboxes": len(active_mailboxes),
-            "emails": int(db.query(func.count(EmailMessage.id)).scalar() or 0),
-            "pending_classification": int(db.query(func.count(EmailMessage.id)).filter(
-                EmailMessage.classification_pending.is_(True),
-                # Human corrections are authoritative and the classification
-                # worker deliberately skips them. Old rows can retain a stale
-                # pending bit from imports that raced with a manual correction;
-                # do not report work that the worker will never consume.
-                EmailMessage.human_corrected.is_not(True),
-            ).scalar() or 0),
+            "emails": email_count,
+            "classified_emails": max(0, email_count - pending_classification),
+            "pending_classification": pending_classification,
+            "human_feedback": feedback_count,
         },
         "queues": {
             "active_mailbox_jobs": active_jobs,

@@ -1,20 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { fetchMonitoringSnapshot, openEvents, type MonitoringService, type MonitoringSnapshot } from "../api";
+import { fetchMonitoringSnapshot, openEvents, type AiStatus, type MonitoringService, type MonitoringSnapshot } from "../api";
 
 type ViewMode = "dashboard" | "architecture";
 const VIEW_KEY = "monitoring-view";
 
 // Which pipeline stages light up when a given live event arrives. Keys match
 // the `data-stage` of each node below so the diagram shows real data flow.
-const FLOW_STAGES = ["providers", "sync", "postgres", "relay", "rabbitmq", "classification", "notification", "api", "browser"] as const;
+const FLOW_STAGES = ["providers", "sync", "postgres", "relay", "rabbitmq", "classification", "model", "notification", "api", "browser"] as const;
 type Stage = (typeof FLOW_STAGES)[number];
 const EVENT_FLOW: Record<string, Stage[]> = {
   "sync.progress": ["providers", "sync", "postgres", "relay", "rabbitmq", "notification", "api", "browser"],
   "sync.done": ["providers", "sync", "postgres", "relay", "rabbitmq", "notification", "api", "browser"],
-  "email.classified": ["classification", "postgres", "relay", "rabbitmq", "notification", "api", "browser"],
-  "reclassify.progress": ["classification", "postgres", "relay", "rabbitmq", "notification", "api", "browser"],
-  "reclassify.done": ["classification", "postgres", "relay", "rabbitmq", "notification", "api", "browser"],
-  "calendar.changed": ["classification", "postgres", "relay", "rabbitmq", "notification", "api", "browser"],
+  "email.classified": ["classification", "model", "postgres", "relay", "rabbitmq", "notification", "api", "browser"],
+  "reclassify.progress": ["classification", "model", "postgres", "relay", "rabbitmq", "notification", "api", "browser"],
+  "reclassify.done": ["classification", "model", "postgres", "relay", "rabbitmq", "notification", "api", "browser"],
+  "calendar.changed": ["classification", "model", "postgres", "relay", "rabbitmq", "notification", "api", "browser"],
 };
 const EVENT_LABELS: Record<string, string> = {
   "sync.progress": "Mailbox sync progressing",
@@ -30,6 +30,7 @@ const FLOW_ACTIVE_MS = 620;
 type FlowWindow = { start: number; end: number };
 type StreamState = "connecting" | "connected" | "reconnecting";
 type LiveActivity = { label: string; detail: string; receivedAt: number };
+type ClassificationActivity = { processed: number; total: number; updated: number; failed: number };
 
 function eventDetail(eventName: string, data: Record<string, unknown>): string {
   const mailbox = typeof data.mailbox_id === "number" ? `Mailbox #${data.mailbox_id}` : "Live system event";
@@ -112,10 +113,15 @@ const ICONS: Record<string, ReactNode> = {
   relay: <><path d="M4 12h12M12 6l6 6-6 6" /><circle cx="4" cy="12" r="1.6" /></>,
   broker: <><rect x="3" y="4" width="18" height="6" rx="2" /><rect x="3" y="14" width="18" height="6" rx="2" /><path d="M7 7h.01M7 17h.01" /></>,
   classify: <><path d="M11 3.5l1.7 4.4 4.4 1.7-4.4 1.7L11 15.7l-1.7-4.4-4.4-1.7 4.4-1.7z" /><path d="M18 14.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z" /></>,
+  model: <><rect x="5" y="5" width="14" height="14" rx="3" /><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3" /><circle cx="12" cy="12" r="3" /></>,
   notify: <><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.7 21a2 2 0 0 1-3.4 0" /></>,
   api: <><rect x="3" y="4" width="18" height="16" rx="3" /><path d="M8 9l-2 3 2 3M16 9l2 3-2 3" /></>,
   client: <><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8M12 16v4" /></>,
   store: <><ellipse cx="12" cy="5" rx="8" ry="3" /><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7" /></>,
+};
+const ICON_CODES: Record<string, string> = {
+  provider: "MX", sync: "SY", relay: "ER", broker: "MQ", classify: "AI",
+  model: "LLM", notify: "NT", api: "API", client: "UI", store: "DB",
 };
 
 function Icon({ name }: { name: keyof typeof ICONS }) {
@@ -135,8 +141,8 @@ function ArchNode({
   live?: boolean;
 }) {
   return (
-    <article className={`arch-node status-${status}${variant ? ` is-${variant}` : ""}${live ? " is-live" : ""}`} role="listitem">
-      <span className="arch-node-icon" aria-hidden="true"><Icon name={icon} /></span>
+    <article className={`arch-node status-${status}${variant ? ` is-${variant}` : ""}${live ? " is-live" : ""}`}>
+      <span className="arch-node-icon" data-code={ICON_CODES[icon] ?? "::"} aria-hidden="true"><Icon name={icon} /></span>
       <div className="arch-node-body">
         <h3>{title}</h3>
         <p>{subtitle}</p>
@@ -149,41 +155,51 @@ function ArchNode({
   );
 }
 
-type ConnectorDirection = "down" | "up" | "right" | "left" | "vertical-both" | "horizontal-both";
-
-function ArchConnector({
-  label, detail, count, error, live, direction = "down", className = "",
+function ArchitectureConnector({
+  className, label, detail, direction = "down", live, badge, badgeTone,
 }: {
+  className: string;
   label: string;
-  detail?: string;
-  count?: number;
-  error?: number;
+  detail: string;
+  direction?: "right" | "left" | "down" | "up" | "both-horizontal" | "both-vertical";
   live?: boolean;
-  direction?: ConnectorDirection;
-  className?: string;
+  badge?: string;
+  badgeTone?: "error" | "warning";
 }) {
-  const vertical = direction === "down" || direction === "up" || direction === "vertical-both";
+  const horizontal = direction === "right" || direction === "left" || direction === "both-horizontal";
+  const reverse = direction === "left" || direction === "up";
+  const bidirectional = direction === "both-horizontal" || direction === "both-vertical";
   return (
-    <div className={`arch-connector is-${direction}${vertical ? " is-vertical" : " is-horizontal"}${live ? " is-live" : ""} ${className}`} aria-hidden="true">
-      <svg viewBox={vertical ? "0 0 24 100" : "0 0 100 24"} preserveAspectRatio="none">
-        <path className="arch-connector-line" d={vertical ? "M12 4V96" : "M4 12H96"} vectorEffect="non-scaling-stroke" />
-        {(direction === "down" || direction === "vertical-both") && <path className="arch-connector-arrow" d="M7 88l5 8 5-8" vectorEffect="non-scaling-stroke" />}
-        {(direction === "up" || direction === "vertical-both") && <path className="arch-connector-arrow" d="M7 12l5-8 5 8" vectorEffect="non-scaling-stroke" />}
-        {(direction === "right" || direction === "horizontal-both") && <path className="arch-connector-arrow" d="M88 7l8 5-8 5" vectorEffect="non-scaling-stroke" />}
-        {(direction === "left" || direction === "horizontal-both") && <path className="arch-connector-arrow" d="M12 7l-8 5 8 5" vectorEffect="non-scaling-stroke" />}
+    <div
+      className={`arch-connector ${horizontal ? "is-horizontal" : "is-vertical"}${reverse ? horizontal ? " is-left" : " is-up" : ""}${bidirectional ? horizontal ? " is-horizontal-both" : " is-vertical-both" : ""}${live ? " is-live" : ""} ${className}`}
+      aria-label={`${label}: ${detail}`}
+    >
+      <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+        {horizontal ? (
+          <>
+            <path className="arch-connector-line" d="M4 50 H96" />
+            {(!reverse || bidirectional) && <path d="M90 43 L96 50 L90 57" />}
+            {(reverse || bidirectional) && <path d="M10 43 L4 50 L10 57" />}
+          </>
+        ) : (
+          <>
+            <path className="arch-connector-line" d="M50 4 V96" />
+            {(!reverse || bidirectional) && <path d="M43 90 L50 96 L57 90" />}
+            {(reverse || bidirectional) && <path d="M43 10 L50 4 L57 10" />}
+          </>
+        )}
       </svg>
-      {live && <span className="arch-packets"><i /><i /></span>}
+      {live && <span className="arch-packets" aria-hidden="true"><i /><i /></span>}
       <span className="arch-connector-chip">
         <strong>{label}</strong>
-        {detail && <small>{detail}</small>}
-        {typeof count === "number" && count > 0 && <b className="arch-edge-badge">{number(count)}</b>}
-        {typeof error === "number" && error > 0 && <b className="arch-edge-badge is-error">{number(error)} failed</b>}
+        <small>{detail}</small>
+        {badge != null && <em className={`arch-edge-badge${badgeTone ? ` is-${badgeTone}` : ""}`}>{badge}</em>}
       </span>
     </div>
   );
 }
 
-export default function MonitoringPage({ active }: { active: boolean }) {
+export default function MonitoringPage({ active, aiStatus, aiStatusOffline }: { active: boolean; aiStatus: AiStatus | null; aiStatusOffline: boolean }) {
   const [snapshot, setSnapshot] = useState<MonitoringSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -232,15 +248,27 @@ export default function MonitoringPage({ active }: { active: boolean }) {
   );
   const nodeMeta = (service?: MonitoringService): string =>
     service ? `${service.replicas} ${service.replicas === 1 ? "replica" : "replicas"} · ${relativeTime(service.last_seen_at)}` : "No data";
+  const aiProvider = aiStatus?.provider === "openai"
+    ? "OpenAI"
+    : aiStatus?.provider === "gemini"
+      ? "Google Gemini"
+      : aiStatus?.provider === "ollama"
+        ? "Ollama"
+        : "AI provider";
+  const aiModelState = aiStatusOffline ? "offline" : !aiStatus ? "stale" : aiStatus.ready ? "healthy" : "degraded";
+  const aiModelStateLabel = aiStatusOffline ? "unreachable" : !aiStatus ? "checking" : aiStatus.ready ? "ready" : "not ready";
 
   // Live data flow: subscribe to the shared event stream and briefly light up
   // the pipeline stages each event passes through, so the diagram animates
   // actual traffic (a synced email, a classification, a calendar update).
   const pulsesRef = useRef<Partial<Record<Stage, FlowWindow>>>({});
+  const snapshotRefreshTimerRef = useRef<number | null>(null);
   const [, setFlowTick] = useState(0);
   const [streamState, setStreamState] = useState<StreamState>("connecting");
   const [lastActivity, setLastActivity] = useState<LiveActivity | null>(null);
   const [liveEventCount, setLiveEventCount] = useState(0);
+  const [liveClassificationCount, setLiveClassificationCount] = useState(0);
+  const [classificationActivity, setClassificationActivity] = useState<ClassificationActivity | null>(null);
   useEffect(() => {
     if (!active || view !== "architecture") return;
     const stream = openEvents();
@@ -262,6 +290,24 @@ export default function MonitoringPage({ active }: { active: boolean }) {
       });
       setLastActivity({ label: EVENT_LABELS[eventName] ?? eventName, detail: eventDetail(eventName, data), receivedAt: now });
       setLiveEventCount((count) => count + 1);
+      if (eventName === "email.classified") setLiveClassificationCount((count) => count + 1);
+      if (eventName === "reclassify.progress") {
+        setClassificationActivity({
+          processed: typeof data.processed === "number" ? data.processed : 0,
+          total: typeof data.total === "number" ? data.total : 0,
+          updated: typeof data.updated === "number" ? data.updated : 0,
+          failed: typeof data.failed === "number" ? data.failed : 0,
+        });
+      } else if (eventName === "reclassify.done") {
+        setClassificationActivity(null);
+      }
+      if (["email.classified", "sync.done", "reclassify.progress", "reclassify.done"].includes(eventName)) {
+        if (snapshotRefreshTimerRef.current != null) window.clearTimeout(snapshotRefreshTimerRef.current);
+        snapshotRefreshTimerRef.current = window.setTimeout(() => {
+          snapshotRefreshTimerRef.current = null;
+          void load(true);
+        }, 250);
+      }
       setFlowTick((tick) => tick + 1);
     };
     for (const [eventName, stages] of Object.entries(EVENT_FLOW)) {
@@ -289,8 +335,10 @@ export default function MonitoringPage({ active }: { active: boolean }) {
       handlers.forEach(([name, handler]) => stream.removeEventListener(name, handler));
       stream.close();
       window.clearInterval(ticker);
+      if (snapshotRefreshTimerRef.current != null) window.clearTimeout(snapshotRefreshTimerRef.current);
+      snapshotRefreshTimerRef.current = null;
     };
-  }, [active, view]);
+  }, [active, view, load]);
 
   const flowNow = Date.now();
   const liveStage = (stage: Stage): boolean => {
@@ -299,6 +347,10 @@ export default function MonitoringPage({ active }: { active: boolean }) {
   };
   const liveEdge = (from: Stage, to: Stage): boolean => liveStage(from) || liveStage(to);
   const flowing = FLOW_STAGES.some(liveStage);
+  const classifiedEmails = snapshot
+    ? snapshot.metrics.classified_emails ?? Math.max(0, snapshot.metrics.emails - snapshot.metrics.pending_classification)
+    : 0;
+  const humanFeedback = snapshot?.metrics.human_feedback ?? 0;
 
   if (loading && !snapshot) {
     return <main className="monitoring-page"><div className="monitoring-loading"><span className="monitoring-spinner" />Loading system health…</div></main>;
@@ -390,79 +442,112 @@ export default function MonitoringPage({ active }: { active: boolean }) {
               <div className="arch-live-stat"><span>Last event</span><strong>{lastActivity ? relativeTime(new Date(lastActivity.receivedAt).toISOString()) : "—"}</strong></div>
             </div>
 
-            <div className="arch-diagram" role="list" aria-label="System service topology">
-              <div className="arch-zone-label arch-zone-external"><span>External systems</span></div>
-              <div className="arch-zone-label arch-zone-data"><span>Durable data plane</span></div>
-              <div className="arch-zone-label arch-zone-client"><span>Client channel</span></div>
+            <section className="arch-blueprint-metrics arch-runtime-metrics" aria-label="Live architecture metrics">
+                <article><span>Stored emails</span><strong>{number(snapshot.metrics.emails)}</strong><small>Authoritative records</small></article>
+                <article><span>Classified</span><strong>{number(classifiedEmails)}</strong><small>{snapshot.metrics.emails ? `${Math.round(classifiedEmails / snapshot.metrics.emails * 100)}% complete` : "No stored mail"}</small></article>
+                <article className={snapshot.metrics.pending_classification ? "has-pressure" : ""}><span>Pending AI</span><strong>{number(snapshot.metrics.pending_classification)}</strong><small>Queued or processing</small></article>
+                <article><span>Human feedback</span><strong>{number(humanFeedback)}</strong><small>Saved corrections</small></article>
+                <article><span>Live classifications</span><strong>{number(liveClassificationCount)}</strong><small>This browser session</small></article>
+                <article><span>Active jobs</span><strong>{number(snapshot.queues.active_mailbox_jobs)}</strong><small>Mailbox operations</small></article>
+            </section>
 
-              <div className="arch-slot arch-slot-providers">
-                <ArchNode live={liveStage("providers")}
-                  icon="provider" title="Email providers" subtitle="Gmail API · Microsoft Graph" variant="endpoint"
-                  status={snapshot.mailbox_issues.length ? "stale" : "healthy"}
-                  statusLabel={snapshot.mailbox_issues.length ? `${snapshot.mailbox_issues.length} issues` : "connected"}
-                  meta={`${number(snapshot.metrics.active_mailboxes)} mailboxes`}
-                />
-              </div>
-              <ArchConnector className="arch-route-provider" label="Inbound mail" detail="webhook + safety polling" count={snapshot.queues.pending_webhooks} live={liveEdge("providers", "sync")} />
-              <div className="arch-slot arch-slot-browser">
-                <ArchNode live={liveStage("browser")} icon="client" title="Browser UI" subtitle="Inbox · calendar · in-app alerts" variant="endpoint"
-                  status="healthy" statusLabel="connected" meta="reconnectable event stream" />
-              </div>
-              <ArchConnector className="arch-route-browser" label="HTTPS" detail="REST ↓ · WebSocket ↑" direction="vertical-both" live={liveEdge("api", "browser")} />
-
-              <div className="arch-slot arch-slot-sync">
-                <ArchNode live={liveStage("sync")} icon="sync" title="Sync worker" subtitle="Webhook and polling mailbox ingestion"
-                  status={svc("sync-worker")?.status ?? "offline"} meta={`${number(snapshot.queues.active_mailbox_jobs)} jobs · ${nodeMeta(svc("sync-worker"))}`} />
-              </div>
-              <ArchConnector className="arch-route-sync-db" label="Commit" detail="emails + job state" direction="right" live={liveEdge("sync", "postgres")} />
-              <div className="arch-slot arch-slot-postgres">
-                <ArchNode live={liveStage("postgres")} icon="store" title="PostgreSQL" subtitle="Mail · jobs · activity log · transactional outbox" variant="store"
-                  status={snapshot.infrastructure.postgres.status} meta={`${number(snapshot.metrics.emails)} emails stored`} />
-              </div>
-              <ArchConnector className="arch-route-db-api" label="Application data" detail="queries ↔ commands" direction="horizontal-both" live={liveEdge("postgres", "api")} />
-              <div className="arch-slot arch-slot-api">
-                <ArchNode live={liveStage("api")} icon="api" title="Email API" subtitle={svc("email-api")?.description ?? "REST · OAuth · webhooks · WebSocket events"}
-                  status={svc("email-api")?.status ?? "offline"} meta={nodeMeta(svc("email-api"))} />
-              </div>
-
-              <ArchConnector className="arch-route-outbox" label="Transactional outbox" detail="claim pending events" count={snapshot.queues.pending_events} error={snapshot.queues.failed_events} live={liveEdge("postgres", "relay")} />
-              <div className="arch-slot arch-slot-relay">
-                <ArchNode live={liveStage("relay")} icon="relay" title="Event relay" subtitle={svc("event-relay")?.description ?? "Outbox publisher with confirms"}
-                  status={svc("event-relay")?.status ?? "offline"} meta={nodeMeta(svc("event-relay"))} />
-              </div>
-              <ArchConnector className="arch-route-publish" label="Topic publish" detail="publisher confirms" live={liveEdge("relay", "rabbitmq")} />
-
-              <div className="arch-zone-label arch-zone-worker"><span>Async consumers</span></div>
+            <div className="arch-diagram" role="group" aria-label="Live system architecture and data flow">
+              <div className="arch-zone-label arch-zone-external"><span>External integrations</span></div>
+              <div className="arch-zone-label arch-zone-data"><span>Durable platform core</span></div>
+              <div className="arch-zone-label arch-zone-client"><span>Client experience</span></div>
+              <div className="arch-zone-label arch-zone-worker"><span>Async compute</span></div>
               <div className="arch-zone-label arch-zone-broker"><span>Event backbone</span></div>
               <div className="arch-zone-label arch-zone-delivery"><span>Notification delivery</span></div>
 
-              <div className="arch-slot arch-slot-classification">
-                <ArchNode live={liveStage("classification")} icon="classify" title="Classification worker" subtitle="Consumes imports · writes AI labels and calendar"
-                  status={svc("classification-worker")?.status ?? "offline"}
-                  statusLabel={statusText(svc("classification-worker")?.status ?? "offline")}
-                  meta={svc("classification-worker")?.status === "recovering" ? "rebuilding broker channel" : nodeMeta(svc("classification-worker"))} />
+              <div className="arch-slot arch-slot-providers">
+                  <ArchNode live={liveStage("providers")} icon="provider" title="Email providers" subtitle="Gmail API · Microsoft Graph"
+                    status={snapshot.mailbox_issues.length ? "stale" : "healthy"}
+                    statusLabel={snapshot.mailbox_issues.length ? `${snapshot.mailbox_issues.length} issues` : "connected"}
+                    meta={`${number(snapshot.metrics.active_mailboxes)} mailboxes`} />
               </div>
-              <ArchConnector className="arch-route-classify" label="email.imported.v1" detail="durable work queue" direction="left" count={snapshot.metrics.pending_classification} live={liveEdge("rabbitmq", "classification")} />
+
+              <ArchitectureConnector className="arch-route-provider" label="Inbound mail" detail="webhook + safety polling" direction="down" live={liveEdge("providers", "sync")} badge={`${number(snapshot.queues.pending_webhooks)} pending`} badgeTone={snapshot.queues.pending_webhooks ? "warning" : undefined} />
+
+              <div className="arch-slot arch-slot-sync">
+                  <ArchNode live={liveStage("sync")} icon="sync" title="Sync worker" subtitle="Webhook and polling ingestion"
+                    status={svc("sync-worker")?.status ?? "offline"} meta={`${number(snapshot.queues.active_mailbox_jobs)} jobs · ${nodeMeta(svc("sync-worker"))}`} />
+              </div>
+
+              <ArchitectureConnector className="arch-route-sync-db" label="Atomic commit" detail="email + job state + outbox" direction="right" live={liveEdge("sync", "postgres")} badge={`${number(snapshot.queues.active_mailbox_jobs)} jobs`} />
+
+              <div className="arch-slot arch-slot-postgres">
+                <ArchNode live={liveStage("postgres")} icon="store" title="PostgreSQL" subtitle="System of record · transactional outbox"
+                  status={snapshot.infrastructure.postgres.status} meta={`${number(snapshot.metrics.emails)} emails · ${number(humanFeedback)} feedback`} variant="store" />
+              </div>
+
+              <ArchitectureConnector className="arch-route-db-api" label="Application data" detail="queries + commands" direction="both-horizontal" live={liveEdge("postgres", "api")} badge={number(snapshot.metrics.emails)} />
+
+              <div className="arch-slot arch-slot-api">
+                <ArchNode live={liveStage("api")} icon="api" title="Email API" subtitle="REST · OAuth · WebSocket gateway"
+                  status={svc("email-api")?.status ?? "offline"} meta={nodeMeta(svc("email-api"))} />
+              </div>
+
+              <ArchitectureConnector className="arch-route-outbox" label="Transactional outbox" detail="claim pending events" direction="down" live={liveEdge("postgres", "relay")} badge={`${number(snapshot.queues.pending_events)} pending`} badgeTone={snapshot.queues.pending_events ? "warning" : undefined} />
+
+              <div className="arch-slot arch-slot-relay">
+                <ArchNode live={liveStage("relay")} icon="relay" title="Event relay" subtitle="Claims and publishes committed events"
+                  status={svc("event-relay")?.status ?? "offline"} meta={nodeMeta(svc("event-relay"))} />
+              </div>
+
+              <ArchitectureConnector className="arch-route-publish" label="Topic publish" detail="publisher confirms" direction="down" live={liveEdge("relay", "rabbitmq")} badge={snapshot.queues.failed_events ? `${number(snapshot.queues.failed_events)} failed` : "confirmed"} badgeTone={snapshot.queues.failed_events ? "error" : undefined} />
+
               <div className="arch-slot arch-slot-rabbitmq">
-                <ArchNode live={liveStage("rabbitmq")} icon="broker" title="RabbitMQ" subtitle="Topic exchange · durable queues · acknowledgements" variant="store"
+                <ArchNode live={liveStage("rabbitmq")} icon="broker" title="RabbitMQ" subtitle="Topic exchange · durable queues"
                   status={snapshot.infrastructure.rabbitmq.status}
-                  statusLabel={snapshot.infrastructure.rabbitmq.status === "disabled" ? "disabled" : undefined}
-                  meta={snapshot.infrastructure.rabbitmq.status === "disabled" ? "database fallback active" : "aec.events exchange"} />
+                  statusLabel={snapshot.infrastructure.rabbitmq.status === "disabled" ? "fallback" : undefined}
+                  meta={snapshot.infrastructure.rabbitmq.status === "disabled" ? "PostgreSQL fallback" : "aec.events exchange"} />
               </div>
-              <ArchConnector className="arch-route-notify" label="user.activity.v1" detail="durable consumer" direction="right" live={liveEdge("rabbitmq", "notification")} />
+
+              <ArchitectureConnector className="arch-route-classify" label="emailImported.v1" detail="durable work queue" direction="left" live={liveEdge("rabbitmq", "classification")} badge={`${number(snapshot.metrics.pending_classification)} pending`} badgeTone={snapshot.metrics.pending_classification ? "warning" : undefined} />
+
+              <div className="arch-slot arch-slot-classification">
+                  <ArchNode live={liveStage("classification")} icon="classify" title="Classification worker" subtitle="AI labels and calendar projection"
+                    status={svc("classification-worker")?.status ?? "offline"}
+                    statusLabel={statusText(svc("classification-worker")?.status ?? "offline")}
+                    meta={classificationActivity
+                      ? `${number(classificationActivity.processed)}/${number(classificationActivity.total)} processed · ${number(classificationActivity.updated)} updated${classificationActivity.failed ? ` · ${number(classificationActivity.failed)} failed` : ""}`
+                      : `${number(snapshot.metrics.pending_classification)} pending · ${nodeMeta(svc("classification-worker"))}`} />
+              </div>
+
+              <ArchitectureConnector className="arch-route-model" label="AI inference" detail="prompt ↔ structured result" direction="up" live={liveEdge("classification", "model")} />
+
+              <div className="arch-slot arch-slot-model">
+                <ArchNode live={liveStage("model")} icon="model" title="AI provider" subtitle={`${aiProvider} · ${aiStatus?.model ?? "Checking model"}`}
+                  status={aiModelState} statusLabel={aiModelStateLabel}
+                  meta={aiStatusOffline ? "Status unavailable" : aiStatus?.ready ? "Inference ready" : aiStatus?.reason ?? "Checking readiness"} />
+              </div>
+
+              <ArchitectureConnector className="arch-route-notify" label="user.activity.v1" detail="durable consumer" direction="right" live={liveEdge("rabbitmq", "notification")} />
+
               <div className="arch-slot arch-slot-notification">
-                <ArchNode live={liveStage("notification")} icon="notify" title="Notification service" subtitle="Persists in-app notifications · emits delivery events"
+                <ArchNode live={liveStage("notification")} icon="notify" title="Notification service" subtitle="Durable in-app alert delivery"
                   status={svc("notification-service")?.status ?? "offline"} meta={nodeMeta(svc("notification-service"))} />
               </div>
-              <ArchConnector className="arch-route-ready" label="notification.ready.v1" detail="outbox → broker → API" direction="up" live={liveEdge("notification", "api")} />
+
+              <ArchitectureConnector className="arch-route-ready" label="notification.ready.v1" detail="outbox → broker → API" direction="up" live={liveEdge("notification", "api")} />
+
+              <ArchitectureConnector className="arch-route-browser" label="HTTPS + WebSocket" detail="commands ↔ live updates" direction="both-vertical" live={liveEdge("api", "browser")} />
+
+              <div className="arch-slot arch-slot-browser">
+                <ArchNode live={liveStage("browser")} icon="client" title="Browser application" subtitle="Inbox · calendar · monitoring"
+                  status={streamState === "connected" ? "healthy" : "recovering"}
+                  statusLabel={streamState === "connected" ? "connected" : streamState}
+                  meta={`${number(snapshot.metrics.users)} user · ${number(liveEventCount)} live events`} variant="endpoint" />
+              </div>
             </div>
 
-            <div className="arch-contracts" aria-label="Runtime message flows">
-              <article><span>01</span><div><strong>Ingest</strong><p>Provider → sync worker → PostgreSQL</p></div></article>
-              <article><span>02</span><div><strong>Classify</strong><p>Outbox → RabbitMQ → AI worker → PostgreSQL</p></div></article>
-              <article><span>03</span><div><strong>Notify</strong><p>Activity event → notification service → API → WebSocket</p></div></article>
-              <article><span>04</span><div><strong>Recover</strong><p>PostgreSQL remains authoritative during broker or browser reconnects</p></div></article>
-            </div>
+            <section className="arch-contracts" aria-label="Architecture guarantees">
+              <article><span>01</span><div><strong>At-least-once ingestion</strong><p>Provider webhooks are backed by safety polling; idempotent commits prevent duplicate email records.</p></div></article>
+              <article><span>02</span><div><strong>Transactional delivery</strong><p>Email state and outbox events commit together before the relay publishes durable messages.</p></div></article>
+              <article><span>03</span><div><strong>Human-in-the-loop AI</strong><p>The classifier combines the selected model with saved corrections and projects interview calendar data.</p></div></article>
+              <article><span>04</span><div><strong>Recoverable live updates</strong><p>PostgreSQL stays authoritative while workers, the broker, model, or browser reconnect independently.</p></div></article>
+            </section>
+
           </section>
         ) : (
           <>

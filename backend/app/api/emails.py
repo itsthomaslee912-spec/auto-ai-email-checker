@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import base64
+import re
 import threading
 import time
+from email.utils import getaddresses
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -74,6 +76,21 @@ _label_effect_locks: dict[int, threading.Lock] = {}
 _LIST_META_TTL_SECONDS = 30.0
 _list_meta_cache: dict[tuple, tuple[float, dict]] = {}
 _list_meta_cache_lock = threading.Lock()
+_RECIPIENT_EMAIL_RE = re.compile(r"^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.I)
+
+
+def _parse_recipient_addresses(value: str) -> list[str]:
+    """Return unique valid destinations from comma/semicolon separated input."""
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for _name, address in getaddresses([value.replace(";", ",")]):
+        candidate = address.strip()
+        key = candidate.lower()
+        if not candidate or not _RECIPIENT_EMAIL_RE.fullmatch(candidate) or key in seen:
+            continue
+        seen.add(key)
+        parsed.append(candidate)
+    return parsed
 _LIST_COLUMNS = load_only(
     EmailMessage.id,
     EmailMessage.mailbox_id,
@@ -976,9 +993,10 @@ async def send_email(payload: SendEmailIn, db: Session = Depends(get_db)) -> Sen
     if mailbox is None:
         raise HTTPException(status_code=404, detail="Mailbox not found")
 
-    to_address = payload.to_address.strip()
-    if "@" not in to_address:
-        raise HTTPException(status_code=400, detail="Invalid recipient email")
+    to_addresses = _parse_recipient_addresses(payload.to_address)
+    if not to_addresses:
+        raise HTTPException(status_code=400, detail="Enter at least one valid recipient email")
+    to_address = ", ".join(to_addresses)
     try:
         attachments = [{
             "name": item.name,
@@ -1005,7 +1023,7 @@ async def send_email(payload: SendEmailIn, db: Session = Depends(get_db)) -> Sen
             in_reply_to, references = await gmail_reply_headers(token, original.provider_message_id)
         result = await gmail_send_message(
             token,
-            to_address=to_address,
+            to_addresses=to_addresses,
             subject=payload.subject.strip() or "(no subject)",
             body_text=payload.body_text,
             from_name=mailbox.display_name,
@@ -1023,14 +1041,14 @@ async def send_email(payload: SendEmailIn, db: Session = Depends(get_db)) -> Sen
             await outlook_reply_message(
                 token,
                 original.provider_message_id,
-                to_address=to_address,
+                to_addresses=to_addresses,
                 body_text=payload.body_text,
                 attachments=attachments,
             )
         else:
             await outlook_send_message(
                 token,
-                to_address=to_address,
+                to_addresses=to_addresses,
                 subject=payload.subject.strip() or "(no subject)",
                 body_text=payload.body_text,
                 attachments=attachments,

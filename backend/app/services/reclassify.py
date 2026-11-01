@@ -17,7 +17,7 @@ from app.config import get_settings
 from app.models import CalendarEvent, EmailLabel, EmailMessage, MailboxConnection
 from app.realtime.sse import publish
 from app.schemas import EmailOut
-from app.services.ai_backend import AI_CALL_CONCURRENCY, ai_call_semaphore, get_ai_backend
+from app.services.ai_backend import ai_call_concurrency, get_ai_backend
 from app.services.calendar_extract import (
     CALENDAR_LABELS,
     clean_company_name,
@@ -352,17 +352,17 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                     snippet=row.snippet or "",
                 ) if ai_only else None
                 if result is None:
-                    async with ai_call_semaphore(ai_priority):
-                        result = await classify_email(
-                            subject=row.subject or "",
-                            sender=row.sender or "",
-                            body_text=row.body_text or "",
-                            snippet=row.snippet or "",
-                            folder=row.folder or "inbox",
-                            account_email=account_email,
-                            correction_examples=correction_examples,
-                            force_openai=True,
-                        )
+                    result = await classify_email(
+                        subject=row.subject or "",
+                        sender=row.sender or "",
+                        body_text=row.body_text or "",
+                        snippet=row.snippet or "",
+                        folder=row.folder or "inbox",
+                        account_email=account_email,
+                        correction_examples=correction_examples,
+                        force_openai=True,
+                        priority=ai_priority,
+                    )
             except Exception:
                 logger.exception("Reclassify failed for email %s", row.id)
                 if getattr(get_settings(), "email_classification_mode", "hybrid").strip().lower() == "ai_only":
@@ -380,6 +380,7 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                         account_email=account_email,
                         correction_examples=correction_examples,
                         use_openai=False,
+                        priority=ai_priority,
                     )
                 except Exception:
                     logger.exception("Heuristic fallback failed for email %s", row.id)
@@ -555,7 +556,7 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
         # Small batches so progress moves even when the model is slow. A full
         # historical pass continuously re-reads pending rows so mail imported
         # after its original snapshot jumps ahead of the backlog.
-        batch_size = AI_CALL_CONCURRENCY
+        batch_size = ai_call_concurrency(backend.provider)
         remaining = list(rows)
         known_ids = {row.id for row in remaining}
         pending_retry_after: dict[int, float] = {}

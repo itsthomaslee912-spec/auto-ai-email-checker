@@ -637,7 +637,7 @@ async def gmail_reply_headers(access_token: str, message_id: str) -> tuple[str |
 async def gmail_send_message(
     access_token: str,
     *,
-    to_address: str,
+    to_addresses: list[str],
     subject: str,
     body_text: str,
     from_name: str | None = None,
@@ -662,7 +662,7 @@ async def gmail_send_message(
             encoders.encode_base64(part)
             part.add_header("Content-Disposition", "attachment", filename=item["name"])
             message.attach(part)
-    message["To"] = to_address
+    message["To"] = ", ".join(to_addresses)
     message["Subject"] = subject
     if from_email:
         message["From"] = formataddr((from_name, from_email)) if from_name else from_email

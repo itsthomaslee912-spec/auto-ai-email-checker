@@ -17,12 +17,8 @@ from app.models import AiSettings
 
 GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
-# Ollama (and most local models) serialize GPU work, so every AI classification
-# call shares this one gate — whether it comes from live ingest, a bulk sync
-# now classifying inline, or a background reclassify pass. Without it, a full
-# mailbox import or several mailboxes syncing at once would fire concurrent
-# calls and flood the local model, which previously starved /api/health and
-# triggered supervisor restarts.
+# Legacy default retained for test and third-party imports. Runtime gates use
+# provider-specific settings via ``ai_call_concurrency`` below.
 AI_CALL_CONCURRENCY = 1
 
 _PRIORITY_TIER = {"live": 0, "background": 1}
@@ -84,25 +80,42 @@ class _PriorityGate:
 
 
 _ai_call_gate: _PriorityGate | None = None
+_ai_call_gates: dict[str, _PriorityGate] = {}
 
 
-def _gate() -> _PriorityGate:
+def ai_call_concurrency(provider: str) -> int:
+    settings = get_settings()
+    configured = settings.ai_ollama_concurrency if provider == "ollama" else (
+        settings.ai_cloud_concurrency if provider in {"openai", "gemini"} else AI_CALL_CONCURRENCY
+    )
+    return max(1, min(int(configured), 32))
+
+
+def _gate(provider: str) -> _PriorityGate:
     global _ai_call_gate
+    # Tests and maintenance helpers historically reset this sentinel directly.
+    # Preserve that contract while keeping independent provider gates.
     if _ai_call_gate is None:
-        _ai_call_gate = _PriorityGate(AI_CALL_CONCURRENCY)
-    return _ai_call_gate
+        _ai_call_gates.clear()
+    gate = _ai_call_gates.get(provider)
+    if gate is None:
+        gate = _PriorityGate(ai_call_concurrency(provider))
+        _ai_call_gates[provider] = gate
+    _ai_call_gate = gate
+    return gate
 
 
 @asynccontextmanager
-async def ai_call_semaphore(priority: str = "live"):
-    """Serialize AI calls behind the shared Ollama-safe gate.
+async def ai_call_semaphore(priority: str = "live", provider: str = "ollama"):
+    """Limit AI calls with a provider-specific, priority-aware gate.
 
     priority="live" (the default) is for anything a user is waiting on right
     now — a webhook-delivered email, a manual repair action. Pass
     priority="background" for bulk sync and reclassify passes so they never
-    delay a live classification that arrives while they're running.
+    delay a queued live classification. Ollama remains serialized while cloud
+    providers can use multiple configured request slots.
     """
-    gate = _gate()
+    gate = _gate(provider)
     tier = _PRIORITY_TIER.get(priority, 1)
     await gate._acquire(tier)
     try:
