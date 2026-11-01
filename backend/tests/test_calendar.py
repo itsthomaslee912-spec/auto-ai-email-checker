@@ -558,6 +558,107 @@ def test_calendar_repair_prunes_unrelated_employers_and_restores_source_company(
         assert linked_ids == {within.id}
 
 
+def test_vizient_repair_rejects_hiring_manager_and_prunes_stale_interview_link():
+    factory, (mailbox_id, _) = _database()
+    start = datetime(2026, 11, 2, 14, 0, tzinfo=timezone.utc)
+    role = "Staff Software Engineer with Agentic AI"
+    with factory() as db:
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="vizient-invitation",
+            thread_id="vizient-invitation-thread",
+            subject=f"Vizient Interview Invitation: {role}",
+            sender="Sowmya Gullapalli <sowmya.gullapalli@vizientinc.com>",
+            received_at=start - timedelta(hours=14),
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="Hiring Manager",
+            job_role=role,
+        )
+        scheduled = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="vizient-scheduled",
+            thread_id="vizient-scheduled-thread",
+            subject="Scheduled: Ryan Queen <> Vizient",
+            sender="Sowmya Gullapalli <sowmya.gullapalli@vizientinc.com>",
+            received_at=start - timedelta(minutes=4),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="Vizientinc",
+            job_role=role,
+        )
+        source = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="vizient-calendar-invite",
+            thread_id="vizient-calendar-thread",
+            subject=f"Sowmya Gullapalli and Ryan Queen Discuss {role} Opportunity",
+            sender='"Gullapalli,Sowmya" <sowmya.gullapalli@vizientinc.com>',
+            received_at=start - timedelta(minutes=4),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="Hiring Manager",
+            job_role=role,
+        )
+        stale = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="ridgeline-stale-link",
+            thread_id="ridgeline-thread",
+            subject="UPDATE: Ridgeline Zoom Interview Confirmation",
+            sender="Deana Coffey <deana.coffey@ridgelineapps.com>",
+            received_at=start - timedelta(days=9),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="time_change",
+            company="Hiring Manager",
+            job_role="",
+        )
+        db.add_all([invitation, scheduled, source, stale])
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=source.id,
+            source_thread_id=source.thread_id,
+            kind="confirmed",
+            origin="email",
+            title=f"Hiring Manager — {role}",
+            company="Hiring Manager",
+            job_role=role,
+            start_at=start,
+            end_at=start + timedelta(minutes=30),
+            meeting_type="video",
+            meeting_provider="Microsoft Teams",
+            is_visible=True,
+        )
+        db.add(event)
+        db.flush()
+        db.add_all(
+            CalendarEventEmail(event_id=event.id, email_id=item.id)
+            for item in (invitation, scheduled, source, stale)
+        )
+        db.commit()
+
+        assert collapse_duplicate_calendar_events(db, mailbox_id) is True
+        db.commit()
+
+        assert event.company == "Vizient"
+        assert event.title == f"Vizient — {role}"
+        linked_ids = {
+            row[0]
+            for row in db.query(CalendarEventEmail.email_id)
+            .filter(CalendarEventEmail.event_id == event.id)
+            .all()
+        }
+        assert linked_ids == {invitation.id, scheduled.id, source.id}
+
+        # A previous resolver persisted the raw sender-domain brand before the
+        # public subject spelling was available. Repair that legacy value too.
+        event.company = "Vizientinc"
+        event.title = f"Vizientinc — {role}"
+        db.commit()
+        assert repair_placeholder_calendar_fields(db, mailbox_id) == 1
+        db.commit()
+        assert event.company == "Vizient"
+        assert event.title == f"Vizient — {role}"
+
+
 def test_time_change_uses_ics_uid_across_threads_to_move_existing_chip():
     factory, (mailbox_id, _) = _database()
     zoom_url = "https://us02web.zoom.us/j/12345678901?pwd=StuutInterview"
@@ -1714,6 +1815,85 @@ def test_repair_uses_a_linked_invite_for_the_same_appointment():
         assert event.meeting_url == join_url
         collapse_duplicate_calendar_events(db, mailbox_id)
         assert event.meeting_url == join_url
+
+
+def test_boston_scientific_keeps_paradox_join_fallback_and_prunes_lila_link():
+    factory, (mailbox_id, _) = _database()
+    start = datetime(2026, 11, 4, 15, 30, tzinfo=timezone.utc)
+    landing_url = "https://oli.vi/jbNCdnUW"
+    role = "Senior Continuous Integration (CI) Engineer"
+    with factory() as db:
+        confirmation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="boston-scientific-confirmed",
+            thread_id="boston-scientific-thread",
+            subject="Your virtual interview with Boston Scientific",
+            sender="Olivia from Boston Scientific <BSCI-paradoxai-SVC@bsci.com>",
+            received_at=datetime(2026, 10, 26, 22, 42, tzinfo=timezone.utc),
+            body_text=(
+                "Your virtual interview with Boston Scientific is Confirmed!\n"
+                "BEGIN:VCALENDAR\nBEGIN:VEVENT\n"
+                "DTSTART:20261104T153000Z\nDTEND:20261104T160000Z\n"
+                "DESCRIPTION:Click here to join the interview by Microsoft Teams: "
+                "https://oli.vi/jbNCdnUW \\nMeeting ID: 2386273504790931\n"
+                f"LOCATION:{landing_url}\nEND:VEVENT\nEND:VCALENDAR"
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="Boston Scientific",
+            job_role=role,
+        )
+        unrelated = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="lila-sciences-unrelated",
+            thread_id="lila-sciences-thread",
+            subject="Thank you for applying to Lila Sciences",
+            sender="no-reply@us.greenhouse-mail.io",
+            received_at=datetime(2026, 10, 22, 8, 45, tzinfo=timezone.utc),
+            body_text="Thank you from our scientific recruiting team.",
+            label=EmailLabel.APPLICATION_CONFIRMATION.value,
+            company="Lila Sciences",
+            job_role="",
+        )
+        db.add_all([confirmation, unrelated])
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=confirmation.id,
+            source_thread_id=confirmation.thread_id,
+            kind="confirmed",
+            origin="email",
+            title=f"Boston Scientific — {role}",
+            company="Boston Scientific",
+            job_role=role,
+            start_at=start,
+            end_at=start + timedelta(minutes=30),
+            meeting_type="video",
+            meeting_provider="Microsoft Teams",
+            meeting_url=None,
+            is_visible=True,
+        )
+        db.add(event)
+        db.flush()
+        db.add_all([
+            CalendarEventEmail(event_id=event.id, email_id=confirmation.id),
+            CalendarEventEmail(event_id=event.id, email_id=unrelated.id),
+        ])
+        db.commit()
+
+        assert repair_meeting_join_urls(db, mailbox_id) == 1
+        assert event.meeting_url == landing_url
+        assert event.meeting_provider == "Microsoft Teams"
+        assert collapse_duplicate_calendar_events(db, mailbox_id) is True
+        db.commit()
+
+        linked_ids = {
+            row[0]
+            for row in db.query(CalendarEventEmail.email_id)
+            .filter(CalendarEventEmail.event_id == event.id)
+            .all()
+        }
+        assert linked_ids == {confirmation.id}
 
 
 def test_teamtailor_landing_page_resolves_provider_join_url(monkeypatch):
@@ -8358,6 +8538,70 @@ def test_deshaw_reply_to_accepted_invite_with_availability_ask_returns_no_slots(
     )
     slots = authoritative_reschedule_slots(email)
     assert slots == []
+
+
+def test_deshaw_booking_inherits_webex_provider_while_join_link_is_pending():
+    factory, (mailbox_id, _) = _database()
+    role = "Generative AI Technical roles"
+    with factory() as db:
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="deshaw-provider-invitation",
+            thread_id="deshaw-provider-thread",
+            subject="From the D. E. Shaw group inviting you to a video interview",
+            sender="Max Ma <deshaw+email@talent.icims.com>",
+            received_at=datetime(2026, 10, 30, 19, 9, tzinfo=timezone.utc),
+            body_text=(
+                "We would like to schedule a 45-minute video interview with you via Webex "
+                "(we'll share details on how to connect once your interview is scheduled)."
+            ),
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="D. E. Shaw & Co., L.P",
+            job_role=role,
+        )
+        booking = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="deshaw-provider-booking",
+            thread_id="deshaw-provider-thread",
+            subject="RE: From the D. E. Shaw group inviting you to a video interview",
+            sender="Max Ma <deshaw+email@talent.icims.com>",
+            received_at=datetime(2026, 10, 30, 20, 14, tzinfo=timezone.utc),
+            body_text=(
+                "Please hold Thursday 11/5 starting at 9am PT/12pm ET. "
+                "I'll follow up soon with a confirmation."
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="time_change",
+            company="The D. E. Shaw Group",
+            job_role=role,
+        )
+        db.add_all([invitation, booking])
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=booking.id,
+            source_thread_id=booking.thread_id,
+            kind="confirmed",
+            origin="email",
+            title=f"D. E. Shaw & Co., L.P — {role}",
+            company="D. E. Shaw & Co., L.P",
+            job_role=role,
+            start_at=datetime(2026, 11, 5, 17, 0, tzinfo=timezone.utc),
+            end_at=datetime(2026, 11, 5, 17, 30, tzinfo=timezone.utc),
+            meeting_type="video",
+            meeting_provider=None,
+            meeting_url=None,
+            is_visible=True,
+        )
+        db.add(event)
+        db.commit()
+
+        assert refresh_calendar_event_details(db, booking) is True
+        db.commit()
+
+        assert event.meeting_type == "video"
+        assert event.meeting_provider == "Webex"
+        assert event.meeting_url is None
 
 
 def test_mathworks_reschedule_with_availability_ask_leaves_interview_unbooked():

@@ -101,16 +101,23 @@ _PUBLIC_EMAIL_DOMAINS = {
 _IDENTITY_STOPWORDS = {
     "appointment",
     "base",
+    "been",
     "booked",
     "calendar",
     "call",
     "candidate",
+    "confirmed",
+    "from",
     "interview",
+    "invitation",
     "meeting",
     "notification",
     "phone",
+    "scheduled",
     "screening",
     "touch",
+    "update",
+    "updated",
 }
 _DOMAIN_STOPWORDS = {"co", "com", "email", "io", "mail", "net", "org", "us"}
 _CROSS_THREAD_WINDOW = timedelta(days=14)
@@ -128,7 +135,7 @@ def _email_calendar_events(db: Session):
 
 # Bump when deterministic extraction semantics change so stored messages can
 # be reprocessed by maintenance/backfill paths.
-_CALENDAR_EXTRACT_VERSION = "6"
+_CALENDAR_EXTRACT_VERSION = "7"
 _SCHEDULE_TOKEN_RE = re.compile(
     r"https://[^\s<>\"']+/schedule/(?P<token>[a-z0-9-]{12,})(?=[/?.#\s<>\"']|$)",
     re.I,
@@ -368,6 +375,27 @@ class MeetingAccess:
     url: str | None = None
     phone_number: str | None = None
     access_code: str | None = None
+
+
+def _inherit_meeting_access(primary: MeetingAccess, fallback: MeetingAccess) -> MeetingAccess:
+    """Fill partial video details without overriding a newer meeting mode.
+
+    A booking follow-up may only say "video interview" while the original
+    invitation says Webex and promises the join link later. The newer message
+    remains authoritative for the mode, but it must not erase the provider
+    already established by the same scheduling conversation.
+    """
+    if primary.meeting_type == "unspecified":
+        return fallback
+    if primary.meeting_type != "video" or fallback.meeting_type != "video":
+        return primary
+    return MeetingAccess(
+        "video",
+        primary.provider or fallback.provider,
+        primary.url or fallback.url,
+        primary.phone_number or fallback.phone_number,
+        primary.access_code or fallback.access_code,
+    )
 
 
 @dataclass(frozen=True)
@@ -1082,6 +1110,12 @@ def is_video_join_url(value: str | None) -> bool:
         return False
     host = (parsed.hostname or "").lower()
     path_query = f"{parsed.path or ''}?{parsed.query or ''}"
+    # Paradox uses an allow-listed, opaque join button that redirects to the
+    # provider. Keep it usable when the intermediate olivia.paradox.ai host
+    # cannot be resolved at ingestion time; the asynchronous resolver can
+    # still replace it with the direct Teams/Zoom URL later.
+    if host in {"oli.vi", "olivia.paradox.ai"}:
+        return _PARADOX_JOIN_RE.fullmatch(raw) is not None
     if "scheduler.zoom.us" in host or host.startswith("scheduler."):
         return False
     if host == "zoom.us" or host.endswith(".zoom.us") or host == "app.zoom.us":
@@ -1175,6 +1209,10 @@ def extract_meeting_access(text: str) -> MeetingAccess:
     ]
     join_urls = [url for url in urls if is_video_join_url(url)]
     complete = [url for url in join_urls if join_url_is_complete(url)]
+    trusted_landing_urls = [
+        url for url in complete
+        if (urlparse(url).hostname or "").lower() in {"oli.vi", "olivia.paradox.ai"}
+    ]
 
     def join_rank(url: str) -> tuple[bool, bool, int]:
         parsed = urlparse(url)
@@ -1198,7 +1236,13 @@ def extract_meeting_access(text: str) -> MeetingAccess:
     for pattern, provider in provider_phrases:
         if re.search(pattern, source, re.I):
             phone, code = _extract_phone(source)
-            return MeetingAccess("video", provider, None, phone, code)
+            return MeetingAccess(
+                "video",
+                provider,
+                trusted_landing_urls[0] if trusted_landing_urls else None,
+                phone,
+                code,
+            )
     phone, code = _extract_phone(source)
     # A candidate may explicitly offer times for a video interview without a
     # provider or join URL yet. Treat that wording as authoritative before a
@@ -1242,6 +1286,32 @@ _PLACEHOLDER_VALUES = {
     "tbd",
     "-",
 }
+
+# These describe the sender's function, not the organization employing the
+# candidate. Local classifiers sometimes copy them from phrases such as
+# "our hiring manager" into the company field. Treating two such values as
+# the same employer can also merge unrelated interviews that share a clock.
+_GENERIC_COMPANY_VALUES = {
+    "hiring manager",
+    "hiring team",
+    "hr team",
+    "people team",
+    "recruiter",
+    "recruiting team",
+    "recruitment team",
+    "talent acquisition",
+    "talent acquisition team",
+}
+
+_GLUED_LEGAL_SUFFIXES = (
+    "incorporated",
+    "corporation",
+    "company",
+    "corp",
+    "inc",
+    "llc",
+    "ltd",
+)
 
 
 def _clean_text(value: object, limit: int = 255) -> str:
@@ -1302,7 +1372,13 @@ def clean_company_name(value: object, limit: int = 255) -> str:
     if text.endswith(".") and not _COMPANY_ABBREV_RE.search(text):
         text = text[:-1].rstrip(" ,;:!?\"'\t")
     text = " ".join(text.split())
-    if not text or text.casefold() in _PLACEHOLDER_VALUES or _ICS_FIELD_RE.match(text) or _COMPANY_SPILL_RE.match(text):
+    if (
+        not text
+        or text.casefold() in _PLACEHOLDER_VALUES
+        or text.casefold() in _GENERIC_COMPANY_VALUES
+        or _ICS_FIELD_RE.match(text)
+        or _COMPANY_SPILL_RE.match(text)
+    ):
         return ""
     return text[:limit]
 
@@ -1593,9 +1669,17 @@ def _company_named_in_message(email: EmailMessage) -> str:
     message row has no stored company.
     """
     tokens = _domain_identity_tokens(_organizer_addresses(email)) - _GENERIC_COMPANY_TOKENS
+    for token in tuple(tokens):
+        for suffix in _GLUED_LEGAL_SUFFIXES:
+            if token.endswith(suffix) and len(token) - len(suffix) >= 4:
+                tokens.add(token[: -len(suffix)])
     if not tokens:
         return ""
-    for source in (email.subject or "", email.sender or ""):
+    # Inspect the sender's display name, not its raw address. Matching the
+    # domain token inside the address itself merely echoes ``vizientinc`` and
+    # defeats the independent subject/display-name corroboration this helper
+    # is intended to require.
+    for source in (email.subject or "", parseaddr(email.sender or "")[0]):
         hits = [word for word in re.findall(r"[A-Za-z0-9]+", source) if word.casefold() in tokens]
         if len(hits) == 1:
             word = hits[0]
@@ -1607,10 +1691,16 @@ def _company_named_in_message(email: EmailMessage) -> str:
     # notifications@calendly.com is a delivery service, not an employer.
     brand = sender_domain_brand(email)
     if brand and brand not in _GENERIC_COMPANY_TOKENS:
+        # Legal suffixes are often glued to the brand in a domain even though
+        # the subject uses the public name: vizientinc.com -> "Vizient".
+        brand_aliases = {brand.casefold()}
+        for suffix in _GLUED_LEGAL_SUFFIXES:
+            if brand.casefold().endswith(suffix) and len(brand) - len(suffix) >= 4:
+                brand_aliases.add(brand.casefold()[: -len(suffix)])
         hits = [
             word
             for word in re.findall(r"[A-Za-z0-9]+", email.subject or "")
-            if word.casefold() == brand.casefold()
+            if word.casefold() in brand_aliases
         ]
         if len(hits) == 1:
             word = hits[0]
@@ -2005,7 +2095,22 @@ def companies_match(left: str | None, right: str | None) -> bool:
 
 def _calendar_companies_match(left: str | None, right: str | None) -> bool:
     """Company match used only after calendar time and mailbox also agree."""
-    return companies_match(left, right) or _company_initialism_matches(left, right)
+    left_clean = clean_company_name(left)
+    right_clean = clean_company_name(right)
+    if not left_clean or not right_clean:
+        return False
+    return companies_match(left_clean, right_clean) or _company_initialism_matches(left_clean, right_clean)
+
+
+def _glued_legal_suffix_alias(value: str | None, public_name: str | None) -> bool:
+    """True when a legacy domain brand glues a legal suffix to the public name."""
+    value_compact = _compact_company(value)
+    public_compact = _compact_company(public_name)
+    return bool(
+        value_compact
+        and public_compact
+        and any(value_compact == public_compact + suffix for suffix in _GLUED_LEGAL_SUFFIXES)
+    )
 
 
 def fuller_company_name(left: str | None, right: str | None) -> str:
@@ -2716,8 +2821,14 @@ def repair_calendar_event_email_links(db: Session, mailbox_id: int | None = None
 
 
 def _known_company(messages: list[EmailMessage]) -> str:
-    values = [(index, (item.company or "").strip()) for index, item in enumerate(messages)]
-    values = [(index, value) for index, value in values if value]
+    values = []
+    for index, item in enumerate(messages):
+        stored = clean_company_name(item.company)
+        inferred = clean_company_name(_company_named_in_message(item))
+        if stored and inferred and _glued_legal_suffix_alias(stored, inferred):
+            stored = inferred
+        if stored or inferred:
+            values.append((index, stored or inferred))
     if not values:
         # Classification can leave company blank even when a sender-domain
         # corroborated subject names it ("WITHIN Interview Confirmation" from
@@ -3469,9 +3580,10 @@ async def extract_calendar_details(
             )
             for slot in slots
         ]
-    access = extract_meeting_access(current_text)
-    if access.meeting_type == "unspecified":
-        access = extract_meeting_access(text)
+    access = _inherit_meeting_access(
+        extract_meeting_access(current_text),
+        extract_meeting_access(text),
+    )
     if access.url is None:
         resolved_access = await _resolve_video_landing_page(current_text)
         if resolved_access is None:
@@ -3706,9 +3818,10 @@ def refresh_calendar_event_details(db: Session, email: EmailMessage) -> bool:
         for item in messages
         for value in (item.subject or "", item.snippet or "", item.body_text or "", item.body_html or "")
     )
-    access = extract_meeting_access(current_text)
-    if access.meeting_type == "unspecified":
-        access = extract_meeting_access(combined_text)
+    access = _inherit_meeting_access(
+        extract_meeting_access(current_text),
+        extract_meeting_access(combined_text),
+    )
     interviewer = extract_interviewer(current_text, email.sender or "")
     if not interviewer:
         interviewer = next(
@@ -5821,7 +5934,11 @@ async def repair_meeting_landing_urls(
     repaired_mailboxes: set[int] = set()
     query = _email_calendar_events(db).filter(
         CalendarEvent.is_visible.is_(True),
-        CalendarEvent.meeting_url.is_(None),
+        or_(
+            CalendarEvent.meeting_url.is_(None),
+            CalendarEvent.meeting_url.ilike("https://oli.vi/%"),
+            CalendarEvent.meeting_url.ilike("https://olivia.paradox.ai/%"),
+        ),
     )
     if mailbox_id is not None:
         query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
@@ -7150,8 +7267,12 @@ def repair_placeholder_calendar_fields(db: Session, mailbox_id: int | None = Non
             )
         ):
             company = source_company
-        if not company and not event.company_human_corrected:
-            company = clean_company_name(_known_company(_linked_messages(db, event)))
+        if not event.company_human_corrected:
+            linked_company = clean_company_name(_known_company(_linked_messages(db, event)))
+            if linked_company and (
+                not company or _glued_legal_suffix_alias(company, linked_company)
+            ):
+                company = linked_company
         role = job_role_or_empty(event.job_role)
         provider = clean_meeting_provider(event.meeting_provider)
         meeting_type = event.meeting_type or "unspecified"
