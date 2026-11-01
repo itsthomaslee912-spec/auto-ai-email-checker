@@ -141,7 +141,12 @@ def monitoring_snapshot(db: Session = Depends(get_db)) -> dict:
             "active_mailboxes": len(active_mailboxes),
             "emails": int(db.query(func.count(EmailMessage.id)).scalar() or 0),
             "pending_classification": int(db.query(func.count(EmailMessage.id)).filter(
-                EmailMessage.classification_pending.is_(True)
+                EmailMessage.classification_pending.is_(True),
+                # Human corrections are authoritative and the classification
+                # worker deliberately skips them. Old rows can retain a stale
+                # pending bit from imports that raced with a manual correction;
+                # do not report work that the worker will never consume.
+                EmailMessage.human_corrected.is_not(True),
             ).scalar() or 0),
         },
         "queues": {

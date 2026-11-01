@@ -11,7 +11,7 @@ from sqlalchemy.pool import StaticPool
 from app.api.monitoring import monitoring_snapshot
 from app.auth.session import current_user_is_admin
 from app.db import Base
-from app.models import MailboxConnection, ServiceHeartbeat, User
+from app.models import EmailMessage, MailboxConnection, ServiceHeartbeat, User
 
 
 def _database():
@@ -73,6 +73,46 @@ def test_monitoring_snapshot_reports_services_and_counts():
     assert snapshot["metrics"]["users"] == 1
     assert snapshot["metrics"]["active_mailboxes"] == 1
     assert all(service["status"] == "healthy" for service in snapshot["services"])
+
+
+def test_monitoring_pending_count_excludes_human_corrected_rows():
+    session_factory = _database()
+    with session_factory() as db:
+        user = User(external_id="monitor-admin", email="admin@example.com", is_admin=True)
+        db.add(user)
+        db.flush()
+        mailbox = MailboxConnection(
+            user_id=user.id,
+            provider="google",
+            email_address="mailbox@example.com",
+            access_token_enc="x",
+            is_active=True,
+        )
+        db.add(mailbox)
+        db.flush()
+        db.add_all([
+            EmailMessage(
+                mailbox_id=mailbox.id,
+                provider_message_id="actually-pending",
+                classification_pending=True,
+                human_corrected=False,
+            ),
+            EmailMessage(
+                mailbox_id=mailbox.id,
+                provider_message_id="manually-corrected",
+                classification_pending=True,
+                human_corrected=True,
+            ),
+        ])
+        db.commit()
+
+        token = current_user_is_admin.set(True)
+        try:
+            snapshot = monitoring_snapshot(db)
+        finally:
+            current_user_is_admin.reset(token)
+
+    assert snapshot["metrics"]["pending_classification"] == 1
 
 
 def test_monitoring_reports_recovering_when_a_replica_self_reports():

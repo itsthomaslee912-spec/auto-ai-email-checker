@@ -279,6 +279,14 @@ def init_db() -> None:
                 conn.execute(text(
                     "ALTER TABLE email_messages ADD COLUMN recipients TEXT DEFAULT ''"
                 ))
+            if {"human_corrected", "classification_pending"}.issubset(email_cols):
+                # A human-selected label is final and is excluded from every
+                # recovery pass. Clear stale import flags so monitoring does
+                # not permanently advertise work that cannot be processed.
+                conn.execute(text(
+                    "UPDATE email_messages SET classification_pending = FALSE "
+                    "WHERE classification_pending = TRUE AND human_corrected = TRUE"
+                ))
         if "calendar_events" in tables:
             calendar_cols = {c["name"] for c in inspect(conn).get_columns("calendar_events")}
             if "interviewer" not in calendar_cols:

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -1129,6 +1130,91 @@ def test_ai_only_classification_bounds_output_and_does_not_duplicate_body(monkey
     assert captured["max_tokens"] == 4096
     assert captured["messages"][1]["content"].count(marker) == 1
     assert "duplicate omitted" in captured["messages"][1]["content"]
+
+
+def test_ai_only_ollama_retries_invalid_json_with_correction_prompt(monkeypatch):
+    attempts = []
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            attempts.append(kwargs)
+            content = (
+                '{"label":"other","confidence":'
+                if len(attempts) == 1
+                else json.dumps({"label": "application_confirmation", "confidence": 0.9})
+            )
+            return SimpleNamespace(
+                id=f"resp_{len(attempts)}",
+                choices=[SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(content=content),
+                )],
+            )
+
+    backend = SimpleNamespace(
+        provider="ollama",
+        model="gemma4:26b",
+        api_key="ollama",
+        client=lambda: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+    )
+    monkeypatch.setattr("app.classify.openai_classifier.has_saved_ai_settings", lambda: True)
+    monkeypatch.setattr("app.classify.openai_classifier.get_ai_backend", lambda: backend)
+    monkeypatch.setattr(
+        "app.classify.openai_classifier.get_settings",
+        lambda: SimpleNamespace(email_classification_mode="ai_only"),
+    )
+
+    result = asyncio.run(classify_email(
+        subject="We received your application",
+        sender="jobs@example.com",
+        body_text="Thank you for applying.",
+        snippet="Thank you for applying.",
+    ))
+
+    assert result.label == EmailLabel.APPLICATION_CONFIRMATION.value
+    assert result.confidence == 0.9
+    assert len(attempts) == 2
+    assert attempts[0]["reasoning_effort"] == "none"
+    assert "previous answer was invalid" in attempts[1]["messages"][-1]["content"]
+
+
+def test_ai_only_ollama_still_rejects_zero_confidence_after_retry(monkeypatch):
+    calls = 0
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            return SimpleNamespace(
+                id=f"resp_{calls}",
+                choices=[SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(content=json.dumps({"label": "other", "confidence": 0})),
+                )],
+            )
+
+    backend = SimpleNamespace(
+        provider="ollama",
+        model="gemma4:26b",
+        api_key="ollama",
+        client=lambda: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+    )
+    monkeypatch.setattr("app.classify.openai_classifier.has_saved_ai_settings", lambda: True)
+    monkeypatch.setattr("app.classify.openai_classifier.get_ai_backend", lambda: backend)
+    monkeypatch.setattr(
+        "app.classify.openai_classifier.get_settings",
+        lambda: SimpleNamespace(email_classification_mode="ai_only"),
+    )
+
+    with pytest.raises(ValueError, match="greater than 0"):
+        asyncio.run(classify_email(
+            subject="Unclear",
+            sender="sender@example.com",
+            body_text="Unclear message",
+            snippet="Unclear message",
+        ))
+
+    assert calls == 2
 
 
 def test_ai_only_verification_code_uses_action_required_guard_without_model(monkeypatch):
