@@ -88,6 +88,34 @@ def test_meeting_access_code_is_not_treated_as_account_verification():
     assert result is None
 
 
+def test_automatic_out_of_office_has_deterministic_ai_only_result():
+    result = deterministic_ai_only_classification(
+        subject="Automatic reply: Hilti Application",
+        sender='"Aslam, Komal" <Komal.Aslam@hilti.com>',
+        body_text=(
+            "Thank you for your message. I'm currently out of the office and "
+            "will return on Tuesday, November 2. For urgent inquiries, contact Kaitlyn."
+        ),
+        snippet="",
+    )
+
+    assert result is not None
+    assert result.label == EmailLabel.OTHER.value
+    assert result.category_subtype is None
+    assert result.confidence == 0.99
+
+
+def test_automatic_application_acknowledgement_still_uses_ai_model():
+    result = deterministic_ai_only_classification(
+        subject="Automatic reply: We received your application",
+        sender="careers@example.com",
+        body_text="Thank you for applying. Our recruiting team will review your application.",
+        snippet="",
+    )
+
+    assert result is None
+
+
 def test_ada_accommodation_disclaimer_is_not_a_scheduled_interview_reminder():
     """"As a reminder, if you need accommodation... during the interview
     process" is a standard ADA disclaimer on application receipts, not a

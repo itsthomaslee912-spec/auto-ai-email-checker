@@ -997,16 +997,43 @@ def deterministic_ai_only_classification(
     snippet: str,
 ) -> ClassificationResult | None:
     """Return high-certainty AI-only classifications that need no model call."""
-    if not _is_verification_code_action(
-        _primary_message_text(subject, sender, body_text, snippet)
-    ):
-        return None
-    return ClassificationResult(
-        label=EmailLabel.APPLICATION_ACTION_REQUIRED.value,
-        category_subtype="profile_account_setup",
-        confidence=0.99,
-        response_id=None,
-    )
+    primary_text = _primary_message_text(subject, sender, body_text, snippet)
+    if _is_verification_code_action(primary_text):
+        return ClassificationResult(
+            label=EmailLabel.APPLICATION_ACTION_REQUIRED.value,
+            category_subtype="profile_account_setup",
+            confidence=0.99,
+            response_id=None,
+        )
+
+    # Automatic out-of-office notices are transport noise, not recruiting
+    # outcomes. Large local models can spend several minutes on these short
+    # messages and occasionally return invalid zero-confidence JSON, leaving
+    # the durable pending flag stuck forever. Only bypass the selected model
+    # when both the auto-reply subject and an explicit absence marker agree;
+    # application acknowledgements with an "Automatic reply" subject remain
+    # model-classified.
+    normalized_subject = re.sub(r"[^a-z0-9]+", " ", (subject or "").lower()).strip()
+    normalized_body = re.sub(r"[^a-z0-9]+", " ", (body_text or snippet or "").lower()).strip()
+    auto_reply_subject = any(marker in normalized_subject for marker in (
+        "automatic reply", "auto reply", "autoreply", "out of office",
+    ))
+    absence_notice = any(marker in normalized_body for marker in (
+        "out of the office",
+        "out of office",
+        "away from the office",
+        "away from office",
+        "limited access to email",
+        "limited access to my email",
+    ))
+    if auto_reply_subject and absence_notice:
+        return ClassificationResult(
+            label=EmailLabel.OTHER.value,
+            category_subtype=None,
+            confidence=0.99,
+            response_id=None,
+        )
+    return None
 
 
 async def classify_email(
