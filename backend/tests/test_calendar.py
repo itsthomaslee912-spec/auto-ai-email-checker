@@ -8729,3 +8729,63 @@ def test_badger_meter_scheduler_booking_uses_explicit_company_and_subject_role()
         assert event.job_role == "Senior Engineer- Machine Learning"
         assert event.start_at == datetime(2026, 11, 9, 15, tzinfo=timezone.utc)
         assert event.end_at == datetime(2026, 11, 9, 15, 45, tzinfo=timezone.utc)
+
+
+def test_linkup_cet_reminder_keeps_the_original_booked_instant():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        booking = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="linkup-booking",
+            thread_id="linkup-booking-thread",
+            subject=(
+                "Appointment booked: Meeting with Phil Mizrahi (Thomas Lee) "
+                "@ Mon Nov 2, 2026 5pm - 5:30pm (CET)"
+            ),
+            sender="philippe@linkup.so",
+            received_at=datetime(2026, 10, 27, 21, 59, tzinfo=timezone.utc),
+            body_text=(
+                "Meeting with Phil Mizrahi (Linkup)\n"
+                "BEGIN:VCALENDAR\nMETHOD:REQUEST\nBEGIN:VEVENT\n"
+                "DTSTART:20261102T160000Z\nDTEND:20261102T163000Z\n"
+                "LOCATION:https://meet.google.com/htq-bgdt-jvq\n"
+                "END:VEVENT\nEND:VCALENDAR"
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="Linkup",
+            job_role="DevOps Engineer",
+        )
+        reminder = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="linkup-reminder",
+            thread_id="linkup-reminder-thread",
+            subject=(
+                "Reminder: Meeting with Phil Mizrahi (Thomas Lee) "
+                "@ Mon Nov 2, 2026 5pm - 5:30pm (CET)"
+            ),
+            sender="calendar-notification@google.com",
+            received_at=datetime(2026, 11, 2, 15, 0, tzinfo=timezone.utc),
+            body_text=(
+                "You have an upcoming appointment with philippe@linkup.so\n"
+                "Join with Google Meet\nhttps://meet.google.com/htq-bgdt-jvq\n"
+                "Monday Nov 2, 2026, 5pm - 5:30pm "
+                "(Central European Time - Paris)\n"
+                "Meeting with Phil Mizrahi (Linkup)"
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="reminder",
+            company="Linkup",
+            job_role="DevOps Engineer",
+        )
+        db.add_all([booking, reminder])
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, booking, use_ai=False)) is True
+        assert asyncio.run(process_calendar_email(db, reminder, use_ai=False)) is True
+
+        visible = db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True)).all()
+        assert len(visible) == 1
+        assert visible[0].company == "Linkup"
+        assert visible[0].start_at == datetime(2026, 11, 2, 16, tzinfo=timezone.utc)
+        assert visible[0].end_at == datetime(2026, 11, 2, 16, 30, tzinfo=timezone.utc)

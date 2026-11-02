@@ -135,7 +135,7 @@ def _email_calendar_events(db: Session):
 
 # Bump when deterministic extraction semantics change so stored messages can
 # be reprocessed by maintenance/backfill paths.
-_CALENDAR_EXTRACT_VERSION = "7"
+_CALENDAR_EXTRACT_VERSION = "8"
 _SCHEDULE_TOKEN_RE = re.compile(
     r"https://[^\s<>\"']+/schedule/(?P<token>[a-z0-9-]{12,})(?=[/?.#\s<>\"']|$)",
     re.I,
@@ -238,6 +238,8 @@ TIME_ZONE_ALIASES = {
     # "Europe/London" observes BST automatically for the date in question, so
     # this stays correct whether or not daylight time is actually in effect.
     "BST": "Europe/London",
+    "CENTRAL EUROPEAN TIME": "Europe/Paris",
+    "CET": "Europe/Paris",
     "UTC": "UTC",
     "GMT": "UTC",
 }
@@ -259,6 +261,7 @@ _CITY_TIME_ZONES: tuple[tuple[re.Pattern[str], str], ...] = (
         re.I,
     ), "America/New_York"),
     (re.compile(r"\b(?:london|manchester|birmingham|edinburgh)\b", re.I), "Europe/London"),
+    (re.compile(r"\b(?:paris|berlin|amsterdam|brussels|vienna|rome|madrid)\b", re.I), "Europe/Paris"),
 )
 
 MONTH_NUMBERS = {
