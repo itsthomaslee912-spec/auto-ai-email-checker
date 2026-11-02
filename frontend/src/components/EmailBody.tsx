@@ -35,12 +35,28 @@ function isIncompleteQuotedHtml(html: string, text: string): boolean {
   const visible = new DOMParser().parseFromString(html, "text/html").body.textContent
     ?.replace(/\s+/g, " ")
     .trim() || "";
+  const plain = text.replace(/\s+/g, " ").trim();
   // Outlook event messages can expose a tiny malformed HTML fragment that
   // contains only the quoted candidate reply while their plain-text body has
   // the actual invitation/confirmation. Do not let that quote replace the
   // complete message in the reader.
   const quoteOnly = /(?:^|\s)(?:on\s.{0,160}\s)?wrote\s*:/i.test(visible);
-  return quoteOnly && visible.length * 2 < text.replace(/\s+/g, " ").trim().length;
+  if (quoteOnly && visible.length * 2 < plain.length) return true;
+
+  // Some Microsoft Graph messages contain mismatched alternatives: the HTML
+  // value is only the previous reply, beginning with an invalid `<address>`
+  // pseudo-tag followed by Outlook's Sent/To/Subject header, while body_text
+  // contains the new incoming message. Prefer that fresh text even when the
+  // quoted reply happens to be longer than it.
+  const outlookQuotedHeader = /^sent:\s.{0,300}?\bto:\s.{0,300}?\bsubject\s*:/i;
+  const rawWithoutAddressTag = html
+    .replace(/^\s*<[^<>\s]+@[^<>\s]+>\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return (
+    (outlookQuotedHeader.test(visible) || outlookQuotedHeader.test(rawWithoutAddressTag))
+    && !outlookQuotedHeader.test(plain)
+  );
 }
 
 const PALETTE = {

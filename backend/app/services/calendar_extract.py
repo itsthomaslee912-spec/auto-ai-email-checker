@@ -609,7 +609,7 @@ def _is_alternate_timezone_restatement(
     )
     between = source[first.end() : second.start()]
     first_zone_match = re.fullmatch(
-        rf"\s*(?P<zone>{aliases})\s*(?:/|\||\bor\b|\()\s*",
+        rf"\s*(?P<zone>{aliases})\s*(?:/|\||,|\bor\b|\()\s*",
         between,
         re.I,
     )
@@ -2574,6 +2574,11 @@ _HIRING_EMPLOYER_RE = re.compile(
     r"([A-Z][A-Za-z0-9&']*(?:[ \t]+[A-Z][A-Za-z0-9&']*){0,3})",
 )
 
+_SCHEDULER_EMPLOYER_RE = re.compile(
+    r"\b(?:booking\s+a\s+time\s+to|position\s+here\s+at)[ \t]+"
+    r"([A-Z][A-Za-z0-9&']*(?:[ \t]+[A-Z][A-Za-z0-9&']*){0,3})",
+)
+
 _HIRING_EMPLOYER_STOPWORDS = {
     "google meet",
     "microsoft teams",
@@ -2599,7 +2604,7 @@ def explicit_hiring_employer(text: str) -> str:
     """
     unescaped = html.unescape(text or "")
     names = []
-    for match in _HIRING_EMPLOYER_RE.finditer(unescaped):
+    for match in [*_HIRING_EMPLOYER_RE.finditer(unescaped), *_SCHEDULER_EMPLOYER_RE.finditer(unescaped)]:
         # A parenthetical right after the name is a title, as in "Adrien
         # Lana (Technical Recruiter II)" — that names the interviewer, not
         # the employer. Checked post-match (not as a regex lookahead) so the
@@ -2614,6 +2619,43 @@ def explicit_hiring_employer(text: str) -> str:
     if not names:
         return ""
     return max(set(names), key=lambda name: (names.count(name), len(name)))
+
+
+def _role_named_in_interview_subject(email: EmailMessage, candidate_name: str = "") -> str:
+    """Return the role explicitly named by a narrow scheduler subject format."""
+    subject = html.unescape((email.subject or "").strip())
+    match = re.match(
+        r"^Schedule Your Interview with .+? for (?P<role>.+?)\s*$",
+        subject,
+        re.I,
+    )
+    if match is None:
+        match = re.search(
+            r"\bVirtual Interview\s*[-:|]\s*(?P<role>.+?)\s*$",
+            subject,
+            re.I,
+        )
+    if match is None:
+        return ""
+    role = match.group("role").strip()
+    role = re.sub(r"\s+on\s+\d{1,2}/\d{1,2}/\d{2,4}.*$", "", role, flags=re.I)
+    if candidate_name:
+        role = re.split(
+            rf"\s+[-–—|]\s+{re.escape(candidate_name)}\b",
+            role,
+            maxsplit=1,
+            flags=re.I,
+        )[0]
+    # Booking systems often append the attendee in all caps. This remains
+    # safe when the mailbox profile has not supplied the candidate's name:
+    # ordinary title-cased role words cannot match the all-caps suffix.
+    role = re.sub(
+        r"\s+[-–—|]\s+[A-Z][A-Z.'-]*(?:\s+[A-Z][A-Z.'-]*){1,3}$",
+        "",
+        role,
+    )
+    role = role.strip(" -–—|:")[:255]
+    return job_role_or_empty(role)
 
 
 def sender_domain_brand(email: EmailMessage) -> str:
@@ -2847,6 +2889,23 @@ def _known_company(messages: list[EmailMessage]) -> str:
 def _source_anchored_company(email: EmailMessage, messages: list[EmailMessage]) -> str:
     """Choose company context without letting unrelated linked mail beat the source."""
     known = clean_company_name(_known_company(messages))
+    scheduler_names = [
+        clean_company_name(match.group(1))
+        for match in _SCHEDULER_EMPLOYER_RE.finditer(
+            html.unescape(_fresh_message_text(email))
+        )
+    ]
+    scheduler_names = [name for name in scheduler_names if name]
+    if scheduler_names:
+        scheduler_company = max(
+            set(scheduler_names),
+            key=lambda name: (scheduler_names.count(name), len(name)),
+        )
+        return (
+            fuller_company_name(scheduler_company, known)
+            if known and companies_match(scheduler_company, known)
+            else scheduler_company
+        )
     stored = clean_company_name(
         employer_instead_of_sender_domain(email, (email.company or "").strip())
     )
@@ -3602,7 +3661,10 @@ async def extract_calendar_details(
         candidate_name = mailbox_candidate_name(db, email.mailbox_id)
     if known_company and candidate_name and companies_match(known_company, candidate_name):
         known_company = _known_company_other_than_candidate(messages, candidate_name)
-    known_role = _known_role(messages)
+    # Scheduler subjects are authoritative for the booked opening. This also
+    # prevents an unrelated stored role from another interview from leaking
+    # into a generic no-reply confirmation.
+    known_role = _role_named_in_interview_subject(email, candidate_name) or _known_role(messages)
     deterministic_job_url = extract_job_url(text)
     deterministic_interviewer = extract_interviewer(current_text, email.sender or "")
     if not deterministic_interviewer:
@@ -3726,13 +3788,14 @@ def _apply_details(
     db: Session | None = None,
 ) -> None:
     candidate_company = clean_company_name(details.company) or clean_company_name(email.company) or (email.company or "").strip()
+    owner_name = ""
+    if db is not None and email.mailbox_id:
+        owner_name = candidate_own_name(email) or mailbox_candidate_name(db, email.mailbox_id)
     # Final merge point for the event's company, so guard here too: any
     # upstream source (AI extraction, a stored email.company from an older,
     # unguarded code path) could still be the candidate's own name.
-    if candidate_company and db is not None and email.mailbox_id:
-        owner_name = candidate_own_name(email) or mailbox_candidate_name(db, email.mailbox_id)
-        if owner_name and companies_match(candidate_company, owner_name):
-            candidate_company = _known_company_other_than_candidate([email], owner_name)
+    if candidate_company and owner_name and companies_match(candidate_company, owner_name):
+        candidate_company = _known_company_other_than_candidate([email], owner_name)
     if not event.company_human_corrected:
         if companies_match(candidate_company, event.company):
             event.company = clean_company_name(fuller_company_name(event.company, candidate_company)) or candidate_company
@@ -3740,8 +3803,11 @@ def _apply_details(
             event.company = candidate_company or clean_company_name(event.company) or event.company
     # Prefer a real job title over a schedule stage ("Recruiter Screen").
     role = job_role_or_empty(details.role) or job_role_or_empty(email.job_role)
+    subject_role = _role_named_in_interview_subject(email, owner_name)
     current_role = job_role_or_empty(event.job_role)
-    if role and (not current_role or is_interview_stage_label(current_role)):
+    if subject_role:
+        event.job_role = subject_role
+    elif role and (not current_role or is_interview_stage_label(current_role)):
         event.job_role = role
     elif role and roles_compatible(current_role, role):
         event.job_role = _fullest_job_title([current_role, role], [])

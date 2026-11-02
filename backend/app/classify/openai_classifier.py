@@ -1033,6 +1033,33 @@ def deterministic_ai_only_classification(
             confidence=0.99,
             response_id=None,
         )
+
+    # A provider calendar request with an explicit interval is already a
+    # booking, not an offer to share availability.  Do this before the model
+    # call so a large/queued local model cannot leave the prior availability
+    # chip visible for minutes after the invite arrives.  Keep the guard
+    # deliberately narrow: ordinary project meetings without recruiting
+    # language still go through the selected classifier.
+    calendar_text = f"{subject or ''}\n{body_text or snippet or ''}"
+    booked_calendar_request = (
+        re.search(r"(?im)^BEGIN:VEVENT\s*$", calendar_text) is not None
+        and re.search(r"(?im)^METHOD\s*:\s*REQUEST\s*$", calendar_text) is not None
+        and re.search(r"(?im)^DTSTART(?:;[^:]*)?:\s*\S+", calendar_text) is not None
+        and re.search(r"(?im)^DTEND(?:;[^:]*)?:\s*\S+", calendar_text) is not None
+        and re.search(
+            r"\b(?:interview|candidate|recruit(?:er|ing|ment)?|hiring|application|job|career|opportunity)\b",
+            calendar_text,
+            re.IGNORECASE,
+        ) is not None
+    )
+    if booked_calendar_request:
+        return ClassificationResult(
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            category_subtype=None,
+            interview_subtype="calendar_invite",
+            confidence=0.99,
+            response_id=None,
+        )
     return None
 
 

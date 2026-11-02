@@ -116,6 +116,42 @@ def test_automatic_application_acknowledgement_still_uses_ai_model():
     assert result is None
 
 
+def test_recruiting_calendar_request_is_deterministic_booked_interview():
+    result = deterministic_ai_only_classification(
+        subject="Connect with Ramya about LSEG Opportunity",
+        sender='"Krishnamurthy, Ramya" <ramya.krishnamurthy@lseg.com>',
+        body_text=(
+            "BEGIN:VCALENDAR\nMETHOD:REQUEST\nBEGIN:VEVENT\n"
+            "SUMMARY:Connect about LSEG Opportunity\n"
+            "DTSTART;TZID=Eastern Standard Time:20261102T120000\n"
+            "DTEND;TZID=Eastern Standard Time:20261102T123000\n"
+            "LOCATION:Microsoft Teams Meeting\nEND:VEVENT\nEND:VCALENDAR"
+        ),
+        snippet="",
+    )
+
+    assert result is not None
+    assert result.label == EmailLabel.INTERVIEW_SCHEDULED.value
+    assert result.interview_subtype == "calendar_invite"
+    assert result.confidence == 0.99
+
+
+def test_generic_calendar_request_still_uses_ai_model():
+    result = deterministic_ai_only_classification(
+        subject="Weekly platform project sync",
+        sender="colleague@example.com",
+        body_text=(
+            "BEGIN:VCALENDAR\nMETHOD:REQUEST\nBEGIN:VEVENT\n"
+            "SUMMARY:Weekly platform project sync\n"
+            "DTSTART:20261102T120000Z\nDTEND:20261102T123000Z\n"
+            "END:VEVENT\nEND:VCALENDAR"
+        ),
+        snippet="",
+    )
+
+    assert result is None
+
+
 def test_ada_accommodation_disclaimer_is_not_a_scheduled_interview_reminder():
     """"As a reminder, if you need accommodation... during the interview
     process" is a standard ADA disclaimer on application receipts, not a

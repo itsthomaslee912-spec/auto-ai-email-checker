@@ -115,6 +115,52 @@ def test_get_email_returns_before_provider_read():
         assert len(tasks.tasks) == 1
 
 
+def test_outlook_body_refresh_clears_stale_html_alternative():
+    SessionLocal = _session_factory()
+    with SessionLocal() as db:
+        mailbox = _seed_mailbox(
+            db,
+            external_id="u-outlook-body",
+            email_address="mark@outlook.com",
+            provider=Provider.MICROSOFT.value,
+        )
+        email = EmailMessage(
+            mailbox_id=mailbox.id,
+            provider_message_id="outlook-body-refresh",
+            subject="RE: Interview",
+            sender="recruiter@example.com",
+            recipients="",
+            body_text="Current incoming message",
+            body_html="<mark@outlook.com>\nSent: yesterday\nTo: Recruiter\nSubject: RE: Interview\nOld quoted reply",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            folder="sent",
+            is_read=True,
+        )
+        db.add(email)
+        db.commit()
+        email_id = email.id
+
+    normalized = {
+        "body_text": "Current incoming message from provider",
+        "body_html": "",
+        "recipients": "Mark <mark@outlook.com>",
+        "snippet": "Current incoming message from provider",
+        "folder": "inbox",
+    }
+    with (
+        patch("app.api.emails.ensure_microsoft_access_token", new_callable=AsyncMock, return_value="token"),
+        patch("app.api.emails.outlook_get_message", new_callable=AsyncMock, return_value={"id": "outlook-body-refresh"}),
+        patch("app.api.emails.outlook_attach_folder", new_callable=AsyncMock, return_value={"id": "outlook-body-refresh"}),
+        patch("app.email.outlook.normalize_outlook_message", return_value=normalized),
+    ):
+        with SessionLocal() as db:
+            result = asyncio.run(
+                emails.get_email(email_id, BackgroundTasks(), db, mark_read=False)
+            )
+            assert result.body_text == "Current incoming message from provider"
+            assert result.body_html == ""
+
+
 def test_get_email_can_mark_the_whole_conversation_read():
     SessionLocal = _session_factory()
     db = SessionLocal()

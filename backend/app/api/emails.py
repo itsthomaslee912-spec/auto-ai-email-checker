@@ -738,8 +738,12 @@ async def get_email(
                     from app.email.gmail import normalize_gmail_message
 
                     normalized = normalize_gmail_message(raw)
-                    email.body_text = normalized.get("body_text") or email.body_text or ""
-                    email.body_html = normalized.get("body_html") or email.body_html or ""
+                    # Provider-owned alternatives must be replaced as a pair.
+                    # Keeping an older HTML value when a refresh now returns
+                    # text-only content makes the reader show a stale quoted
+                    # reply instead of the current message.
+                    email.body_text = normalized.get("body_text") or ""
+                    email.body_html = normalized.get("body_html") or ""
                     email.recipients = normalized.get("recipients") or email.recipients or ""
                     if normalized.get("snippet"):
                         email.snippet = normalized["snippet"][:1000]
@@ -753,8 +757,8 @@ async def get_email(
                     from app.email.outlook import normalize_outlook_message
 
                     normalized = normalize_outlook_message(raw)
-                    email.body_text = normalized.get("body_text") or email.body_text or ""
-                    email.body_html = normalized.get("body_html") or email.body_html or ""
+                    email.body_text = normalized.get("body_text") or ""
+                    email.body_html = normalized.get("body_html") or ""
                     email.recipients = normalized.get("recipients") or email.recipients or ""
                     if normalized.get("snippet"):
                         email.snippet = normalized["snippet"][:1000]

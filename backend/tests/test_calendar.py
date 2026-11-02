@@ -2160,6 +2160,19 @@ def test_same_start_repeated_in_parenthesized_timezone_defaults_to_thirty_minute
     assert slots[0].end_is_explicit is False
 
 
+def test_same_start_repeated_in_comma_separated_timezones_defaults_to_thirty_minutes():
+    slots = parse_text_slots(
+        "I will call you on Wednesday, 11/4 at 8 am PST, 11 am EST.",
+        datetime(2026, 11, 2, 14, 48, tzinfo=timezone.utc),
+    )
+
+    assert len(slots) == 1
+    assert slots[0].start_at == datetime(2026, 11, 4, 16, 0, tzinfo=timezone.utc)
+    assert slots[0].end_at == datetime(2026, 11, 4, 16, 30, tzinfo=timezone.utc)
+    assert slots[0].source_timezone == "America/Los_Angeles"
+    assert slots[0].end_is_explicit is False
+
+
 def test_human_readable_time_without_timezone_is_not_guessed():
     assert parse_text_slots("Interview Oct 1, 2026 at 10:30am") == []
 
@@ -8663,3 +8676,56 @@ def test_deshaw_confirmed_from_range_is_not_an_availability_window():
     assert slots[0].is_availability_window is False
     assert slots[0].start_at == datetime(2026, 11, 5, 17, tzinfo=timezone.utc)
     assert slots[0].end_at == datetime(2026, 11, 5, 20, tzinfo=timezone.utc)
+
+
+def test_badger_meter_scheduler_booking_uses_explicit_company_and_subject_role():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        mailbox = db.get(MailboxConnection, mailbox_id)
+        mailbox.email_address = "jordanwm914@gmail.com"
+        booking = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="badger-meter-booking",
+            thread_id="badger-meter-booking-thread",
+            subject=(
+                "You're all set for Virtual Interview - Senior Engineer- Machine Learning "
+                "- JORDAN MEEKER on 11/09/2026!"
+            ),
+            sender="Badger Meter <no-reply@sensehq.com>",
+            recipients="JORDAN MEEKER <jordanwm914@gmail.com>",
+            received_at=datetime(2026, 11, 2, 16, 27, tzinfo=timezone.utc),
+            body_text=(
+                "Thank you for booking a time to Badger Meter.\n"
+                "This will be a 45-minute video interview.\n"
+                "BEGIN:VCALENDAR\nBEGIN:VEVENT\n"
+                "DTSTART:20261109T150000Z\nDTEND:20261109T154500Z\n"
+                "END:VEVENT\nEND:VCALENDAR"
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            job_role="Senior Lead/ Principal Software Engineer BKK [SHP]",
+        )
+        db.add(booking)
+        db.flush()
+        db.add(CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=booking.id,
+            source_thread_id=booking.thread_id,
+            kind="confirmed",
+            origin="email",
+            title="Senior Lead/ Principal Software Engineer BKK [SHP]",
+            company="",
+            job_role="Senior Lead/ Principal Software Engineer BKK [SHP]",
+            start_at=datetime(2026, 11, 9, 15, tzinfo=timezone.utc),
+            end_at=datetime(2026, 11, 9, 15, 45, tzinfo=timezone.utc),
+            is_visible=True,
+        ))
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, booking, use_ai=False)) is True
+        event = db.query(CalendarEvent).filter(CalendarEvent.kind == "confirmed").one()
+
+        assert event.company == "Badger Meter"
+        assert event.job_role == "Senior Engineer- Machine Learning"
+        assert event.start_at == datetime(2026, 11, 9, 15, tzinfo=timezone.utc)
+        assert event.end_at == datetime(2026, 11, 9, 15, 45, tzinfo=timezone.utc)
