@@ -26,6 +26,7 @@ from app.services.calendar_extract import (
     message_appointment_slots,
     message_cancels_appointment,
     process_calendar_email,
+    refresh_calendar_events_linked_to_email,
 )
 
 logger = logging.getLogger(__name__)
@@ -527,11 +528,18 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                     ):
                         # No deterministic appointment to project. Leave the
                         # invalidated hash for the normal backfill/model path.
-                        return False
+                        # The message can still have gained company/role data
+                        # needed by an event that was projected earlier from a
+                        # separate confirmation thread.
+                        changed = refresh_calendar_events_linked_to_email(db, email)
+                        if changed:
+                            db.commit()
+                        return changed
                     process_kwargs = {"use_ai": False} if deterministic_only else {}
                     changed = await process_calendar_email(
                         db, email, force=True, priority="background", **process_kwargs,
                     )
+                    changed = refresh_calendar_events_linked_to_email(db, email) or changed
                     # Calendar extraction mutates events and the email's
                     # processed hash but does not own the transaction. Without
                     # this commit, closing the short-lived worker session rolls

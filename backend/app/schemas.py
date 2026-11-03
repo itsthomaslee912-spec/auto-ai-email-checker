@@ -68,6 +68,7 @@ class EmailOut(BaseModel):
     provider_message_id: str
     subject: str
     sender: str
+    reply_to: str = ""
     recipients: str = ""
     received_at: UtcDateTime | None = None
     snippet: str

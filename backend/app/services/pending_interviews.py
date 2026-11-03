@@ -17,7 +17,12 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session, aliased, load_only
 
 from app.models import CalendarEvent, CalendarEventEmail, EmailMessage
-from app.services.calendar_extract import companies_match, leaves_interview_unbooked, roles_compatible
+from app.services.calendar_extract import (
+    companies_match,
+    interview_subject_company_role,
+    leaves_interview_unbooked,
+    roles_compatible,
+)
 from app.timeutil import as_utc
 
 PENDING_WINDOW = timedelta(days=21)
@@ -85,6 +90,9 @@ def _subject_company_role(message: EmailMessage | _MailRef) -> tuple[str, str]:
     subject form is unambiguous: ``...: [Candidate] Role at Company``.
     """
     subject = (message.subject or "").strip()
+    explicit_company, explicit_role = interview_subject_company_role(subject)
+    if explicit_company:
+        return explicit_company, explicit_role or (message.job_role or "").strip()
     match = re.search(
         r":\s*(?:\[[^\]]+\]\s*)?(?P<role>[^:\n]{2,160}?)\s+at\s+"
         r"(?P<company>[^|\n]{2,120}?)\s*$",

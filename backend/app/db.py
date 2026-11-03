@@ -279,6 +279,10 @@ def init_db() -> None:
                 conn.execute(text(
                     "ALTER TABLE email_messages ADD COLUMN recipients TEXT DEFAULT ''"
                 ))
+            if "reply_to" not in email_cols:
+                conn.execute(text(
+                    "ALTER TABLE email_messages ADD COLUMN reply_to VARCHAR(512) DEFAULT ''"
+                ))
             if {"human_corrected", "classification_pending"}.issubset(email_cols):
                 # A human-selected label is final and is excluded from every
                 # recovery pass. Clear stale import flags so monitoring does

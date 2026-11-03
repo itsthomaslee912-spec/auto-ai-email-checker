@@ -128,6 +128,10 @@ class EmailMessage(Base):
     thread_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     subject: Mapped[str] = mapped_column(String(998), default="")
     sender: Mapped[str] = mapped_column(String(512), default="")
+    # RFC Reply-To (or the provider sender when Reply-To is absent). Automated
+    # recruiting systems often send from a no-reply address but provide a
+    # per-conversation routing address here.
+    reply_to: Mapped[str] = mapped_column(String(512), default="")
     # Provider To header / recipients. Keeping this separate from sender is
     # essential for Sent mail: the sender is the connected account while the
     # reader must show the external recipient.

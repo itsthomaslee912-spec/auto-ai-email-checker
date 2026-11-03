@@ -16,7 +16,7 @@ from sqlalchemy.pool import StaticPool
 from app.api import calendar_events, emails
 from app.db import Base, get_db
 from app.models import CalendarEvent, CalendarEventEmail, EmailLabel, EmailMessage, MailboxConnection, Provider, User
-from app.services.calendar_extract import InterviewDetails, MeetingAccess, _absorb_calendar_event, _assign_join_url, _calendar_email_lock, _parse_ai_slot, _resolve_video_landing_page, _without_quoted_history, authoritative_reschedule_slots, candidate_reschedule_proposal_slots, clean_company_name, clean_meeting_provider, collapse_duplicate_calendar_events, companies_match, employer_instead_of_sender_domain, explicit_hiring_employer, extract_calendar_details, extract_interviewer, extract_meeting_access, fuller_company_name, hide_open_reschedules, is_interview_stage_label, job_role_or_empty, leaves_interview_unbooked, message_appointment_slots, message_is_booked_appointment, needs_calendar_event_repair, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details, repair_availability_window_appointments, repair_calendar_attendee_response_labels, repair_conflicting_calendar_roles, repair_interview_stage_roles, repair_meeting_join_urls, repair_meeting_landing_urls, repair_mixed_thread_appointments, repair_phantom_availability_slots, repair_placeholder_calendar_fields, repair_quoted_option_bookings
+from app.services.calendar_extract import InterviewDetails, MeetingAccess, _absorb_calendar_event, _assign_join_url, _calendar_email_lock, _parse_ai_slot, _resolve_video_landing_page, _without_quoted_history, authoritative_reschedule_slots, candidate_reschedule_proposal_slots, clean_company_name, clean_meeting_provider, collapse_duplicate_calendar_events, companies_match, employer_instead_of_sender_domain, explicit_hiring_employer, extract_calendar_details, extract_interviewer, extract_meeting_access, fuller_company_name, hide_open_reschedules, interview_subject_company_role, is_interview_stage_label, job_role_or_empty, leaves_interview_unbooked, message_appointment_slots, message_is_booked_appointment, needs_calendar_event_repair, parse_ics_slots, parse_text_slots, process_calendar_email, refresh_calendar_event_details, refresh_calendar_events_linked_to_email, repair_availability_window_appointments, repair_calendar_attendee_response_labels, repair_conflicting_calendar_roles, repair_interview_stage_roles, repair_meeting_join_urls, repair_meeting_landing_urls, repair_mixed_thread_appointments, repair_phantom_availability_slots, repair_placeholder_calendar_fields, repair_quoted_option_bookings
 
 
 def test_calendar_email_locks_are_scoped_to_their_event_loop():
@@ -8676,6 +8676,130 @@ def test_deshaw_confirmed_from_range_is_not_an_availability_window():
     assert slots[0].is_availability_window is False
     assert slots[0].start_at == datetime(2026, 11, 5, 17, tzinfo=timezone.utc)
     assert slots[0].end_at == datetime(2026, 11, 5, 20, tzinfo=timezone.utc)
+
+
+def test_modernloop_subjects_expose_company_and_role():
+    assert interview_subject_company_role(
+        "Staff Cloud Engineer (R5801), Shield AI - Requesting Mark's availability for a phone interview"
+    ) == ("Shield AI", "Staff Cloud Engineer (R5801)")
+    assert interview_subject_company_role(
+        "Your interview with Shield AI is scheduled for Nov 6, 2026 at 1:00 PM"
+    ) == ("Shield AI", "")
+    assert interview_subject_company_role(
+        "Shield AI | Interview for Mark | Staff Cloud Engineer (R5801) role"
+    ) == ("Shield AI", "Staff Cloud Engineer (R5801)")
+
+
+def test_modernloop_confirmation_enriches_event_and_closes_pending_invitation():
+    from app.services.pending_interviews import invalidate_calendar_read_cache, pending_interview_requests
+
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="shield-invitation",
+            thread_id="shield-invitation-thread",
+            subject=(
+                "Staff Cloud Engineer (R5801), Shield AI - Requesting Mark's "
+                "availability for a phone interview with Talent Acquisition"
+            ),
+            sender="Margo Cash <margo.cash@shield.ai>",
+            received_at=datetime(2026, 11, 2, 22, 54, 17, tzinfo=timezone.utc),
+            body_text="Please use the self-schedule link to schedule a time on my calendar.",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+        )
+        confirmation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="shield-confirmation",
+            thread_id="shield-confirmation-thread",
+            subject="Your interview with Shield AI is scheduled for Nov 6, 2026 at 1:00 PM",
+            sender="Shield AI <no-reply@interviews.modernloop.io>",
+            received_at=datetime(2026, 11, 2, 22, 56, 57, tzinfo=timezone.utc),
+            body_text=(
+                "BEGIN:VCALENDAR\nMETHOD:REQUEST\nBEGIN:VEVENT\n"
+                "DTSTART:20261106T180000Z\nDTEND:20261106T182500Z\n"
+                "END:VEVENT\nEND:VCALENDAR"
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+        )
+        db.add_all([invitation, confirmation])
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, confirmation, use_ai=False)) is True
+        db.flush()
+        event = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == confirmation.id).one()
+
+        assert event.kind == "confirmed"
+        assert event.company == "Shield AI"
+        assert event.job_role == "Staff Cloud Engineer (R5801)"
+        assert event.title == "Shield AI — Staff Cloud Engineer (R5801)"
+
+        invalidate_calendar_read_cache()
+        pending = pending_interview_requests(
+            db,
+            [mailbox_id],
+            now=datetime(2026, 11, 2, 23, tzinfo=timezone.utc),
+        )
+        assert all(item.email.id != invitation.id for item in pending)
+
+
+def test_late_classification_enriches_an_event_linked_from_another_thread():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="lattice-workday-invitation",
+            thread_id="lattice-invitation-thread",
+            subject="Thank you for applying to Sr Staff Engineer role at Lattice Semiconductor Corp",
+            sender="Eloise Cruz <latticesemi@myworkday.com>",
+            received_at=datetime(2026, 11, 2, 22, 52, tzinfo=timezone.utc),
+            body_text="Please reply with availability. Eloise.Cruz@latticesemi.com",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+        )
+        confirmation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="lattice-teams-confirmation",
+            thread_id="lattice-confirmation-thread",
+            subject="Jordan and Eloise (Lattice Semiconductor - discuss Sr. Staff engr role)",
+            sender="Eloise Cruz <Eloise.Cruz@latticesemi.com>",
+            received_at=datetime(2026, 11, 2, 22, 57, tzinfo=timezone.utc),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+        )
+        db.add_all([invitation, confirmation])
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=confirmation.id,
+            source_thread_id=confirmation.thread_id,
+            kind="confirmed",
+            origin="email",
+            title=confirmation.subject,
+            company="",
+            job_role="",
+            start_at=datetime(2026, 11, 3, 20, tzinfo=timezone.utc),
+            end_at=datetime(2026, 11, 3, 20, 20, tzinfo=timezone.utc),
+            is_visible=True,
+        )
+        db.add(event)
+        db.flush()
+        db.add_all([
+            CalendarEventEmail(event_id=event.id, email_id=invitation.id),
+            CalendarEventEmail(event_id=event.id, email_id=confirmation.id),
+        ])
+        db.flush()
+
+        # Simulate classification completing after the calendar invite was
+        # already projected from the separate confirmation thread.
+        invitation.company = "Lattice Semiconductor Corp"
+        invitation.job_role = "Sr Staff Engineer"
+        assert refresh_calendar_events_linked_to_email(db, invitation) is True
+
+        assert event.source_email_id == confirmation.id
+        assert event.company == "Lattice Semiconductor Corp"
+        assert event.job_role == "Sr Staff Engineer"
+        assert event.title == "Lattice Semiconductor Corp — Sr Staff Engineer"
 
 
 def test_badger_meter_scheduler_booking_uses_explicit_company_and_subject_role():

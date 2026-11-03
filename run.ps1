@@ -83,8 +83,9 @@ if (Test-Path $SupervisorPidFile) {
     $supervisorReloadEnabled = [bool]($supervisorProcess.CommandLine -match '(?i)(?:^|\s)-Reload(?:\s|$)')
   }
 }
-if ($Reload -and $supervisorRunning -and -not $supervisorReloadEnabled) {
-  Write-Host "  Restarting existing services to enable backend reload..."
+if ($supervisorRunning -and ([bool]$Reload -ne $supervisorReloadEnabled)) {
+  $reloadAction = if ($Reload) { "enable" } else { "disable" }
+  Write-Host "  Restarting existing services to $reloadAction backend reload..."
   & (Join-Path $Root "scripts\stop-servers.ps1")
   $supervisorRunning = $false
   & (Join-Path $Root "scripts\run-postgres.ps1")

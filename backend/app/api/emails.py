@@ -97,6 +97,7 @@ _LIST_COLUMNS = load_only(
     EmailMessage.provider_message_id,
     EmailMessage.subject,
     EmailMessage.sender,
+    EmailMessage.reply_to,
     EmailMessage.recipients,
     EmailMessage.received_at,
     EmailMessage.snippet,
@@ -724,7 +725,8 @@ async def get_email(
     # body, so a body-only lazy load can never repair the incorrect Sent
     # recipient shown by the reader. Refresh those legacy Sent rows once.
     needs_recipients = email.folder == MailFolder.SENT.value and not (email.recipients or "").strip()
-    if not has_body or needs_recipients:
+    needs_reply_to = email.folder != MailFolder.SENT.value and not (email.reply_to or "").strip()
+    if not has_body or needs_recipients or needs_reply_to:
         mailbox = (
             db.query(MailboxConnection)
             .filter(MailboxConnection.id == email.mailbox_id, mailbox_scope())
@@ -744,6 +746,7 @@ async def get_email(
                     # reply instead of the current message.
                     email.body_text = normalized.get("body_text") or ""
                     email.body_html = normalized.get("body_html") or ""
+                    email.reply_to = normalized.get("reply_to") or normalized.get("sender") or email.sender or ""
                     email.recipients = normalized.get("recipients") or email.recipients or ""
                     if normalized.get("snippet"):
                         email.snippet = normalized["snippet"][:1000]
@@ -759,6 +762,7 @@ async def get_email(
                     normalized = normalize_outlook_message(raw)
                     email.body_text = normalized.get("body_text") or ""
                     email.body_html = normalized.get("body_html") or ""
+                    email.reply_to = normalized.get("reply_to") or normalized.get("sender") or email.sender or ""
                     email.recipients = normalized.get("recipients") or email.recipients or ""
                     if normalized.get("snippet"):
                         email.snippet = normalized["snippet"][:1000]

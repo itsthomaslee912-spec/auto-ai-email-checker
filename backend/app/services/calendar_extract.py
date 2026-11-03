@@ -135,7 +135,7 @@ def _email_calendar_events(db: Session):
 
 # Bump when deterministic extraction semantics change so stored messages can
 # be reprocessed by maintenance/backfill paths.
-_CALENDAR_EXTRACT_VERSION = "8"
+_CALENDAR_EXTRACT_VERSION = "9"
 _SCHEDULE_TOKEN_RE = re.compile(
     r"https://[^\s<>\"']+/schedule/(?P<token>[a-z0-9-]{12,})(?=[/?.#\s<>\"']|$)",
     re.I,
@@ -1671,6 +1671,9 @@ def _company_named_in_message(email: EmailMessage) -> str:
     "Chat with itility" from jasper@us-itility.com is Itility, even when the
     message row has no stored company.
     """
+    subject_company, _subject_role = interview_subject_company_role(email.subject)
+    if subject_company:
+        return subject_company
     tokens = _domain_identity_tokens(_organizer_addresses(email)) - _GENERIC_COMPANY_TOKENS
     for token in tuple(tokens):
         for suffix in _GLUED_LEGAL_SUFFIXES:
@@ -2243,7 +2246,10 @@ def _candidate_role_rows(messages: list[EmailMessage]) -> list[tuple[str, EmailM
     rows = [
         (role, item)
         for item in messages
-        if (role := job_role_or_empty(item.job_role))
+        if (
+            role := job_role_or_empty(item.job_role)
+            or interview_subject_company_role(item.subject)[1]
+        )
     ]
     non_staff = [row for row in rows if not _is_recruiting_staff_role(row[0])]
     return non_staff or rows
@@ -2516,6 +2522,31 @@ def _related_interview_emails(
     for item in _employer_context_messages(db, email):
         related.setdefault(item.id, item)
 
+    # ModernLoop and similar ATS providers split an invitation and its
+    # confirmation into separate threads, with the confirmation coming from a
+    # generic scheduler domain. Explicit employer names in both subjects are
+    # a safe bridge; the role-conflict filter below still prevents two open
+    # positions at the same company from being merged.
+    source_company, _source_subject_role = interview_subject_company_role(email.subject)
+    if include_cross_thread and received_at and source_company:
+        subject_candidates = (
+            db.query(EmailMessage)
+            .filter(
+                EmailMessage.mailbox_id == email.mailbox_id,
+                EmailMessage.id != email.id,
+                EmailMessage.label.in_(CONTEXT_LABELS),
+                EmailMessage.received_at >= received_at - _CROSS_THREAD_WINDOW,
+                EmailMessage.received_at <= received_at + timedelta(days=2),
+            )
+            .order_by(EmailMessage.received_at.desc(), EmailMessage.id.desc())
+            .limit(80)
+            .all()
+        )
+        for candidate in subject_candidates:
+            candidate_company, _candidate_role = interview_subject_company_role(candidate.subject)
+            if candidate_company and companies_match(source_company, candidate_company):
+                related.setdefault(candidate.id, candidate)
+
     invitation = _pending_scheduler_invitation(db, email)
     if invitation is not None:
         related.setdefault(invitation.id, invitation)
@@ -2595,6 +2626,42 @@ _HIRING_EMPLOYER_STOPWORDS = {
 }
 
 
+def interview_subject_company_role(subject: str | None) -> tuple[str, str]:
+    """Return explicit employer/role identity from common ATS subject forms.
+
+    ModernLoop sends the invitation, calendar file, and confirmation in
+    separate provider threads. Their subjects are the durable join key:
+    ``Role, Company - Requesting ... availability`` and
+    ``Your interview with Company is scheduled ...``.
+    """
+    value = html.unescape((subject or "").strip())
+    patterns = (
+        re.compile(
+            r"^(?P<role>.+?),\s*(?P<company>[^,|]{2,120}?)\s*[-–—|]\s*"
+            r"Requesting\b.*\bavailability\b",
+            re.I,
+        ),
+        re.compile(
+            r"^(?P<company>[^|]{2,120}?)\s*\|\s*Interview\s+for\s+[^|]+\|\s*"
+            r"(?P<role>.+?)(?:\s+role)?\s*$",
+            re.I,
+        ),
+        re.compile(
+            r"^Your\s+interview\s+with\s+(?P<company>.+?)\s+is\s+"
+            r"(?:scheduled|confirmed|booked)\b",
+            re.I,
+        ),
+    )
+    for pattern in patterns:
+        match = pattern.search(value)
+        if match is None:
+            continue
+        company = clean_company_name(match.groupdict().get("company") or "")
+        role = job_role_or_empty(match.groupdict().get("role") or "")
+        return company, role
+    return "", ""
+
+
 def explicit_hiring_employer(text: str) -> str:
     """The employer a message names, as in 'position with Tapestry'.
 
@@ -2627,6 +2694,9 @@ def explicit_hiring_employer(text: str) -> str:
 def _role_named_in_interview_subject(email: EmailMessage, candidate_name: str = "") -> str:
     """Return the role explicitly named by a narrow scheduler subject format."""
     subject = html.unescape((email.subject or "").strip())
+    _subject_company, subject_role = interview_subject_company_role(subject)
+    if subject_role:
+        return subject_role
     match = re.match(
         r"^Schedule Your Interview with .+? for (?P<role>.+?)\s*$",
         subject,
@@ -3973,6 +4043,37 @@ def refresh_calendar_event_details(db: Session, email: EmailMessage) -> bool:
         changed = changed or after != before
         if needs_cross_thread:
             changed = _link_event_emails(db, event, (item.id for item in messages)) or changed
+    return changed
+
+
+def refresh_calendar_events_linked_to_email(db: Session, email: EmailMessage) -> bool:
+    """Re-enrich events after a linked message gains company/role metadata.
+
+    Classification and calendar projection are separate workers. A calendar
+    invite can create the confirmed event before its related Workday message
+    finishes classification. Once that related message gains identity fields,
+    refresh the event through its authoritative source email rather than
+    replacing the event source with the related message.
+    """
+    event_ids = [
+        row.event_id
+        for row in db.query(CalendarEventEmail.event_id).filter(
+            CalendarEventEmail.email_id == email.id
+        ).all()
+    ]
+    if not event_ids:
+        return False
+    source_ids = {
+        row.source_email_id
+        for row in _email_calendar_events(db).filter(
+            CalendarEvent.id.in_(event_ids),
+            CalendarEvent.source_email_id.isnot(None),
+        ).all()
+        if row.source_email_id is not None
+    }
+    changed = False
+    for source in db.query(EmailMessage).filter(EmailMessage.id.in_(source_ids)).all():
+        changed = refresh_calendar_event_details(db, source) or changed
     return changed
 
 

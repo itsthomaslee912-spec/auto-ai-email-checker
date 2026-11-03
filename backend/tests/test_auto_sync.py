@@ -455,7 +455,13 @@ def test_distributed_auto_sync_status_reuses_request_session(monkeypatch):
         "get_settings",
         lambda: SimpleNamespace(auto_sync_interval_seconds=120, distributed_runtime=True),
     )
-    monkeypatch.setattr(auto_sync, "_load_runtime_status", lambda: (now, None))
+    runtime_sessions = []
+
+    def load_runtime_status(db):
+        runtime_sessions.append(db)
+        return now, None
+
+    monkeypatch.setattr(auto_sync, "_load_runtime_status", load_runtime_status)
 
     with session_factory() as db:
         user = User(external_id="distributed-status")
@@ -471,6 +477,7 @@ def test_distributed_auto_sync_status_reuses_request_session(monkeypatch):
         db.commit()
 
         status = auto_sync.get_auto_sync_status(db)
+        assert runtime_sessions == [db]
 
     assert status["state"] == "active"
     assert status["mailboxes"][0]["state"] == "idle"

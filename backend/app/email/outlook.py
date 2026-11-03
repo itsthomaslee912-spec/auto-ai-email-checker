@@ -239,7 +239,7 @@ async def outlook_list_recent(
     folders = ("inbox", "junkemail", "deleteditems", "archive", "sentitems")
     collected: dict[str, dict] = {}
     per_folder = max(1, top)
-    select = "id,subject,from,toRecipients,receivedDateTime,bodyPreview,body,conversationId,isRead"
+    select = "id,subject,from,replyTo,toRecipients,receivedDateTime,bodyPreview,body,conversationId,isRead"
     async with httpx.AsyncClient(timeout=60) as client:
         for folder in folders:
             messages: list[dict] = []
@@ -364,6 +364,16 @@ def _outlook_event_calendar(raw: dict) -> str:
 def normalize_outlook_message(raw: dict) -> dict:
     sender_obj = ((raw.get("from") or {}).get("emailAddress") or {})
     sender = sender_obj.get("address") or sender_obj.get("name") or ""
+    reply_to = ", ".join(
+        (
+            f'{address.get("name")} <{address.get("address")}>'
+            if address.get("name") and address.get("address")
+            else address.get("address") or address.get("name") or ""
+        )
+        for item in raw.get("replyTo") or []
+        for address in [(item.get("emailAddress") or {})]
+        if address.get("address") or address.get("name")
+    ) or sender
     recipients = ", ".join(
         (
             f'{address.get("name")} <{address.get("address")}>'
@@ -415,6 +425,7 @@ def normalize_outlook_message(raw: dict) -> dict:
         "thread_id": raw.get("conversationId"),
         "subject": raw.get("subject") or "",
         "sender": sender,
+        "reply_to": reply_to,
         "recipients": recipients,
         "received_at": received_at,
         "snippet": snippet,

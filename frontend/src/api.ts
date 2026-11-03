@@ -124,6 +124,7 @@ export interface EmailItem {
   provider_message_id: string;
   subject: string;
   sender: string;
+  reply_to?: string;
   recipients?: string;
   received_at: string | null;
   snippet: string;

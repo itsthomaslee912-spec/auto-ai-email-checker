@@ -46,14 +46,20 @@ def _persist_runtime_status(last_check_at: datetime, last_error: str | None) -> 
         db.commit()
 
 
-def _load_runtime_status() -> tuple[datetime | None, str | None]:
+def _load_runtime_status(db: Session) -> tuple[datetime | None, str | None]:
+    """Read the sync-worker heartbeat through the caller's active session.
+
+    Opening a nested ``SessionLocal`` here lets concurrent status requests
+    exhaust the pool: every request can hold its outer connection while all
+    of them wait for a second one. The status endpoint is read-only, so the
+    request-scoped session is both sufficient and deadlock-free.
+    """
     from app.models import SyncRuntimeStatus
 
-    with SessionLocal() as db:
-        row = db.get(SyncRuntimeStatus, 1)
-        if row is None:
-            return None, None
-        return as_utc(row.last_check_at), row.last_error
+    row = db.get(SyncRuntimeStatus, 1)
+    if row is None:
+        return None, None
+    return as_utc(row.last_check_at), row.last_error
 
 
 def has_registered_webhook(mailbox: MailboxConnection, now: datetime | None = None) -> bool:
@@ -313,7 +319,7 @@ def get_auto_sync_status(db: Session) -> dict:
     # The auto-sync loop runs in the sync-worker process, so the API must read
     # its heartbeat from the database rather than from in-process globals.
     if _distributed():
-        last_check_at, last_error = _load_runtime_status()
+        last_check_at, last_error = _load_runtime_status(db)
         loop_running = last_check_at is not None
     else:
         last_check_at, last_error, loop_running = _last_check_at, _last_error, _loop_running

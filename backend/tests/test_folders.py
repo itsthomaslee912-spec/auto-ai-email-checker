@@ -87,6 +87,35 @@ def test_normalize_gmail_message_keeps_unread_state():
     assert normalize_gmail_message(raw)["is_read"] is False
 
 
+def test_normalize_gmail_message_prefers_reply_to_over_automated_sender():
+    raw = {
+        "id": "g-jobvite",
+        "labelIds": ["INBOX"],
+        "payload": {"headers": [
+            {"name": "From", "value": "Amee Parmar <notification@jobvite.com>"},
+            {"name": "Reply-To", "value": "Amee Parmar <joy52tnsx@jobvite.com>"},
+            {"name": "To", "value": "Jordan <jordan@example.com>"},
+        ]},
+    }
+
+    normalized = normalize_gmail_message(raw)
+
+    assert normalized["sender"] == "Amee Parmar <notification@jobvite.com>"
+    assert normalized["reply_to"] == "Amee Parmar <joy52tnsx@jobvite.com>"
+
+
+def test_normalize_gmail_message_uses_sender_when_reply_to_is_absent():
+    raw = {
+        "id": "g-direct",
+        "labelIds": ["INBOX"],
+        "payload": {"headers": [
+            {"name": "From", "value": "Recruiter <recruiter@example.com>"},
+        ]},
+    }
+
+    assert normalize_gmail_message(raw)["reply_to"] == "Recruiter <recruiter@example.com>"
+
+
 def test_normalize_outlook_message_stamps_folder():
     raw = {
         "id": "o1",
@@ -108,6 +137,20 @@ def test_normalize_outlook_message_keeps_unread_state():
         "body": {"contentType": "text", "content": "hello"},
     }
     assert normalize_outlook_message(raw)["is_read"] is False
+
+
+def test_normalize_outlook_message_prefers_reply_to_over_sender():
+    raw = {
+        "id": "o-routed",
+        "from": {"emailAddress": {"name": "Recruiting", "address": "noreply@example.com"}},
+        "replyTo": [{"emailAddress": {"name": "Amee Parmar", "address": "route@example.com"}}],
+        "body": {"contentType": "text", "content": "hello"},
+    }
+
+    normalized = normalize_outlook_message(raw)
+
+    assert normalized["sender"] == "noreply@example.com"
+    assert normalized["reply_to"] == "Amee Parmar <route@example.com>"
 
 
 def test_normalize_outlook_meeting_request_preserves_structured_calendar_time():

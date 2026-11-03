@@ -111,12 +111,12 @@ const QUICK_REPLY_OPTIONS: { id: QuickReplyKind; label: string; description: str
   {
     id: "interview_follow_up",
     label: "Interview follow-up",
-    description: "Thank the interviewer and reaffirm your interest.",
+    description: "Follow up professionally and ask about the next steps.",
   },
   {
     id: "reschedule_interview",
     label: "Reschedule interview",
-    description: "Ask for a different interview time politely.",
+    description: "Check your calendar and offer available replacement times.",
   },
 ];
 
@@ -2175,21 +2175,28 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     let body = "";
     setAiDrafting(true);
     try {
-      if (kind === "suggest_available_times") {
+      let availableSlots: Date[] = [];
+      if (kind === "suggest_available_times" || kind === "reschedule_interview") {
         const rangeStart = new Date();
         const rangeEnd = new Date(rangeStart);
         rangeEnd.setDate(rangeEnd.getDate() + 15);
         const events = await fetchCalendarEvents(rangeStart.toISOString(), rangeEnd.toISOString());
-        const slots = availableInterviewSlots(events, rangeStart, 3);
-        if (!slots.length) {
-          setBanner("No open weekday interview times were found in the next two weeks");
+        availableSlots = availableInterviewSlots(events, rangeStart, 3);
+        if (!availableSlots.length) {
+          setBanner(
+            kind === "reschedule_interview"
+              ? "No open replacement times were found in the next two weeks"
+              : "No open weekday interview times were found in the next two weeks",
+          );
           return;
         }
-        body = `Hi ${recipientName},\n\nThank you for reaching out. I would be happy to connect. Based on my calendar, I am available at the following times:\n\n${slots.map((slot) => `• ${formatAvailabilitySlot(slot)}`).join("\n")}\n\nPlease let me know which option works best for you. If none of these times are convenient, I would be glad to coordinate another time.\n\nBest regards,\n${signature}`;
+      }
+      if (kind === "suggest_available_times") {
+        body = `Hi ${recipientName},\n\nThank you for reaching out. I would be happy to connect. Based on my calendar, I am available at the following times:\n\n${availableSlots.map((slot) => `• ${formatAvailabilitySlot(slot)}`).join("\n")}\n\nPlease let me know which option works best for you. If none of these times are convenient, I would be glad to coordinate another time.\n\nBest regards,\n${signature}`;
       } else if (kind === "interview_follow_up") {
-        body = `Hi ${recipientName},\n\nThank you again for taking the time to speak with me about this opportunity. I appreciated learning more about the role and the team, and our conversation strengthened my interest in the position.\n\nPlease let me know if I can provide any additional information. I look forward to hearing about the next steps.\n\nBest regards,\n${signature}`;
+        body = `Hi ${recipientName},\n\nI hope you are doing well. I wanted to follow up regarding my recent interview and thank you again for taking the time to speak with me. I appreciated learning more about the role and the team, and I remain very interested in the opportunity.\n\nCould you please provide an update on the next steps in the interview process? Please let me know if I can provide any additional information.\n\nBest regards,\n${signature}`;
       } else {
-        body = `Hi ${recipientName},\n\nThank you for arranging the interview. Unfortunately, I need to request a different meeting time. I apologize for any inconvenience this may cause.\n\nWould it be possible to reschedule? I am happy to work with your availability and find a time that is convenient for everyone.\n\nThank you for your understanding.\n\nBest regards,\n${signature}`;
+        body = `Hi ${recipientName},\n\nThank you for arranging the interview. Unfortunately, I need to request a different meeting time, and I apologize for any inconvenience this may cause.\n\nBased on my calendar, I am available at the following alternative times:\n\n${availableSlots.map((slot) => `• ${formatAvailabilitySlot(slot)}`).join("\n")}\n\nWould any of these options work for you? If not, I would be happy to coordinate another time that is convenient for everyone.\n\nThank you for your understanding.\n\nBest regards,\n${signature}`;
       }
       setReplyText(body);
       setQuickRepliesOpen(false);
@@ -2270,7 +2277,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     ? mailboxById.get(replyMailboxId) ?? defaultReplyMailbox
     : defaultReplyMailbox;
   const replyRecipient = selected
-    ? (selected.folder === "sent" && selected.recipients ? selected.recipients : selected.sender)
+    ? (selected.folder === "sent" && selected.recipients
+      ? selected.recipients
+      : selected.reply_to || selected.sender)
     : "";
   const replySubject = selected
     ? (/^re:/i.test(selected.subject) ? selected.subject : `Re: ${selected.subject}`)

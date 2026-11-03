@@ -37,7 +37,7 @@ $frontendRestartDelay = 0
 $startupGraceSeconds = 90
 $backendFailureThreshold = 3
 $backendSourceVersion = ""
-$workerHeartbeatMaxAgeSeconds = 60
+$workerHeartbeatMaxAgeSeconds = 180
 $workerHeartbeatStartupGraceSeconds = 90
 
 function Write-SupervisorLog([string]$Message) {
