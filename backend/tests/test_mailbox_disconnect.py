@@ -258,20 +258,20 @@ def test_account_settings_are_saved_and_listed():
         "calendar_color": "#E11D48",
         "display_name": "Ryan Queen",
         "timezone_name": "America/Chicago",
-        "avatar_key": "cartoon-glasses",
+        "avatar_key": "cartoon-hijab",
     })
     assert saved.status_code == 200
     assert saved.json()["calendar_color"] == "#e11d48"
     assert saved.json()["display_name"] == "Ryan Queen"
     assert saved.json()["timezone_name"] == "America/Chicago"
-    assert saved.json()["avatar_key"] == "cartoon-glasses"
+    assert saved.json()["avatar_key"] == "cartoon-hijab"
 
     listed = client.get("/api/mailboxes")
     assert listed.status_code == 200
     assert listed.json()[0]["calendar_color"] == "#e11d48"
     assert listed.json()[0]["display_name"] == "Ryan Queen"
     assert listed.json()[0]["timezone_name"] == "America/Chicago"
-    assert listed.json()[0]["avatar_key"] == "cartoon-glasses"
+    assert listed.json()[0]["avatar_key"] == "cartoon-hijab"
 
     invalid_avatar = client.patch(
         f"/api/mailboxes/{mailbox_id}",

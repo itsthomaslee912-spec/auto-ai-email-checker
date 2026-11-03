@@ -21,7 +21,13 @@ from app.schemas import (
     PendingInterviewSlotOut,
 )
 from app.services.pending_interviews import pending_interview_requests, resolved_availability_ids
-from app.services.calendar_extract import appointment_email_ids, clean_meeting_provider, companies_match, roles_compatible
+from app.services.calendar_extract import (
+    appointment_email_ids,
+    clean_meeting_provider,
+    companies_match,
+    job_role_or_empty,
+    roles_compatible,
+)
 from app.timeutil import as_utc
 
 router = APIRouter(prefix="/api/calendar-events", tags=["calendar"])
@@ -223,13 +229,22 @@ def get_interview_timeline(event_id: int, db: Session = Depends(get_db)) -> list
         .order_by(CalendarEvent.start_at.asc(), CalendarEvent.id.asc())
         .all()
     )
+    event_role = job_role_or_empty(event.job_role)
     related = [
         item
         for item in rows
         if item.id == event.id
         or (
             (not event.company or companies_match(item.company, event.company))
-            and (not event.job_role or roles_compatible(item.job_role, event.job_role))
+            # Calendar providers often replace the application role with a
+            # round name such as "Coding Fundamentals Interview". A stage
+            # label carries no conflicting role identity, so it must not split
+            # the new round from the application's earlier booked rounds.
+            and (
+                not event_role
+                or not job_role_or_empty(item.job_role)
+                or roles_compatible(item.job_role, event_role)
+            )
         )
     ]
     kinds = _request_kinds(db, related)

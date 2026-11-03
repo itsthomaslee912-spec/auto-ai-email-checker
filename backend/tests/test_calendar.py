@@ -87,6 +87,84 @@ Join https://meet.google.com/abc-defg-hij or call +1 (212) 555-0199, PIN: 456 78
     assert access.access_code == "456 789"
 
 
+def test_ics_with_argentina_windows_timezone_is_parsed_without_ai():
+    text = """BEGIN:VCALENDAR
+METHOD:REQUEST
+BEGIN:VTIMEZONE
+TZID:Argentina Standard Time
+END:VTIMEZONE
+BEGIN:VEVENT
+SUMMARY:Opportunity at EY - Financial Services - Forward Deployed Engineer
+DTSTART;TZID=Argentina Standard Time:20261105T113000
+DTEND;TZID=Argentina Standard Time:20261105T120000
+STATUS:CONFIRMED
+END:VEVENT
+END:VCALENDAR"""
+
+    slots = parse_ics_slots(text)
+
+    assert len(slots) == 1
+    assert slots[0].start_at == datetime(2026, 11, 5, 14, 30, tzinfo=timezone.utc)
+    assert slots[0].end_at == datetime(2026, 11, 5, 15, 0, tzinfo=timezone.utc)
+    assert slots[0].source_timezone == "Argentina Standard Time"
+
+
+def test_cross_thread_booking_inherits_role_named_in_invitation_body():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="biorce-invitation",
+            thread_id="biorce-invitation-thread",
+            subject="Talent Acquisition & Jordan | Interview with Biorce (select availability)",
+            sender="Frederico Peten <frederico.peten@biorce.com>",
+            received_at=datetime(2026, 11, 3, 12, 47, tzinfo=timezone.utc),
+            body_text=(
+                "This will be a 30 minutes video interview with myself to discuss your "
+                "application for the AI Orchestration Architect - Austin role and give us "
+                "a chance to get to know you better."
+            ),
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+        )
+        booking = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="biorce-booking",
+            thread_id="biorce-booking-thread",
+            subject=(
+                "Confirmation - Talent Acquisition interview with Biorce on Thursday, "
+                "05 November 10:30 AM (America/New_York)"
+            ),
+            sender="Frederico Peten <frederico.peten@biorce.com>",
+            received_at=datetime(2026, 11, 3, 12, 49, tzinfo=timezone.utc),
+            body_text="The interview has been scheduled and will be accessible via Google Meet.",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+            job_role="Talent Acquisition",
+        )
+        db.add_all([invitation, booking])
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=booking.id,
+            source_thread_id=booking.thread_id,
+            kind="confirmed",
+            origin="email",
+            title="Biorce",
+            company="Biorce",
+            job_role="",
+            start_at=datetime(2026, 11, 5, 15, 30, tzinfo=timezone.utc),
+            end_at=datetime(2026, 11, 5, 16, 0, tzinfo=timezone.utc),
+            is_visible=True,
+        )
+        db.add(event)
+        db.flush()
+
+        assert refresh_calendar_event_details(db, booking) is True
+        assert event.company == "Biorce"
+        assert event.job_role == "AI Orchestration Architect - Austin"
+        assert event.title == "Biorce — AI Orchestration Architect - Austin"
+
+
 def test_named_video_provider_is_preserved_without_a_direct_join_url():
     access = extract_meeting_access(
         "Your meeting will be a video call on Google Meet. Click below to join."
@@ -5769,9 +5847,9 @@ def test_interview_timeline_returns_all_application_rounds_in_date_order():
             mailbox_id=mailbox_id,
             kind="confirmed",
             origin="email",
-            title="ADUSA – Retail Business — Senior Cloud Engineer",
+            title="ADUSA – Retail Business — Coding Fundamentals Interview",
             company="ADUSA – Retail Business",
-            job_role="Senior Cloud Engineer",
+            job_role="Coding Fundamentals Interview",
             start_at=datetime(2026, 11, 4, 19, 0, tzinfo=timezone.utc),
             end_at=datetime(2026, 11, 4, 19, 45, tzinfo=timezone.utc),
             source_received_at=datetime(2026, 11, 2, 15, 55, tzinfo=timezone.utc),
@@ -6443,6 +6521,24 @@ def test_explicit_hiring_employer_skips_interviewer_name_with_title():
     assert explicit_hiring_employer(
         "This is a great interview with Sam (https://example.com/press), our CEO and Co-Founder"
     ) == ""
+    assert explicit_hiring_employer(
+        "Phone Interview with Komal Aslam, Hilti Sr. Recruiter - Mark Wei"
+    ) == ""
+    assert explicit_hiring_employer(
+        r"SUMMARY:Phone Interview with Komal Aslam\, Hilti Sr. Recruiter - Mark Wei"
+    ) == ""
+    assert explicit_hiring_employer(
+        "SUMMARY:Phone Interview with Komal Aslam\\, Hilti Sr. Recruit\r\n er - Mark Wei"
+    ) == ""
+    assert extract_interviewer(
+        """Phone Interview with Komal Aslam, Hilti Sr. Recruiter - Mark Wei
+BEGIN:VCALENDAR
+BEGIN:VEVENT
+ORGANIZER;CN=HILTI-Booking-Recruiter Connection:mailto:booking@hilti.com
+END:VEVENT
+END:VCALENDAR""",
+        "HILTI-Booking-Recruiter Connection <booking@hilti.com>",
+    ) == "Komal Aslam"
     # The employer named elsewhere in the message still wins when it matches
     # the trigger pattern directly.
     assert explicit_hiring_employer(
@@ -7184,6 +7280,12 @@ def test_sender_domain_does_not_replace_the_named_employer():
         body_text="Confirming the Senior Engineer position with Corewe tomorrow.",
     )
     assert employer_instead_of_sender_domain(clipped, "CoreWeave") == "CoreWeave"
+    hilti = EmailMessage(
+        sender="HILTI-Booking-Recruiter Connection <booking@hilti.com>",
+        subject="Phone Interview with Komal Aslam, Hilti Sr. Recruiter - Mark Wei",
+        body_text="Hilti North America Corporate Office",
+    )
+    assert employer_instead_of_sender_domain(hilti, "Hilti") == "Hilti"
 
 
 def test_same_clock_slot_collapses_role_and_company_variants():

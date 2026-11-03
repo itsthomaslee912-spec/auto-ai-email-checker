@@ -483,10 +483,10 @@ export default function SettingsPage({
                             type="button"
                             className="account-avatar"
                             style={{ "--account-color": color } as CSSProperties}
-                            aria-label={`Choose account color for ${mailbox.email_address}`}
+                            aria-label={`Customize avatar and color for ${mailbox.email_address}`}
                             aria-controls={`account-color-panel-${mailbox.id}`}
                             aria-expanded={colorPickerMailboxId === mailbox.id}
-                            data-tooltip="Choose account color"
+                            data-tooltip="Customize avatar and color"
                             onClick={() => {
                               setSettingsMailboxId(null);
                               setColorPickerMailboxId((current) => current === mailbox.id ? null : mailbox.id);
@@ -508,7 +508,7 @@ export default function SettingsPage({
                             <div className="account-color-panel-inner" role="group" aria-label={`Account appearance for ${mailbox.email_address}`}>
                               <div className="account-color-popover-heading account-appearance-heading">
                                 <strong>Account avatar</strong>
-                                <small>Choose a simple or cartoon avatar</small>
+                                <small>Choose one of 10 male cartoon characters</small>
                               </div>
                               <div className="account-avatar-palette" role="listbox" aria-label="Available account avatars">
                                 {ACCOUNT_AVATAR_OPTIONS.map((option) => {
@@ -526,7 +526,6 @@ export default function SettingsPage({
                                       <span className="account-avatar-option-preview" style={{ "--account-color": color } as CSSProperties} aria-hidden="true">
                                         <AccountAvatarGlyph avatarKey={option.key} initials={initialsFrom(mailbox.display_name || mailbox.email_address)} />
                                       </span>
-                                      <small>{option.name}</small>
                                     </button>
                                   );
                                 })}

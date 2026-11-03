@@ -194,6 +194,7 @@ VIDEO_HOSTS = {
 }
 
 WINDOWS_TIME_ZONES = {
+    "Argentina Standard Time": "America/Argentina/Buenos_Aires",
     "Eastern Standard Time": "America/New_York",
     "Central Standard Time": "America/Chicago",
     "Mountain Standard Time": "America/Denver",
@@ -1033,7 +1034,7 @@ def _generic_interviewer(value: str | None) -> bool:
         "recruitmentteam",
         "screeningavailability",
         "talentacquisitionteam",
-    }
+    } or ("booking" in compact and ("recruiter" in compact or "connection" in compact))
 
 
 def extract_interviewer(text: str, sender: str = "") -> str:
@@ -1046,6 +1047,10 @@ def extract_interviewer(text: str, sender: str = "") -> str:
             organizer = _clean_text(match.group(1))
             if not _generic_interviewer(organizer):
                 return organizer
+            # A generic Bookings organizer's mailto local-part (often just
+            # "booking") is no more personal than its display name. Continue
+            # to the human name in the subject/body instead.
+            continue
         if value.lower().startswith("mailto:"):
             organizer = _clean_text(value[7:])
             if not _generic_interviewer(organizer.partition("@")[0]):
@@ -2226,6 +2231,10 @@ def is_interview_stage_label(role: str | None) -> bool:
     key = _role_key(role)
     if not key:
         return False
+    # Scheduler event names often use the recruiting department as the
+    # appointment title. It is context for the round, not the candidate's job.
+    if key == "talent acquisition":
+        return True
     if _INTERVIEW_STAGE_RE.fullmatch(key):
         return True
     if re.fullmatch(
@@ -2287,6 +2296,7 @@ def _candidate_role_rows(messages: list[EmailMessage]) -> list[tuple[str, EmailM
         if (
             role := job_role_or_empty(item.job_role)
             or interview_subject_company_role(item.subject)[1]
+            or _role_named_in_interview_message(item)
         )
     ]
     non_staff = [row for row in rows if not _is_recruiting_staff_role(row[0])]
@@ -2720,6 +2730,15 @@ def explicit_hiring_employer(text: str) -> str:
         # ("Adrien Lana" -> "Adrien").
         if re.match(r"[ \t]*\(", unescaped[match.end() : match.end() + 4]):
             continue
+        # Calendar subjects such as "Phone Interview with Komal Aslam, Hilti
+        # Sr. Recruiter" name a person followed by their recruiting title.
+        # The person is the interviewer, never the hiring company.
+        if re.match(
+            r"[ \t]*\\?,[\s\S]{0,80}\b(?:recruit\s*er|talent\s+acquisition|human\s+resources)\b",
+            unescaped[match.end() : match.end() + 100],
+            re.I,
+        ):
+            continue
         name = clean_company_name(match.group(1))
         if name:
             names.append(name)
@@ -2766,6 +2785,28 @@ def _role_named_in_interview_subject(email: EmailMessage, candidate_name: str = 
         role,
     )
     role = role.strip(" -–—|:")[:255]
+    return job_role_or_empty(role)
+
+
+def _role_named_in_interview_message(email: EmailMessage) -> str:
+    """Return a role explicitly attached to the candidate's application.
+
+    Some schedulers use a generic subject and put the only job title in a
+    sentence such as ``discuss your application for the Platform Architect
+    role``. Keep this deliberately narrow so signatures and quoted job-alert
+    content cannot become calendar roles.
+    """
+    text = html.unescape(_fresh_message_text(email))
+    text = re.sub(r"[*_]+", "", text)
+    match = re.search(
+        r"\b(?:discuss\s+)?your\s+application\s+for\s+(?:the\s+)?"
+        r"(?P<role>[A-Za-z0-9][^\r\n.!?]{2,180}?)\s+role\b",
+        text,
+        re.I,
+    )
+    if match is None:
+        return ""
+    role = re.sub(r"\s+", " ", match.group("role")).strip(" -–—|:")[:255]
     return job_role_or_empty(role)
 
 
@@ -3849,7 +3890,11 @@ async def extract_calendar_details(
     # Scheduler subjects are authoritative for the booked opening. This also
     # prevents an unrelated stored role from another interview from leaking
     # into a generic no-reply confirmation.
-    known_role = _role_named_in_interview_subject(email, candidate_name) or _known_role(messages)
+    known_role = (
+        _role_named_in_interview_subject(email, candidate_name)
+        or _role_named_in_interview_message(email)
+        or _known_role(messages)
+    )
     deterministic_job_url = extract_job_url(text)
     deterministic_interviewer = extract_interviewer(current_text, email.sender or "")
     if not deterministic_interviewer:
