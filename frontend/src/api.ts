@@ -22,7 +22,9 @@ export interface Mailbox {
   provider: Provider;
   email_address: string;
   display_name: string | null;
+  timezone_name?: string | null;
   calendar_color?: string | null;
+  avatar_key?: string | null;
   is_active: boolean;
   created_at: string | null;
 }
@@ -211,13 +213,16 @@ export async function fetchMailboxes(): Promise<Mailbox[]> {
   return res.json();
 }
 
-export async function updateMailboxColor(id: number, calendarColor: string): Promise<Mailbox> {
+export async function updateMailboxSettings(
+  id: number,
+  settings: Partial<Pick<Mailbox, "display_name" | "timezone_name" | "calendar_color" | "avatar_key">>,
+): Promise<Mailbox> {
   const res = await apiFetch(`${API_BASE}/api/mailboxes/${id}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ calendar_color: calendarColor }),
+    body: JSON.stringify(settings),
   });
-  if (!res.ok) throw new Error(await readApiError(res, "Failed to save account color"));
+  if (!res.ok) throw new Error(await readApiError(res, "Failed to save account settings"));
   return res.json();
 }
 
@@ -351,8 +356,13 @@ export function prefetchEmailDetail(id: number): void {
   void fetchEmailDetail(id, false).catch(() => {});
 }
 
-export async function fetchEmailDetail(id: number, markRead = true, markThread = false): Promise<EmailDetail> {
-  if (!markRead) {
+export async function fetchEmailDetail(
+  id: number,
+  markRead = true,
+  markThread = false,
+  resolveReplyTo = false,
+): Promise<EmailDetail> {
+  if (!markRead && !resolveReplyTo) {
     const cached = detailCache.get(id);
     if (cached) return cached;
     const pending = detailInflight.get(id);
@@ -361,6 +371,7 @@ export async function fetchEmailDetail(id: number, markRead = true, markThread =
   const params = new URLSearchParams();
   if (!markRead) params.set("mark_read", "false");
   if (markRead && markThread) params.set("mark_thread", "true");
+  if (resolveReplyTo) params.set("resolve_reply_to", "true");
   const suffix = params.size ? `?${params.toString()}` : "";
   const request = (async () => {
     const res = await apiFetch(`${API_BASE}/api/emails/${id}${suffix}`, undefined, markRead ? 4 : 1);
@@ -369,7 +380,7 @@ export async function fetchEmailDetail(id: number, markRead = true, markThread =
     rememberEmailDetail(detail);
     return detail;
   })();
-  if (!markRead) {
+  if (!markRead && !resolveReplyTo) {
     detailInflight.set(id, request);
     void request.finally(() => {
       if (detailInflight.get(id) === request) detailInflight.delete(id);
@@ -547,6 +558,8 @@ export interface CalendarEvent {
   meeting_url: string | null;
   phone_number: string | null;
   phone_access_code: string | null;
+  source_received_at: string | null;
+  outcome_at: string | null;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -639,6 +652,12 @@ export async function fetchInterviewEmailAlerts(signal?: AbortSignal): Promise<I
 export async function fetchCalendarEventEmails(id: number): Promise<EmailDetail[]> {
   const res = await apiFetch(`${API_BASE}/api/calendar-events/${id}/emails`, undefined, 4);
   if (!res.ok) throw new Error(await readApiError(res, "Failed to load associated emails"));
+  return res.json();
+}
+
+export async function fetchInterviewTimeline(id: number, signal?: AbortSignal): Promise<CalendarEvent[]> {
+  const res = await apiFetch(`${API_BASE}/api/calendar-events/${id}/timeline`, { signal }, 4);
+  if (!res.ok) throw new Error(await readApiError(res, "Failed to load interview timeline"));
   return res.json();
 }
 

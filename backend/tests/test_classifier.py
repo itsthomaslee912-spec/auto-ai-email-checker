@@ -88,6 +88,31 @@ def test_meeting_access_code_is_not_treated_as_account_verification():
     assert result is None
 
 
+def test_structured_recruiter_questionnaire_is_screening_in_ai_only_mode():
+    body = """
+    Thank you for applying through our careers site.
+    This role is based in Jacksonville, Florida and follows a hybrid work model.
+    Please let me know if this arrangement works for you. If yes, kindly provide the following details:
+    Current location:
+    Total years of experience:
+    Years of experience as SRE:
+    Expected compensation:
+    Notice period / availability to join:
+    Work authorization status:
+    """
+
+    result = deterministic_ai_only_classification(
+        subject="Sr Lead SRE role with FIS",
+        sender="Abhinav Vemuru <workday@fisglobal.com>",
+        body_text=body,
+        snippet="",
+    )
+
+    assert result is not None
+    assert result.label == EmailLabel.SCREENING.value
+    assert _heuristic_label("Sr Lead SRE role with FIS", "", body, "") == EmailLabel.SCREENING.value
+
+
 def test_automatic_out_of_office_has_deterministic_ai_only_result():
     result = deterministic_ai_only_classification(
         subject="Automatic reply: Hilti Application",

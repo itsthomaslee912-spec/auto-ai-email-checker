@@ -51,13 +51,18 @@ class MailboxOut(BaseModel):
     provider: ProviderLiteral
     email_address: str
     display_name: str | None = None
+    timezone_name: str | None = None
     calendar_color: str | None = None
+    avatar_key: str = "initials"
     is_active: bool
     created_at: UtcDateTime | None = None
 
 
-class MailboxColorIn(BaseModel):
-    calendar_color: str
+class MailboxUpdateIn(BaseModel):
+    calendar_color: str | None = None
+    display_name: str | None = Field(default=None, max_length=255)
+    timezone_name: str | None = Field(default=None, max_length=128)
+    avatar_key: str | None = Field(default=None, max_length=32)
 
 
 class EmailOut(BaseModel):
@@ -317,6 +322,8 @@ class CalendarEventOut(BaseModel):
     phone_number: str | None = None
     phone_access_code: str | None = None
     request_kind: Literal["invitation", "reschedule"] | None = None
+    source_received_at: UtcDateTime | None = None
+    outcome_at: UtcDateTime | None = None
     created_at: UtcDateTime | None = None
     updated_at: UtcDateTime | None = None
 

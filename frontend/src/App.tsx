@@ -31,7 +31,7 @@ import {
   fetchReclassifyStatus,
   sendEmail,
   fetchMailboxes,
-  updateMailboxColor,
+  updateMailboxSettings,
   markAllRead,
   oauthStartUrl,
   syncMailbox,
@@ -54,6 +54,7 @@ import {
   type Provider,
   type SessionUser,
 } from "./api";
+import { AccountAvatarGlyph } from "./components/AccountAvatar";
 import { accountColor } from "./accountColor";
 import { CLASSIFY_LABELS, CLASSIFY_LABEL_TITLES, EMPTY_LABEL_COUNTS, INTERVIEW_SUBTYPE_TITLES } from "./labels";
 import {
@@ -290,36 +291,64 @@ function senderProfileName(mailbox: Mailbox | null | undefined, sessionUser: Ses
     .join(" ") || "Regards";
 }
 
-function availableInterviewSlots(events: CalendarEvent[], now = new Date(), count = 3): Date[] {
+function timezoneParts(date: Date, timeZone: string) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const value = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value || "";
+  return {
+    dateKey: `${value("year")}-${value("month")}-${value("day")}`,
+    weekday: value("weekday"),
+    time: `${value("hour")}:${value("minute")}`,
+  };
+}
+
+function availableInterviewSlots(
+  events: CalendarEvent[],
+  now = new Date(),
+  count = 3,
+  timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+): Date[] {
   const busy = events
     .map((event) => ({ start: new Date(event.start_at).getTime(), end: new Date(event.end_at).getTime() }))
     .filter((event) => Number.isFinite(event.start) && Number.isFinite(event.end) && event.end > event.start);
   const suggestions: Date[] = [];
-  const seen = new Set<number>();
-  const candidateHours = [9.5, 11, 13.5, 15];
+  const seenDates = new Set<string>();
+  const candidateTimes = new Set(["09:30", "11:00", "13:30", "15:00"]);
+  const today = timezoneParts(now, timeZone).dateKey;
+  const cursor = new Date(Math.ceil((now.getTime() + 1) / (30 * 60 * 1000)) * 30 * 60 * 1000);
+  const limit = new Date(now.getTime() + 15 * 24 * 60 * 60 * 1000);
 
-  for (let offset = 1; offset <= 14 && suggestions.length < count; offset += 1) {
-    const day = new Date(now);
-    day.setDate(now.getDate() + offset);
-    day.setHours(0, 0, 0, 0);
-    if (day.getDay() === 0 || day.getDay() === 6) continue;
-
-    for (const hour of candidateHours) {
-      const start = new Date(day);
-      start.setHours(Math.floor(hour), hour % 1 ? 30 : 0, 0, 0);
-      const startMs = start.getTime();
-      const endMs = startMs + 30 * 60 * 1000;
-      if (seen.has(startMs) || busy.some((event) => event.start < endMs && event.end > startMs)) continue;
-      seen.add(startMs);
-      suggestions.push(start);
-      break;
+  while (cursor < limit && suggestions.length < count) {
+    const zoned = timezoneParts(cursor, timeZone);
+    const startMs = cursor.getTime();
+    const endMs = startMs + 30 * 60 * 1000;
+    if (
+      zoned.dateKey !== today
+      && zoned.weekday !== "Sat"
+      && zoned.weekday !== "Sun"
+      && candidateTimes.has(zoned.time)
+      && !seenDates.has(zoned.dateKey)
+      && !busy.some((event) => event.start < endMs && event.end > startMs)
+    ) {
+      suggestions.push(new Date(cursor));
+      seenDates.add(zoned.dateKey);
     }
+    cursor.setTime(cursor.getTime() + 30 * 60 * 1000);
   }
   return suggestions;
 }
 
-function formatAvailabilitySlot(slot: Date): string {
+function formatAvailabilitySlot(slot: Date, timeZone: string): string {
   return new Intl.DateTimeFormat(undefined, {
+    timeZone,
     weekday: "long",
     month: "long",
     day: "numeric",
@@ -382,10 +411,6 @@ function groupEmailsByDate(items: EmailItem[]): { key: string; heading: string; 
       heading: key === "unknown" ? "Unknown date" : formatDateHeading(key),
       items: groupItems,
     }));
-}
-
-function providerMark(provider: Provider): string {
-  return provider === "google" ? "G" : "O";
 }
 
 type SidebarIconName = "home" | "inbox" | "calendar" | "monitoring" | "statistics" | "categories" | "sent" | "spam" | "trash" | "archive" | "settings";
@@ -519,6 +544,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   const [replyInstruction, setReplyInstruction] = useState("");
   const [quickRepliesOpen, setQuickRepliesOpen] = useState(false);
   const [replyFiles, setReplyFiles] = useState<File[]>([]);
+  const [resolvingReplyRecipient, setResolvingReplyRecipient] = useState(false);
   const [scheduleAt, setScheduleAt] = useState("");
   const [sendingReply, setSendingReply] = useState(false);
   const [aiDrafting, setAiDrafting] = useState(false);
@@ -1602,12 +1628,18 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     await load();
   }
 
-  function onAccountColor(id: number, calendarColor: string) {
-    const previous = mailboxes.find((box) => box.id === id)?.calendar_color ?? null;
-    setMailboxes((current) => current.map((box) => box.id === id ? { ...box, calendar_color: calendarColor } : box));
-    void updateMailboxColor(id, calendarColor).catch(() => {
-      setMailboxes((current) => current.map((box) => box.id === id ? { ...box, calendar_color: previous } : box));
-    });
+  function onAccountSettings(
+    id: number,
+    settings: Partial<Pick<Mailbox, "display_name" | "timezone_name" | "calendar_color" | "avatar_key">>,
+  ) {
+    const previous = mailboxes.find((box) => box.id === id);
+    setMailboxes((current) => current.map((box) => box.id === id ? { ...box, ...settings } : box));
+    void updateMailboxSettings(id, settings)
+      .then((saved) => setMailboxes((current) => current.map((box) => box.id === id ? saved : box)))
+      .catch((err) => {
+        if (previous) setMailboxes((current) => current.map((box) => box.id === id ? previous : box));
+        setBanner(err instanceof Error ? err.message : "Could not save account settings");
+      });
   }
 
   async function onSync(id: number, selectAccount = true) {
@@ -2168,10 +2200,42 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     setReplyRecipients((current) => current.filter((item) => item.toLowerCase() !== address.toLowerCase()));
   }
 
+  async function openReplyComposer() {
+    if (!selected || resolvingReplyRecipient) return;
+    let message = selected;
+    if (message.folder !== "sent" && !message.reply_to?.trim()) {
+      setResolvingReplyRecipient(true);
+      try {
+        message = await fetchEmailDetail(message.id, false, false, true);
+        setSelected(message);
+      } catch (err) {
+        setBanner(err instanceof Error ? err.message : "Could not resolve the reply address");
+        return;
+      } finally {
+        setResolvingReplyRecipient(false);
+      }
+    }
+    const recipient = message.folder === "sent" && message.recipients
+      ? message.recipients
+      : message.reply_to || message.sender;
+    const subject = /^re:/i.test(message.subject) ? message.subject : `Re: ${message.subject}`;
+    const senderMailbox = mailboxById.get(message.mailbox_id) ?? selectedMailbox ?? activeReplyMailboxes[0];
+    setScheduleAt("");
+    setReplyInstruction("");
+    setQuickRepliesOpen(false);
+    setReplyExpanded(false);
+    setReplySubjectText(subject);
+    setReplyRecipients(extractEmailAddresses(recipient));
+    setReplyRecipientDraft("");
+    setReplyMailboxId(senderMailbox?.id ?? null);
+    setReplyOpen(true);
+  }
+
   async function applyQuickReply(kind: QuickReplyKind) {
     if (!selected) return;
     const recipientName = replyGreetingName(replyRecipient);
     const signature = senderProfileName(replyMailbox, sessionUser);
+    const replyTimeZone = replyMailbox?.timezone_name || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
     let body = "";
     setAiDrafting(true);
     try {
@@ -2181,7 +2245,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         const rangeEnd = new Date(rangeStart);
         rangeEnd.setDate(rangeEnd.getDate() + 15);
         const events = await fetchCalendarEvents(rangeStart.toISOString(), rangeEnd.toISOString());
-        availableSlots = availableInterviewSlots(events, rangeStart, 3);
+        availableSlots = availableInterviewSlots(events, rangeStart, 3, replyTimeZone);
         if (!availableSlots.length) {
           setBanner(
             kind === "reschedule_interview"
@@ -2192,11 +2256,11 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         }
       }
       if (kind === "suggest_available_times") {
-        body = `Hi ${recipientName},\n\nThank you for reaching out. I would be happy to connect. Based on my calendar, I am available at the following times:\n\n${availableSlots.map((slot) => `• ${formatAvailabilitySlot(slot)}`).join("\n")}\n\nPlease let me know which option works best for you. If none of these times are convenient, I would be glad to coordinate another time.\n\nBest regards,\n${signature}`;
+        body = `Hi ${recipientName},\n\nThank you for reaching out. I would be happy to connect. Based on my calendar, I am available at the following times:\n\n${availableSlots.map((slot) => `• ${formatAvailabilitySlot(slot, replyTimeZone)}`).join("\n")}\n\nPlease let me know which option works best for you. If none of these times are convenient, I would be glad to coordinate another time.\n\nBest regards,\n${signature}`;
       } else if (kind === "interview_follow_up") {
         body = `Hi ${recipientName},\n\nI hope you are doing well. I wanted to follow up regarding my recent interview and thank you again for taking the time to speak with me. I appreciated learning more about the role and the team, and I remain very interested in the opportunity.\n\nCould you please provide an update on the next steps in the interview process? Please let me know if I can provide any additional information.\n\nBest regards,\n${signature}`;
       } else {
-        body = `Hi ${recipientName},\n\nThank you for arranging the interview. Unfortunately, I need to request a different meeting time, and I apologize for any inconvenience this may cause.\n\nBased on my calendar, I am available at the following alternative times:\n\n${availableSlots.map((slot) => `• ${formatAvailabilitySlot(slot)}`).join("\n")}\n\nWould any of these options work for you? If not, I would be happy to coordinate another time that is convenient for everyone.\n\nThank you for your understanding.\n\nBest regards,\n${signature}`;
+        body = `Hi ${recipientName},\n\nThank you for arranging the interview. Unfortunately, I need to request a different meeting time, and I apologize for any inconvenience this may cause.\n\nBased on my calendar, I am available at the following alternative times:\n\n${availableSlots.map((slot) => `• ${formatAvailabilitySlot(slot, replyTimeZone)}`).join("\n")}\n\nWould any of these options work for you? If not, I would be happy to coordinate another time that is convenient for everyone.\n\nThank you for your understanding.\n\nBest regards,\n${signature}`;
       }
       setReplyText(body);
       setQuickRepliesOpen(false);
@@ -2280,9 +2344,6 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     ? (selected.folder === "sent" && selected.recipients
       ? selected.recipients
       : selected.reply_to || selected.sender)
-    : "";
-  const replySubject = selected
-    ? (/^re:/i.test(selected.subject) ? selected.subject : `Re: ${selected.subject}`)
     : "";
   const scopeUnread = useMemo(() => {
     if (selectedMailboxId == null) {
@@ -2702,7 +2763,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
           key={box.id}
         >
           <button type="button" className={`sidebar-account-row ${active ? "active" : ""}`} onClick={() => selectMailboxFolder(box.id, "all")}>
-            <span className={`sidebar-account-avatar provider-${box.provider}`} style={{ "--account-color": accountColor(box) } as CSSProperties}>{providerMark(box.provider)}</span>
+            <span className={`sidebar-account-avatar provider-${box.provider}`} style={{ "--account-color": accountColor(box) } as CSSProperties}>
+              <AccountAvatarGlyph avatarKey={box.avatar_key} initials={initialsFrom(box.display_name || box.email_address)} />
+            </span>
             <span className="sidebar-account-email">{box.email_address}</span>
             {unread > 0 && <span className="sidebar-account-count is-unread" aria-label={`${unread} unread`}>+{unread}</span>}
           </button>
@@ -2749,7 +2812,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
           setDialogStep("type");
           setAddAccountOpen(true);
         }}
-        onAccountColor={onAccountColor}
+        onAccountSettings={onAccountSettings}
         onRemoveAccount={onDisconnect}
         onReconnectAccount={onReconnect}
         accountSyncDetails={accountSyncDetails}
@@ -3351,9 +3414,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
               {laterThread.map((message) => renderThreadMessage(message))}
               {!replyOpen && (
                 <div className="reply-action-row">
-                  <button type="button" className="reply-pill" onClick={() => { setScheduleAt(""); setReplyInstruction(""); setQuickRepliesOpen(false); setReplyExpanded(false); setReplySubjectText(replySubject); setReplyRecipients(extractEmailAddresses(replyRecipient)); setReplyRecipientDraft(""); setReplyMailboxId(defaultReplyMailbox?.id ?? null); setReplyOpen(true); }}>
+                  <button type="button" className="reply-pill" disabled={resolvingReplyRecipient} onClick={() => void openReplyComposer()}>
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 8 4 12l5 4" /><path d="M4 12h9.5a5.5 5.5 0 0 1 5.5 5.5V19" /></svg>
-                    <span>Reply</span>
+                    <span>{resolvingReplyRecipient ? "Checking recipient…" : "Reply"}</span>
                   </button>
                 </div>
               )}
@@ -3483,7 +3546,10 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                           disabled={sendingReply || activeReplyMailboxes.length === 0}
                           onClick={() => setReplySenderOpen((open) => !open)}
                         >
-                          <span>{replyMailbox?.email_address ?? "No registered account"}</span>
+                          {replyMailbox && <span className="reply-sender-avatar" style={{ "--account-color": accountColor(replyMailbox) } as CSSProperties} aria-hidden="true">
+                            <AccountAvatarGlyph avatarKey={replyMailbox.avatar_key} initials={initialsFrom(replyMailbox.display_name || replyMailbox.email_address)} />
+                          </span>}
+                          <span className="reply-sender-label">{replyMailbox?.email_address ?? "No registered account"}</span>
                           <UiIcon name="chevron-down" />
                         </button>
                         {replySenderOpen && (
@@ -3500,12 +3566,12 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                                   key={mailbox.id}
                                   onClick={() => { setReplyMailboxId(mailbox.id); setReplySenderOpen(false); }}
                                 >
-                                  <span className={`reply-sender-provider is-${mailbox.provider}`} aria-hidden="true">
-                                    {mailbox.provider === "google" ? "G" : "M"}
+                                  <span className="reply-sender-avatar" style={{ "--account-color": accountColor(mailbox) } as CSSProperties} aria-hidden="true">
+                                    <AccountAvatarGlyph avatarKey={mailbox.avatar_key} initials={initialsFrom(mailbox.display_name || mailbox.email_address)} />
                                   </span>
                                   <span className="reply-sender-account">
-                                    <strong>{mailbox.email_address}</strong>
-                                    <small>{mailbox.provider === "google" ? "Google" : "Microsoft"} account</small>
+                                    <strong>{mailbox.display_name || mailbox.email_address}</strong>
+                                    <small>{mailbox.email_address} · {mailbox.provider === "google" ? "Gmail" : "Outlook"}</small>
                                   </span>
                                   {selectedSender && <UiIcon name="check" />}
                                 </button>

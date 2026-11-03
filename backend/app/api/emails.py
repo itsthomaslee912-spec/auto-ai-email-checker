@@ -703,6 +703,7 @@ async def get_email(
     db: Session = Depends(get_db),
     mark_read: bool = Query(default=True),
     mark_thread: bool = Query(default=False),
+    resolve_reply_to: bool = Query(default=False),
 ) -> EmailMessage:
     email = _email_from_active_mailbox(db, email_id)
     if email is None:
@@ -725,7 +726,15 @@ async def get_email(
     # body, so a body-only lazy load can never repair the incorrect Sent
     # recipient shown by the reader. Refresh those legacy Sent rows once.
     needs_recipients = email.folder == MailFolder.SENT.value and not (email.recipients or "").strip()
-    needs_reply_to = email.folder != MailFolder.SENT.value and not (email.reply_to or "").strip()
+    # Most legacy rows predate the reply_to column. Their saved body can be
+    # displayed immediately and the UI already falls back to sender. Only pay
+    # for a provider round-trip when the user actually opens the reply composer,
+    # where an ATS-specific Reply-To address must be resolved accurately.
+    needs_reply_to = (
+        resolve_reply_to is True
+        and email.folder != MailFolder.SENT.value
+        and not (email.reply_to or "").strip()
+    )
     if not has_body or needs_recipients or needs_reply_to:
         mailbox = (
             db.query(MailboxConnection)

@@ -326,6 +326,18 @@ def init_db() -> None:
                 conn.execute(text(
                     "ALTER TABLE mailbox_connections ADD COLUMN calendar_color VARCHAR(7)"
                 ))
+            if "timezone_name" not in mailbox_cols:
+                conn.execute(text(
+                    "ALTER TABLE mailbox_connections ADD COLUMN timezone_name VARCHAR(128)"
+                ))
+            if "avatar_key" not in mailbox_cols:
+                conn.execute(text(
+                    "ALTER TABLE mailbox_connections ADD COLUMN avatar_key VARCHAR(32) DEFAULT 'initials'"
+                ))
+            conn.execute(text(
+                "UPDATE mailbox_connections SET avatar_key = 'initials' "
+                "WHERE avatar_key IS NULL OR avatar_key = ''"
+            ))
         if "mailbox_job_states" in tables:
             job_cols = {c["name"] for c in inspect(conn).get_columns("mailbox_job_states")}
             timestamp_type = (
@@ -530,6 +542,11 @@ def init_db() -> None:
                     conn.execute(text(
                         "ALTER TABLE mailbox_connections "
                         "ADD COLUMN calendar_color VARCHAR(7)"
+                    ))
+                if "timezone_name" not in mb_cols:
+                    conn.execute(text(
+                        "ALTER TABLE mailbox_connections "
+                        "ADD COLUMN timezone_name VARCHAR(128)"
                     ))
             if "classify_corrections" in tables:
                 correction_cols = {c["name"] for c in inspect(conn).get_columns("classify_corrections")}

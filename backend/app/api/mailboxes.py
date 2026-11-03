@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy import func
@@ -23,7 +24,7 @@ from app.realtime.sse import publish
 from app.schemas import (
     LabelTimelineOut,
     LabelTimelineBucketOut,
-    MailboxColorIn,
+    MailboxUpdateIn,
     MailboxLabelStatsOut,
     MailboxOut,
     MailboxOutcomesOut,
@@ -32,6 +33,29 @@ from app.schemas import (
 from app.services.mailbox_cleanup import delete_emails_for_mailbox
 
 router = APIRouter(prefix="/api/mailboxes", tags=["mailboxes"])
+
+_ACCOUNT_AVATAR_KEYS = {
+    "initials",
+    "person",
+    "briefcase",
+    "inbox",
+    "calendar",
+    "sparkles",
+    "rocket",
+    "shield",
+    "cartoon-smile",
+    "cartoon-glasses",
+    "cartoon-headphones",
+    "cartoon-cap",
+    "engineer-1",
+    "engineer-2",
+    "engineer-3",
+    "engineer-4",
+    "engineer-5",
+    "engineer-6",
+    "engineer-7",
+    "engineer-8",
+}
 _ACCOUNT_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 TIMELINE_LABELS = frozenset(item.value for item in EmailLabel)
@@ -128,9 +152,9 @@ def list_mailboxes(db: Session = Depends(get_db)) -> list[MailboxConnection]:
 
 
 @router.patch("/{mailbox_id}", response_model=MailboxOut)
-def update_mailbox_color(
+def update_mailbox_settings(
     mailbox_id: int,
-    payload: MailboxColorIn,
+    payload: MailboxUpdateIn,
     db: Session = Depends(get_db),
 ) -> MailboxConnection:
     mailbox = (
@@ -140,10 +164,29 @@ def update_mailbox_color(
     )
     if mailbox is None:
         raise HTTPException(status_code=404, detail="Email account not found")
-    color = payload.calendar_color.strip()
-    if _ACCOUNT_COLOR_RE.fullmatch(color) is None:
-        raise HTTPException(status_code=422, detail="Account color must be a hex color like #1d9bf0")
-    mailbox.calendar_color = color.lower()
+    fields = payload.model_fields_set
+    if "calendar_color" in fields:
+        color = (payload.calendar_color or "").strip()
+        if _ACCOUNT_COLOR_RE.fullmatch(color) is None:
+            raise HTTPException(status_code=422, detail="Account color must be a hex color like #1d9bf0")
+        mailbox.calendar_color = color.lower()
+    if "display_name" in fields:
+        mailbox.display_name = (payload.display_name or "").strip() or None
+    if "timezone_name" in fields:
+        timezone_name = (payload.timezone_name or "").strip()
+        if timezone_name:
+            try:
+                ZoneInfo(timezone_name)
+            except ZoneInfoNotFoundError as exc:
+                raise HTTPException(status_code=422, detail="Select a valid timezone") from exc
+        mailbox.timezone_name = timezone_name or None
+    if "avatar_key" in fields:
+        avatar_key = (payload.avatar_key or "").strip().casefold()
+        if avatar_key not in _ACCOUNT_AVATAR_KEYS:
+            raise HTTPException(status_code=422, detail="Select an available account avatar")
+        mailbox.avatar_key = avatar_key
+    if not fields:
+        raise HTTPException(status_code=422, detail="Provide at least one account setting")
     db.commit()
     db.refresh(mailbox)
     return mailbox

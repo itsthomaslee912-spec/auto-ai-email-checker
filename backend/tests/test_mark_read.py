@@ -115,6 +115,29 @@ def test_get_email_returns_before_provider_read():
         assert len(tasks.tasks) == 1
 
 
+def test_saved_body_does_not_wait_for_missing_reply_to_metadata():
+    SessionLocal = _session_factory()
+    with SessionLocal() as db:
+        email = _seed_unread_email(db)
+        email.is_read = True
+        email.reply_to = ""
+        db.commit()
+        email_id = email.id
+
+    with (
+        patch("app.api.emails.ensure_google_access_token", new_callable=AsyncMock) as ensure_token,
+        patch("app.api.emails.gmail_get_message", new_callable=AsyncMock) as get_message,
+        SessionLocal() as db,
+    ):
+        result = asyncio.run(
+            emails.get_email(email_id, BackgroundTasks(), db, mark_read=False)
+        )
+
+    assert result.body_text == "Hello body"
+    ensure_token.assert_not_awaited()
+    get_message.assert_not_awaited()
+
+
 def test_outlook_body_refresh_clears_stale_html_alternative():
     SessionLocal = _session_factory()
     with SessionLocal() as db:

@@ -21,7 +21,7 @@ from app.schemas import (
     PendingInterviewSlotOut,
 )
 from app.services.pending_interviews import pending_interview_requests, resolved_availability_ids
-from app.services.calendar_extract import clean_meeting_provider
+from app.services.calendar_extract import appointment_email_ids, clean_meeting_provider, companies_match, roles_compatible
 from app.timeutil import as_utc
 
 router = APIRouter(prefix="/api/calendar-events", tags=["calendar"])
@@ -91,6 +91,8 @@ def _event_out(event: CalendarEvent, mailbox: MailboxConnection | None = None, r
         phone_number=event.phone_number,
         phone_access_code=event.phone_access_code,
         request_kind=request_kind,
+        source_received_at=event.source_received_at,
+        outcome_at=event.outcome_at,
         created_at=event.created_at,
         updated_at=event.updated_at,
     )
@@ -201,6 +203,39 @@ def get_calendar_event(event_id: int, db: Session = Depends(get_db)) -> Calendar
     return _event_out(event, request_kind=_request_kinds(db, [event]).get(event.id))
 
 
+@router.get("/{event_id}/timeline", response_model=list[CalendarEventOut])
+def get_interview_timeline(event_id: int, db: Session = Depends(get_db)) -> list[CalendarEventOut]:
+    """Return every booked round for the selected application, oldest first."""
+    event = _event_query(db).filter(CalendarEvent.id == event_id).one_or_none()
+    if event is None:
+        raise HTTPException(status_code=404, detail="Calendar event not found")
+    if event.origin == "manual":
+        return [_event_out(event)]
+    rows = (
+        _event_query(db)
+        .filter(
+            CalendarEvent.mailbox_id == event.mailbox_id,
+            CalendarEvent.kind == "confirmed",
+            CalendarEvent.origin == "email",
+            CalendarEvent.is_visible.is_(True),
+            CalendarEvent.superseded_by_event_id.is_(None),
+        )
+        .order_by(CalendarEvent.start_at.asc(), CalendarEvent.id.asc())
+        .all()
+    )
+    related = [
+        item
+        for item in rows
+        if item.id == event.id
+        or (
+            (not event.company or companies_match(item.company, event.company))
+            and (not event.job_role or roles_compatible(item.job_role, event.job_role))
+        )
+    ]
+    kinds = _request_kinds(db, related)
+    return [_event_out(item, request_kind=kinds.get(item.id)) for item in related]
+
+
 @router.get("/{event_id}/emails", response_model=list[EmailPreviewOut])
 def list_calendar_event_emails(event_id: int, db: Session = Depends(get_db)) -> list[EmailMessage]:
     """Return every stored email linked to an event, newest first."""
@@ -260,6 +295,7 @@ def list_calendar_event_emails(event_id: int, db: Session = Depends(get_db)) -> 
             )
             .all()
         )
+    linked_ids = appointment_email_ids(db, event, linked_ids)
 
     # Provider thread IDs identify a mailbox conversation, not a calendar
     # appointment. A recruiter can reuse one thread for an application,

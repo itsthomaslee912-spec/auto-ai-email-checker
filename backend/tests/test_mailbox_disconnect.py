@@ -234,7 +234,7 @@ def test_delete_emails_for_mailbox_is_scoped():
     db.close()
 
 
-def test_account_color_is_saved_and_listed():
+def test_account_settings_are_saved_and_listed():
     SessionLocal = _session_factory()
     db = SessionLocal()
     mailbox, _ = _seed_mailbox(
@@ -247,13 +247,44 @@ def test_account_color_is_saved_and_listed():
     db.close()
 
     client = _client(SessionLocal)
+    initial = client.get("/api/mailboxes")
+    assert initial.status_code == 200
+    assert initial.json()[0]["avatar_key"] == "initials"
+
     missing = client.patch(f"/api/mailboxes/{mailbox_id}", json={"calendar_color": "blue"})
     assert missing.status_code == 422
 
-    saved = client.patch(f"/api/mailboxes/{mailbox_id}", json={"calendar_color": "#E11D48"})
+    saved = client.patch(f"/api/mailboxes/{mailbox_id}", json={
+        "calendar_color": "#E11D48",
+        "display_name": "Ryan Queen",
+        "timezone_name": "America/Chicago",
+        "avatar_key": "cartoon-glasses",
+    })
     assert saved.status_code == 200
     assert saved.json()["calendar_color"] == "#e11d48"
+    assert saved.json()["display_name"] == "Ryan Queen"
+    assert saved.json()["timezone_name"] == "America/Chicago"
+    assert saved.json()["avatar_key"] == "cartoon-glasses"
 
     listed = client.get("/api/mailboxes")
     assert listed.status_code == 200
     assert listed.json()[0]["calendar_color"] == "#e11d48"
+    assert listed.json()[0]["display_name"] == "Ryan Queen"
+    assert listed.json()[0]["timezone_name"] == "America/Chicago"
+    assert listed.json()[0]["avatar_key"] == "cartoon-glasses"
+
+    invalid_avatar = client.patch(
+        f"/api/mailboxes/{mailbox_id}",
+        json={"avatar_key": "remote-image"},
+    )
+    assert invalid_avatar.status_code == 422
+
+    invalid_timezone = client.patch(
+        f"/api/mailboxes/{mailbox_id}",
+        json={"timezone_name": "Mars/Olympus_Mons"},
+    )
+    assert invalid_timezone.status_code == 422
+
+    cleared_name = client.patch(f"/api/mailboxes/{mailbox_id}", json={"display_name": "  "})
+    assert cleared_name.status_code == 200
+    assert cleared_name.json()["display_name"] is None

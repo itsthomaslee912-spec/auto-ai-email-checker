@@ -17,7 +17,7 @@ import {
   type Mailbox,
   type SessionUser,
 } from "../api";
-import { accountColor } from "../accountColor";
+import { ACCOUNT_COLOR_PALETTE, accountColor } from "../accountColor";
 import { CLASSIFY_LABEL_TITLES, INTERVIEW_SUBTYPE_TITLES } from "../labels";
 import {
   FONT_FAMILIES,
@@ -35,6 +35,7 @@ import type { ThemePref } from "../theme";
 import CompactSelect from "../components/CompactSelect";
 import { IconButton } from "../components/UiIcon";
 import SignInAccountsPanel from "../components/SignInAccountsPanel";
+import { ACCOUNT_AVATAR_OPTIONS, AccountAvatarGlyph, accountAvatarKey } from "../components/AccountAvatar";
 
 export type SettingsSection = "signin" | "accounts" | "appearance" | "ai" | "training";
 
@@ -47,6 +48,30 @@ const DEFAULT_GEMINI_MODELS = [
   "gemini-2.5-flash-lite",
   "gemini-2.5-pro",
 ];
+
+const BROWSER_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+const COMMON_TIMEZONES = [
+  ["America/Los_Angeles", "Pacific Time (Los Angeles)"],
+  ["America/Denver", "Mountain Time (Denver)"],
+  ["America/Chicago", "Central Time (Chicago)"],
+  ["America/New_York", "Eastern Time (New York)"],
+  ["UTC", "UTC"],
+  ["Europe/London", "London"],
+  ["Europe/Berlin", "Central European Time (Berlin)"],
+  ["Asia/Kolkata", "India Time (Kolkata)"],
+  ["Asia/Singapore", "Singapore"],
+  ["Asia/Tokyo", "Japan Time (Tokyo)"],
+  ["Australia/Sydney", "Sydney"],
+] as const;
+
+function timezoneOptions(savedTimezone?: string | null): Array<readonly [string, string]> {
+  const extras = [savedTimezone, BROWSER_TIMEZONE]
+    .filter((value): value is string => Boolean(value))
+    .filter((value, index, values) => values.indexOf(value) === index)
+    .filter((value) => !COMMON_TIMEZONES.some(([timezone]) => timezone === value))
+    .map((value) => [value, value] as const);
+  return [...extras, ...COMMON_TIMEZONES];
+}
 
 function formatWhen(value: string | null): string {
   if (!value) return "";
@@ -96,6 +121,7 @@ const ACCOUNT_ICONS = {
   reclassify: <><path d="M11 3.5l1.7 4.4 4.4 1.7-4.4 1.7L11 15.7l-1.7-4.4-4.4-1.7 4.4-1.7z" /><path d="M18 14.5l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z" /></>,
   reconnect: <><path d="M10 14a4.5 4.5 0 0 0 6.4 0l3.2-3.2a4.5 4.5 0 0 0-6.4-6.4l-1.1 1.1" /><path d="M14 10a4.5 4.5 0 0 0-6.4 0l-3.2 3.2a4.5 4.5 0 0 0 6.4 6.4l1.1-1.1" /></>,
   remove: <><path d="M4 7h16M10 11v6M14 11v6" /><path d="M6 7l1 13h10l1-13M9 7V4h6v3" /></>,
+  settings: <><path d="M4 7h10M18 7h2M4 17h2M10 17h10" /><circle cx="16" cy="7" r="2" /><circle cx="8" cy="17" r="2" /></>,
 } as const;
 
 function AccountIcon({ name }: { name: keyof typeof ACCOUNT_ICONS }) {
@@ -127,7 +153,7 @@ export default function SettingsPage({
   onTrainingDeleted,
   onAiSettingsSaved,
   onAddAccount,
-  onAccountColor,
+  onAccountSettings,
   onRemoveAccount,
   onReconnectAccount,
   accountSyncDetails,
@@ -166,7 +192,10 @@ export default function SettingsPage({
   onTrainingDeleted: () => Promise<void>;
   onAiSettingsSaved: () => Promise<void> | void;
   onAddAccount: () => void;
-  onAccountColor: (mailboxId: number, calendarColor: string) => void;
+  onAccountSettings: (
+    mailboxId: number,
+    settings: Partial<Pick<Mailbox, "display_name" | "timezone_name" | "calendar_color" | "avatar_key">>,
+  ) => void;
   onRemoveAccount: (mailboxId: number) => Promise<void>;
   onReconnectAccount: (mailboxId: number) => void;
   accountSyncDetails: Record<number, AccountSyncDetail>;
@@ -202,6 +231,31 @@ export default function SettingsPage({
   const [aiBusy, setAiBusy] = useState(false);
   const [aiNotice, setAiNotice] = useState<string | null>(null);
   const [removingMailboxId, setRemovingMailboxId] = useState<number | null>(null);
+  const [colorPickerMailboxId, setColorPickerMailboxId] = useState<number | null>(null);
+  const [settingsMailboxId, setSettingsMailboxId] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (colorPickerMailboxId == null) return;
+    const closeOnPointerDown = (event: PointerEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target?.closest(`[data-account-color-picker="${colorPickerMailboxId}"]`)) {
+        setColorPickerMailboxId(null);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setColorPickerMailboxId(null);
+    };
+    document.addEventListener("pointerdown", closeOnPointerDown);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnPointerDown);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [colorPickerMailboxId]);
+
+  useEffect(() => setColorPickerMailboxId(null), [section]);
 
   useEffect(() => {
     void fetchAiSettings().then((settings) => {
@@ -424,19 +478,112 @@ export default function SettingsPage({
                           : "New mail arrives instantly through the webhook.");
                       return (
                       <div className={`settings-account-row${needsReconnect ? " needs-attention" : ""}`} key={mailbox.id}>
-                        <label
-                          className="account-avatar"
-                          style={{ "--account-color": color } as CSSProperties}
-                          data-tooltip="Change calendar color"
+                        <div className="account-color-picker" data-account-color-picker={mailbox.id}>
+                          <button
+                            type="button"
+                            className="account-avatar"
+                            style={{ "--account-color": color } as CSSProperties}
+                            aria-label={`Choose account color for ${mailbox.email_address}`}
+                            aria-controls={`account-color-panel-${mailbox.id}`}
+                            aria-expanded={colorPickerMailboxId === mailbox.id}
+                            data-tooltip="Choose account color"
+                            onClick={() => {
+                              setSettingsMailboxId(null);
+                              setColorPickerMailboxId((current) => current === mailbox.id ? null : mailbox.id);
+                            }}
+                          >
+                            <AccountAvatarGlyph
+                              avatarKey={mailbox.avatar_key}
+                              initials={initialsFrom(mailbox.display_name || mailbox.email_address)}
+                            />
+                          </button>
+                        </div>
+                        <div
+                          id={`account-color-panel-${mailbox.id}`}
+                          className={`account-color-panel${colorPickerMailboxId === mailbox.id ? " is-open" : ""}`}
+                          data-account-color-picker={mailbox.id}
+                          aria-hidden={colorPickerMailboxId !== mailbox.id}
                         >
-                          {initialsFrom(mailbox.display_name || mailbox.email_address)}
-                          <input
-                            type="color"
-                            aria-label={`Calendar color for ${mailbox.email_address}`}
-                            value={color}
-                            onChange={(event) => onAccountColor(mailbox.id, event.target.value)}
-                          />
-                        </label>
+                          <div className="account-color-panel-clip">
+                            <div className="account-color-panel-inner" role="group" aria-label={`Account appearance for ${mailbox.email_address}`}>
+                              <div className="account-color-popover-heading account-appearance-heading">
+                                <strong>Account avatar</strong>
+                                <small>Choose a simple or cartoon avatar</small>
+                              </div>
+                              <div className="account-avatar-palette" role="listbox" aria-label="Available account avatars">
+                                {ACCOUNT_AVATAR_OPTIONS.map((option) => {
+                                  const selected = accountAvatarKey(mailbox.avatar_key) === option.key;
+                                  return (
+                                    <button
+                                      key={option.key}
+                                      type="button"
+                                      role="option"
+                                      aria-selected={selected}
+                                      aria-label={option.name}
+                                      className={selected ? "is-selected" : ""}
+                                      onClick={() => onAccountSettings(mailbox.id, { avatar_key: option.key })}
+                                    >
+                                      <span className="account-avatar-option-preview" style={{ "--account-color": color } as CSSProperties} aria-hidden="true">
+                                        <AccountAvatarGlyph avatarKey={option.key} initials={initialsFrom(mailbox.display_name || mailbox.email_address)} />
+                                      </span>
+                                      <small>{option.name}</small>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                              <div className="account-color-popover-heading">
+                                <strong>Account color</strong>
+                                <small>Used across inbox and calendar</small>
+                              </div>
+                              <div className="account-color-palette" role="listbox" aria-label="Color palette">
+                                {ACCOUNT_COLOR_PALETTE.map((option) => {
+                                  const selected = color.toLowerCase() === option.value;
+                                  return (
+                                    <button
+                                      key={option.value}
+                                      type="button"
+                                      role="option"
+                                      aria-selected={selected}
+                                      aria-label={option.name}
+                                      className={selected ? "is-selected" : ""}
+                                      style={{ "--swatch-color": option.value } as CSSProperties}
+                                      onClick={() => {
+                                        onAccountSettings(mailbox.id, { calendar_color: option.value });
+                                        setColorPickerMailboxId(null);
+                                      }}
+                                    >
+                                      <span aria-hidden="true" />
+                                      <small>{option.name}</small>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                              <div className="account-color-custom">
+                                <span className="account-color-custom-preview" style={{ background: color }} aria-hidden="true" />
+                                <span><strong>Custom color</strong><small>{color.toUpperCase()}</small></span>
+                                <input
+                                  key={`${mailbox.id}-${color}`}
+                                  type="text"
+                                  aria-label={`Custom hex color for ${mailbox.email_address}`}
+                                  defaultValue={color.toUpperCase()}
+                                  maxLength={7}
+                                  spellCheck={false}
+                                  onKeyDown={(event) => {
+                                    if (event.key === "Enter") event.currentTarget.blur();
+                                  }}
+                                  onBlur={(event) => {
+                                    const nextColor = event.currentTarget.value.trim();
+                                    if (/^#[0-9a-f]{6}$/i.test(nextColor) && nextColor.toLowerCase() !== color.toLowerCase()) {
+                                      onAccountSettings(mailbox.id, { calendar_color: nextColor });
+                                    } else {
+                                      event.currentTarget.value = color.toUpperCase();
+                                    }
+                                  }}
+                                />
+                              </div>
+                            </div>
+                          </div>
+                        </div>
                         <div className="settings-account-info">
                           <strong title={mailbox.email_address}>{mailbox.email_address}</strong>
                           <div className="account-meta">
@@ -476,6 +623,20 @@ export default function SettingsPage({
                           >
                             <AccountIcon name="reconnect" />
                           </button>
+                          <button
+                            type="button"
+                            className={`account-icon-btn${settingsMailboxId === mailbox.id ? " is-active" : ""}`}
+                            aria-label="Account settings"
+                            aria-controls={`account-settings-${mailbox.id}`}
+                            aria-expanded={settingsMailboxId === mailbox.id}
+                            data-tooltip="Account name, timezone, and email"
+                            onClick={() => {
+                              setColorPickerMailboxId(null);
+                              setSettingsMailboxId((current) => current === mailbox.id ? null : mailbox.id);
+                            }}
+                          >
+                            <AccountIcon name="settings" />
+                          </button>
                           <span className="account-actions-divider" aria-hidden="true" />
                           <button
                             type="button"
@@ -491,6 +652,51 @@ export default function SettingsPage({
                           >
                             <AccountIcon name="remove" />
                           </button>
+                        </div>
+                        <div
+                          id={`account-settings-${mailbox.id}`}
+                          className={`account-profile-panel${settingsMailboxId === mailbox.id ? " is-open" : ""}`}
+                          aria-hidden={settingsMailboxId !== mailbox.id}
+                        >
+                          <div className="account-profile-panel-clip">
+                            <div className="account-profile-settings">
+                              <label className="account-setting-field is-readonly">
+                                <span>Email address</span>
+                                <input value={mailbox.email_address} readOnly aria-readonly="true" />
+                                <small>Managed by {mailbox.provider === "google" ? "Google" : "Microsoft"}</small>
+                              </label>
+                              <label className="account-setting-field">
+                                <span>Account name</span>
+                                <input
+                                  key={`${mailbox.id}-${mailbox.display_name ?? ""}`}
+                                  defaultValue={mailbox.display_name ?? ""}
+                                  placeholder="Name used in reply signatures"
+                                  maxLength={255}
+                                  onBlur={(event) => {
+                                    const displayName = event.currentTarget.value.trim();
+                                    if (displayName !== (mailbox.display_name ?? "")) {
+                                      onAccountSettings(mailbox.id, { display_name: displayName || null });
+                                    }
+                                  }}
+                                />
+                                <small>Used to sign generated replies</small>
+                              </label>
+                              <label className="account-setting-field">
+                                <span>Timezone</span>
+                                <CompactSelect
+                                  containerClassName="account-timezone-select"
+                                  aria-label={`Timezone for ${mailbox.email_address}`}
+                                  value={mailbox.timezone_name || BROWSER_TIMEZONE}
+                                  onChange={(event) => onAccountSettings(mailbox.id, { timezone_name: event.target.value })}
+                                >
+                                  {timezoneOptions(mailbox.timezone_name).map(([value, label]) => (
+                                    <option key={value} value={value}>{label}</option>
+                                  ))}
+                                </CompactSelect>
+                                <small>Used for availability and rescheduling</small>
+                              </label>
+                            </div>
+                          </div>
                         </div>
                         {needsReconnect && !isWorking && (
                           <div className="account-alert" role="alert">

@@ -946,6 +946,93 @@ def test_linked_role_consensus_does_not_guess_from_weak_conflicting_evidence():
         assert event.job_role == "Staff Software Engineer"
 
 
+def test_cross_thread_role_consensus_repairs_booking_and_closes_pending_invitation():
+    """A role-less provider invite must not retain an unrelated older opening."""
+    from app.services.pending_interviews import invalidate_calendar_read_cache, pending_interview_requests
+
+    factory, (mailbox_id, _) = _database()
+    requested_at = datetime(2026, 11, 3, 1, 7, tzinfo=timezone.utc)
+    booked_at = requested_at + timedelta(minutes=7)
+    start = datetime(2026, 11, 5, 19, tzinfo=timezone.utc)
+    with factory() as db:
+        application = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="artos-application",
+            thread_id="artos-application-thread",
+            subject="Thanks for applying to ArtosAI!",
+            sender="no-reply@ashbyhq.com",
+            received_at=requested_at - timedelta(days=5),
+            label=EmailLabel.APPLICATION_CONFIRMATION.value,
+            company="ArtosAI",
+            job_role="Technical Solutions Engineer",
+        )
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="artos-next-steps",
+            thread_id="artos-invitation-thread",
+            subject="ArtosAI - Technical Solutions Engineer - Next Steps",
+            sender="john@artosai.com",
+            received_at=requested_at,
+            body_text="Please book a time for an intro call.",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="ArtosAI",
+            job_role="Technical Solutions Engineer",
+        )
+        reminder = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="artos-reminder",
+            thread_id="artos-reminder-thread",
+            subject="Reminder: Your Upcoming Interview with ArtosAI",
+            sender="john@artosai.com",
+            received_at=booked_at,
+            body_text="Thursday, November 5, 2026, 2:00 PM - 2:45 PM EST",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="reminder",
+            company="ArtosAI",
+            job_role="Technical Solutions Engineer",
+        )
+        provider_invite = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="artos-provider-invite",
+            thread_id="artos-calendar-thread",
+            subject="Interview with ArtosAI",
+            sender="john@artosai.com",
+            received_at=booked_at,
+            body_text="BEGIN:VCALENDAR\nBEGIN:VEVENT\nDTSTART:20261105T190000Z\nDTEND:20261105T194500Z\nEND:VEVENT\nEND:VCALENDAR",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="ArtosAI",
+            job_role="",
+        )
+        db.add_all([application, invitation, reminder, provider_invite])
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=provider_invite.id,
+            source_thread_id=provider_invite.thread_id,
+            source_received_at=provider_invite.received_at,
+            kind="confirmed",
+            origin="email",
+            title="ArtosAI — Staff DevOps Engineer",
+            company="ArtosAI",
+            job_role="Staff DevOps Engineer",
+            start_at=start,
+            end_at=start + timedelta(minutes=45),
+            is_visible=True,
+        )
+        db.add(event)
+        db.commit()
+
+        assert repair_conflicting_calendar_roles(db, mailbox_id) == 1
+        db.commit()
+        invalidate_calendar_read_cache()
+
+        assert event.job_role == "Technical Solutions Engineer"
+        assert event.title == "ArtosAI — Technical Solutions Engineer"
+        assert provider_invite.job_role == "Technical Solutions Engineer"
+        assert pending_interview_requests(db, [mailbox_id], now=requested_at + timedelta(hours=4)) == []
+
+
 def test_microsoft_bookings_parent_tenant_collapses_child_company_interview_and_resolves_alert():
     from app.services.pending_interviews import invalidate_calendar_read_cache, pending_interview_requests
 
@@ -1346,6 +1433,110 @@ END:VCALENDAR""",
         db.flush()
         assert available.is_visible is True
         assert available.superseded_by_event_id is None
+
+
+def test_later_confirmation_marks_round_that_has_started_as_passed():
+    """A confirmed later round advances the current round without magic words."""
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        first_round = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="vizient-first-round",
+            thread_id="vizient-initial-thread",
+            folder="inbox",
+            subject="Vizient interview invitation",
+            sender="recruiter@vizientinc.com",
+            received_at=datetime(2026, 11, 1, 18, 51, tzinfo=timezone.utc),
+            body_text="""BEGIN:VCALENDAR
+BEGIN:VEVENT
+DTSTART:20261102T153000Z
+DTEND:20261102T160000Z
+STATUS:CONFIRMED
+END:VEVENT
+END:VCALENDAR""",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="Vizient",
+            job_role="Staff Software Engineer with Agentic AI",
+        )
+        next_round = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="vizient-tech-screen",
+            thread_id="vizient-tech-thread",
+            folder="inbox",
+            subject="1st round - Tech Screen - Staff Software Engineer with Agentic AI @ Vizient",
+            sender="recruiter@vizientinc.com",
+            received_at=datetime(2026, 11, 2, 15, 55, tzinfo=timezone.utc),
+            body_text="""BEGIN:VCALENDAR
+BEGIN:VEVENT
+DTSTART:20261104T190000Z
+DTEND:20261104T194500Z
+STATUS:CONFIRMED
+END:VEVENT
+END:VCALENDAR""",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+            company="Vizient",
+            # Provider itinerary text is an interview stage, not the opening's
+            # job title. Progression must match through the employer/open role.
+            job_role="Coding Fundamentals Interview",
+        )
+        db.add_all([first_round, next_round])
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, first_round, use_ai=False)) is True
+        first_event = db.query(CalendarEvent).filter(
+            CalendarEvent.source_email_id == first_round.id,
+        ).one()
+        assert first_event.application_status == "active"
+
+        assert asyncio.run(process_calendar_email(db, next_round, use_ai=False)) is True
+        next_event = db.query(CalendarEvent).filter(
+            CalendarEvent.source_email_id == next_round.id,
+        ).one()
+
+        assert first_event.application_status == "passed"
+        assert first_event.outcome_source_email_id == next_round.id
+        assert first_event.is_visible is True
+        assert next_event.application_status == "active"
+        assert next_event.is_visible is True
+        assert next_event.start_at == datetime(2026, 11, 4, 19, tzinfo=timezone.utc)
+        assert next_event.job_role == "Staff Software Engineer with Agentic AI"
+        assert is_interview_stage_label("Coding Fundamentals Interview") is True
+        next_links = {
+            row[0]
+            for row in db.query(CalendarEventEmail.email_id).filter(
+                CalendarEventEmail.event_id == next_event.id,
+            )
+        }
+        assert next_links == {next_round.id}
+
+        # Older versions linked the whole application history to every round.
+        # The all-chip repair must remove the prior round from this appointment.
+        from app.services.calendar_extract import repair_calendar_event_email_links
+
+        db.add(CalendarEventEmail(event_id=next_event.id, email_id=first_round.id))
+        db.flush()
+        assert repair_calendar_event_email_links(db, mailbox_id) >= 1
+        repaired_links = {
+            row[0]
+            for row in db.query(CalendarEventEmail.email_id).filter(
+                CalendarEventEmail.event_id == next_event.id,
+            )
+        }
+        assert repaired_links == {next_round.id}
+
+        # A mailbox created before automatic progression was introduced must
+        # converge to the same timeline during the repair pass.
+        from app.services.calendar_extract import repair_prior_round_progression
+
+        first_event.application_status = "active"
+        first_event.outcome_source_email_id = None
+        first_event.outcome_at = None
+        db.flush()
+        assert repair_prior_round_progression(db, mailbox_id) == 1
+        assert first_event.application_status == "passed"
+        assert first_event.outcome_source_email_id == next_round.id
 
 
 def test_superseded_availability_link_resolves_companyless_cross_thread_invitation():
@@ -5557,6 +5748,59 @@ def test_calendar_api_loads_all_accounts_by_range_and_email_preview_can_stay_unr
         assert db.get(EmailMessage, source_id).is_read is False
 
 
+def test_interview_timeline_returns_all_application_rounds_in_date_order():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        first = CalendarEvent(
+            mailbox_id=mailbox_id,
+            kind="confirmed",
+            origin="email",
+            title="AholdDelhaize — Sr. Cloud Engineer",
+            company="AholdDelhaize",
+            job_role="Sr. Cloud Engineer",
+            start_at=datetime(2026, 11, 2, 15, 30, tzinfo=timezone.utc),
+            end_at=datetime(2026, 11, 2, 16, 0, tzinfo=timezone.utc),
+            source_received_at=datetime(2026, 11, 1, 18, 51, tzinfo=timezone.utc),
+            outcome_at=datetime(2026, 11, 2, 15, 55, tzinfo=timezone.utc),
+            application_status="passed",
+            is_visible=True,
+        )
+        second = CalendarEvent(
+            mailbox_id=mailbox_id,
+            kind="confirmed",
+            origin="email",
+            title="ADUSA – Retail Business — Senior Cloud Engineer",
+            company="ADUSA – Retail Business",
+            job_role="Senior Cloud Engineer",
+            start_at=datetime(2026, 11, 4, 19, 0, tzinfo=timezone.utc),
+            end_at=datetime(2026, 11, 4, 19, 45, tzinfo=timezone.utc),
+            source_received_at=datetime(2026, 11, 2, 15, 55, tzinfo=timezone.utc),
+            application_status="active",
+            is_visible=True,
+        )
+        unrelated = CalendarEvent(
+            mailbox_id=mailbox_id,
+            kind="confirmed",
+            origin="email",
+            title="Other Company — Staff Software Engineer",
+            company="Other Company",
+            job_role="Staff Software Engineer",
+            start_at=datetime(2026, 11, 3, 17, 0, tzinfo=timezone.utc),
+            end_at=datetime(2026, 11, 3, 17, 30, tzinfo=timezone.utc),
+            is_visible=True,
+        )
+        db.add_all([second, unrelated, first])
+        db.commit()
+        first_id, second_id = first.id, second.id
+
+    response = _client(factory).get(f"/api/calendar-events/{second_id}/timeline")
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()] == [first_id, second_id]
+    assert response.json()[0]["application_status"] == "passed"
+    assert response.json()[0]["source_received_at"] == "2026-11-01T18:51:00Z"
+    assert response.json()[0]["outcome_at"] == "2026-11-02T15:55:00Z"
+
+
 def test_email_conversation_returns_thread_messages_in_order_without_marking_read():
     factory, (mailbox_id, _) = _database()
     with factory() as db:
@@ -6028,7 +6272,7 @@ def test_selected_ai_extracts_full_calendar_details_from_related_email_thread(mo
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
 
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    backend = SimpleNamespace(api_key="configured", model="selected-calendar-model", client=lambda: client)
+    backend = SimpleNamespace(api_key="configured", model="selected-calendar-model", provider="openai", client=lambda: client)
     monkeypatch.setattr("app.services.calendar_extract.get_ai_backend", lambda: backend)
 
     with factory() as db:
@@ -6092,6 +6336,7 @@ def test_company_variants_match_and_keep_the_fuller_name():
     assert companies_match("collectfanatics", "Fanatics Collectibles")
     assert fuller_company_name("collectfanatics", "Fanatics Collectibles") == "Fanatics Collectibles"
     assert companies_match("kochind", "Koch Industries")
+    assert companies_match("AholdDelhaize", "ADUSA – Retail Business")
     assert fuller_company_name("HRT", "Hudson River Trading") == "Hudson River Trading"
     assert not companies_match("HRT", "Human Resources Team")
     assert not companies_match("United Health", "United Airlines")
@@ -6299,6 +6544,7 @@ def test_role_titles_match_when_a_middle_word_is_optional():
     assert roles_compatible("Principal Software Engineer", "Principal Engineer")
     assert roles_compatible("Lead Machine Learning Engineer", "Lead Engineer")
     assert roles_compatible("Senior ML Engineer", "Senior Machine Learning Engineer")
+    assert roles_compatible("Sr. Cloud Engineer", "Senior Cloud Engineer")
     assert not roles_compatible("Principal Software Engineer", "Staff Engineer")
 
 

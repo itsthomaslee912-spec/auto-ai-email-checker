@@ -1939,8 +1939,17 @@ def _fullest_job_title(roles: list[str], subjects: list[str]) -> str:
 def _fill_missing_role(db: Session, email: EmailMessage, details: InterviewDetails) -> InterviewDetails:
     current = job_role_or_empty(details.role) or job_role_or_empty(email.job_role)
     if current:
+        company = details.company
+        found = _open_role_for_employer(db, email, company or email.company or "")
+        if (
+            found is not None
+            and found[1]
+            and roles_compatible(current, found[0])
+            and (not company or companies_match(company, found[1]))
+        ):
+            company = fuller_company_name(company, found[1])
         return InterviewDetails(
-            company=details.company,
+            company=company,
             role=current,
             interviewer=details.interviewer,
             work_model=details.work_model,
@@ -1993,6 +2002,19 @@ def company_name_tokens(company: str | None) -> set[str]:
 
 def _compact_company(company: str | None) -> str:
     return re.sub(r"[^a-z0-9]", "", (company or "").casefold())
+
+
+# Recruiting threads can move between a parent company and its US operating
+# company without changing the application. Keep these aliases deliberately
+# narrow: they are verified corporate identities, not fuzzy name guesses.
+_CORPORATE_COMPANY_FAMILIES = (
+    frozenset({"aholddelhaize", "aholddelhaizeusa", "adusa", "adusaretailbusiness"}),
+)
+
+
+def _corporate_company_family(company: str | None) -> frozenset[str] | None:
+    compact = _compact_company(company)
+    return next((family for family in _CORPORATE_COMPANY_FAMILIES if compact in family), None)
 
 
 def _unglued_token(token: str) -> str:
@@ -2077,6 +2099,9 @@ def companies_match(left: str | None, right: str | None) -> bool:
     right_compact = _compact_company(right)
     if left_compact and left_compact == right_compact:
         return True
+    left_family = _corporate_company_family(left)
+    if left_family is not None and left_family is _corporate_company_family(right):
+        return True
     if _company_compact_aliases(left).intersection(_company_compact_aliases(right)):
         return True
     left_tokens = _match_tokens(left)
@@ -2142,14 +2167,21 @@ def fuller_company_name(left: str | None, right: str | None) -> str:
 
 def _role_key(role: str | None) -> str:
     words = re.sub(r"[^a-z0-9]+", " ", (role or "").casefold()).split()
-    # Recruiters frequently alternate between the acronym and expanded title
-    # across a scheduling handoff (for example "Senior ML Engineer" in the
-    # first thread and "Senior Machine Learning Engineer" in the calendar
-    # confirmation). Normalize the unambiguous role acronym before comparing
-    # titles so those messages remain one interview.
+    # Recruiters frequently alternate between abbreviations and expanded
+    # titles across a scheduling handoff (for example "Sr. ML Engineer" in
+    # the first thread and "Senior Machine Learning Engineer" in a later
+    # calendar confirmation). Normalize unambiguous role abbreviations before
+    # comparing titles so those messages remain one application timeline.
     expanded: list[str] = []
     for word in words:
-        expanded.extend(("machine", "learning") if word == "ml" else (word,))
+        if word == "ml":
+            expanded.extend(("machine", "learning"))
+        elif word == "sr":
+            expanded.append("senior")
+        elif word == "jr":
+            expanded.append("junior")
+        else:
+            expanded.append(word)
     return " ".join(expanded)
 
 
@@ -2203,6 +2235,12 @@ def is_interview_stage_label(role: str | None) -> bool:
         return True
     if re.fullmatch(
         r"(?:(?:software|technical)\s+)?system\s+design|coding|behavioral|behavioural|domain\s+knowledge|role\s+(?:sync|alignment)",
+        key,
+    ):
+        return True
+    if re.fullmatch(
+        r"(?:coding|technical|behavioral|behavioural|system\s+design|domain\s+knowledge)"
+        r"(?:\s+[a-z0-9]+){0,3}\s+interview",
         key,
     ):
         return True
@@ -2831,6 +2869,37 @@ def correct_sender_domain_employers(db: Session, mailbox_id: int | None = None) 
                     )
                 )
             ]
+            if not invitations and (source_tokens or source_sender) and source_received is not None:
+                # Link pruning intentionally assigns one scheduling request to
+                # one appointment. A provider can still deliver duplicate
+                # invite/confirmation rows for that appointment, so the sibling
+                # row may not retain the request link needed to replace a parent
+                # tenant (Koch) with the hiring subsidiary (Georgia-Pacific).
+                # Recover only a recent invitation sharing the exact scheduler
+                # identity; a broad company-only search is not sufficient.
+                candidates = (
+                    db.query(EmailMessage)
+                    .filter(
+                        EmailMessage.mailbox_id == event.mailbox_id,
+                        EmailMessage.label == EmailLabel.INTERVIEW_INVITATION.value,
+                        EmailMessage.received_at >= source_received - timedelta(days=30),
+                        EmailMessage.received_at <= source_received,
+                    )
+                    .all()
+                )
+                invitations = [
+                    item
+                    for item in candidates
+                    if (item.company or "").strip()
+                    and roles_compatible(event.job_role, item.job_role)
+                    and (
+                        source_tokens.intersection(_schedule_tokens(_message_text(item)))
+                        or (
+                            source_sender
+                            and _normalized_address(parseaddr(item.sender or "")[1]) == source_sender
+                        )
+                    )
+                ]
             same_sender_invitation = any(
                 source_sender
                 and _normalized_address(parseaddr(item.sender or "")[1]) == source_sender
@@ -2898,8 +2967,9 @@ def repair_calendar_event_email_links(db: Session, mailbox_id: int | None = None
     )
     if mailbox_id is not None:
         query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
+    events = query.all()
     repaired = 0
-    for event in query.all():
+    for event in events:
         source = db.get(EmailMessage, event.source_email_id)
         if source is None:
             continue
@@ -2913,7 +2983,7 @@ def repair_calendar_event_email_links(db: Session, mailbox_id: int | None = None
                 continue
             for nested in _related_interview_emails(db, item):
                 expanded.setdefault(nested.id, nested)
-        related_ids = list(expanded)
+        related_ids = appointment_email_ids(db, event, expanded, peer_pool=events)
         link_changed = bool(related_ids and _link_event_emails(db, event, related_ids))
         allowed = {source.id, *related_ids}
         if event.outcome_source_email_id:
@@ -2930,6 +3000,48 @@ def repair_calendar_event_email_links(db: Session, mailbox_id: int | None = None
             ).delete(synchronize_session=False)
         if link_changed or stale_ids:
             repaired += 1
+    if repaired:
+        db.flush()
+    return repaired
+
+
+def prune_calendar_event_email_links(db: Session, mailbox_id: int | None = None) -> int:
+    """Remove historical application-wide links without rediscovering context.
+
+    This bounded pass works only from already-persisted event/message links, so
+    it can safely audit an entire mailbox without running cross-thread searches
+    once per calendar chip.
+    """
+    query = _email_calendar_events(db).filter(
+        CalendarEvent.is_visible.is_(True),
+        CalendarEvent.kind == "confirmed",
+        CalendarEvent.source_email_id.is_not(None),
+    )
+    if mailbox_id is not None:
+        query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
+    events = query.all()
+    if not events:
+        return 0
+    event_ids = [event.id for event in events]
+    linked: dict[int, set[int]] = {event_id: set() for event_id in event_ids}
+    for event_id, email_id in db.query(
+        CalendarEventEmail.event_id,
+        CalendarEventEmail.email_id,
+    ).filter(CalendarEventEmail.event_id.in_(event_ids)).all():
+        linked[event_id].add(email_id)
+
+    repaired = 0
+    for event in events:
+        current = linked[event.id]
+        allowed = appointment_email_ids(db, event, current, peer_pool=events)
+        stale = current - allowed
+        if not stale:
+            continue
+        db.query(CalendarEventEmail).filter(
+            CalendarEventEmail.event_id == event.id,
+            CalendarEventEmail.email_id.in_(stale),
+        ).delete(synchronize_session=False)
+        repaired += 1
     if repaired:
         db.flush()
     return repaired
@@ -4141,6 +4253,168 @@ def _link_event_emails(
     return True
 
 
+def _appointment_peer_events(
+    db: Session,
+    event: CalendarEvent,
+    peer_pool: list[CalendarEvent] | None = None,
+) -> list[CalendarEvent]:
+    """Visible bookings that could compete for one application's messages."""
+    rows = peer_pool if peer_pool is not None else (
+        _email_calendar_events(db)
+        .filter(
+            CalendarEvent.mailbox_id == event.mailbox_id,
+            CalendarEvent.kind == "confirmed",
+            CalendarEvent.is_visible.is_(True),
+            CalendarEvent.superseded_by_event_id.is_(None),
+        )
+        .all()
+    )
+    company = (event.company or "").strip()
+    role = (event.job_role or "").strip()
+    peers = [
+        item
+        for item in rows
+        if item.id == event.id
+        or (
+            (not company or companies_match(item.company, company))
+            and (not role or roles_compatible(item.job_role, role))
+        )
+    ]
+    return peers or [event]
+
+
+def _appointment_owner_id(
+    db: Session,
+    event: CalendarEvent,
+    email: EmailMessage,
+    peers: list[CalendarEvent] | None = None,
+) -> int:
+    """Choose the booked appointment that owns an application email."""
+    peers = peers or _appointment_peer_events(db, event)
+    if len(peers) == 1:
+        return event.id
+    email_received = as_utc(email.received_at)
+    email_uid = _ics_uid(_calendar_text(email))
+    email_tokens = _schedule_tokens(_message_text(email))
+    email_slots = parse_ics_slots(_calendar_text(email))
+
+    def score(item: CalendarEvent) -> tuple[int, int, int, int, float, int]:
+        source = db.get(EmailMessage, item.source_email_id) if item.source_email_id else None
+        source_uid = _ics_uid(_calendar_text(source)) if source is not None else ""
+        source_tokens = _schedule_tokens(_message_text(source)) if source is not None else set()
+        source_received = as_utc(source.received_at) if source is not None else as_utc(item.source_received_at)
+        distance = (
+            abs((email_received - source_received).total_seconds())
+            if email_received is not None and source_received is not None
+            else float("inf")
+        )
+        return (
+            int(email.id == item.source_email_id),
+            int(bool(email_slots) and _slot_matches_event(item, email_slots)),
+            int(bool((email_uid and source_uid and email_uid == source_uid) or email_tokens.intersection(source_tokens))),
+            int(bool(email.thread_id and source is not None and email.thread_id == source.thread_id)),
+            -distance,
+            -item.id,
+        )
+
+    return max(peers, key=score).id
+
+
+def appointment_email_ids(
+    db: Session,
+    event: CalendarEvent,
+    email_ids: Iterable[int | None],
+    *,
+    peer_pool: list[CalendarEvent] | None = None,
+) -> set[int]:
+    """Filter application-wide context down to this exact appointment."""
+    wanted = {email_id for email_id in email_ids if email_id is not None}
+    direct = {email_id for email_id in (event.source_email_id, event.outcome_source_email_id) if email_id}
+    wanted.update(direct)
+    if not wanted:
+        return set()
+    emails = db.query(EmailMessage).filter(
+        EmailMessage.mailbox_id == event.mailbox_id,
+        EmailMessage.id.in_(wanted),
+    ).all()
+    allowed = set(direct)
+    source = db.get(EmailMessage, event.source_email_id) if event.source_email_id else None
+    source_received = as_utc(source.received_at) if source is not None else as_utc(event.source_received_at)
+    source_uid = _ics_uid(_calendar_text(source)) if source is not None else ""
+    source_tokens = _schedule_tokens(_message_text(source)) if source is not None else set()
+    peers = _appointment_peer_events(db, event, peer_pool)
+    for email in emails:
+        if email.id in direct:
+            continue
+        if email.label == EmailLabel.APPLICATION_CONFIRMATION.value:
+            # A legacy provider grouping can attach receipts for several
+            # subsidiaries to the same appointment. Keep only the receipt for
+            # the employer ultimately selected for this event. This preserves
+            # useful application history while preventing a sibling employer
+            # (for example Molex beside Georgia-Pacific) from leaking into the
+            # interview timeline.
+            receipt_company = (
+                clean_company_name(email.company)
+                or clean_company_name(_company_named_in_message(email))
+            )
+            receipt_received = as_utc(email.received_at)
+            if (
+                receipt_company
+                and event.company
+                and companies_match(event.company, receipt_company)
+                and (
+                    source_received is None
+                    or receipt_received is None
+                    or receipt_received <= source_received
+                )
+            ):
+                allowed.add(email.id)
+            continue
+        if email.label not in CALENDAR_LABELS:
+            continue
+        email_company = (
+            clean_company_name(email.company)
+            or interview_subject_company_role(email.subject)[0]
+            or clean_company_name(_company_named_in_message(email))
+        )
+        email_role = job_role_or_empty(email.job_role) or interview_subject_company_role(email.subject)[1]
+        email_uid = _ics_uid(_calendar_text(email))
+        email_tokens = _schedule_tokens(_message_text(email))
+        same_provider_identity = bool(
+            (email_uid and source_uid and email_uid == source_uid)
+            or email_tokens.intersection(source_tokens)
+        )
+        event_company_key = (event.company or "").strip().casefold()
+        email_company_key = email_company.strip().casefold()
+        if (
+            event.company
+            and email_company
+            and event_company_key not in _GENERIC_COMPANY_VALUES
+            and email_company_key not in _GENERIC_COMPANY_VALUES
+            and not companies_match(event.company, email_company)
+            and not same_provider_identity
+        ):
+            continue
+        if event.job_role and email_role and not roles_compatible(event.job_role, email_role):
+            continue
+        if _appointment_owner_id(db, event, email, peers) != event.id:
+            continue
+        same_thread = bool(source is not None and email.thread_id and email.thread_id == source.thread_id)
+        email_slots = explicit_message_slots(email)
+        exact_clock = bool(email_slots) and _slot_matches_event(event, email_slots)
+        if email.label == EmailLabel.INTERVIEW_SCHEDULED.value and email_slots and not exact_clock:
+            continue
+        email_received = as_utc(email.received_at)
+        close_in_time = bool(
+            email_received is not None
+            and source_received is not None
+            and abs(email_received - source_received) <= timedelta(days=2)
+        )
+        if same_provider_identity or same_thread or exact_clock or close_in_time:
+            allowed.add(email.id)
+    return allowed
+
+
 def _transfer_event_email_links(db: Session, source: CalendarEvent, target: CalendarEvent) -> None:
     """Carry invitation/update history forward when one event supersedes another."""
     if source.origin != "email" or target.origin != "email":
@@ -4161,7 +4435,8 @@ def _transfer_event_email_links(db: Session, source: CalendarEvent, target: Cale
 
 
 def _identity_events(db: Session, email: EmailMessage, *, kind: str | None = None) -> list[CalendarEvent]:
-    if not (email.company or email.job_role):
+    email_role = job_role_or_empty(email.job_role)
+    if not (email.company or email_role):
         return []
     query = _email_calendar_events(db).filter(CalendarEvent.mailbox_id == email.mailbox_id)
     if kind:
@@ -4171,7 +4446,7 @@ def _identity_events(db: Session, email: EmailMessage, *, kind: str | None = Non
         event
         for event in rows
         if (not email.company or companies_match(event.company, email.company))
-        and (not email.job_role or roles_compatible(event.job_role, email.job_role))
+        and (not email_role or roles_compatible(event.job_role, email_role))
     ]
 
 
@@ -6271,6 +6546,22 @@ def repair_conflicting_calendar_roles(db: Session, mailbox_id: int | None = None
     for event in query.all():
         messages = _linked_messages(db, event)
         role = _consensus_linked_role(messages)
+        # A provider invite can omit the role entirely and be processed before
+        # the adjacent recruiter invitation/reminder has finished enrichment.
+        # In that race the event may borrow an older opening at the same
+        # employer, and role-gated link repair can no longer attach the very
+        # messages that would correct it. Use cross-thread scheduling context
+        # only when at least two distinct messages corroborate one role.
+        if not role and event.source_email_id:
+            source = db.get(EmailMessage, event.source_email_id)
+            if source is not None:
+                context = [*_related_interview_emails(db, source, include_cross_thread=True), source]
+                supported = {message.id for _candidate, message in _candidate_role_rows(context)}
+                if len(supported) >= 2:
+                    context_role = _consensus_linked_role(context)
+                    if context_role:
+                        role = context_role
+                        messages = context
         current = job_role_or_empty(event.job_role)
         if not role or role.casefold() == current.casefold():
             continue
@@ -6281,6 +6572,8 @@ def repair_conflicting_calendar_roles(db: Session, mailbox_id: int | None = None
             event.title = f"{event.company} — {role}" if event.company else role
         for message in messages:
             if _is_recruiting_staff_role(message.job_role):
+                message.job_role = role
+            elif message.id == event.source_email_id and not job_role_or_empty(message.job_role):
                 message.job_role = role
         repaired += 1
     if repaired:
@@ -6937,6 +7230,92 @@ def _hide_prior_bookings_replaced_by(
         _absorb_calendar_event(db, replacement, event)
         changed = True
     return changed
+
+
+def _mark_prior_round_passed_for_later_booking(
+    db: Session,
+    email: EmailMessage,
+    later_booking: CalendarEvent,
+) -> bool:
+    """Advance an earlier round when a distinct later round is now booked.
+
+    Recruiter confirmations do not always say "passed" or "move forward".
+    A newly confirmed, materially later appointment is still progression
+    evidence when it was sent after the earlier appointment had begun. The
+    timing and identity guards keep ordinary reminders, panel sessions booked
+    in advance, and same-appointment updates from changing the outcome.
+    """
+    subtype = (email.interview_subtype or "").casefold()
+    if (
+        email.label != EmailLabel.INTERVIEW_SCHEDULED.value
+        or subtype not in {"confirmation", "calendar_invite"}
+        or later_booking.kind != "confirmed"
+        or not later_booking.is_visible
+        or later_booking.superseded_by_event_id is not None
+        or (later_booking.interview_status or "").casefold() == "cancellation"
+        or later_booking.source_email_id != email.id
+    ):
+        return False
+
+    booked_at = as_utc(email.received_at)
+    later_start = as_utc(later_booking.start_at)
+    if booked_at is None or later_start is None:
+        return False
+
+    changed = False
+    for prior in _identity_events(db, email, kind="confirmed"):
+        prior_start = as_utc(prior.start_at)
+        prior_end = as_utc(prior.end_at) or prior_start
+        if (
+            prior.id == later_booking.id
+            or not prior.is_visible
+            or prior.superseded_by_event_id is not None
+            or prior.application_status != "active"
+            or (prior.interview_status or "").casefold() == "cancellation"
+            or prior_start is None
+            or prior_end is None
+        ):
+            continue
+        # The later booking must have been sent at/after the earlier interview
+        # began (with a small clock-delivery allowance), and it must represent
+        # a clearly separate appointment rather than a same-day panel/update.
+        if booked_at < prior_start - timedelta(minutes=15):
+            continue
+        if later_start <= prior_end + timedelta(hours=4):
+            continue
+        prior.application_status = "passed"
+        prior.outcome_source_email_id = email.id
+        prior.outcome_at = booked_at
+        _link_event_email(db, prior, email.id)
+        changed = True
+    return changed
+
+
+def repair_prior_round_progression(db: Session, mailbox_id: int | None = None) -> int:
+    """Backfill completed rounds from later interview confirmations.
+
+    The live ingestion path advances the prior round immediately, but bookings
+    created before that rule existed can still show every historical round as
+    ``Booked``. Re-run the same guarded progression rule over persisted
+    confirmations so old timelines converge without inventing an outcome from
+    mere future scheduling.
+    """
+    query = _email_calendar_events(db).filter(
+        CalendarEvent.kind == "confirmed",
+        CalendarEvent.is_visible.is_(True),
+        CalendarEvent.superseded_by_event_id.is_(None),
+        CalendarEvent.source_email_id.is_not(None),
+    )
+    if mailbox_id is not None:
+        query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
+    repaired = 0
+    for event in query.order_by(CalendarEvent.start_at.asc(), CalendarEvent.id.asc()).all():
+        source = db.get(EmailMessage, event.source_email_id)
+        if source is not None and _mark_prior_round_passed_for_later_booking(db, source, event):
+            repaired += 1
+    if repaired:
+        db.flush()
+    return repaired
 
 
 _SIGNATURE_ORG_RE = re.compile(
@@ -7596,9 +7975,15 @@ def collapse_duplicate_calendar_events(
     if repair_cross_company_outcome_links(db, mailbox_id) > 0:
         changed = True
     checkpoint()
+    if prune_calendar_event_email_links(db, mailbox_id) > 0:
+        changed = True
+    checkpoint()
     # Remove stale links before any field repair reads them. This applies to all
     # confirmed email events, not only Microsoft Bookings messages.
     if repair_calendar_event_email_links(db, mailbox_id) > 0:
+        changed = True
+    checkpoint()
+    if repair_prior_round_progression(db, mailbox_id) > 0:
         changed = True
     checkpoint()
     if repair_mixed_thread_appointments(db, mailbox_id) > 0:
@@ -8259,10 +8644,17 @@ async def _process_calendar_email_locked(
                 event.interview_status = later_reschedule.interview_subtype or "reschedule"
                 _link_event_email(db, event, later_reschedule.id)
             db.flush()
-            _link_event_emails(db, event, [email.id, *(related.id for related in related_emails)])
+            safe_email_ids = appointment_email_ids(
+                db,
+                event,
+                [email.id, *(related.id for related in related_emails)],
+            )
+            _link_event_emails(db, event, safe_email_ids)
             _hide_availability(db, email, event, (related.id for related in related_emails))
             if event.is_visible and status != "cancellation":
                 if _hide_prior_bookings_replaced_by(db, email, event):
+                    changed = True
+                if _mark_prior_round_passed_for_later_booking(db, email, event):
                     changed = True
 
     email.calendar_processed_hash = digest

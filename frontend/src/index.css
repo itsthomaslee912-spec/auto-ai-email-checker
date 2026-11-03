@@ -4175,7 +4175,7 @@ button:active:not(:disabled) {
 .reply-sender-trigger[aria-expanded="true"] { background: var(--bg-hover); color: var(--ink); }
 .reply-sender-trigger:focus-visible { box-shadow: var(--focus-ring); }
 .reply-sender-trigger:disabled { cursor: not-allowed; opacity: .55; }
-.reply-sender-trigger > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reply-sender-trigger > .reply-sender-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .reply-sender-trigger > svg {
   width: .75rem;
   height: .75rem;
@@ -4228,6 +4228,21 @@ button:active:not(:disabled) {
 .reply-sender-menu > button:hover,
 .reply-sender-menu > button:focus-visible { outline: none; background: var(--bg-hover); }
 .reply-sender-menu > button.is-selected { background: color-mix(in srgb, var(--accent) 11%, transparent); }
+.reply-sender-avatar {
+  display: grid;
+  width: 1.75rem;
+  height: 1.75rem;
+  flex: 0 0 1.75rem;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--account-color) 72%, white);
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--account-color) 18%, var(--bg-card));
+  color: var(--account-color);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--account-color) 10%, transparent);
+}
+.reply-sender-trigger > .reply-sender-avatar { width: 1.35rem; height: 1.35rem; flex-basis: 1.35rem; overflow: hidden; }
+.reply-sender-avatar > svg { width: 76%; height: 76%; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .reply-sender-provider {
   display: grid;
   width: 1.75rem;
@@ -4323,7 +4338,7 @@ button:active:not(:disabled) {
 .settings-account-row {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
-  grid-template-areas: "avatar info actions" "alert alert alert" "status status status" "progress progress progress";
+  grid-template-areas: "avatar info actions" "profile profile profile" "color color color" "alert alert alert" "status status status" "progress progress progress";
   align-items: center;
   gap: 0 0.9rem;
   padding: 0.85rem 0.95rem;
@@ -4334,24 +4349,32 @@ button:active:not(:disabled) {
 .settings-account-row:hover { border-color: color-mix(in srgb, var(--accent) 30%, var(--line)); box-shadow: var(--shadow-sm); }
 .settings-account-row.needs-attention { border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); background: linear-gradient(135deg, color-mix(in srgb, var(--bg-card) 90%, var(--danger) 6%), var(--bg-elev)); }
 
-.account-avatar {
+.account-color-picker {
   grid-area: avatar;
+  position: relative;
+  width: 2.6rem;
+  height: 2.6rem;
+}
+.account-avatar {
   position: relative;
   display: grid;
   place-items: center;
   width: 2.6rem;
   height: 2.6rem;
+  padding: 0;
   border-radius: 50%;
   background: color-mix(in srgb, var(--account-color) 22%, var(--bg-card));
   border: 2px solid var(--account-color);
   color: var(--account-color);
+  font-family: inherit;
   font-size: 0.82rem;
   font-weight: 800;
   letter-spacing: 0.02em;
   cursor: pointer;
-  transition: transform 140ms ease;
+  transition: transform 140ms ease, box-shadow 140ms ease, background-color 140ms ease;
 }
-.account-avatar:hover { transform: scale(1.06); }
+.account-avatar:hover { transform: scale(1.06); box-shadow: 0 0 0 4px color-mix(in srgb, var(--account-color) 14%, transparent); }
+.account-avatar:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--bg-card), 0 0 0 5px var(--account-color); }
 .account-avatar::after {
   content: "";
   position: absolute;
@@ -4363,7 +4386,190 @@ button:active:not(:disabled) {
   border-radius: 50%;
   background: var(--account-color);
 }
-.account-avatar input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+.account-avatar > svg,
+.account-avatar-option-preview > svg,
+.sidebar-account-avatar > svg {
+  width: 1.15rem;
+  height: 1.15rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.account-avatar-art .avatar-face { fill: color-mix(in srgb, currentColor 9%, transparent); }
+.account-avatar-art .avatar-dot { fill: currentColor; stroke: none; }
+
+.account-color-panel {
+  grid-area: color;
+  min-width: 0;
+  display: grid;
+  grid-template-rows: 0fr;
+  margin-top: 0;
+  opacity: 0;
+  visibility: hidden;
+  transition: grid-template-rows 220ms cubic-bezier(.2,.8,.2,1), margin-top 220ms cubic-bezier(.2,.8,.2,1), opacity 150ms ease, visibility 0s linear 220ms;
+}
+.account-color-panel.is-open {
+  grid-template-rows: 1fr;
+  margin-top: 0.8rem;
+  opacity: 1;
+  visibility: visible;
+  transition: grid-template-rows 220ms cubic-bezier(.2,.8,.2,1), margin-top 220ms cubic-bezier(.2,.8,.2,1), opacity 180ms ease, visibility 0s;
+}
+.account-color-panel-clip { min-height: 0; overflow: hidden; }
+.account-color-panel-inner {
+  display: grid;
+  grid-template-columns: minmax(8.5rem, .8fr) minmax(17rem, 1.4fr) minmax(11rem, .8fr);
+  align-items: center;
+  gap: 0.85rem;
+  min-width: 0;
+  padding: 0.75rem 0.8rem;
+  border: 1px solid color-mix(in srgb, var(--line) 88%, var(--ink));
+  border-radius: 12px;
+  background: linear-gradient(135deg, color-mix(in srgb, var(--bg-elev) 96%, var(--accent) 2%), var(--bg-card));
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 5%, transparent);
+  color: var(--ink);
+}
+.account-color-popover-heading { display: grid; gap: 0.16rem; padding: 0.1rem 0.15rem; }
+.account-color-popover-heading strong { font-size: 0.82rem; font-weight: 750; }
+.account-color-popover-heading small { color: var(--muted); font-size: 0.67rem; }
+.account-appearance-heading { grid-column: 1 / -1; }
+.account-avatar-palette {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(4.5rem, 1fr));
+  gap: 0.45rem;
+  min-width: 0;
+  padding-bottom: 0.7rem;
+  border-bottom: 1px solid var(--line);
+}
+.account-avatar-palette button {
+  display: grid;
+  justify-items: center;
+  gap: 0.32rem;
+  min-width: 0;
+  padding: 0.48rem 0.35rem 0.4rem;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: border-color 140ms ease, background-color 140ms ease, color 140ms ease, transform 140ms ease;
+}
+.account-avatar-option-preview {
+  display: grid;
+  width: 2.25rem;
+  height: 2.25rem;
+  place-items: center;
+  border: 1.5px solid color-mix(in srgb, var(--account-color) 70%, white);
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--account-color) 17%, var(--bg-card));
+  color: var(--account-color);
+  box-shadow: 0 3px 10px color-mix(in srgb, var(--account-color) 14%, transparent);
+}
+.account-avatar-palette button small { overflow: hidden; max-width: 100%; font-size: 0.64rem; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
+.account-avatar-palette button:hover { transform: translateY(-1px); color: var(--ink); background: var(--bg-hover); }
+.account-avatar-palette button.is-selected { border-color: color-mix(in srgb, var(--account-color) 68%, var(--line)); background: color-mix(in srgb, var(--account-color) 11%, transparent); color: var(--ink); }
+.account-avatar-palette button.is-selected .account-avatar-option-preview { box-shadow: 0 0 0 3px color-mix(in srgb, var(--account-color) 18%, transparent); }
+.account-avatar-palette button:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--bg-elev), 0 0 0 4px var(--accent); }
+.account-color-palette {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(4rem, 1fr));
+  gap: 0.35rem;
+  min-width: 0;
+  padding: 0.1rem 0.05rem;
+}
+.account-color-palette button {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.38rem;
+  min-height: 2.25rem;
+  min-width: 0;
+  padding: 0.28rem 0.42rem;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--swatch-color) 6%, transparent);
+  color: var(--ink);
+  cursor: pointer;
+  transition: border-color 130ms ease, background-color 130ms ease, transform 130ms ease;
+}
+.account-color-palette button > span {
+  width: 1.15rem;
+  height: 1.15rem;
+  flex: 0 0 auto;
+  border: 2px solid color-mix(in srgb, var(--swatch-color) 78%, white);
+  border-radius: 50%;
+  background: var(--swatch-color);
+  box-shadow: 0 2px 6px color-mix(in srgb, var(--swatch-color) 38%, transparent);
+  transition: transform 130ms ease, box-shadow 130ms ease;
+}
+.account-color-palette button > small { min-width: 0; overflow: hidden; font-size: 0.62rem; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
+.account-color-palette button:hover { border-color: color-mix(in srgb, var(--swatch-color) 48%, var(--line)); background: color-mix(in srgb, var(--swatch-color) 13%, transparent); transform: translateY(-1px); }
+.account-color-palette button:hover > span { transform: scale(1.12); }
+.account-color-palette button.is-selected { border-color: var(--swatch-color); background: color-mix(in srgb, var(--swatch-color) 18%, transparent); }
+.account-color-palette button.is-selected::after {
+  content: "✓";
+  margin-left: auto;
+  display: grid;
+  place-items: center;
+  width: 0.88rem;
+  height: 0.88rem;
+  flex: 0 0 auto;
+  border: 2px solid var(--bg-elev);
+  border-radius: 50%;
+  background: var(--swatch-color);
+  color: white;
+  font-size: 0.55rem;
+  font-weight: 900;
+}
+.account-color-palette button:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--bg-elev), 0 0 0 4px var(--swatch-color); }
+.account-color-custom {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) 6.5rem;
+  align-items: center;
+  gap: 0.58rem;
+  min-height: 2.65rem;
+  padding: 0.42rem 0.52rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-card) 72%, transparent);
+  transition: border-color 140ms ease, background-color 140ms ease;
+}
+.account-color-custom:hover { border-color: color-mix(in srgb, var(--account-color, var(--accent)) 45%, var(--line)); background: var(--bg-hover); }
+.account-color-custom-preview { width: 1.45rem; height: 1.45rem; border: 2px solid color-mix(in srgb, currentColor 12%, white); border-radius: 7px; box-shadow: inset 0 0 0 1px color-mix(in srgb, #000 12%, transparent); }
+.account-color-custom > span:nth-child(2) { min-width: 0; display: grid; gap: 0.05rem; }
+.account-color-custom strong { color: var(--ink); font-size: 0.72rem; }
+.account-color-custom small { color: var(--muted); font-size: 0.61rem; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.account-color-custom input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  height: 2rem;
+  padding: 0 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  outline: none;
+  background: var(--bg-pane);
+  color: var(--ink);
+  font: 0.7rem ui-monospace, SFMono-Regular, Consolas, monospace;
+  text-transform: uppercase;
+}
+.account-color-custom input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent); }
+
+@media (max-width: 900px) {
+  .account-color-panel-inner { grid-template-columns: minmax(7rem, .7fr) minmax(14rem, 1.3fr); }
+  .account-avatar-palette { grid-template-columns: repeat(5, minmax(3.6rem, 1fr)); }
+  .account-color-custom { grid-column: 1 / -1; }
+}
+
+@media (max-width: 620px) {
+  .account-color-panel-inner { grid-template-columns: 1fr; align-items: stretch; gap: 0.6rem; }
+  .account-avatar-palette { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .account-color-palette { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .account-color-custom { grid-column: auto; }
+}
 
 .settings-account-info { grid-area: info; gap: 0.3rem; margin-right: 0; }
 .settings-account-info strong { font-size: 0.94rem; white-space: nowrap; }
@@ -4387,6 +4593,85 @@ button:active:not(:disabled) {
 .account-health.error { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
 
 .settings-account-actions { grid-area: actions; flex-wrap: nowrap; gap: 0.3rem; }
+.account-profile-panel {
+  grid-area: profile;
+  min-width: 0;
+  display: grid;
+  grid-template-rows: 0fr;
+  margin-top: 0;
+  opacity: 0;
+  visibility: hidden;
+  transition: grid-template-rows 220ms cubic-bezier(.2,.8,.2,1), margin-top 220ms cubic-bezier(.2,.8,.2,1), opacity 160ms ease, visibility 0s linear 220ms;
+}
+.account-profile-panel.is-open {
+  grid-template-rows: 1fr;
+  margin-top: 0.8rem;
+  opacity: 1;
+  visibility: visible;
+  transition: grid-template-rows 220ms cubic-bezier(.2,.8,.2,1), margin-top 220ms cubic-bezier(.2,.8,.2,1), opacity 180ms ease, visibility 0s;
+}
+.account-profile-panel-clip { min-height: 0; overflow: hidden; }
+.account-profile-settings {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.65rem;
+  min-width: 0;
+  padding: 0.8rem;
+  border: 1px solid color-mix(in srgb, var(--line) 86%, var(--ink));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg-elev) 92%, var(--accent) 2%);
+}
+.account-setting-field { display: grid; gap: 0.28rem; min-width: 0; }
+.account-setting-field > span { color: var(--muted); font-size: 0.66rem; font-weight: 700; letter-spacing: 0.035em; text-transform: uppercase; }
+.account-setting-field input,
+.account-setting-field select {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  height: 2.45rem;
+  padding: 0 0.72rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  outline: none;
+  background: color-mix(in srgb, var(--bg-pane) 82%, transparent);
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.78rem;
+  transition: border-color 140ms ease, box-shadow 140ms ease, background-color 140ms ease;
+}
+.account-setting-field > .account-timezone-select { width: 100%; }
+.account-timezone-select > .compact-select-trigger {
+  width: 100%;
+  height: 2.45rem;
+  padding-left: 0.72rem;
+  border-color: var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-pane) 82%, transparent);
+  font-size: 0.78rem;
+  font-weight: 620;
+}
+.account-timezone-select > .compact-select-trigger:hover {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--line));
+  background: var(--bg-card);
+}
+.account-timezone-select[data-open="true"] > .compact-select-trigger {
+  border-color: var(--accent);
+  background: var(--bg-card);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent);
+}
+.account-timezone-select .compact-select-indicator {
+  width: 1.7rem;
+  height: 1.7rem;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--accent);
+}
+.account-setting-field input:hover:not(:read-only),
+.account-setting-field select:hover { border-color: color-mix(in srgb, var(--accent) 42%, var(--line)); }
+.account-setting-field input:focus,
+.account-setting-field select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent); background: var(--bg-card); }
+.account-setting-field.is-readonly input { color: var(--muted); cursor: default; }
+.account-setting-field small { overflow: hidden; color: var(--muted); font-size: 0.64rem; line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }
 .account-icon-btn {
   display: grid;
   place-items: center;
@@ -4491,8 +4776,13 @@ button:active:not(:disabled) {
 @media (max-width: 720px) { .outcome-browser-actions { align-items: stretch; } .outcome-browser-actions > * { flex: 1 1 auto; } .outcome-company-search { margin-left: 0; } .outcome-stats-btn { margin-left: 0; } .pagination { justify-content: space-between; } }
 @keyframes account-status-pulse { 50% { opacity: 0.35; } }
 @media (max-width: 940px) {
-  .settings-account-row { grid-template-columns: auto minmax(0, 1fr); grid-template-areas: "avatar info" "actions actions" "alert alert" "status status" "progress progress"; }
+  .settings-account-row { grid-template-columns: auto minmax(0, 1fr); grid-template-areas: "avatar info" "profile profile" "color color" "actions actions" "alert alert" "status status" "progress progress"; }
   .settings-account-actions { justify-content: flex-start; flex-wrap: wrap; margin-top: 0.6rem; }
+}
+@media (max-width: 700px) {
+  .account-profile-settings { grid-template-columns: 1fr; }
+  .account-color-custom { grid-template-columns: auto minmax(0, 1fr); }
+  .account-color-custom input { grid-column: 1 / -1; }
 }
 
 .train-check input {
@@ -5079,17 +5369,17 @@ html[data-theme="light"] .calendar-holiday { background: color-mix(in srgb, #256
 .month-day-agenda footer { border-top: 1px solid var(--calendar-border-soft); }
 .month-day-agenda footer button { width: 100%; padding: .45rem .6rem; border: 1px solid var(--calendar-border); border-radius: 9px; background: var(--calendar-control); color: var(--ink); font: inherit; font-size: .75rem; font-weight: 700; cursor: pointer; }
 .month-day-agenda footer button:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--calendar-border)); color: var(--accent); }
-.calendar-event { --account-color: var(--accent); --event-ink: #f8fafc; container: calendar-event / inline-size; position: relative; width: 100%; min-width: 0; display: flex; flex-direction: row; align-items: center; gap: .28rem; padding: .28rem .4rem .28rem .42rem; border: 0; border-radius: 8px; outline: none; background-color: var(--account-color); background-image: none; color: var(--event-ink); text-align: left; font: inherit; font-size: .71rem; cursor: pointer; transform: translateY(0) scale(1); transform-origin: center; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--event-ink) 18%, transparent); transition: filter 160ms ease, box-shadow 180ms ease, transform 180ms cubic-bezier(.2,.8,.2,1); }
-.calendar-event:hover { z-index: 6; filter: brightness(1.08); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--event-ink) 28%, transparent), 0 8px 18px color-mix(in srgb, var(--account-color) 35%, transparent); transform: translateY(-1px); }
+.calendar-event { --account-color: var(--accent); --event-ink: #f8fafc; container: calendar-event / inline-size; position: relative; width: 100%; min-width: 0; display: flex; flex-direction: row; align-items: center; gap: .28rem; padding: .28rem .4rem .28rem .42rem; border: 1px solid color-mix(in srgb, var(--account-color) 72%, var(--calendar-border)); border-left: 4px solid color-mix(in srgb, var(--account-color) 88%, white); border-radius: 9px; outline: none; background-color: color-mix(in srgb, var(--account-color) 31%, var(--calendar-control)); background-image: linear-gradient(135deg, color-mix(in srgb, var(--account-color) 46%, transparent) 0%, color-mix(in srgb, var(--account-color) 25%, transparent) 52%, transparent 100%); color: var(--event-ink); text-align: left; font: inherit; font-size: .71rem; cursor: pointer; transform: translateY(0) scale(1); transform-origin: center; box-shadow: inset 0 1px 0 color-mix(in srgb, white 9%, transparent), 0 3px 8px color-mix(in srgb, #000 18%, transparent), 0 0 12px color-mix(in srgb, var(--account-color) 7%, transparent); transition: background-color 160ms ease, border-color 160ms ease, box-shadow 180ms ease, transform 180ms cubic-bezier(.2,.8,.2,1); }
+.calendar-event:hover { z-index: 6; border-color: color-mix(in srgb, var(--account-color) 90%, white 10%); border-left-color: color-mix(in srgb, var(--account-color) 82%, white); background-color: color-mix(in srgb, var(--account-color) 40%, var(--calendar-control)); box-shadow: inset 0 1px 0 color-mix(in srgb, white 14%, transparent), 0 9px 22px color-mix(in srgb, #000 27%, transparent), 0 0 18px color-mix(in srgb, var(--account-color) 20%, transparent); transform: translateY(-2px); }
 .calendar-event:active { transform: translateY(0) scale(.985); transition-duration: 70ms; }
-.calendar-event.selected { z-index: 5; box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--event-ink) 82%, transparent); }
-.calendar-event:focus-visible { box-shadow: inset 0 0 0 2px var(--calendar-control), 0 0 0 2px var(--account-color); }
-.calendar-event.status-active { background-color: var(--account-color); }
-.calendar-event.status-passed { background-color: color-mix(in srgb, var(--account-color) 72%, transparent); color: var(--ink); }
-.calendar-event.status-rejected { background-color: color-mix(in srgb, var(--account-color) 48%, transparent); color: var(--ink); }
-.calendar-event.status-position-closed { background-color: color-mix(in srgb, var(--account-color) 36%, transparent); color: var(--ink); }
+.calendar-event.selected { z-index: 5; border-color: color-mix(in srgb, var(--account-color) 78%, white); background-color: color-mix(in srgb, var(--account-color) 42%, var(--calendar-control)); box-shadow: inset 0 1px 0 color-mix(in srgb, white 15%, transparent), 0 0 0 2px var(--calendar-control), 0 0 0 4px color-mix(in srgb, var(--account-color) 88%, white), 0 9px 24px color-mix(in srgb, var(--account-color) 24%, #000); }
+.calendar-event:focus-visible { border-color: var(--account-color); box-shadow: 0 0 0 2px var(--calendar-control), 0 0 0 4px color-mix(in srgb, var(--account-color) 82%, transparent); }
+.calendar-event.status-active { background-color: color-mix(in srgb, var(--account-color) 31%, var(--calendar-control)); }
+.calendar-event.status-passed { background-color: color-mix(in srgb, var(--account-color) 14%, var(--calendar-control)); color: var(--ink); }
+.calendar-event.status-rejected { background-color: color-mix(in srgb, var(--account-color) 10%, var(--calendar-control)); color: var(--ink); }
+.calendar-event.status-position-closed { background-color: color-mix(in srgb, var(--account-color) 8%, var(--calendar-control)); color: var(--ink); }
 .calendar-event.canceled,
-.calendar-event.status-canceled { background-color: color-mix(in srgb, var(--account-color) 28%, transparent); background-image: none; color: var(--ink); animation: none; }
+.calendar-event.status-canceled { background-color: color-mix(in srgb, var(--account-color) 6%, var(--calendar-control)); background-image: none; color: var(--ink); animation: none; }
 .calendar-event.status-passed .calendar-event-company,
 .calendar-event.status-rejected .calendar-event-company,
 .calendar-event.status-position-closed .calendar-event-company,
@@ -5103,9 +5393,9 @@ html[data-theme="light"] .calendar-holiday { background: color-mix(in srgb, #256
 .calendar-event.availability { border: 1px dashed color-mix(in srgb, var(--account-color) 72%, var(--ink)); background-color: color-mix(in srgb, var(--account-color) 22%, var(--calendar-control)); background-image: repeating-linear-gradient(-45deg, transparent, transparent 5px, color-mix(in srgb, var(--account-color) 16%, transparent) 5px, color-mix(in srgb, var(--account-color) 16%, transparent) 6px); color: var(--ink); box-shadow: none; }
 .calendar-event.has-meeting-type { padding-right: 1.7rem; }
 .calendar-event.has-status { padding-left: 1.15rem; }
-.calendar-event-status-icon { position: absolute; z-index: 3; top: 2px; left: 2px; width: .9rem; height: .9rem; display: inline-flex; align-items: center; justify-content: center; border-radius: 999px; background: var(--event-ink); color: var(--account-color); box-shadow: 0 0 0 1px color-mix(in srgb, var(--account-color) 55%, #000); }
+.calendar-event-status-icon { position: absolute; z-index: 3; top: 2px; left: 2px; width: .9rem; height: .9rem; display: inline-flex; align-items: center; justify-content: center; border-radius: 999px; background: var(--calendar-control); color: var(--account-color); box-shadow: 0 0 0 1px color-mix(in srgb, var(--account-color) 62%, var(--calendar-border)); }
 .calendar-event-status-icon svg { width: .66rem; height: .66rem; fill: none; stroke: currentColor; stroke-width: 1.75px; stroke-linecap: round; stroke-linejoin: round; }
-.calendar-event-pending-icon { background: var(--account-color); color: var(--event-ink); box-shadow: 0 0 0 1.5px var(--calendar-canvas, #111); }
+.calendar-event-pending-icon { background: var(--calendar-control); color: var(--account-color); box-shadow: 0 0 0 1.5px var(--account-color); }
 .calendar-event-pending-icon.is-reschedule { background: var(--warn); color: #1a1205; }
 @keyframes calendar-passed-alarm { 0%, 70%, 100% { box-shadow: var(--shadow-sm); } 78% { box-shadow: 0 0 0 2px color-mix(in srgb, #22c55e 30%, transparent), 0 0 16px color-mix(in srgb, #22c55e 34%, transparent); } 86% { box-shadow: 0 0 0 5px color-mix(in srgb, #22c55e 0%, transparent), var(--shadow-sm); } }
 @keyframes calendar-outcome-settle { from { opacity: .55; filter: saturate(.35); transform: scale(.96); } to { opacity: 1; filter: saturate(1); transform: scale(1); } }
@@ -5122,6 +5412,9 @@ html[data-theme="light"] .calendar-holiday { background: color-mix(in srgb, #256
 .calendar-event.availability.timed.very-short .calendar-event-main { flex-direction: row; align-items: center; gap: .3rem; }
 .calendar-event.availability.timed.very-short .calendar-event-company { flex: 0 1 auto; }
 .calendar-event.availability.timed.very-short .calendar-event-role { flex: 1 1 0; }
+html[data-theme="light"] .calendar-event { --event-ink: #172033; border-color: color-mix(in srgb, var(--account-color) 52%, var(--calendar-border)); border-left-color: var(--account-color); background-color: color-mix(in srgb, var(--account-color) 14%, var(--calendar-control)); background-image: linear-gradient(135deg, color-mix(in srgb, var(--account-color) 18%, transparent), transparent 68%); box-shadow: inset 0 1px 0 color-mix(in srgb, white 72%, transparent), 0 3px 8px color-mix(in srgb, #0f172a 10%, transparent); }
+html[data-theme="light"] .calendar-event.status-active { background-color: color-mix(in srgb, var(--account-color) 14%, var(--calendar-control)); }
+html[data-theme="light"] .calendar-event:hover { background-color: color-mix(in srgb, var(--account-color) 22%, var(--calendar-control)); box-shadow: inset 0 1px 0 color-mix(in srgb, white 80%, transparent), 0 8px 18px color-mix(in srgb, #0f172a 15%, transparent), 0 0 0 1px color-mix(in srgb, var(--account-color) 20%, transparent); }
 .calendar-event-hover-card .calendar-hover-offer dd { color: var(--accent); }
 .calendar-event-hover-card .calendar-hover-offer.is-reschedule dd { color: var(--warn); }
 .calendar-event-hover-card .calendar-hover-offer dd svg { color: currentColor; }
@@ -5294,6 +5587,11 @@ html[data-theme="light"] .calendar-event-hover-card .calendar-hover-status.statu
 .interview-account-copy { min-width: 0; display: grid; gap: .3rem; }
 .interview-account-copy strong { min-width: 0; overflow: hidden; color: var(--ink); font-size: .72rem; font-weight: 700; line-height: 1.2; text-overflow: ellipsis; white-space: nowrap; }
 .interview-account-copy em { color: var(--muted); font-style: normal; font-weight: 500; }
+.interview-account-copy > small { min-width: 0; overflow: hidden; margin-top: -.18rem; color: var(--muted); font-size: .58rem; text-overflow: ellipsis; white-space: nowrap; }
+.calendar-legend-copy { min-width: 0; display: grid; gap: .04rem; }
+.calendar-legend-copy strong, .calendar-legend-copy small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.calendar-legend-copy strong { font-size: .72rem; }
+.calendar-legend-copy small { color: var(--muted); font-size: .6rem; font-weight: 520; }
 .interview-account-bar { height: .25rem; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, var(--ink) 8%, transparent); }
 .interview-account-bar span { display: block; height: 100%; border-radius: inherit; background: var(--account-color); transition: width 320ms var(--ease-emphasized, ease); }
 .interview-account-stat { display: grid; justify-items: end; gap: .1rem; min-width: 2rem; }
@@ -5491,6 +5789,74 @@ html[data-theme="light"] .source-email-status.status-position-closed { color: #3
 .source-email-list-top time { flex: 0 0 auto; color: var(--muted); font-size: .59rem; font-weight: 560; white-space: nowrap; }
 .source-email-body { height: min(24rem, 48vh); border-top: 1px solid var(--calendar-border); overflow: hidden; background: var(--calendar-control); }
 .source-email-body .email-body-scroll { height: 100%; }
+.interview-progress {
+  display: grid;
+  gap: 1rem;
+  margin-top: .25rem;
+  padding-top: 1.15rem;
+  border-top: 1px solid var(--calendar-border-soft);
+}
+.interview-progress-heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.interview-progress-heading h3 { margin: 0; color: var(--ink); font-size: .92rem; font-weight: 760; letter-spacing: -.015em; }
+.interview-progress-heading p { margin: .14rem 0 0; color: var(--muted); font-size: .67rem; }
+.interview-progress-count { flex: 0 0 auto; padding: .24rem .48rem; border: 1px solid var(--calendar-border-soft); border-radius: 999px; background: var(--calendar-control); color: var(--muted); font-size: .61rem; font-weight: 700; }
+.interview-progress-list { display: grid; gap: .15rem; margin: 0; padding: 0; list-style: none; }
+.interview-progress-list > li {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1.75rem minmax(0, 1fr);
+  gap: .7rem;
+  min-width: 0;
+  padding: .18rem 0 .9rem;
+}
+.interview-progress-list > li:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  top: 1.72rem;
+  bottom: -.12rem;
+  left: .855rem;
+  width: 2px;
+  border-radius: 99px;
+  background: color-mix(in srgb, var(--calendar-border) 82%, transparent);
+}
+.interview-progress-marker {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  border: 1px solid var(--calendar-border);
+  border-radius: 50%;
+  background: var(--calendar-panel);
+  color: var(--muted);
+  box-shadow: 0 0 0 4px var(--calendar-panel);
+}
+.interview-progress-marker svg { width: .9rem; height: .9rem; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+.interview-progress-marker > span { width: .42rem; height: .42rem; border-radius: 50%; background: currentColor; }
+.interview-progress-marker > strong { font-size: .66rem; font-weight: 800; line-height: 1; }
+.progress-complete .interview-progress-marker { border-color: color-mix(in srgb, #34d399 55%, var(--calendar-border)); background: color-mix(in srgb, #34d399 14%, var(--calendar-panel)); color: #34d399; }
+.progress-success .interview-progress-marker { border-color: color-mix(in srgb, #34d399 70%, var(--calendar-border)); background: color-mix(in srgb, #34d399 20%, var(--calendar-panel)); color: #34d399; box-shadow: 0 0 0 4px var(--calendar-panel), 0 0 0 6px color-mix(in srgb, #34d399 12%, transparent); }
+.progress-current .interview-progress-marker { border-color: color-mix(in srgb, var(--accent) 65%, var(--calendar-border)); background: color-mix(in srgb, var(--accent) 16%, var(--calendar-panel)); color: var(--accent); box-shadow: 0 0 0 4px var(--calendar-panel), 0 0 0 6px color-mix(in srgb, var(--accent) 11%, transparent); }
+.progress-upcoming .interview-progress-marker { border-style: dashed; border-color: color-mix(in srgb, var(--accent) 48%, var(--calendar-border)); color: color-mix(in srgb, var(--accent) 72%, var(--muted)); }
+.progress-negative .interview-progress-marker { border-color: color-mix(in srgb, #fb7185 58%, var(--calendar-border)); background: color-mix(in srgb, #fb7185 13%, var(--calendar-panel)); color: #fb7185; }
+.interview-progress-copy { min-width: 0; padding-top: .12rem; }
+.interview-progress-list > li.is-selected .interview-progress-copy { margin: -.34rem -.5rem -.34rem 0; padding: .46rem .55rem; border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--calendar-border-soft)); border-radius: 10px; background: color-mix(in srgb, var(--accent) 6%, var(--calendar-control)); }
+.interview-progress-round-label { display: flex; align-items: center; gap: .38rem; margin-bottom: .24rem; color: var(--muted); font-size: .58rem; font-weight: 760; letter-spacing: .055em; text-transform: uppercase; }
+.interview-progress-round-label em { padding: .13rem .32rem; border-radius: 999px; background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); font-size: .52rem; font-style: normal; letter-spacing: .035em; }
+.interview-progress-title-row { display: flex; align-items: baseline; justify-content: space-between; gap: .65rem; min-width: 0; }
+.interview-progress-title-row strong { min-width: 0; color: var(--ink); font-size: .76rem; font-weight: 735; }
+.interview-progress-title-row time { flex: 0 0 auto; color: var(--muted); font-size: .59rem; font-weight: 580; white-space: nowrap; }
+.interview-progress-copy p { margin: .2rem 0 0; color: var(--muted); font-size: .67rem; line-height: 1.42; }
+.interview-progress-status { flex: 0 0 auto; padding: .18rem .4rem; border-radius: 999px; background: var(--calendar-control); color: var(--muted); font-size: .57rem; font-weight: 760; white-space: nowrap; }
+.interview-progress-status.progress-success { background: color-mix(in srgb, #34d399 15%, var(--calendar-control)); color: #34d399; }
+.interview-progress-status.progress-negative { background: color-mix(in srgb, #fb7185 14%, var(--calendar-control)); color: #fb7185; }
+.interview-progress-status.progress-current { background: color-mix(in srgb, var(--accent) 13%, var(--calendar-control)); color: var(--accent); }
+.interview-progress-status.progress-upcoming { border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--calendar-border)); color: color-mix(in srgb, var(--accent) 80%, var(--ink)); }
+html[data-theme="light"] .progress-complete .interview-progress-marker { color: #047857; }
+html[data-theme="light"] .progress-success .interview-progress-marker { color: #047857; }
+html[data-theme="light"] .progress-negative .interview-progress-marker { color: #be123c; }
 .modal-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 1rem; background: rgba(4,8,14,.66); backdrop-filter: blur(8px); }
 .calendar-editor { width: min(42rem, 100%); max-height: 92vh; overflow: auto; display: grid; gap: .75rem; padding: 1rem; border: 1px solid var(--line); border-radius: 16px; background: var(--bg-elev); box-shadow: var(--shadow-md); }.calendar-editor header, .calendar-editor footer { display: flex; justify-content: space-between; align-items: center; gap: .6rem; }.calendar-editor h2 { margin: 0; }.calendar-editor label { display: grid; gap: .3rem; color: var(--muted); font-size: .78rem; font-weight: 700; }.editor-timezone { margin-bottom: -.25rem; color: var(--muted); font-size: .72rem; }.editor-row { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: .65rem; }.calendar-editor footer { justify-content: flex-end; }.error-text { color: var(--danger) !important; }
 
@@ -6986,16 +7352,18 @@ html[data-theme="light"] .source-email-status.status-position-closed { color: #3
   font-weight: 800;
 }
 .sidebar-account-avatar.provider-microsoft { background: var(--account-color, hsl(var(--avatar-hue) 76% 47%)); }
+.sidebar-account-avatar > svg { width: 0.72rem; height: 0.72rem; stroke-width: 2.15; }
 .sidebar-account-email { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sidebar-account-count { flex: 0 0 auto; min-width: 1.1rem; padding: .05rem .3rem; border-radius: 999px; background: color-mix(in srgb, var(--accent) 18%, var(--bg-pane)); color: color-mix(in srgb, var(--accent) 70%, var(--ink)); font-size: .62rem; text-align: center; }
 .sidebar-empty { margin: .35rem 1rem .6rem 2rem; color: var(--muted); font-size: .73rem; }
 
-.sidebar-category-list { display: grid; gap: .08rem; margin: .05rem 0 .45rem 1.2rem; }
-.sidebar-filter-row { min-height: 1.9rem; display: flex; align-items: center; justify-content: space-between; gap: .5rem; padding: .28rem .65rem .28rem 2.05rem; border-radius: 7px; color: var(--muted); font-size: .73rem; text-align: left; }
-.sidebar-filter-row > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sidebar-filter-row > span:last-child { flex: 0 0 auto; font-size: .64rem; }
+.sidebar-category-list { display: grid; gap: .12rem; margin: .08rem 0 .55rem 1.2rem; }
+.sidebar-filter-row { min-height: max(2.05rem, 30px); display: flex; align-items: center; justify-content: space-between; gap: .5rem; padding: .34rem .65rem .34rem 1.65rem; border-radius: 8px; color: color-mix(in srgb, var(--ink) 72%, var(--muted)); font-size: max(.78rem, 12px); line-height: 1.3; text-align: left; }
+.sidebar-filter-row > span:first-child { min-width: 0; overflow: hidden; font-weight: 540; text-overflow: ellipsis; white-space: nowrap; }
+.sidebar-filter-row > span:last-child { flex: 0 0 auto; font-size: max(.64rem, 10px); }
 .sidebar-filter-row:hover { background: var(--bg-hover); color: var(--ink); }
-.sidebar-filter-row.active { background: color-mix(in srgb, var(--accent) 15%, var(--bg-hover)); color: var(--ink); }
+.sidebar-filter-row.active { background: color-mix(in srgb, var(--accent) 18%, var(--bg-hover)); color: var(--ink); box-shadow: inset 3px 0 0 color-mix(in srgb, var(--accent) 78%, white); }
+.sidebar-filter-row.active > span:first-child { font-weight: 700; }
 .sidebar-filter-row > .sidebar-filter-count { color: var(--muted); font-variant-numeric: tabular-nums; }
 
 /* Unread count: accent pill. Total count (no unread): quiet muted number. */

@@ -346,10 +346,32 @@ def _is_pre_interview_screen(text: str) -> bool:
             text,
         )
     )
+    # Recruiters often send a compact first-pass questionnaire without using
+    # the words "screening questions". A list of candidate-evaluation fields
+    # after an application acknowledgement is a screen, not an administrative
+    # profile/application repair. Keep the threshold high so a lone work-
+    # authorization request can still be application_action_required.
+    screening_fields = sum(
+        bool(re.search(pattern, text))
+        for pattern in (
+            r"\bcurrent location\b",
+            r"\btotal years? of experience\b",
+            r"\byears? of experience as\b",
+            r"\bexpected compensation\b",
+            r"\bnotice period\b",
+            r"\bavailability to join\b",
+            r"\bwork authorization status\b",
+        )
+    )
+    structured_questionnaire = bool(
+        application_context
+        and screening_fields >= 3
+        and re.search(r"\b(?:provide|share|send) (?:me )?(?:the )?following (?:details|information)\b", text)
+    )
     named_role = bool(re.search(r"\b(the\s+)?[\w /+-]+ (role|position) at\b", text))
     if before_booking and (asks_written or thanks_interest):
         return True
-    return (thanks_interest and named_role and asks_written) or (
+    return structured_questionnaire or (thanks_interest and named_role and asks_written) or (
         application_context and (asks_written or direct_questionnaire)
     )
 
@@ -1002,6 +1024,13 @@ def deterministic_ai_only_classification(
         return ClassificationResult(
             label=EmailLabel.APPLICATION_ACTION_REQUIRED.value,
             category_subtype="profile_account_setup",
+            confidence=0.99,
+            response_id=None,
+        )
+    if _is_pre_interview_screen(primary_text):
+        return ClassificationResult(
+            label=EmailLabel.SCREENING.value,
+            category_subtype=None,
             confidence=0.99,
             response_id=None,
         )
