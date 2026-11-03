@@ -777,6 +777,9 @@ def _is_verification_code_action(text: str) -> bool:
     return any(re.search(pattern, text) for pattern in (
         r"\bverification code\b",
         r"\bsecurity code\b",
+        r"\bone[- ]time (?:password|passcode|code)\b",
+        r"\b(?:enter|use|provide|input)\b.{0,50}\botp\b",
+        r"\botp\b.{0,100}\b(?:log ?in|sign ?in|proceed|valid for|minutes?)\b",
         r"\bconfirm your identity\b",
         r"\bmultifactor authentication\b",
         r"\b(?:enter|use|copy and paste) this code\b",

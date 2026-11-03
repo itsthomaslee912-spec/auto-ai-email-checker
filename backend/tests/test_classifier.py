@@ -75,6 +75,24 @@ def test_verification_code_has_deterministic_ai_only_result():
     assert result.confidence == 0.99
 
 
+def test_recruiting_portal_otp_has_deterministic_ai_only_result():
+    result = deterministic_ai_only_classification(
+        subject="OTP for login - Tata Consultancy Services Limited.",
+        sender="tcs.recruitment@tcs.com",
+        body_text=(
+            "You have requested for a new OTP to log on to the TCS Careers website. "
+            "Enter the following OTP to proceed. OTP: 1302067. "
+            "This OTP is valid for the next 10 minutes."
+        ),
+        snippet="",
+    )
+
+    assert result is not None
+    assert result.label == EmailLabel.APPLICATION_ACTION_REQUIRED.value
+    assert result.category_subtype == "profile_account_setup"
+    assert result.confidence == 0.99
+
+
 def test_meeting_access_code_is_not_treated_as_account_verification():
     result = deterministic_ai_only_classification(
         subject="Your interview with ADP",

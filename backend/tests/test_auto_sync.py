@@ -9,7 +9,13 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.db import Base
-from app.models import MailboxConnection, User, WebhookSubscription
+from app.models import (
+    MailboxConnection,
+    ServiceHeartbeat,
+    SyncRuntimeStatus,
+    User,
+    WebhookSubscription,
+)
 from app.services import auto_sync
 from app.services.webhook_health import (
     record_webhook_delivery_failure,
@@ -481,6 +487,47 @@ def test_distributed_auto_sync_status_reuses_request_session(monkeypatch):
 
     assert status["state"] == "active"
     assert status["mailboxes"][0]["state"] == "idle"
+    engine.dispose()
+
+
+def test_fresh_worker_heartbeat_prevents_false_paused_status_during_long_sync(monkeypatch):
+    engine, session_factory = _session_factory()
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(
+        auto_sync,
+        "get_settings",
+        lambda: SimpleNamespace(auto_sync_interval_seconds=120, distributed_runtime=False),
+    )
+    monkeypatch.setattr(auto_sync, "_loop_running", False)
+    monkeypatch.setattr(auto_sync, "_last_check_at", None)
+
+    with session_factory() as db:
+        user = User(external_id="live-sync-worker")
+        db.add(user)
+        db.flush()
+        db.add(MailboxConnection(
+            user_id=user.id,
+            provider="google",
+            email_address="working@example.com",
+            access_token_enc="x",
+            is_active=True,
+        ))
+        db.add(SyncRuntimeStatus(
+            id=1,
+            last_check_at=now - timedelta(minutes=10),
+        ))
+        db.add(ServiceHeartbeat(
+            service_name="sync-worker",
+            instance_id="test:1",
+            started_at=now - timedelta(hours=1),
+            last_seen_at=now,
+            status="healthy",
+        ))
+        db.commit()
+
+        status = auto_sync.get_auto_sync_status(db)
+
+    assert status["state"] == "active"
     engine.dispose()
 
 

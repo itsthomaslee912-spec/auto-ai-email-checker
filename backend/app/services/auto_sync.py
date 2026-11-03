@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.db import SessionLocal
 from app.email.gmail import is_transient_quota_error, is_transient_sync_error
-from app.models import MailboxConnection
+from app.models import MailboxConnection, ServiceHeartbeat
 from app.services.mailbox_sync import get_sync_status, start_mailbox_sync
 from app.services.ngrok_status import get_ngrok_status
 from app.services.reconnect import needs_reconnect
@@ -60,6 +60,28 @@ def _load_runtime_status(db: Session) -> tuple[datetime | None, str | None]:
     if row is None:
         return None, None
     return as_utc(row.last_check_at), row.last_error
+
+
+def _load_sync_worker_heartbeat(db: Session) -> datetime | None:
+    """Return the latest sync-worker liveness heartbeat.
+
+    A full polling pass can spend several minutes syncing multiple accounts.
+    During that work the auto-sync check timestamp does not advance, but the
+    worker's independent heartbeat continues every 15 seconds. Treating only
+    the completed check as liveness therefore raises a false "paused" alert
+    while email sync is actively running.
+    """
+    value = (
+        db.query(ServiceHeartbeat.last_seen_at)
+        .filter(
+            ServiceHeartbeat.service_name == "sync-worker",
+            ServiceHeartbeat.status != "offline",
+        )
+        .order_by(ServiceHeartbeat.last_seen_at.desc())
+        .limit(1)
+        .scalar()
+    )
+    return as_utc(value)
 
 
 def has_registered_webhook(mailbox: MailboxConnection, now: datetime | None = None) -> bool:
@@ -316,15 +338,33 @@ def get_auto_sync_status(db: Session) -> dict:
             ),
         })
 
-    # The auto-sync loop runs in the sync-worker process, so the API must read
-    # its heartbeat from the database rather than from in-process globals.
-    if _distributed():
-        last_check_at, last_error = _load_runtime_status(db)
-        loop_running = last_check_at is not None
+    # The completed-check timestamp describes scheduler progress, while the
+    # service heartbeat describes worker liveness. A multi-account poll may
+    # legitimately outlive two scheduler intervals, so either fresh signal is
+    # sufficient to prove automatic sync is still running. Reading the worker
+    # heartbeat even in monolith mode also makes status resilient to a process
+    # launched by the service supervisor with a mismatched runtime flag.
+    now = datetime.now(timezone.utc)
+    persisted_check_at, persisted_error = _load_runtime_status(db)
+    worker_seen_at = _load_sync_worker_heartbeat(db)
+    worker_recent = bool(
+        worker_seen_at
+        and now - worker_seen_at < timedelta(seconds=max(60, interval * 2))
+    )
+    persisted_recent = bool(
+        persisted_check_at
+        and now - persisted_check_at < timedelta(seconds=interval * 2)
+    )
+    if _distributed() or worker_recent or persisted_recent:
+        last_check_at, last_error = persisted_check_at, persisted_error
+        loop_running = worker_recent or persisted_check_at is not None
+        recent = worker_recent or persisted_recent
     else:
         last_check_at, last_error, loop_running = _last_check_at, _last_error, _loop_running
-
-    recent = last_check_at is not None and datetime.now(timezone.utc) - last_check_at < timedelta(seconds=interval * 2)
+        recent = bool(
+            last_check_at
+            and now - last_check_at < timedelta(seconds=interval * 2)
+        )
     if not mailboxes:
         state = "no_account"
     elif not loop_running or not recent:
