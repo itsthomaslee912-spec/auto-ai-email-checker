@@ -234,7 +234,9 @@ export default function MonitoringPage({ active, aiStatus, aiStatusOffline }: { 
   useEffect(() => {
     if (!active) return;
     void load(true);
-    const timer = window.setInterval(() => void load(true), 15_000);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void load(true);
+    }, 30_000);
     return () => window.clearInterval(timer);
   }, [active, load]);
 

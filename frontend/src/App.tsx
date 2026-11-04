@@ -28,7 +28,7 @@ import {
   peekEmailDetailRequest,
   prefetchEmailDetail,
   createAiReply,
-  fetchReclassifyStatus,
+  fetchReclassifyStatuses,
   sendEmail,
   fetchMailboxes,
   updateMailboxSettings,
@@ -800,13 +800,10 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   const mailboxIdsKey = useMemo(() => mailboxes.map((mailbox) => mailbox.id).join(","), [mailboxes]);
   const refreshReclassifyStatuses = useCallback(async () => {
     if (!mailboxIdsKey) return;
-    const ids = mailboxIdsKey.split(",").map(Number);
-    const results = await Promise.allSettled(ids.map((id) => fetchReclassifyStatus(id)));
+    const statuses = await fetchReclassifyStatuses().catch(() => []);
     const running = new Set<number>();
     const progress: Record<number, { processed: number; total: number; failed: number }> = {};
-    results.forEach((result) => {
-      if (result.status !== "fulfilled") return;
-      const status = result.value;
+    statuses.forEach((status) => {
       if (status.state !== "running") return;
       running.add(status.mailbox_id);
       progress[status.mailbox_id] = { processed: status.processed, total: status.total, failed: status.failed };
@@ -883,7 +880,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
 
   useEffect(() => {
     void refreshAiStatus();
-    const timer = window.setInterval(() => void refreshAiStatus(), 30_000);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refreshAiStatus();
+    }, 60_000);
     return () => window.clearInterval(timer);
   }, [refreshAiStatus]);
 
@@ -915,15 +914,24 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
 
   useEffect(() => {
     void refreshAutoSyncStatus();
-    const timer = window.setInterval(() => void refreshAutoSyncStatus(), 15_000);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refreshAutoSyncStatus();
+    }, 30_000);
     return () => window.clearInterval(timer);
   }, [refreshAutoSyncStatus]);
 
+  const hasActiveReclassification = reclassifyingIds.size > 0;
   useEffect(() => {
     void refreshReclassifyStatuses();
-    const timer = window.setInterval(() => void refreshReclassifyStatuses(), 20_000);
+    // Discover externally-started jobs occasionally while idle. Once work is
+    // active, poll quickly enough for smooth progress; realtime events still
+    // trigger the normal inbox refresh path.
+    const interval = hasActiveReclassification ? 5_000 : 60_000;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refreshReclassifyStatuses();
+    }, interval);
     return () => window.clearInterval(timer);
-  }, [refreshReclassifyStatuses]);
+  }, [hasActiveReclassification, refreshReclassifyStatuses]);
 
   useEffect(() => {
     refreshCountsRef.current();

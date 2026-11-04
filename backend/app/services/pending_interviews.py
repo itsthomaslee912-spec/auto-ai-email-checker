@@ -145,17 +145,19 @@ class _MailRef:
 _cache_lock = threading.Lock()
 _cache_inflight: dict[tuple, threading.Event] = {}
 _CACHE_TTL_SECONDS = 2.0
+_PENDING_CACHE_TTL_SECONDS = 10.0
 _booking_cache: dict[tuple, tuple[float, tuple[list[_BookingRef], dict[int, set[int]]]]] = {}
 _follower_cache: dict[tuple, tuple[float, list[_MailRef]]] = {}
+_pending_cache: dict[tuple, tuple[float, list[PendingInterview]]] = {}
 
 
-def _cached(slot: dict, key: tuple, loader):
+def _cached(slot: dict, key: tuple, loader, *, ttl: float = _CACHE_TTL_SECONDS):
     """Share a briefly-lived read without allowing cross-process stale state."""
     with _cache_lock:
         hit = slot.get(key)
         if hit is not None:
             cached_at, value = hit
-            if time.monotonic() - cached_at <= _CACHE_TTL_SECONDS:
+            if time.monotonic() - cached_at <= ttl:
                 return value
             slot.pop(key, None)
         waiter = _cache_inflight.get(key)
@@ -171,7 +173,7 @@ def _cached(slot: dict, key: tuple, loader):
             hit = slot.get(key)
             if hit is not None:
                 cached_at, value = hit
-                if time.monotonic() - cached_at <= _CACHE_TTL_SECONDS:
+                if time.monotonic() - cached_at <= ttl:
                     return value
                 slot.pop(key, None)
     try:
@@ -233,6 +235,7 @@ def invalidate_calendar_read_cache() -> None:
     with _cache_lock:
         _booking_cache.clear()
         _follower_cache.clear()
+        _pending_cache.clear()
 
 
 def _confirmed_bookings(db: Session, mailbox_ids: list[int]) -> tuple[list[_BookingRef], dict[int, set[int]]]:
@@ -405,10 +408,13 @@ def resolved_availability_ids(db: Session, events: list[CalendarEvent]) -> set[i
     return resolved
 
 
-def pending_interview_requests(db: Session, mailbox_ids: list[int], now: datetime | None = None) -> list[PendingInterview]:
+def _pending_interview_requests_uncached(
+    db: Session,
+    mailbox_ids: list[int],
+    now: datetime,
+) -> list[PendingInterview]:
     if not mailbox_ids:
         return []
-    now = now or datetime.now(timezone.utc)
     since = now - PENDING_WINDOW
     messages = _follower_messages(db, mailbox_ids, since - timedelta(seconds=1))
     messages.sort(key=lambda message: (as_utc(message.received_at) or since, message.id), reverse=True)
@@ -552,3 +558,32 @@ def pending_interview_requests(db: Session, mailbox_ids: list[int], now: datetim
             if owner is not None and slot not in owner.slots:
                 owner.slots.append(slot)
     return pending
+
+
+def pending_interview_requests(
+    db: Session,
+    mailbox_ids: list[int],
+    now: datetime | None = None,
+) -> list[PendingInterview]:
+    """Return pending requests while coalescing duplicate dashboard reads.
+
+    The calendar page and global interview alert request this data at nearly
+    the same time. Computing it twice scans the recent interview window and
+    confirmed-event links twice. Calendar/email mutations explicitly call
+    ``invalidate_calendar_read_cache``, so a short shared cache preserves
+    real-time behavior while removing that duplicate work.
+    """
+    if not mailbox_ids:
+        return []
+    # Tests and repair scripts pass an explicit clock and expect an exact
+    # point-in-time calculation. Production requests omit it and can share.
+    if now is not None:
+        return _pending_interview_requests_uncached(db, mailbox_ids, now)
+    effective_now = datetime.now(timezone.utc)
+    key = (id(db.get_bind()), tuple(sorted(mailbox_ids)))
+    return _cached(
+        _pending_cache,
+        key,
+        lambda: _pending_interview_requests_uncached(db, mailbox_ids, effective_now),
+        ttl=_PENDING_CACHE_TTL_SECONDS,
+    )

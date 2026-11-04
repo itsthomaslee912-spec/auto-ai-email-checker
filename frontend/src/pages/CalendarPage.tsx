@@ -443,6 +443,9 @@ function cardStatus(event: CalendarEvent): CardStatus {
   // "active" is the persisted application state. On the calendar, however,
   // this row is a confirmed appointment, so calling it Active makes it look
   // like another open availability slot. Use the booking state in UI copy.
+  // Past events that never received an outcome are shown as "Complete" so the
+  // card label doesn't claim an interview from weeks ago is still "Booked".
+  if (new Date(event.end_at).getTime() <= Date.now()) return { key: "active", label: "Complete", className: "status-active" };
   return { key: "active", label: "Booked", className: "status-active" };
 }
 
@@ -474,7 +477,10 @@ function progressTimestamp(value: string | null | undefined, timeZone: string) {
 
 function interviewRoundStatus(event: CalendarEvent): { label: string; tone: "complete" | "current" | "upcoming" | "success" | "negative" } {
   if (event.interview_status === "cancellation") return { label: "Canceled", tone: "negative" };
-  if (event.application_status === "passed") return { label: "Passed", tone: "success" };
+  if (event.application_status === "passed")
+    return new Date(event.end_at).getTime() <= Date.now()
+      ? { label: "Passed", tone: "complete" }
+      : { label: "Passed", tone: "success" };
   if (event.application_status === "rejected") return { label: "Rejected", tone: "negative" };
   if (event.application_status === "position_closed") return { label: "Position closed", tone: "negative" };
   if (event.kind === "availability") return { label: "Available", tone: "current" };
@@ -499,7 +505,7 @@ function InterviewProgressTimeline({ events, selectedId, timeZone }: { events: C
         const bookedAt = event.source_received_at || event.created_at;
         return <li className={`progress-${status.tone}${event.id === selectedId ? " is-selected" : ""}`} key={event.id}>
           <span className="interview-progress-marker" aria-hidden="true">
-            {status.tone === "success" ? <svg viewBox="0 0 16 16"><path d="m3.5 8.2 3 3 6-6.2" /></svg> : status.tone === "negative" ? <svg viewBox="0 0 16 16"><path d="m4.2 4.2 7.6 7.6m0-7.6-7.6 7.6" /></svg> : <strong>{index + 1}</strong>}
+            {(status.tone === "success" || status.tone === "complete") ? <svg viewBox="0 0 16 16"><path d="m3.5 8.2 3 3 6-6.2" /></svg> : status.tone === "negative" ? <svg viewBox="0 0 16 16"><path d="m4.2 4.2 7.6 7.6m0-7.6-7.6 7.6" /></svg> : <strong>{index + 1}</strong>}
           </span>
           <div className="interview-progress-copy">
             <div className="interview-progress-round-label"><span>Round {index + 1}</span>{event.id === selectedId && <em>Selected</em>}</div>

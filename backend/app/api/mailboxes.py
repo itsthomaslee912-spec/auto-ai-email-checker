@@ -156,6 +156,25 @@ def list_mailboxes(db: Session = Depends(get_db)) -> list[MailboxConnection]:
     )
 
 
+@router.get("/reclassify-status")
+def mailbox_reclassify_statuses(db: Session = Depends(get_db)) -> list[dict]:
+    """Return every visible mailbox status without one HTTP/SQL call per account."""
+    from app.services.reclassify import get_reclassify_status
+
+    mailbox_ids = [
+        row[0]
+        for row in db.query(MailboxConnection.id)
+        .filter(mailbox_scope())
+        .order_by(MailboxConnection.id)
+        .all()
+    ]
+    if get_settings().distributed_runtime:
+        from app.services.job_queue import get_statuses
+
+        return get_statuses(db, mailbox_ids, "reclassify")
+    return [get_reclassify_status(mailbox_id) for mailbox_id in mailbox_ids]
+
+
 @router.patch("/{mailbox_id}", response_model=MailboxOut)
 def update_mailbox_settings(
     mailbox_id: int,

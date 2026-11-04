@@ -5501,8 +5501,6 @@ html[data-theme="light"] .calendar-event:hover { background-color: color-mix(in 
 .calendar-event.has-outcome .event-type-badge { right: 1.72rem; }
 .event-outcome-badge { position: absolute; z-index: 3; top: .22rem; right: .28rem; width: 1.2rem; height: 1.2rem; display: inline-flex; align-items: center; justify-content: center; border: 1px solid color-mix(in srgb, var(--outcome-color) 55%, var(--calendar-border)); border-radius: 999px; background: color-mix(in srgb, var(--outcome-color) 20%, var(--calendar-control)); color: color-mix(in srgb, var(--outcome-color) 75%, var(--ink)); }
 .event-outcome-badge svg { width: .72rem; height: .72rem; fill: none; stroke: currentColor; stroke-width: 1.55; stroke-linecap: round; stroke-linejoin: round; }
-.calendar-event.status-passed .event-outcome-badge { transform-origin: 50% 12%; animation: calendar-alarm-ring 1.8s ease-in-out infinite; }
-@keyframes calendar-alarm-ring { 0%, 70%, 100% { transform: rotate(0); } 74% { transform: rotate(18deg); } 78% { transform: rotate(-16deg); } 82% { transform: rotate(12deg); } 86% { transform: rotate(-8deg); } 90% { transform: rotate(0); } }
 .calendar-event-hover-card { position: fixed; z-index: 100; width: min(18rem, calc(100vw - 1.5rem)); padding: .58rem .72rem; border: 1px solid var(--calendar-border, var(--line)); border-radius: 10px; background: var(--surface-glass); color: var(--ink); box-shadow: var(--shadow-md); pointer-events: none; opacity: 0; backdrop-filter: blur(18px) saturate(130%); transition: opacity 140ms ease, transform 180ms cubic-bezier(.2,.8,.2,1); will-change: opacity, transform; }
 .calendar-event-hover-card.above { transform: translateY(calc(-100% - 5px)) scale(.97); transform-origin: bottom center; }
 .calendar-event-hover-card.above.is-visible { transform: translateY(-100%) scale(1); }
@@ -5921,6 +5919,7 @@ html[data-theme="light"] .source-email-status.status-position-closed { color: #3
 .interview-progress-title-row time { flex: 0 0 auto; color: var(--muted); font-size: .59rem; font-weight: 580; white-space: nowrap; }
 .interview-progress-copy p { margin: .2rem 0 0; color: var(--muted); font-size: .67rem; line-height: 1.42; }
 .interview-progress-status { flex: 0 0 auto; padding: .18rem .4rem; border-radius: 999px; background: var(--calendar-control); color: var(--muted); font-size: .57rem; font-weight: 760; white-space: nowrap; }
+.interview-progress-status.progress-complete { background: color-mix(in srgb, #34d399 10%, var(--calendar-control)); color: color-mix(in srgb, #34d399 68%, var(--muted)); }
 .interview-progress-status.progress-success { background: color-mix(in srgb, #34d399 15%, var(--calendar-control)); color: #34d399; }
 .interview-progress-status.progress-negative { background: color-mix(in srgb, #fb7185 14%, var(--calendar-control)); color: #fb7185; }
 .interview-progress-status.progress-current { background: color-mix(in srgb, var(--accent) 13%, var(--calendar-control)); color: var(--accent); }

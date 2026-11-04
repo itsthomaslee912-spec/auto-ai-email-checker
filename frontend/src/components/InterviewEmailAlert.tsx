@@ -13,7 +13,7 @@ import {
 
 const SNOOZE_KEY = "interview-attention.snooze";
 const SNOOZE_MS = 30 * 60_000;
-const REFRESH_MS = 60_000;
+const REFRESH_MS = 120_000;
 
 type Snooze = { until: number; ids: number[] };
 type RowKind = "invitation" | "reschedule" | "scheduled";
@@ -226,7 +226,9 @@ export default function InterviewEmailAlert({ mailboxes, refreshKey, suppressed,
   useEffect(() => {
     // Let the inbox list load first; this check is the heaviest startup request.
     const first = window.setTimeout(() => { void refresh(); }, 1500);
-    const timer = window.setInterval(() => { void refresh(); }, REFRESH_MS);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refresh();
+    }, REFRESH_MS);
     const source = openEvents();
     const names = ["connected", "email.classified", "sync.done", "calendar.changed"];
     names.forEach((name) => source.addEventListener(name, scheduleRefresh));

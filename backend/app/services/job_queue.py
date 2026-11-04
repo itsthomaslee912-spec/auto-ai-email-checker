@@ -75,6 +75,21 @@ def get_status(db: Session, mailbox_id: int, job_type: str) -> dict[str, Any]:
     return _decode(row) if row is not None else default_status(mailbox_id, job_type)
 
 
+def get_statuses(db: Session, mailbox_ids: list[int], job_type: str) -> list[dict[str, Any]]:
+    """Load status for several mailboxes with one query."""
+    if not mailbox_ids:
+        return []
+    rows = db.query(MailboxJobState).filter(
+        MailboxJobState.mailbox_id.in_(mailbox_ids),
+        MailboxJobState.job_type == job_type,
+    ).all()
+    by_mailbox = {row.mailbox_id: _decode(row) for row in rows}
+    return [
+        by_mailbox.get(mailbox_id, default_status(mailbox_id, job_type))
+        for mailbox_id in mailbox_ids
+    ]
+
+
 def enqueue(
     db: Session, mailbox_id: int, job_type: str, *, options: dict[str, Any] | None = None
 ) -> dict[str, Any]:

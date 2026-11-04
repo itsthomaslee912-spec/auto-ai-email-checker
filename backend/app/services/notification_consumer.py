@@ -12,10 +12,14 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.models import ConsumedEvent, Notification
 from app.services.event_bus import enqueue, event_envelope, topic
+from app.services.service_health import set_component_health
 
 logger = logging.getLogger(__name__)
 CONSUMER_NAME = "notification-service-v1"
 READY_EVENT = "notification.ready.v1"
+_HEALTH_COMPONENT = "notification-consumer"
+_QUEUE_RPC_TIMEOUT_SECONDS = 15
+_RECONNECT_BACKOFF_CAP_SECONDS = 30
 
 
 def persist_notification(envelope: dict) -> bool:
@@ -77,26 +81,36 @@ def persist_notification(envelope: dict) -> bool:
     return True
 
 
-async def notification_consumer_loop(stop_event: asyncio.Event) -> None:
-    settings = get_settings()
-    if not settings.rabbitmq_enabled:
-        await stop_event.wait()
-        return
-
+async def _consume_once(settings, stop_event: asyncio.Event) -> None:
     import aio_pika
 
-    connection = await aio_pika.connect_robust(settings.rabbitmq_url)
-    channel = await connection.channel()
-    await channel.set_qos(prefetch_count=max(1, settings.rabbitmq_prefetch_count))
-    exchange = await channel.declare_exchange(
-        settings.rabbitmq_exchange, aio_pika.ExchangeType.TOPIC, durable=True
+    connection = await asyncio.wait_for(
+        aio_pika.connect_robust(settings.rabbitmq_url),
+        timeout=_QUEUE_RPC_TIMEOUT_SECONDS,
     )
-    prefix = settings.rabbitmq_routing_prefix.strip().strip(".")
-    queue_name = f"{prefix}.{CONSUMER_NAME}" if prefix else CONSUMER_NAME
-    queue = await channel.declare_queue(queue_name, durable=True)
-    await queue.bind(exchange, routing_key=topic("user.activity.v1"))
-    logger.info("Notification service RabbitMQ consumer started")
     try:
+        channel = await asyncio.wait_for(
+            connection.channel(), timeout=_QUEUE_RPC_TIMEOUT_SECONDS
+        )
+        await channel.set_qos(prefetch_count=max(1, settings.rabbitmq_prefetch_count))
+        exchange = await channel.declare_exchange(
+            settings.rabbitmq_exchange, aio_pika.ExchangeType.TOPIC, durable=True
+        )
+        prefix = settings.rabbitmq_routing_prefix.strip().strip(".")
+        queue_name = f"{prefix}.{CONSUMER_NAME}" if prefix else CONSUMER_NAME
+        # A durable queue can remain registered while its Erlang process is
+        # unavailable after a broker restart. Without a timeout this RPC hangs
+        # forever and the supervisor repeatedly kills an apparently live worker.
+        queue = await asyncio.wait_for(
+            channel.declare_queue(queue_name, durable=True),
+            timeout=_QUEUE_RPC_TIMEOUT_SECONDS,
+        )
+        await asyncio.wait_for(
+            queue.bind(exchange, routing_key=topic("user.activity.v1")),
+            timeout=_QUEUE_RPC_TIMEOUT_SECONDS,
+        )
+        set_component_health(_HEALTH_COMPONENT, "healthy")
+        logger.info("Notification service RabbitMQ consumer started")
         async with queue.iterator() as messages:
             while not stop_event.is_set():
                 next_message = asyncio.create_task(anext(messages))
@@ -121,3 +135,30 @@ async def notification_consumer_loop(stop_event: asyncio.Event) -> None:
     finally:
         await connection.close()
         logger.info("Notification service RabbitMQ consumer stopped")
+
+
+async def notification_consumer_loop(stop_event: asyncio.Event) -> None:
+    settings = get_settings()
+    if not settings.rabbitmq_enabled:
+        await stop_event.wait()
+        return
+
+    backoff = 1.0
+    while not stop_event.is_set():
+        try:
+            await _consume_once(settings, stop_event)
+            return
+        except Exception as error:
+            if stop_event.is_set():
+                return
+            set_component_health(_HEALTH_COMPONENT, "recovering")
+            logger.warning(
+                "Notification consumer lost its broker channel (%s); reconnecting",
+                error,
+            )
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+                return
+            except TimeoutError:
+                backoff = min(backoff * 2, _RECONNECT_BACKOFF_CAP_SECONDS)
+    set_component_health(_HEALTH_COMPONENT, "healthy")

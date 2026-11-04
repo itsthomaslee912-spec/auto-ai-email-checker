@@ -3038,7 +3038,9 @@ def repair_calendar_event_email_links(db: Session, mailbox_id: int | None = None
         link_changed = bool(related_ids and _link_event_emails(db, event, related_ids))
         allowed = {source.id, *related_ids}
         if event.outcome_source_email_id:
-            allowed.add(event.outcome_source_email_id)
+            outcome = db.get(EmailMessage, event.outcome_source_email_id)
+            if outcome is not None and _message_belongs_to_event_application(db, event, outcome):
+                allowed.add(event.outcome_source_email_id)
         stale_ids = {
             row.email_id
             for row in db.query(CalendarEventEmail).filter(CalendarEventEmail.event_id == event.id).all()
@@ -3189,6 +3191,42 @@ def _source_anchored_company(email: EmailMessage, messages: list[EmailMessage]) 
             return known
         return inferred
     return known
+
+
+def _message_thread_company(db: Session, email: EmailMessage) -> str:
+    """Employer supported by the message's own provider thread.
+
+    Role similarity is intentionally excluded. Common titles such as "Staff
+    Software Engineer" occur at many employers and were the source of the
+    recurring Aerovy/GM cross-application contamination.
+    """
+    messages = [email]
+    if email.thread_id:
+        messages = (
+            db.query(EmailMessage)
+            .filter(
+                EmailMessage.mailbox_id == email.mailbox_id,
+                EmailMessage.thread_id == email.thread_id,
+            )
+            .order_by(EmailMessage.received_at.asc(), EmailMessage.id.asc())
+            .all()
+        ) or [email]
+    return clean_company_name(_source_anchored_company(email, messages))
+
+
+def _message_belongs_to_event_application(
+    db: Session,
+    event: CalendarEvent,
+    email: EmailMessage,
+) -> bool:
+    """Reject a durable link when both sides name different employers."""
+    message_company = _message_thread_company(db, email)
+    event_company = clean_company_name(event.company)
+    return not (
+        message_company
+        and event_company
+        and not companies_match(message_company, event_company)
+    )
 
 
 def _known_company_other_than_candidate(
@@ -4436,7 +4474,9 @@ def appointment_email_ids(
 ) -> set[int]:
     """Filter application-wide context down to this exact appointment."""
     wanted = {email_id for email_id in email_ids if email_id is not None}
-    direct = {email_id for email_id in (event.source_email_id, event.outcome_source_email_id) if email_id}
+    if event.outcome_source_email_id:
+        wanted.add(event.outcome_source_email_id)
+    direct = {email_id for email_id in (event.source_email_id,) if email_id}
     wanted.update(direct)
     if not wanted:
         return set()
@@ -4444,6 +4484,13 @@ def appointment_email_ids(
         EmailMessage.mailbox_id == event.mailbox_id,
         EmailMessage.id.in_(wanted),
     ).all()
+    if event.outcome_source_email_id:
+        outcome = next(
+            (email for email in emails if email.id == event.outcome_source_email_id),
+            None,
+        )
+        if outcome is not None and _message_belongs_to_event_application(db, event, outcome):
+            direct.add(outcome.id)
     allowed = set(direct)
     source = db.get(EmailMessage, event.source_email_id) if event.source_email_id else None
     source_received = as_utc(source.received_at) if source is not None else as_utc(event.source_received_at)
@@ -4718,6 +4765,65 @@ def repair_cross_company_outcome_links(db: Session, mailbox_id: int | None = Non
             event.outcome_at = None
             if event.application_status in {"rejected", "position_closed", "passed"}:
                 event.application_status = "active"
+        repaired += 1
+    if repaired:
+        db.flush()
+    return repaired
+
+
+def repair_cross_company_progression_links(
+    db: Session,
+    mailbox_id: int | None = None,
+) -> int:
+    """Remove a later-booking progression edge from another employer.
+
+    A sent acceptance can be projected before its company classification is
+    complete. Older code then matched every prior round with a compatible job
+    title and persisted the acceptance as that round's outcome. Once company
+    metadata arrived, the durable edge kept recreating the bad timeline. The
+    source thread is now authoritative and this repair removes the stale edge.
+    """
+    query = (
+        db.query(CalendarEvent, EmailMessage)
+        .join(EmailMessage, EmailMessage.id == CalendarEvent.outcome_source_email_id)
+        .filter(
+            CalendarEvent.origin == "email",
+            EmailMessage.label == EmailLabel.INTERVIEW_SCHEDULED.value,
+        )
+    )
+    if mailbox_id is not None:
+        query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
+    repaired = 0
+    for event, outcome in query.all():
+        if _message_belongs_to_event_application(db, event, outcome):
+            continue
+        db.query(CalendarEventEmail).filter(
+            CalendarEventEmail.event_id == event.id,
+            CalendarEventEmail.email_id == outcome.id,
+        ).delete(synchronize_session=False)
+        event.outcome_source_email_id = None
+        event.outcome_at = None
+        if event.application_status == "passed":
+            event.application_status = "active"
+        source = db.get(EmailMessage, event.source_email_id) if event.source_email_id else None
+        if source is not None:
+            source_messages = [source]
+            if source.thread_id:
+                source_messages = db.query(EmailMessage).filter(
+                    EmailMessage.mailbox_id == source.mailbox_id,
+                    EmailMessage.thread_id == source.thread_id,
+                ).all() or [source]
+            source_role = _known_role(source_messages)
+            current_role = job_role_or_empty(event.job_role)
+            outcome_role = job_role_or_empty(outcome.job_role)
+            if (
+                source_role
+                and current_role
+                and current_role.casefold() == outcome_role.casefold()
+                and source_role.casefold() != current_role.casefold()
+            ):
+                event.job_role = source_role
+                event.title = f"{event.company} — {source_role}" if event.company else source_role
         repaired += 1
     if repaired:
         db.flush()
@@ -6728,7 +6834,16 @@ def repair_conflicting_calendar_roles(db: Session, mailbox_id: int | None = None
         current = job_role_or_empty(event.job_role)
         if not role or role.casefold() == current.casefold():
             continue
-        if current and _same_job_family(role, current) and len(role) <= len(current):
+        current_is_supported = any(
+            job_role_or_empty(message.job_role).casefold() == current.casefold()
+            for message in messages
+        )
+        if (
+            current
+            and current_is_supported
+            and _same_job_family(role, current)
+            and len(role) <= len(current)
+        ):
             continue
         event.job_role = role
         if event.origin == "email":
@@ -7425,6 +7540,16 @@ def _mark_prior_round_passed_for_later_booking(
     if booked_at is None or later_start is None:
         return False
 
+    # When the booking email carries no specific role (e.g. it was classified
+    # as a stage label such as "Technical Interview Round 2"), _identity_events
+    # falls back to matching every confirmed event at the same company.  Use
+    # the later booking's own extracted role as a tiebreaker so that a
+    # no-role email cannot mark a *different* application's earlier rounds as
+    # passed at the same company.
+    email_role = job_role_or_empty(email.job_role)
+    booking_role = job_role_or_empty(later_booking.job_role) if not email_role else None
+    booking_company = _message_thread_company(db, email) or clean_company_name(later_booking.company)
+
     changed = False
     for prior in _identity_events(db, email, kind="confirmed"):
         prior_start = as_utc(prior.start_at)
@@ -7445,6 +7570,17 @@ def _mark_prior_round_passed_for_later_booking(
         if booked_at < prior_start - timedelta(minutes=15):
             continue
         if later_start <= prior_end + timedelta(hours=4):
+            continue
+        # A job title is not application identity. When the booking email was
+        # classified before its company, role-only matching previously joined
+        # unrelated employers (Aerovy and GM) and persisted that bad edge.
+        if booking_company and prior.company and not companies_match(prior.company, booking_company):
+            continue
+        if not booking_company and email.thread_id != prior.source_thread_id:
+            continue
+        # When the email has no role, use the later booking's role to block
+        # cross-application contamination at the same company.
+        if booking_role and job_role_or_empty(prior.job_role) and not roles_compatible(prior.job_role, booking_role):
             continue
         prior.application_status = "passed"
         prior.outcome_source_email_id = email.id
@@ -8143,6 +8279,9 @@ def collapse_duplicate_calendar_events(
     if repair_cross_company_outcome_links(db, mailbox_id) > 0:
         changed = True
     checkpoint()
+    if repair_cross_company_progression_links(db, mailbox_id) > 0:
+        changed = True
+    checkpoint()
     if prune_calendar_event_email_links(db, mailbox_id) > 0:
         changed = True
     checkpoint()
@@ -8161,6 +8300,13 @@ def collapse_duplicate_calendar_events(
         changed = True
     checkpoint()
     if repair_placeholder_calendar_fields(db, mailbox_id) > 0:
+        changed = True
+    checkpoint()
+    # Correcting a chip from a stale linked employer back to its source
+    # employer can expose a cross-company progression edge that was hidden at
+    # the start of this pass. Re-audit immediately so one maintenance run fully
+    # converges instead of allowing the bad timeline to return until next sync.
+    if repair_cross_company_progression_links(db, mailbox_id) > 0:
         changed = True
     checkpoint()
     if repair_reminder_duplicates(db, mailbox_id) > 0:

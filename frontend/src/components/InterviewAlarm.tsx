@@ -121,7 +121,12 @@ export default function InterviewAlarm({ mailboxes }: { mailboxes: Mailbox[] }) 
 
   useEffect(() => {
     void refresh();
-    const timer = window.setInterval(() => { void refresh(); }, 20_000);
+    // Calendar changes arrive immediately over the event stream. This is only
+    // a safety refresh for missed/reconnected events, so avoid a constant
+    // database query every 20 seconds (especially in a background tab).
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refresh();
+    }, 60_000);
     const source = openEvents();
     const onChange = () => { void refresh(); };
     source.addEventListener("calendar.changed", onChange);

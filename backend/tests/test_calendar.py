@@ -3192,6 +3192,131 @@ def test_sent_availability_label_is_promoted_when_it_accepts_employer_exact_time
         assert visible[0].title == "GM — Staff Software Engineer - Simulation Platform (Galileo)"
 
 
+def test_companyless_gm_booking_never_rejoins_aerovy_after_repair():
+    """Round progression must use employer/thread identity, never role alone."""
+    from app.services.calendar_extract import (
+        repair_calendar_event_email_links,
+        repair_conflicting_calendar_roles,
+        repair_cross_company_progression_links,
+        repair_placeholder_calendar_fields,
+        repair_prior_round_progression,
+    )
+
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        aerovy_source = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="aerovy-booking-before-gm",
+            thread_id="aerovy-thread",
+            folder="inbox",
+            subject="Re: Aerovy Hiring - Introduction",
+            sender="Thomas Dmytryk <thomas.dmytryk@aerovy.com>",
+            received_at=datetime(2026, 10, 21, 17, 9, tzinfo=timezone.utc),
+            body_text="""BEGIN:VCALENDAR
+BEGIN:VEVENT
+DTSTART:20261023T140000Z
+DTEND:20261023T141500Z
+STATUS:CONFIRMED
+END:VEVENT
+END:VCALENDAR""",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="Aerovy",
+            job_role="Staff Software Engineer",
+        )
+        gm_invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="gm-thread-identity",
+            thread_id="gm-thread",
+            folder="inbox",
+            subject="Greetings from GM",
+            sender="Daniel Oglivie <daniel.oglivie@gm.com>",
+            received_at=datetime(2026, 10, 29, 19, 15, tzinfo=timezone.utc),
+            body_text="When is a good time next week for us to connect?",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="GM",
+            job_role="Staff Software Engineer - Simulation Platform (Galileo)",
+        )
+        gm_proposal = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="gm-employer-proposal",
+            thread_id="gm-thread",
+            folder="inbox",
+            subject="Re: Greetings from GM",
+            sender="Daniel Oglivie <daniel.oglivie@gm.com>",
+            received_at=datetime(2026, 10, 30, 19, 0, tzinfo=timezone.utc),
+            body_text="Can you make Wednesday 11/4 at 1:30 PM ET?",
+            label=EmailLabel.INTERVIEW_AVAILABILITY.value,
+            company="GM",
+            job_role="Staff Software Engineer - Simulation Platform (Galileo)",
+        )
+        gm_acceptance = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="gm-companyless-acceptance",
+            thread_id="gm-thread",
+            folder="sent",
+            subject="Re: Greetings from GM",
+            sender="candidate@example.com",
+            received_at=datetime(2026, 10, 30, 19, 5, tzinfo=timezone.utc),
+            body_text="11/4 at 1:30 PM ET works well for me.",
+            label=EmailLabel.INTERVIEW_AVAILABILITY.value,
+            job_role="Staff Software Engineer - Simulation Platform (Galileo)",
+        )
+        db.add_all([aerovy_source, gm_invitation, gm_proposal, gm_acceptance])
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, aerovy_source, use_ai=False)) is True
+        assert asyncio.run(process_calendar_email(db, gm_proposal, use_ai=False)) is True
+        assert asyncio.run(process_calendar_email(db, gm_acceptance, use_ai=False)) is True
+        db.flush()
+
+        aerovy = db.query(CalendarEvent).filter(
+            CalendarEvent.source_email_id == aerovy_source.id,
+            CalendarEvent.kind == "confirmed",
+        ).one()
+        gm = db.query(CalendarEvent).filter(
+            CalendarEvent.source_email_id == gm_acceptance.id,
+            CalendarEvent.kind == "confirmed",
+        ).one()
+        assert gm.company == "GM"
+        assert aerovy.application_status == "active"
+        assert aerovy.outcome_source_email_id is None
+        assert db.get(CalendarEventEmail, (aerovy.id, gm_acceptance.id)) is None
+
+        # Reproduce the durable corruption from the live database, then run
+        # every repair twice. The second pass must remain stable.
+        aerovy.application_status = "passed"
+        aerovy.outcome_source_email_id = gm_acceptance.id
+        aerovy.outcome_at = gm_acceptance.received_at
+        aerovy.job_role = gm_acceptance.job_role
+        gm.company = "Aerovy"
+        gm.title = f"Aerovy — {gm.job_role}"
+        gm_acceptance.company = "GM"
+        db.add(CalendarEventEmail(event_id=aerovy.id, email_id=gm_acceptance.id))
+        db.flush()
+
+        assert repair_cross_company_progression_links(db, mailbox_id) == 1
+        assert repair_placeholder_calendar_fields(db, mailbox_id) >= 1
+        repair_calendar_event_email_links(db, mailbox_id)
+        repair_conflicting_calendar_roles(db, mailbox_id)
+        assert repair_prior_round_progression(db, mailbox_id) == 0
+
+        assert aerovy.company == "Aerovy"
+        assert aerovy.job_role == "Staff Software Engineer"
+        assert aerovy.application_status == "active"
+        assert aerovy.outcome_source_email_id is None
+        assert db.get(CalendarEventEmail, (aerovy.id, gm_acceptance.id)) is None
+        assert gm.company == "GM"
+        assert gm.job_role == "Staff Software Engineer - Simulation Platform (Galileo)"
+
+        assert repair_cross_company_progression_links(db, mailbox_id) == 0
+        repair_calendar_event_email_links(db, mailbox_id)
+        repair_prior_round_progression(db, mailbox_id)
+        assert aerovy.company == "Aerovy"
+        assert aerovy.application_status == "active"
+        assert gm.company == "GM"
+
+
 def test_reprocessing_wrong_company_replaces_its_leaked_role():
     factory, (mailbox_id, _) = _database()
     with factory() as db:

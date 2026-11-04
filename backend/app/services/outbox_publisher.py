@@ -10,11 +10,19 @@ from sqlalchemy import and_, or_, select
 
 from app.config import get_settings
 from app.db import SessionLocal
-from app.models import OutboxEvent
+from app.models import ConsumedEvent, OutboxEvent
 from app.services.event_bus import topic
+from app.services.service_health import set_component_health
 
 logger = logging.getLogger(__name__)
 CONSUMER_QUEUE = "email-classifiers-v1"
+NOTIFICATION_CONSUMER = "notification-service-v1"
+_HEALTH_COMPONENT = "rabbitmq-publisher"
+_RECONNECT_BACKOFF_CAP_SECONDS = 30
+
+
+class BrokerPublishError(RuntimeError):
+    """The current publisher channel cannot safely be reused."""
 
 
 @dataclass(frozen=True)
@@ -30,6 +38,28 @@ def _claim_batch() -> list[ClaimedEvent]:
     now = datetime.now(timezone.utc)
     stale_claim = now - timedelta(minutes=5)
     with SessionLocal() as db:
+        # A broker can route a message to a fast consumer and still return a
+        # publisher NACK while a queue is recovering. The notification inbox is
+        # authoritative proof that delivery completed, so reconcile those rows
+        # instead of retrying them forever and reporting a false degradation.
+        consumed_activity_ids = select(ConsumedEvent.event_id).where(
+            ConsumedEvent.consumer == NOTIFICATION_CONSUMER
+        )
+        reconciled = list(db.scalars(
+            select(OutboxEvent).where(
+                OutboxEvent.status == "failed",
+                OutboxEvent.topic == topic("user.activity.v1"),
+                OutboxEvent.event_id.in_(consumed_activity_ids),
+            )
+        ))
+        for row in reconciled:
+            row.status = "published"
+            row.published_at = now
+            row.last_error = None
+        if reconciled:
+            # SessionLocal disables autoflush, so make the new status visible to
+            # the claim query in this same transaction.
+            db.flush()
         stmt = (
             select(OutboxEvent)
             .where(
@@ -91,7 +121,11 @@ async def _publish_batch(exchange) -> int:
         return 0
     events = await asyncio.to_thread(_claim_batch)
     failures: dict[int, str] = {}
+    broker_error: Exception | None = None
     for event in events:
+        if broker_error is not None:
+            failures[event.id] = f"Publish batch aborted after broker error: {broker_error}"
+            continue
         try:
             await exchange.publish(
                 Message(
@@ -104,7 +138,14 @@ async def _publish_batch(exchange) -> int:
             )
         except Exception as exc:
             failures[event.id] = str(exc)
-    return await asyncio.to_thread(_finish_batch, events, failures)
+            broker_error = exc
+    published = await asyncio.to_thread(_finish_batch, events, failures)
+    if broker_error is not None:
+        # A NACK or channel failure invalidates publisher-confirm state for the
+        # whole channel. Reusing that exchange caused every retry to be NACKed
+        # until its exponential backoff reached an hour.
+        raise BrokerPublishError(str(broker_error)) from broker_error
+    return published
 
 
 async def _open_broker():
@@ -136,24 +177,43 @@ async def outbox_publisher_loop(stop_event: asyncio.Event) -> None:
         await stop_event.wait()
         return
 
-    connection, exchange = await _open_broker()
-    logger.info("RabbitMQ outbox publisher started")
-    try:
-        while not stop_event.is_set():
-            try:
+    backoff = 1.0
+    while not stop_event.is_set():
+        connection = None
+        try:
+            connection, exchange = await _open_broker()
+            set_component_health(_HEALTH_COMPONENT, "healthy")
+            logger.info("RabbitMQ outbox publisher started")
+            backoff = 1.0
+            while not stop_event.is_set():
                 count = await _publish_batch(exchange)
-            except Exception:
-                count = 0
-                logger.exception("RabbitMQ outbox publisher failed")
-            if count:
-                await asyncio.sleep(0)
-                continue
+                if count:
+                    await asyncio.sleep(0)
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        stop_event.wait(),
+                        timeout=max(0.05, settings.rabbitmq_outbox_poll_seconds),
+                    )
+                except TimeoutError:
+                    pass
+        except Exception as error:
+            if stop_event.is_set():
+                break
+            set_component_health(_HEALTH_COMPONENT, "recovering")
+            logger.warning(
+                "RabbitMQ publisher lost its broker channel (%s); reconnecting",
+                error,
+            )
             try:
-                await asyncio.wait_for(
-                    stop_event.wait(),
-                    timeout=max(0.05, settings.rabbitmq_outbox_poll_seconds),
-                )
+                await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+                break
             except TimeoutError:
-                pass
-    finally:
-        await connection.close()
+                backoff = min(backoff * 2, _RECONNECT_BACKOFF_CAP_SECONDS)
+        finally:
+            if connection is not None:
+                try:
+                    await connection.close()
+                except Exception:
+                    logger.debug("Could not close RabbitMQ publisher connection", exc_info=True)
+    set_component_health(_HEALTH_COMPONENT, "healthy")

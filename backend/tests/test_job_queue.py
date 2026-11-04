@@ -142,3 +142,43 @@ def test_pending_reclassify_mode_survives_lease_recovery(monkeypatch):
         db.commit()
 
     assert job_queue.claim("reclassify") == [(mailbox_id, {"pending_only": True})]
+
+
+def test_get_statuses_returns_saved_and_idle_mailboxes_in_requested_order():
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+
+    with session_factory() as db:
+        user = User(external_id="bulk-job-status")
+        db.add(user)
+        db.flush()
+        mailboxes = [
+            MailboxConnection(
+                user_id=user.id,
+                provider=Provider.GOOGLE.value,
+                email_address=f"bulk-{index}@example.com",
+                access_token_enc="x",
+                is_active=True,
+            )
+            for index in range(2)
+        ]
+        db.add_all(mailboxes)
+        db.flush()
+        db.add(MailboxJobState(
+            mailbox_id=mailboxes[1].id,
+            job_type="reclassify",
+            state="running",
+            progress='{"processed":3,"total":9}',
+        ))
+        db.commit()
+        ids = [mailboxes[0].id, mailboxes[1].id]
+
+        statuses = job_queue.get_statuses(db, ids, "reclassify")
+
+    assert [status["mailbox_id"] for status in statuses] == ids
+    assert statuses[0]["state"] == "idle"
+    assert statuses[1]["state"] == "running"
+    assert statuses[1]["processed"] == 3

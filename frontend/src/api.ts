@@ -181,6 +181,7 @@ function noteUnauthorized(res: Response): Response {
 }
 
 const IDEMPOTENT_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+const TRANSIENT_SERVER_STATUSES = new Set([500, 502, 503, 504]);
 
 async function apiFetch(url: string, init?: RequestInit, attempts = 3): Promise<Response> {
   const method = (init?.method || "GET").toUpperCase();
@@ -193,6 +194,21 @@ async function apiFetch(url: string, init?: RequestInit, attempts = 3): Promise<
   for (let i = 0; i < maxAttempts; i += 1) {
     try {
       const res = await fetch(url, { credentials: "include", ...init });
+      // The Vite development proxy returns a short-lived 500/502 while the
+      // supervised backend is reloading. GET/HEAD/OPTIONS are safe to retry;
+      // without this branch a normal reload surfaced as "Failed to load email
+      // (500)" even though the API was healthy again a fraction of a second
+      // later. Keep the final response so persistent server failures still
+      // reach the caller with their useful status and detail.
+      if (
+        IDEMPOTENT_METHODS.has(method)
+        && TRANSIENT_SERVER_STATUSES.has(res.status)
+        && i < maxAttempts - 1
+      ) {
+        await res.body?.cancel();
+        await new Promise((resolve) => window.setTimeout(resolve, 350 * (i + 1)));
+        continue;
+      }
       return noteUnauthorized(res);
     } catch (err) {
       lastError = err;
@@ -479,6 +495,12 @@ export interface ReclassifyStatus {
 export async function fetchReclassifyStatus(id: number): Promise<ReclassifyStatus> {
   const res = await apiFetch(`${API_BASE}/api/mailboxes/${id}/reclassify-status`);
   if (!res.ok) throw new Error(await readApiError(res, "Failed to load reclassification status"));
+  return res.json();
+}
+
+export async function fetchReclassifyStatuses(): Promise<ReclassifyStatus[]> {
+  const res = await apiFetch(`${API_BASE}/api/mailboxes/reclassify-status`);
+  if (!res.ok) throw new Error(await readApiError(res, "Failed to load reclassification statuses"));
   return res.json();
 }
 
