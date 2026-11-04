@@ -2294,8 +2294,8 @@ def _candidate_role_rows(messages: list[EmailMessage]) -> list[tuple[str, EmailM
         (role, item)
         for item in messages
         if (
-            role := job_role_or_empty(item.job_role)
-            or interview_subject_company_role(item.subject)[1]
+            role := interview_subject_company_role(item.subject)[1]
+            or job_role_or_empty(item.job_role)
             or _role_named_in_interview_message(item)
         )
     ]
@@ -2684,6 +2684,16 @@ def interview_subject_company_role(subject: str | None) -> tuple[str, str]:
     """
     value = html.unescape((subject or "").strip())
     patterns = (
+        re.compile(
+            r"^(?:Re:\s*)?Application\s+for\s+(?P<role>.+?)\s*[-–—]\s*"
+            r"(?P<company>[^|]{2,120}?)\s*$",
+            re.I,
+        ),
+        re.compile(
+            r"^(?:Re:\s*)?Your\s+application\s+for\s+(?P<role>.+?)\s+at\s+"
+            r"(?P<company>[^|]{2,120}?)\s*$",
+            re.I,
+        ),
         re.compile(
             r"^(?P<role>.+?),\s*(?P<company>[^,|]{2,120}?)\s*[-–—|]\s*"
             r"Requesting\b.*\bavailability\b",
@@ -3499,6 +3509,41 @@ def message_appointment_slots(email: EmailMessage) -> list[ExtractedSlot]:
         return _prefer_specific_slots(fresh_slots)
     quoted = full[len(fresh) :] if fresh and full.startswith(fresh) else ""
     times = list(_TIME_PATTERN.finditer(fresh or ""))
+    # A recruiter can counter a dated proposal without repeating its date:
+    # "I can't move my 2 PM meeting. Any chance you can make 1:30 PM ET?"
+    # The requested clock, not the conflicting-meeting clock, inherits the
+    # date from quoted history. This also lets the candidate's exact acceptance
+    # promote the slot to a confirmed booking.
+    proposed = re.search(
+        r"\b(?:you\s+(?:can|could)|(?:can|could|would)\s+you)\s+"
+        r"(?:make|do|meet|be\s+available)\b(?P<tail>[^?\r\n]{0,100})",
+        fresh or "",
+        re.I,
+    )
+    if proposed is not None and quoted:
+        proposal_text = proposed.group(0)
+        proposal_times = list(_TIME_PATTERN.finditer(proposal_text))
+        date_parts = _first_interview_date(quoted, reference)
+        if proposal_times and date_parts is not None:
+            zone_match = _zone_near_clock(
+                proposal_text,
+                proposal_times[0].start(),
+                proposal_times[0].end(),
+            )
+            if zone_match is not None:
+                zone, zone_name = zone_match
+                year, month, day = date_parts
+                slot = _slot_from_clock(
+                    proposal_times,
+                    year,
+                    month,
+                    day,
+                    zone,
+                    zone_name,
+                    reference,
+                )
+                if slot is not None:
+                    return [slot]
     # A bare clock in a short reply ("around 11:30 AM PST") must not borrow a
     # date from a job description buried in the quoted thread.
     if times and quoted and re.search(r"\b(?:available|availability|reschedul|moved?|move|booked|confirmed|scheduled)\b", fresh or "", re.I):
@@ -3896,12 +3941,17 @@ async def extract_calendar_details(
         or _known_role(messages)
     )
     deterministic_job_url = extract_job_url(text)
-    deterministic_interviewer = extract_interviewer(current_text, email.sender or "")
+    deterministic_interviewer = (
+        ""
+        if (getattr(email, "folder", "") or "").casefold() == "sent"
+        else extract_interviewer(current_text, email.sender or "")
+    )
     if not deterministic_interviewer:
         deterministic_interviewer = next(
             (
                 interviewer
                 for item in reversed(messages[:-1])
+                if (item.folder or "").casefold() != "sent"
                 if (
                     interviewer := extract_interviewer(
                         "\n".join([item.subject or "", item.snippet or "", item.body_text or "", item.body_html or ""]),
@@ -4018,6 +4068,7 @@ def _apply_details(
     db: Session | None = None,
 ) -> None:
     candidate_company = clean_company_name(details.company) or clean_company_name(email.company) or (email.company or "").strip()
+    previous_company = (event.company or "").strip()
     owner_name = ""
     if db is not None and email.mailbox_id:
         owner_name = candidate_own_name(email) or mailbox_candidate_name(db, email.mailbox_id)
@@ -4035,9 +4086,15 @@ def _apply_details(
     role = job_role_or_empty(details.role) or job_role_or_empty(email.job_role)
     subject_role = _role_named_in_interview_subject(email, owner_name)
     current_role = job_role_or_empty(event.job_role)
+    employer_changed = bool(
+        candidate_company
+        and previous_company
+        and not companies_match(candidate_company, previous_company)
+        and companies_match(event.company, candidate_company)
+    )
     if subject_role:
         event.job_role = subject_role
-    elif role and (not current_role or is_interview_stage_label(current_role)):
+    elif role and (not current_role or is_interview_stage_label(current_role) or employer_changed):
         event.job_role = role
     elif role and roles_compatible(current_role, role):
         event.job_role = _fullest_job_title([current_role, role], [])
@@ -4118,12 +4175,17 @@ def refresh_calendar_event_details(db: Session, email: EmailMessage) -> bool:
         extract_meeting_access(current_text),
         extract_meeting_access(combined_text),
     )
-    interviewer = extract_interviewer(current_text, email.sender or "")
+    interviewer = (
+        ""
+        if (getattr(email, "folder", "") or "").casefold() == "sent"
+        else extract_interviewer(current_text, email.sender or "")
+    )
     if not interviewer:
         interviewer = next(
             (
                 found
                 for item in reversed(messages[:-1])
+                if (item.folder or "").casefold() != "sent"
                 if (
                     found := extract_interviewer(
                         "\n".join([item.subject or "", item.snippet or "", item.body_text or "", item.body_html or ""]),
@@ -5072,6 +5134,62 @@ _UNCONFIRMED_CANDIDATE_PROPOSAL_RE = re.compile(
     r")",
     re.IGNORECASE | re.DOTALL,
 )
+
+_CANDIDATE_ACCEPTANCE_RE = re.compile(
+    r"\b(?:works?(?:\s+well)?\s+for\s+me|that\s+works|i\s+can\s+make\s+(?:it|that)|"
+    r"looking\s+forward\s+to\s+(?:speaking|meeting|connecting))\b",
+    re.I,
+)
+
+
+def _accepted_employer_proposal(db: Session, email: EmailMessage) -> EmailMessage | None:
+    """Return the prior employer message whose exact time the candidate accepted.
+
+    Classifiers often label ``11/4 1:30 PM works well for me`` as availability.
+    It is actually a booking when the employer proposed that exact time earlier
+    in the same thread. Requiring one slot, explicit acceptance language, and
+    an exact same-thread employer proposal avoids promoting a candidate's own
+    unsolicited one-time suggestion.
+    """
+    if (
+        email.human_corrected
+        or email.folder != "sent"
+        or not email.thread_id
+        or email.label not in {
+            EmailLabel.INTERVIEW_AVAILABILITY.value,
+            EmailLabel.INTERVIEW_SCHEDULED.value,
+        }
+    ):
+        return None
+    fresh = _without_quoted_history(_calendar_text(email))
+    if not _CANDIDATE_ACCEPTANCE_RE.search(fresh) or _UNCONFIRMED_CANDIDATE_PROPOSAL_RE.search(fresh):
+        return None
+    accepted = message_appointment_slots(email)
+    if len(accepted) != 1:
+        return None
+    received = as_utc(email.received_at)
+    candidates = (
+        db.query(EmailMessage)
+        .filter(
+            EmailMessage.mailbox_id == email.mailbox_id,
+            EmailMessage.thread_id == email.thread_id,
+            EmailMessage.id != email.id,
+            EmailMessage.folder.notin_({"sent", "spam", "trash"}),
+            *([EmailMessage.received_at <= received] if received else []),
+            *([EmailMessage.received_at >= received - _CROSS_THREAD_WINDOW] if received else []),
+        )
+        .order_by(EmailMessage.received_at.desc(), EmailMessage.id.desc())
+        .limit(20)
+        .all()
+    )
+    for candidate in candidates:
+        offered = message_appointment_slots(candidate)
+        if any(
+            abs((accepted[0].start_at - slot.start_at).total_seconds()) <= 60
+            for slot in offered
+        ):
+            return candidate
+    return None
 
 _CANDIDATE_RESCHEDULE_TO_RE = re.compile(
     r"\b(?:reschedul(?:e|ed|ing)|move|change)\b[^\r\n]{0,120}?"
@@ -7852,10 +7970,15 @@ def repair_placeholder_calendar_fields(db: Session, mailbox_id: int | None = Non
             and not (source.company or "").strip()
             and _company_named_in_message(source)
         )
+        source_has_stored_company = bool(
+            source is not None
+            and (source.company or "").strip()
+            and (source.folder or "").casefold() == "sent"
+        )
         if not event.company_human_corrected and source_company and (
             not company
             or (
-                source_inferred_without_stored_company
+                (source_inferred_without_stored_company or source_has_stored_company)
                 and not companies_match(company, source_company)
                 and not _company_supported_by_messages(company, [source])
             )
@@ -8255,6 +8378,19 @@ async def process_calendar_email(
             return await _process_calendar_email(
                 db, email, force=force, use_ai=use_ai, priority=priority,
             )
+    accepted_proposal = _accepted_employer_proposal(db, email)
+    if accepted_proposal is not None and not email.human_corrected:
+        email.label = EmailLabel.INTERVIEW_SCHEDULED.value
+        email.interview_subtype = "confirmation"
+        if not (email.company or "").strip() and accepted_proposal.company:
+            email.company = accepted_proposal.company
+        context = [*_related_interview_emails(db, email), accepted_proposal, email]
+        known_role = _known_role(context)
+        if known_role:
+            email.job_role = known_role
+        return await _process_calendar_email(
+            db, email, force=force, use_ai=use_ai, priority=priority,
+        )
     if _candidate_replaces_booked_slot(db, email) and not email.human_corrected:
         related = _related_interview_emails(db, email)
         _hide_open_reschedule(db, email, related)

@@ -3109,6 +3109,129 @@ def test_sent_acceptance_of_one_time_can_remain_scheduled():
         assert event.kind == "confirmed"
 
 
+def test_sent_availability_label_is_promoted_when_it_accepts_employer_exact_time():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="gm-invitation",
+            thread_id="gm-thread",
+            folder="inbox",
+            subject="Greetings from GM",
+            sender="Daniel Oglivie <daniel.oglivie@gm.com>",
+            received_at=datetime(2026, 10, 29, 19, 15, tzinfo=timezone.utc),
+            body_text="When is a good time next week for us to connect?",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="GM",
+            job_role="Staff Software Engineer - Simulation Platform (Galileo)",
+        )
+        proposal = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="gm-exact-proposal",
+            thread_id="gm-thread",
+            folder="inbox",
+            subject="Re: Greetings from GM",
+            sender="Daniel Oglivie <daniel.oglivie@gm.com>",
+            received_at=datetime(2026, 10, 30, 19, 0, tzinfo=timezone.utc),
+            body_text=(
+                "I unfortunately have a meeting I can't move at 2 PM ET. "
+                "Any chance you can make 1:30 PM ET?\n"
+                "From: candidate@example.com\n"
+                "I am available Wednesday 11/4 at 2 PM ET."
+            ),
+            label=EmailLabel.INTERVIEW_AVAILABILITY.value,
+            company="GM",
+            job_role="Staff Software Engineer - Simulation Platform (Galileo)",
+        )
+        acceptance = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="gm-acceptance",
+            thread_id="gm-thread",
+            folder="sent",
+            subject="Re: Greetings from GM",
+            sender="candidate@example.com",
+            received_at=datetime(2026, 10, 30, 19, 5, tzinfo=timezone.utc),
+            body_text="11/4 1:30 PM ET works well for me.",
+            label=EmailLabel.INTERVIEW_AVAILABILITY.value,
+            job_role="Staff Software Engineer - Simulation Platform (Galileo)",
+        )
+        later_follow_up = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="gm-later-follow-up",
+            thread_id="gm-thread",
+            folder="sent",
+            subject="Re: Greetings from GM",
+            sender="Ryan <candidate@example.com>",
+            received_at=datetime(2026, 11, 2, 16, 29, tzinfo=timezone.utc),
+            body_text="Could you please send over a calendar invite?",
+            label=EmailLabel.INTERVIEW_AVAILABILITY.value,
+            job_role="Staff Software Engineer - Simulation Platform (Galileo)",
+        )
+        db.add_all([invitation, proposal, acceptance, later_follow_up])
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, proposal, use_ai=False)) is True
+        assert asyncio.run(process_calendar_email(db, acceptance, use_ai=False)) is True
+
+        assert acceptance.label == EmailLabel.INTERVIEW_SCHEDULED.value
+        assert acceptance.interview_subtype == "confirmation"
+        visible = db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True)).all()
+        assert len(visible) == 1
+        assert visible[0].kind == "confirmed"
+        assert visible[0].company == "GM"
+        assert visible[0].job_role == "Staff Software Engineer - Simulation Platform (Galileo)"
+        assert visible[0].interviewer == "Daniel Oglivie"
+        assert visible[0].start_at == datetime(2026, 11, 4, 18, 30, tzinfo=timezone.utc)
+
+        # A stale cleanup pass must not restore an unrelated employer merely
+        # because it has a broadly compatible "Staff Software Engineer" role.
+        visible[0].company = "Aerovy"
+        visible[0].title = "Aerovy — Staff Software Engineer - Simulation Platform (Galileo)"
+        assert repair_placeholder_calendar_fields(db, mailbox_id) > 0
+        assert visible[0].company == "GM"
+        assert visible[0].title == "GM — Staff Software Engineer - Simulation Platform (Galileo)"
+
+
+def test_reprocessing_wrong_company_replaces_its_leaked_role():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        reply = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="parts-town-availability",
+            thread_id="parts-town-thread",
+            folder="sent",
+            subject="Re: Application for Sr. AI Platform Architect - Parts Town",
+            sender="candidate@example.com",
+            received_at=datetime(2026, 11, 3, 21, 20, tzinfo=timezone.utc),
+            body_text="Wednesday, November 4 at 9:30 AM EST",
+            label=EmailLabel.INTERVIEW_AVAILABILITY.value,
+            company="Parts Town",
+            job_role="Staff Software Engineer",
+        )
+        db.add(reply)
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=reply.id,
+            source_thread_id=reply.thread_id,
+            kind="availability",
+            origin="email",
+            title="Aerovy — Staff Software Engineer",
+            company="Aerovy",
+            job_role="Staff Software Engineer",
+            start_at=datetime(2026, 11, 4, 14, 30, tzinfo=timezone.utc),
+            end_at=datetime(2026, 11, 4, 15, 0, tzinfo=timezone.utc),
+            is_visible=True,
+        )
+        db.add(event)
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, reply, force=True, use_ai=False)) is True
+        assert event.company == "Parts Town"
+        assert event.job_role == "Sr. AI Platform Architect"
+        assert event.title == "Parts Town — Sr. AI Platform Architect"
+
+
 def test_single_time_reply_to_open_calendar_request_remains_availability():
     """A candidate naming one time does not book it when the employer never proposed it."""
     factory, (mailbox_id, _) = _database()
