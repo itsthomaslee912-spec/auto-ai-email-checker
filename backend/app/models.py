@@ -359,7 +359,10 @@ class CalendarEventEmail(Base):
     """
 
     __tablename__ = "calendar_event_emails"
-    __table_args__ = (Index("ix_calendar_event_emails_email", "email_id"),)
+    __table_args__ = (
+        Index("ix_calendar_event_emails_email", "email_id"),
+        Index("ix_calendar_event_emails_event", "event_id"),
+    )
 
     event_id: Mapped[int] = mapped_column(
         ForeignKey("calendar_events.id", ondelete="CASCADE"), primary_key=True

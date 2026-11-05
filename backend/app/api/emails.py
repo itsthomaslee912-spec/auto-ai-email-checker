@@ -22,7 +22,7 @@ from app.classify.openai_classifier import (
     deterministic_ai_only_classification,
     infer_interview_subtype,
 )
-from app.services.ai_backend import close_ai_client, get_ai_backend
+from app.services.ai_backend import close_ai_client, get_ai_backend, get_ai_client
 from app.auth.oauth_microsoft import ensure_microsoft_access_token
 from app.db import SessionLocal, get_db
 from app.email.gmail import (
@@ -1140,7 +1140,7 @@ async def ai_reply(
     instruction = (payload.instruction if payload else "").strip()
     if not instruction:
         instruction = "Write a concise, professional reply appropriate to this email."
-    client = backend.client()
+    client = get_ai_client(backend)
     try:
         response = await client.chat.completions.create(
             model=backend.model,

@@ -69,6 +69,7 @@ const TIME_ZONES = (() => {
 })();
 
 type ZonedParts = { year: number; month: number; day: number; hour: number; minute: number; second: number };
+const FORMATTER_CACHE_LIMIT = 64;
 const zonedFormatters = new Map<string, Intl.DateTimeFormat>();
 
 function validTimeZone(value: string | null): value is string {
@@ -88,6 +89,10 @@ function partsInTimeZone(value: Date, timeZone: string): ZonedParts {
       timeZone, year: "numeric", month: "2-digit", day: "2-digit",
       hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
     });
+    if (zonedFormatters.size >= FORMATTER_CACHE_LIMIT) {
+      const oldest = zonedFormatters.keys().next().value;
+      if (oldest) zonedFormatters.delete(oldest);
+    }
     zonedFormatters.set(timeZone, formatter);
   }
   const values: Record<string, number> = {};
@@ -186,7 +191,10 @@ function rememberCalendarRange(key: string, rows: CalendarEvent[]) {
 }
 
 function calendarRangeKey(start: Date, end: Date, timeZone: string) {
-  return `${start.getTime()}|${end.getTime()}|${timeZone}`;
+  // Key on the actual UTC instants sent to the API so cached data survives
+  // timezone switches. Switching timezone produces slightly different UTC
+  // boundaries, but switching back is a cache hit rather than a re-fetch.
+  return `${instantForWallDate(start, timeZone).getTime()}|${instantForWallDate(end, timeZone).getTime()}`;
 }
 
 function fetchCalendarRange(start: Date, end: Date, timeZone: string, signal?: AbortSignal, forceFresh = false): Promise<CalendarEvent[]> {
@@ -217,7 +225,10 @@ export function warmCalendarCache(): void {
   const anchor = wallDateForInstant(new Date(), timeZone);
   const start = rangeStart(anchor, view);
   const end = view === "month" ? addDays(start, 42) : endExclusive(start, view);
-  if (CALENDAR_RANGE_CACHE.has(calendarRangeKey(start, end, timeZone))) return;
+  const key = calendarRangeKey(start, end, timeZone);
+  // Skip entirely when the range is already cached or in-flight — avoids
+  // re-fetching pendingInterviews on every route re-entry.
+  if (CALENDAR_RANGE_CACHE.has(key) || CALENDAR_RANGE_INFLIGHT.has(key)) return;
   void fetchCalendarRange(start, end, timeZone).catch(() => {});
   void fetchPendingInterviews().catch(() => {});
 }
@@ -239,6 +250,10 @@ function cachedDateTime(timeZone: string, options: Intl.DateTimeFormatOptions, v
   let formatter = dateTimeFormatters.get(key);
   if (!formatter) {
     formatter = new Intl.DateTimeFormat("en-US", { timeZone, ...options });
+    if (dateTimeFormatters.size >= FORMATTER_CACHE_LIMIT) {
+      const oldest = dateTimeFormatters.keys().next().value;
+      if (oldest) dateTimeFormatters.delete(oldest);
+    }
     dateTimeFormatters.set(key, formatter);
   }
   return formatter.format(value);

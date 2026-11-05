@@ -256,19 +256,25 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                 ]
                 if only_pending:
                     query_filters.append(EmailMessage.classification_pending.is_(True))
+                # body_html is only needed for company/role extraction, which
+                # never runs on pending-only rows (should_extract guards on
+                # not classification_pending). Skip the column for the common
+                # new-email path to avoid loading 50-500 KB per message.
+                columns = [
+                    EmailMessage.id,
+                    EmailMessage.subject,
+                    EmailMessage.sender,
+                    EmailMessage.body_text,
+                    EmailMessage.snippet,
+                    EmailMessage.label,
+                    EmailMessage.outcome_extracted,
+                    EmailMessage.folder,
+                    EmailMessage.classification_pending,
+                ]
+                if not only_pending:
+                    columns.insert(4, EmailMessage.body_html)
                 loaded = (
-                    lookup.query(
-                        EmailMessage.id,
-                        EmailMessage.subject,
-                        EmailMessage.sender,
-                        EmailMessage.body_text,
-                        EmailMessage.body_html,
-                        EmailMessage.snippet,
-                        EmailMessage.label,
-                        EmailMessage.outcome_extracted,
-                        EmailMessage.folder,
-                        EmailMessage.classification_pending,
-                    )
+                    lookup.query(*columns)
                     .filter(*query_filters)
                     .order_by(
                         EmailMessage.classification_pending.desc(),
@@ -282,7 +288,7 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                         subject=row.subject,
                         sender=row.sender,
                         body_text=row.body_text,
-                        body_html=row.body_html,
+                        body_html=row.body_html if not only_pending else None,
                         snippet=row.snippet,
                         label=row.label,
                         outcome_extracted=row.outcome_extracted,

@@ -12,7 +12,7 @@ from app.classify.prompt_store import activate_prompt_text
 from app.models import ClassifyCorrection, ClassifyPromptVersion, EmailLabel
 from app.schemas import ClassifyPromptStatusOut, ClassifyPromptUpdateOut
 from app.config import get_settings
-from app.services.ai_backend import AiBackend, close_ai_client, get_ai_backend, has_saved_ai_settings
+from app.services.ai_backend import AiBackend, close_ai_client, get_ai_backend, get_ai_client, has_saved_ai_settings
 
 logger = logging.getLogger(__name__)
 
@@ -253,7 +253,7 @@ async def update_prompt_from_corrections(db: Session) -> ClassifyPromptUpdateOut
         "Human corrections (wrong label → correct label):\n"
         f"{_format_examples(rows)}"
     )
-    client = backend.client() if backend.provider in {"ollama", "gemini"} else AsyncOpenAI(api_key=backend.api_key)
+    client = get_ai_client(backend)
     response_id = None
     source = f"{backend.provider}_update"
     try:

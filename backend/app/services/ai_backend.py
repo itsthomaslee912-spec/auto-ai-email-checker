@@ -82,6 +82,18 @@ class _PriorityGate:
 _ai_call_gate: _PriorityGate | None = None
 _ai_call_gates: dict[str, _PriorityGate] = {}
 
+_cached_backend: "AiBackend | None" = None
+_cached_client: AsyncOpenAI | None = None
+_has_saved_settings: bool | None = None
+
+
+def invalidate_ai_backend_cache() -> None:
+    """Call after saving AI settings so the next classification sees the update."""
+    global _cached_backend, _cached_client, _has_saved_settings
+    _cached_backend = None
+    _cached_client = None
+    _has_saved_settings = None
+
 
 def ai_call_concurrency(provider: str) -> int:
     settings = get_settings()
@@ -152,45 +164,69 @@ class AiBackend:
 
 
 def get_ai_backend() -> AiBackend:
+    global _cached_backend
+    if _cached_backend is not None:
+        return _cached_backend
     defaults = get_settings()
     with SessionLocal() as db:
         saved = db.get(AiSettings, 1)
         if saved and saved.provider == "ollama":
-            return AiBackend(
+            _cached_backend = AiBackend(
                 provider="ollama", model=saved.ollama_model,
                 api_key="ollama", base_url=saved.ollama_url,
             )
-        if saved and saved.provider == "gemini":
+        elif saved and saved.provider == "gemini":
             key = decrypt_token(saved.gemini_key_enc) if saved.gemini_key_enc else defaults.gemini_api_key
-            return AiBackend(
+            _cached_backend = AiBackend(
                 provider="gemini",
                 model=saved.gemini_model,
                 api_key=key,
                 base_url=GEMINI_OPENAI_BASE_URL,
             )
-        key = decrypt_token(saved.openai_key_enc) if saved and saved.openai_key_enc else defaults.openai_api_key
-        return AiBackend(
-            provider="openai",
-            model=saved.openai_model if saved else defaults.openai_model,
-            api_key=key,
-        )
+        else:
+            key = decrypt_token(saved.openai_key_enc) if saved and saved.openai_key_enc else defaults.openai_api_key
+            _cached_backend = AiBackend(
+                provider="openai",
+                model=saved.openai_model if saved else defaults.openai_model,
+                api_key=key,
+            )
+    return _cached_backend
 
 
 def has_saved_ai_settings() -> bool:
+    global _has_saved_settings
+    if _has_saved_settings is not None:
+        return _has_saved_settings
     try:
         with SessionLocal() as db:
-            return db.get(AiSettings, 1) is not None
+            result = db.get(AiSettings, 1) is not None
+        _has_saved_settings = result
+        return result
     except OperationalError:
         return False
+
+
+def get_ai_client(backend: AiBackend) -> AsyncOpenAI:
+    """Return a long-lived client for the current backend, reusing the connection pool.
+
+    The cached client is shared across AI calls for the same backend
+    configuration. Call ``invalidate_ai_backend_cache`` when settings change to
+    get a fresh client on the next request.
+    """
+    global _cached_client
+    if _cached_client is None:
+        _cached_client = backend.client()
+    return _cached_client
 
 
 async def close_ai_client(client: object) -> None:
     """Close a per-request SDK client without constraining test doubles.
 
-    AI calls intentionally honor exactly one selected provider.  Each call gets
-    its own client, so it must also close that client or long reclassification
-    passes leave dozens of idle sockets behind.
+    The long-lived cached client is not closed here — it is reused across calls.
+    One-off clients (test doubles, temporary overrides) are closed normally.
     """
+    if client is _cached_client:
+        return
     close = getattr(client, "close", None)
     if close is None:
         return

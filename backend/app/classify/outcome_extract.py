@@ -9,7 +9,7 @@ from datetime import timedelta
 from sqlalchemy.orm import Session
 
 from app.models import EmailLabel, EmailMessage
-from app.services.ai_backend import ai_call_semaphore, close_ai_client, get_ai_backend
+from app.services.ai_backend import ai_call_semaphore, close_ai_client, get_ai_backend, get_ai_client
 from app.services.calendar_extract import (
     _company_named_in_message,
     candidate_own_name,
@@ -197,7 +197,7 @@ async def extract_company_role(
     if not backend.api_key:
         return None
 
-    client = backend.client()
+    client = get_ai_client(backend)
     html_text = _visible_html_text(body_html)
     evidence = "\n\n".join(part for part in (body_text or "", html_text) if part.strip())
     user_content = f"From: {sender}\nSubject: {subject}\nSnippet: {snippet}\n\nBody:\n{evidence[:12000]}"

@@ -22,7 +22,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.models import CalendarEvent, CalendarEventEmail, EmailLabel, EmailMessage, MailboxConnection
-from app.services.ai_backend import ai_call_semaphore, close_ai_client, get_ai_backend
+from app.services.ai_backend import ai_call_semaphore, close_ai_client, get_ai_backend, get_ai_client
 from app.timeutil import as_utc
 
 logger = logging.getLogger(__name__)
@@ -4043,7 +4043,7 @@ async def extract_calendar_details(
     backend = get_ai_backend()
     if not backend.api_key:
         return slots, access, details, bool(slots)
-    client = backend.client()
+    client = get_ai_client(backend)
     try:
         async with ai_call_semaphore(priority, provider=backend.provider):
             response = await client.chat.completions.create(
@@ -5963,7 +5963,11 @@ def _hide_booked_interview_availability(db: Session, confirmed: CalendarEvent) -
     company = (confirmed.company or "").strip()
     if not company or not confirmed.is_visible:
         return
-    booked_at = as_utc(confirmed.source_received_at)
+    # Fall back to epoch-zero when source_received_at is absent (old rows
+    # created before the field existed) so the temporal guard is never skipped.
+    # A guard of None short-circuits and hides every matching availability event
+    # unconditionally, including future ones belonging to a new interview round.
+    booked_at = as_utc(confirmed.source_received_at) or datetime.min.replace(tzinfo=timezone.utc)
     candidates = (
         _email_calendar_events(db)
         .filter(
@@ -5980,7 +5984,7 @@ def _hide_booked_interview_availability(db: Session, confirmed: CalendarEvent) -
         if not _same_booked_role(confirmed, event):
             continue
         offered_at = as_utc(event.source_received_at)
-        if booked_at and offered_at and offered_at > booked_at:
+        if offered_at and offered_at > booked_at:
             continue
         event.is_visible = False
         event.superseded_by_event_id = confirmed.id

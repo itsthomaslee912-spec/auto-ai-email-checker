@@ -50,7 +50,8 @@ def test_selected_gemini_backend_is_used_for_classification(monkeypatch):
     )
     monkeypatch.setattr("app.classify.openai_classifier.has_saved_ai_settings", lambda: True)
     monkeypatch.setattr("app.classify.openai_classifier.get_ai_backend", lambda: backend)
-    monkeypatch.setattr("app.classify.openai_classifier.get_active_system_prompt", lambda: "Classify this email.")
+    monkeypatch.setattr("app.classify.openai_classifier.get_normalized_active_prompt", lambda: "Classify this email.")
+    monkeypatch.setattr("app.classify.openai_classifier.get_ai_client", lambda _b: fake_client)
     monkeypatch.setattr(
         "app.classify.openai_classifier.AsyncOpenAI",
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("OpenAI client should not be used")),
@@ -100,7 +101,8 @@ def test_selected_ollama_backend_never_calls_openai_and_closes_client(monkeypatc
     )
     monkeypatch.setattr("app.classify.openai_classifier.has_saved_ai_settings", lambda: True)
     monkeypatch.setattr("app.classify.openai_classifier.get_ai_backend", lambda: backend)
-    monkeypatch.setattr("app.classify.openai_classifier.get_active_system_prompt", lambda: "Classify this email.")
+    monkeypatch.setattr("app.classify.openai_classifier.get_normalized_active_prompt", lambda: "Classify this email.")
+    monkeypatch.setattr("app.classify.openai_classifier.get_ai_client", lambda _b: FakeClient())
     monkeypatch.setattr(
         "app.classify.openai_classifier.get_settings",
         lambda: SimpleNamespace(email_classification_mode="ai_only"),
@@ -119,6 +121,8 @@ def test_selected_ollama_backend_never_calls_openai_and_closes_client(monkeypatc
 
     assert captured["model"] == "local-test"
     assert result.label == "other"
+    # get_ai_client returns a fresh non-cached client per call in this test; it
+    # is closed via close_ai_client once the AI call finishes.
     assert closed == [True]
 
 

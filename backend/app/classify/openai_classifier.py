@@ -8,13 +8,12 @@ from email.utils import parseaddr
 
 from openai import AsyncOpenAI
 
-from app.classify.prompt_store import get_active_system_prompt
-from app.classify.prompt import with_interview_subtype_rules
+from app.classify.prompt_store import get_normalized_active_prompt
 from app.classify.correction_retrieval import CorrectionExample, format_retrieved_corrections
 from app.models import EmailLabel
 from app.schemas import ClassificationResult
 from app.config import get_settings
-from app.services.ai_backend import AiBackend, ai_call_semaphore, close_ai_client, get_ai_backend, has_saved_ai_settings
+from app.services.ai_backend import AiBackend, ai_call_semaphore, close_ai_client, get_ai_backend, get_ai_client, has_saved_ai_settings
 
 logger = logging.getLogger(__name__)
 
@@ -1217,7 +1216,7 @@ async def classify_email(
         "max_tokens": CLASSIFICATION_MAX_OUTPUT_TOKENS,
         "response_format": {"type": "json_object"},
         "messages": [
-            {"role": "system", "content": with_interview_subtype_rules(get_active_system_prompt())},
+            {"role": "system", "content": get_normalized_active_prompt()},
             {"role": "user", "content": user_content},
         ],
     }
@@ -1239,7 +1238,7 @@ async def classify_email(
     content = ""
     strict_result = None
     for attempt in range(max_attempts):
-        client = backend.client() if backend.provider in {"ollama", "gemini"} else AsyncOpenAI(api_key=backend.api_key)
+        client = get_ai_client(backend)
         try:
             async with ai_call_semaphore(priority, provider=backend.provider):
                 response = await client.chat.completions.create(**request_options)

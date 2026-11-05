@@ -257,7 +257,7 @@ def test_prompt_update_receives_subtype_correction(monkeypatch):
             return SimpleNamespace(id="resp_subtype", choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"prompt": SYSTEM_PROMPT})))])
 
     monkeypatch.setattr("app.services.prompt_update.get_settings", lambda: SimpleNamespace(openai_api_key="sk-test", openai_model="gpt-4o-mini"))
-    monkeypatch.setattr("app.services.prompt_update.AsyncOpenAI", lambda **kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())))
+    monkeypatch.setattr("app.services.prompt_update.get_ai_client", lambda _b: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())))
     result = asyncio.run(update_prompt_from_corrections(db))
     assert result.ok is True
     assert "Previous interview subtype: reminder" in captured["content"]
@@ -883,8 +883,8 @@ def test_update_prompt_from_corrections(monkeypatch):
         lambda: SimpleNamespace(openai_api_key="sk-test", openai_model="gpt-4o-mini"),
     )
     monkeypatch.setattr(
-        "app.services.prompt_update.AsyncOpenAI",
-        lambda **kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+        "app.services.prompt_update.get_ai_client",
+        lambda _b: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
     )
 
     result = asyncio.run(update_prompt_from_corrections(db))
@@ -1074,6 +1074,10 @@ def test_classify_email_uses_db_prompt_not_seed(monkeypatch):
         "app.classify.openai_classifier.AsyncOpenAI",
         lambda **kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
     )
+    monkeypatch.setattr(
+        "app.classify.openai_classifier.get_ai_client",
+        lambda _b: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+    )
     monkeypatch.setattr("app.classify.prompt_store._load_from_db", lambda: updated.strip())
     invalidate_prompt_cache()
 
@@ -1117,6 +1121,10 @@ def test_ai_only_classification_bounds_output_and_does_not_duplicate_body(monkey
     monkeypatch.setattr(
         "app.classify.openai_classifier.AsyncOpenAI",
         lambda **_kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+    )
+    monkeypatch.setattr(
+        "app.classify.openai_classifier.get_ai_client",
+        lambda _b: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
     )
 
     marker = "UNIQUE-BODY-MARKER"
@@ -1271,6 +1279,10 @@ def test_ai_only_keeps_visible_message_after_large_css_prefix(monkeypatch):
         "app.classify.openai_classifier.AsyncOpenAI",
         lambda **_kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
     )
+    monkeypatch.setattr(
+        "app.classify.openai_classifier.get_ai_client",
+        lambda _b: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+    )
 
     marker = "VISIBLE-AI-INTERVIEW-INVITATION"
     asyncio.run(classify_email(
@@ -1319,8 +1331,8 @@ def test_prompt_update_preserves_taxonomy_when_model_returns_rules_only(monkeypa
         lambda: SimpleNamespace(openai_api_key="sk-test", openai_model="gpt-4o-mini"),
     )
     monkeypatch.setattr(
-        "app.services.prompt_update.AsyncOpenAI",
-        lambda **kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+        "app.services.prompt_update.get_ai_client",
+        lambda _b: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
     )
 
     result = asyncio.run(update_prompt_from_corrections(db))
@@ -1343,6 +1355,7 @@ def test_openai_subtype_overrides_keyword_inference(monkeypatch):
 
     monkeypatch.setattr("app.classify.openai_classifier.get_settings", lambda: SimpleNamespace(openai_api_key="sk-test", openai_model="gpt-4o-mini"))
     monkeypatch.setattr("app.classify.openai_classifier.AsyncOpenAI", lambda **kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())))
+    monkeypatch.setattr("app.classify.openai_classifier.get_ai_client", lambda _b: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())))
     result = asyncio.run(classify_email(
         subject="Interview confirmed for Friday",
         sender="recruiter@example.com",
@@ -1378,6 +1391,10 @@ def test_classify_email_uses_activated_prompt_immediately(monkeypatch):
     monkeypatch.setattr(
         "app.classify.openai_classifier.AsyncOpenAI",
         lambda **kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+    )
+    monkeypatch.setattr(
+        "app.classify.openai_classifier.get_ai_client",
+        lambda _b: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
     )
     monkeypatch.setattr("app.classify.prompt_store._load_from_db", lambda: SYSTEM_PROMPT)
     invalidate_prompt_cache()
