@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from fastapi import HTTPException
@@ -47,7 +47,7 @@ def test_monitoring_snapshot_reports_services_and_counts():
             access_token_enc="x",
             is_active=True,
         ))
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for service_name in (
             "email-api",
             "sync-worker",
@@ -126,7 +126,7 @@ def test_monitoring_reports_recovering_when_a_replica_self_reports():
     session_factory = _database()
     with session_factory() as db:
         db.add(User(external_id="monitor-admin", email="admin@example.com", is_admin=True))
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for service_name in (
             "email-api",
             "sync-worker",
@@ -162,7 +162,7 @@ def test_monitoring_uses_old_heartbeat_only_for_latest_timestamp():
     session_factory = _database()
     with session_factory() as db:
         db.add(User(external_id="monitor-admin", email="admin@example.com", is_admin=True))
-        old = datetime.now(timezone.utc) - timedelta(days=3)
+        old = datetime.now(UTC) - timedelta(days=3)
         db.add(ServiceHeartbeat(
             service_name="sync-worker",
             instance_id="retired:sync-worker",

@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
-
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -15,22 +14,30 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.api import classify, emails
-from app.classify.openai_classifier import classify_email
 from app.classify.correction_retrieval import load_correction_corpus, retrieve_relevant_corrections
+from app.classify.openai_classifier import classify_email
 from app.classify.prompt import CLASSIFY_TYPES, SYSTEM_PROMPT
-from app.classify.prompt_store import activate_prompt_text, get_active_system_prompt, invalidate_prompt_cache
+from app.classify.prompt_store import (
+    activate_prompt_text,
+    get_active_system_prompt,
+    invalidate_prompt_cache,
+)
 from app.db import Base, get_db
 from app.models import (
+    CalendarEvent,
     ClassifyCorrection,
     ClassifyPromptVersion,
-    CalendarEvent,
     EmailLabel,
     EmailMessage,
     MailboxConnection,
     Provider,
     User,
 )
-from app.services.prompt_update import PromptUpdateError, _latest_corrections, update_prompt_from_corrections
+from app.services.prompt_update import (
+    PromptUpdateError,
+    _latest_corrections,
+    update_prompt_from_corrections,
+)
 
 
 def _session_factory():
@@ -434,7 +441,7 @@ def test_reclassify_commits_calendar_changes_before_worker_session_closes(monkey
         )
 
     async def create_calendar_event(db, email, *, force=False, priority="live"):
-        start = datetime(2026, 10, 20, 18, tzinfo=timezone.utc)
+        start = datetime(2026, 10, 20, 18, tzinfo=UTC)
         db.add(CalendarEvent(
             mailbox_id=email.mailbox_id,
             source_email_id=email.id,
@@ -513,7 +520,7 @@ def test_pending_interview_classification_invalidates_temporary_calendar_hash(mo
         email = _seed_email(db, label=EmailLabel.OTHER.value)
         email.classification_pending = True
         email.calendar_processed_hash = "temporary-other-projection"
-        email.calendar_processed_at = datetime.now(timezone.utc)
+        email.calendar_processed_at = datetime.now(UTC)
         email.calendar_processing_error = "temporary error"
         db.commit()
         mailbox_id = email.mailbox_id
@@ -580,7 +587,7 @@ END:VCALENDAR"""
     async def create_calendar_event(db, email, *, force=False, use_ai=True, priority="live"):
         assert force is True
         assert use_ai is False
-        start = datetime(2026, 11, 3, 18, tzinfo=timezone.utc)
+        start = datetime(2026, 11, 3, 18, tzinfo=UTC)
         db.add(CalendarEvent(
             mailbox_id=email.mailbox_id,
             source_email_id=email.id,
@@ -607,7 +614,7 @@ END:VCALENDAR"""
     with SessionLocal() as db:
         event = db.query(CalendarEvent).filter(CalendarEvent.source_email_id == email_id).one()
         assert event.kind == "confirmed"
-        assert event.start_at == datetime(2026, 11, 3, 18, tzinfo=timezone.utc)
+        assert event.start_at == datetime(2026, 11, 3, 18, tzinfo=UTC)
     assert any(call.args[0] == "calendar.changed" for call in publish.await_args_list)
 
 
@@ -911,7 +918,7 @@ def test_update_prompt_requires_examples(monkeypatch):
     )
     try:
         asyncio.run(update_prompt_from_corrections(db))
-        assert False, "expected PromptUpdateError"
+        raise AssertionError("expected PromptUpdateError")
     except PromptUpdateError as exc:
         assert "No unused training examples" in str(exc)
     db.close()
@@ -1071,10 +1078,6 @@ def test_classify_email_uses_db_prompt_not_seed(monkeypatch):
         lambda: SimpleNamespace(openai_api_key="sk-test", openai_model="gpt-4o-mini"),
     )
     monkeypatch.setattr(
-        "app.classify.openai_classifier.AsyncOpenAI",
-        lambda **kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
-    )
-    monkeypatch.setattr(
         "app.classify.openai_classifier.get_ai_client",
         lambda _b: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
     )
@@ -1117,10 +1120,6 @@ def test_ai_only_classification_bounds_output_and_does_not_duplicate_body(monkey
             openai_model="gpt-4o-mini",
             email_classification_mode="ai_only",
         ),
-    )
-    monkeypatch.setattr(
-        "app.classify.openai_classifier.AsyncOpenAI",
-        lambda **_kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
     )
     monkeypatch.setattr(
         "app.classify.openai_classifier.get_ai_client",
@@ -1234,10 +1233,6 @@ def test_ai_only_verification_code_uses_action_required_guard_without_model(monk
             email_classification_mode="ai_only",
         ),
     )
-    monkeypatch.setattr(
-        "app.classify.openai_classifier.AsyncOpenAI",
-        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("AI must not be called")),
-    )
 
     result = asyncio.run(classify_email(
         subject="Your Verification Code",
@@ -1274,10 +1269,6 @@ def test_ai_only_keeps_visible_message_after_large_css_prefix(monkeypatch):
             openai_model="gpt-4o-mini",
             email_classification_mode="ai_only",
         ),
-    )
-    monkeypatch.setattr(
-        "app.classify.openai_classifier.AsyncOpenAI",
-        lambda **_kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
     )
     monkeypatch.setattr(
         "app.classify.openai_classifier.get_ai_client",
@@ -1354,7 +1345,6 @@ def test_openai_subtype_overrides_keyword_inference(monkeypatch):
             ))])
 
     monkeypatch.setattr("app.classify.openai_classifier.get_settings", lambda: SimpleNamespace(openai_api_key="sk-test", openai_model="gpt-4o-mini"))
-    monkeypatch.setattr("app.classify.openai_classifier.AsyncOpenAI", lambda **kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())))
     monkeypatch.setattr("app.classify.openai_classifier.get_ai_client", lambda _b: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())))
     result = asyncio.run(classify_email(
         subject="Interview confirmed for Friday",
@@ -1387,10 +1377,6 @@ def test_classify_email_uses_activated_prompt_immediately(monkeypatch):
     monkeypatch.setattr(
         "app.classify.openai_classifier.get_settings",
         lambda: SimpleNamespace(openai_api_key="sk-test", openai_model="gpt-4o-mini"),
-    )
-    monkeypatch.setattr(
-        "app.classify.openai_classifier.AsyncOpenAI",
-        lambda **kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
     )
     monkeypatch.setattr(
         "app.classify.openai_classifier.get_ai_client",

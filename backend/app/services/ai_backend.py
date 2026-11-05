@@ -82,7 +82,7 @@ class _PriorityGate:
 _ai_call_gate: _PriorityGate | None = None
 _ai_call_gates: dict[str, _PriorityGate] = {}
 
-_cached_backend: "AiBackend | None" = None
+_cached_backend: AiBackend | None = None
 _cached_client: AsyncOpenAI | None = None
 _has_saved_settings: bool | None = None
 

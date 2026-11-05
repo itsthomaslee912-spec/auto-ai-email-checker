@@ -7,8 +7,8 @@ import tempfile
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 
-from app.db import init_db
 from app.config import get_settings
+from app.db import init_db
 from app.services.service_health import service_heartbeat_loop
 
 WorkerLoop = Callable[[asyncio.Event], Awaitable[None]]

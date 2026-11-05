@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -42,7 +42,7 @@ def event_envelope(
         "event_id": event_id or str(uuid.uuid4()),
         "event_type": event_type,
         "schema_version": 1,
-        "occurred_at": datetime.now(timezone.utc).isoformat(),
+        "occurred_at": datetime.now(UTC).isoformat(),
         "producer": producer,
         "user_id": user_id,
         "aggregate_id": aggregate_id,

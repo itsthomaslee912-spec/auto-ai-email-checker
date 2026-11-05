@@ -1,21 +1,32 @@
 from __future__ import annotations
 
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
 from app.timeutil import UtcDateTime
 
 
-class Provider(str, Enum):
+class Provider(StrEnum):
     GOOGLE = "google"
     MICROSOFT = "microsoft"
 
 
-class EmailLabel(str, Enum):
+class EmailLabel(StrEnum):
     APPLICATION_CONFIRMATION = "application_confirmation"
     APPLICATION_ACTION_REQUIRED = "application_action_required"
     SCREENING = "screening"
@@ -30,7 +41,7 @@ class EmailLabel(str, Enum):
     OTHER = "other"
 
 
-class MailFolder(str, Enum):
+class MailFolder(StrEnum):
     INBOX = "inbox"
     SENT = "sent"
     SPAM = "spam"

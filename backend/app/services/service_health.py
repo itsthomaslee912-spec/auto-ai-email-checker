@@ -5,7 +5,7 @@ import logging
 import os
 import socket
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from app.db import SessionLocal
@@ -14,7 +14,7 @@ from app.models import ServiceHeartbeat
 logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL_SECONDS = 15
 INSTANCE_ID = f"{socket.gethostname()}:{os.getpid()}"
-STARTED_AT = datetime.now(timezone.utc)
+STARTED_AT = datetime.now(UTC)
 
 # Self-reported health for the components running inside this process. A worker
 # can keep writing heartbeats (liveness) while one of its consume loops has
@@ -68,7 +68,7 @@ def worker_health_status() -> str:
 
 
 def record_service_heartbeat(service_name: str) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     status = worker_health_status()
     with SessionLocal() as db:
         row = db.query(ServiceHeartbeat).filter(

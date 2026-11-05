@@ -195,8 +195,9 @@ def _ensure_search_index(conn) -> None:
 
 
 def init_db() -> None:
-    from app import models  # noqa: F401
     from sqlalchemy import inspect, text
+
+    from app import models  # noqa: F401
 
     # The API and every native worker start at roughly the same time and each
     # calls init_db(). Serialize PostgreSQL schema initialization so two

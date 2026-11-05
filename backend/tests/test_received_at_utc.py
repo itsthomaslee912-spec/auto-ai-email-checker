@@ -1,4 +1,4 @@
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
 from sqlalchemy import Column, Integer, create_engine, text
@@ -21,7 +21,7 @@ class Sample(Base):
 def test_as_utc_converts_offset():
     edt = parsedate_to_datetime("Mon, 21 Sep 2026 09:15:05 -0400")
     utc = as_utc(edt)
-    assert utc == datetime(2026, 9, 21, 13, 15, 5, tzinfo=timezone.utc)
+    assert utc == datetime(2026, 9, 21, 13, 15, 5, tzinfo=UTC)
 
 
 def test_sqlite_stores_utc_wall_clock_not_local():
@@ -36,7 +36,7 @@ def test_sqlite_stores_utc_wall_clock_not_local():
     assert raw.startswith("2026-09-21 13:15:05")
 
     back = db.query(Sample).one().received_at
-    assert back == datetime(2026, 9, 21, 13, 15, 5, tzinfo=timezone.utc)
+    assert back == datetime(2026, 9, 21, 13, 15, 5, tzinfo=UTC)
     db.close()
 
 
@@ -59,7 +59,7 @@ def test_gmail_falls_back_to_internal_date_utc():
         "labelIds": ["INBOX"],
     }
     norm = normalize_gmail_message(raw)
-    assert norm["received_at"] == datetime(2026, 9, 21, 13, 15, 5, tzinfo=timezone.utc)
+    assert norm["received_at"] == datetime(2026, 9, 21, 13, 15, 5, tzinfo=UTC)
 
 
 def test_gmail_prefers_received_header_over_stale_date():
@@ -68,7 +68,7 @@ def test_gmail_prefers_received_header_over_stale_date():
         "id": "msg-waymo",
         "threadId": "t1",
         "snippet": "jobs",
-        "internalDate": str(int(datetime(2026, 9, 21, 16, 34, 16, tzinfo=timezone.utc).timestamp() * 1000)),
+        "internalDate": str(int(datetime(2026, 9, 21, 16, 34, 16, tzinfo=UTC).timestamp() * 1000)),
         "payload": {
             "headers": [
                 {"name": "Subject", "value": "Here are some new roles at Waymo"},
@@ -87,4 +87,4 @@ def test_gmail_prefers_received_header_over_stale_date():
         "labelIds": ["INBOX"],
     }
     norm = normalize_gmail_message(raw)
-    assert norm["received_at"] == datetime(2026, 9, 21, 21, 21, 13, tzinfo=timezone.utc)
+    assert norm["received_at"] == datetime(2026, 9, 21, 21, 21, 13, tzinfo=UTC)

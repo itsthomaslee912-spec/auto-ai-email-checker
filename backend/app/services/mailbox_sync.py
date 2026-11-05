@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import getaddresses, parseaddr
 from typing import Any
 
@@ -15,6 +15,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.auth.oauth_google import ensure_google_access_token
 from app.auth.oauth_microsoft import ensure_microsoft_access_token
 from app.config import get_settings
+from app.email.folders import folder_from_outlook_well_known
 from app.email.gmail import (
     GmailHistoryExpired,
     gmail_get_message,
@@ -26,7 +27,6 @@ from app.email.gmail import (
     is_transient_quota_error,
     normalize_gmail_message,
 )
-from app.email.folders import folder_from_outlook_well_known
 from app.email.outlook import (
     OutlookDeltaExpired,
     normalize_outlook_message,
@@ -88,7 +88,7 @@ def _webhook_is_active(mailbox: MailboxConnection) -> bool:
         webhook
         and webhook.external_id
         and expires_at
-        and expires_at > datetime.now(timezone.utc)
+        and expires_at > datetime.now(UTC)
         and not invalid_client_state
     )
 
@@ -261,7 +261,7 @@ async def _run_sync_job_exclusive(
             _set_job(mailbox_id, state="error", message="Mailbox not found")
             await publish("sync.done", get_sync_status(mailbox_id))
             return
-        mailbox.last_sync_started_at = datetime.now(timezone.utc)
+        mailbox.last_sync_started_at = datetime.now(UTC)
         mailbox.last_sync_error = None
         db.commit()
         async with _cursor_lock(mailbox_id):
@@ -273,7 +273,7 @@ async def _run_sync_job_exclusive(
                     ),
                     timeout=SYNC_JOB_TIMEOUT_SECONDS,
                 )
-            except (asyncio.TimeoutError, TimeoutError) as exc:
+            except TimeoutError as exc:
                 raise RuntimeError(
                     f"Sync timed out after {SYNC_JOB_TIMEOUT_SECONDS}s and was stopped"
                 ) from exc
@@ -285,7 +285,7 @@ async def _run_sync_job_exclusive(
                 message=f"Sync stopped — imported {imported} new messages",
             )
         else:
-            mailbox.last_sync_completed_at = datetime.now(timezone.utc)
+            mailbox.last_sync_completed_at = datetime.now(UTC)
             mailbox.last_sync_error = None
             db.commit()
             job = _set_job(
@@ -802,7 +802,7 @@ def _record_notification_failure(db: Session, mailbox: MailboxConnection, exc: E
             mailbox.id,
         )
         return
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     mailbox.last_sync_error = message
     if mailbox.webhook is not None:
         mailbox.webhook.last_delivery_failure_at = now
@@ -818,7 +818,7 @@ def _record_notification_success(db: Session, mailbox: MailboxConnection) -> Non
     the nullable error fields dirty ensures that final success clears the newer
     database value instead of leaving a stale dashboard warning.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     mailbox.last_sync_completed_at = now
     mailbox.last_sync_error = None
     flag_modified(mailbox, "last_sync_error")

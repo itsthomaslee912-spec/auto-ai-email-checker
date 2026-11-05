@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
-from app.classify.openai_classifier import classify_email, infer_interview_subtype
 from app.classify.correction_retrieval import load_correction_corpus, retrieve_relevant_corrections
+from app.classify.openai_classifier import classify_email, infer_interview_subtype
 from app.classify.outcome_extract import apply_outcome
+from app.config import get_settings
 from app.email.folders import normalize_folder
 from app.models import EmailLabel, EmailMessage, MailboxConnection
 from app.realtime.sse import publish
@@ -16,7 +17,6 @@ from app.services.calendar_extract import (
     collapse_duplicate_calendar_events_post_commit,
     process_calendar_email,
 )
-from app.config import get_settings
 from app.services.event_bus import enqueue, event_envelope
 from app.timeutil import as_utc
 

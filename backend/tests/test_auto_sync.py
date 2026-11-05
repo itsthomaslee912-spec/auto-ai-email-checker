@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
@@ -46,8 +46,8 @@ def _verified_mailbox(session_factory, delivered_ago: timedelta) -> int:
         db.flush()
         db.add(WebhookSubscription(
             mailbox_id=mailbox.id, provider="google", external_id="history-1",
-            expires_at=datetime.now(timezone.utc) + timedelta(days=1),
-            last_delivery_success_at=datetime.now(timezone.utc) - delivered_ago,
+            expires_at=datetime.now(UTC) + timedelta(days=1),
+            last_delivery_success_at=datetime.now(UTC) - delivered_ago,
         ))
         db.commit()
         return mailbox.id
@@ -91,7 +91,7 @@ def test_recently_synced_healthy_webhook_skips_safety_reconciliation(monkeypatch
     mailbox_id = _verified_mailbox(session_factory, timedelta(minutes=5))
     with session_factory() as db:
         mailbox = db.get(MailboxConnection, mailbox_id)
-        mailbox.last_sync_completed_at = datetime.now(timezone.utc) - timedelta(minutes=2)
+        mailbox.last_sync_completed_at = datetime.now(UTC) - timedelta(minutes=2)
         db.commit()
 
     sync = _poll(monkeypatch, session_factory)
@@ -105,7 +105,7 @@ def test_stale_healthy_webhook_still_gets_safety_reconciliation(monkeypatch):
     mailbox_id = _verified_mailbox(session_factory, timedelta(minutes=5))
     with session_factory() as db:
         mailbox = db.get(MailboxConnection, mailbox_id)
-        mailbox.last_sync_completed_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+        mailbox.last_sync_completed_at = datetime.now(UTC) - timedelta(minutes=30)
         db.commit()
 
     sync = _poll(monkeypatch, session_factory)
@@ -231,10 +231,10 @@ def test_auto_sync_reconciles_live_and_expired_webhooks(monkeypatch):
                 mailbox_id=live.id,
                 provider="google",
                 external_id="history-1",
-                expires_at=datetime.now(timezone.utc) + timedelta(days=1),
-                last_delivery_success_at=datetime.now(timezone.utc),
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+                last_delivery_success_at=datetime.now(UTC),
             ),
-            WebhookSubscription(mailbox_id=expired.id, provider="google", external_id="history-2", expires_at=datetime.now(timezone.utc) - timedelta(minutes=1)),
+            WebhookSubscription(mailbox_id=expired.id, provider="google", external_id="history-2", expires_at=datetime.now(UTC) - timedelta(minutes=1)),
         ])
         live_id, expired_id = live.id, expired.id
         db.commit()
@@ -281,8 +281,8 @@ def test_auto_sync_reconciles_verified_webhook_after_process_restart(monkeypatch
             mailbox_id=mailbox.id,
             provider="google",
             external_id="history-persisted",
-            expires_at=datetime.now(timezone.utc) + timedelta(days=1),
-            last_delivery_success_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+            expires_at=datetime.now(UTC) + timedelta(days=1),
+            last_delivery_success_at=datetime.now(UTC) - timedelta(minutes=5),
         ))
         mailbox_id = mailbox.id
         db.commit()
@@ -336,7 +336,7 @@ def test_auto_sync_polls_registered_webhook_after_delivery_auth_failure(monkeypa
                 mailbox_id=mailbox.id,
                 provider="google",
                 external_id="history-1",
-                expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+                expires_at=datetime.now(UTC) + timedelta(days=1),
             )
         )
         mailbox_id = mailbox.id
@@ -394,11 +394,11 @@ def test_webhook_health_is_isolated_per_mailbox():
         )
         db.add_all([verified, unverified])
         db.flush()
-        expires = datetime.now(timezone.utc) + timedelta(days=1)
+        expires = datetime.now(UTC) + timedelta(days=1)
         db.add_all([
             WebhookSubscription(
                 mailbox_id=verified.id, provider="microsoft", external_id="sub-1",
-                expires_at=expires, last_delivery_success_at=datetime.now(timezone.utc),
+                expires_at=expires, last_delivery_success_at=datetime.now(UTC),
             ),
             WebhookSubscription(
                 mailbox_id=unverified.id, provider="microsoft", external_id="sub-2",
@@ -422,7 +422,7 @@ def test_auto_sync_status_distinguishes_no_account_stopped_and_failure(monkeypat
     session_factory = sessionmaker(bind=engine)
     monkeypatch.setattr(auto_sync, "get_settings", lambda: SimpleNamespace(auto_sync_interval_seconds=120))
     monkeypatch.setattr(auto_sync, "_loop_running", True)
-    monkeypatch.setattr(auto_sync, "_last_check_at", datetime.now(timezone.utc))
+    monkeypatch.setattr(auto_sync, "_last_check_at", datetime.now(UTC))
     monkeypatch.setattr(auto_sync, "_last_error", None)
 
     with session_factory() as db:
@@ -455,7 +455,7 @@ def test_distributed_auto_sync_status_reuses_request_session(monkeypatch):
     )
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     monkeypatch.setattr(
         auto_sync,
         "get_settings",
@@ -492,7 +492,7 @@ def test_distributed_auto_sync_status_reuses_request_session(monkeypatch):
 
 def test_fresh_worker_heartbeat_prevents_false_paused_status_during_long_sync(monkeypatch):
     engine, session_factory = _session_factory()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     monkeypatch.setattr(
         auto_sync,
         "get_settings",
@@ -539,7 +539,7 @@ def test_transient_network_error_does_not_raise_a_problem(monkeypatch):
     session_factory = sessionmaker(bind=engine)
     monkeypatch.setattr(auto_sync, "get_settings", lambda: SimpleNamespace(auto_sync_interval_seconds=120))
     monkeypatch.setattr(auto_sync, "_loop_running", True)
-    monkeypatch.setattr(auto_sync, "_last_check_at", datetime.now(timezone.utc))
+    monkeypatch.setattr(auto_sync, "_last_check_at", datetime.now(UTC))
     monkeypatch.setattr(auto_sync, "_last_error", None)
 
     dns_error = "[Errno 11001] getaddrinfo failed"
@@ -579,7 +579,7 @@ def test_successful_sync_supersedes_older_durable_job_error(monkeypatch):
     )
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     monkeypatch.setattr(auto_sync, "get_settings", lambda: SimpleNamespace(auto_sync_interval_seconds=120))
     monkeypatch.setattr(auto_sync, "_loop_running", True)
     monkeypatch.setattr(auto_sync, "_last_check_at", now)
@@ -631,7 +631,7 @@ def _mailbox_with_webhook(session_factory, *, success_ago: timedelta, failure_ag
         )
         db.add(mailbox)
         db.flush()
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         db.add(WebhookSubscription(
             mailbox_id=mailbox.id, provider="google", external_id="history-1",
             expires_at=now + timedelta(days=1),

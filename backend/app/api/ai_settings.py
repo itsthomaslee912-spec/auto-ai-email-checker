@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 import httpx
@@ -116,8 +116,8 @@ async def read_openai_costs(db: Session = Depends(get_db)) -> dict:
     row = db.get(AiSettings, 1)
     if row is None or not row.openai_admin_key_enc:
         raise HTTPException(400, "OpenAI organization admin key is not configured")
-    now = datetime.now(timezone.utc)
-    start = int(datetime(now.year, now.month, 1, tzinfo=timezone.utc).timestamp())
+    now = datetime.now(UTC)
+    start = int(datetime(now.year, now.month, 1, tzinfo=UTC).timestamp())
     try:
         key = decrypt_token(row.openai_admin_key_enc)
         async with httpx.AsyncClient(timeout=15) as client:
@@ -141,7 +141,7 @@ async def read_openai_costs(db: Session = Depends(get_db)) -> dict:
     return {
         "month_spend_usd": round(spent, 6),
         "currency": "usd",
-        "period_start": datetime.fromtimestamp(start, timezone.utc).isoformat(),
+        "period_start": datetime.fromtimestamp(start, UTC).isoformat(),
         "as_of": now.isoformat(),
         "credit_balance_available": False,
     }

@@ -11,7 +11,7 @@ import hmac
 import secrets
 import time
 from contextvars import ContextVar
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException, Request
 from sqlalchemy import and_
@@ -39,10 +39,7 @@ def normalize_email(value: str) -> str:
 def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
     digest = hashlib.scrypt(password.encode(), salt=salt, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P)
-    return "scrypt${}${}${}${}${}".format(
-        _SCRYPT_N, _SCRYPT_R, _SCRYPT_P,
-        base64.b64encode(salt).decode(), base64.b64encode(digest).decode(),
-    )
+    return f"scrypt${_SCRYPT_N}${_SCRYPT_R}${_SCRYPT_P}${base64.b64encode(salt).decode()}${base64.b64encode(digest).decode()}"
 
 
 def verify_password(password: str, stored: str | None) -> bool:
@@ -66,9 +63,9 @@ def token_hash(token: str) -> str:
 
 def create_session(db: Session, user: User) -> tuple[str, datetime]:
     token = secrets.token_urlsafe(32)
-    expires_at = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
+    expires_at = datetime.now(UTC) + timedelta(days=SESSION_DAYS)
     db.add(UserSession(user_id=user.id, token_hash=token_hash(token), expires_at=expires_at))
-    db.query(UserSession).filter(UserSession.expires_at < datetime.now(timezone.utc)).delete(
+    db.query(UserSession).filter(UserSession.expires_at < datetime.now(UTC)).delete(
         synchronize_session=False
     )
     db.commit()

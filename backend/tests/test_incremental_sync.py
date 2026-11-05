@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -14,7 +14,14 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import Base
 from app.email import gmail
-from app.models import EmailLabel, EmailMessage, MailboxConnection, Provider, User, WebhookSubscription
+from app.models import (
+    EmailLabel,
+    EmailMessage,
+    MailboxConnection,
+    Provider,
+    User,
+    WebhookSubscription,
+)
 from app.realtime import gmail_watch
 from app.services import mailbox_sync
 
@@ -42,7 +49,7 @@ def test_outlook_client_state_failure_forces_subscription_replacement():
         mailbox_id=mailbox.id,
         provider=Provider.MICROSOFT.value,
         external_id='["existing-subscription"]',
-        expires_at=datetime.now(timezone.utc) + timedelta(days=3),
+        expires_at=datetime.now(UTC) + timedelta(days=3),
         last_delivery_error="Invalid Outlook clientState",
     ))
     db.commit()
@@ -211,8 +218,8 @@ def test_gmail_quota_failure_keeps_the_webhook(monkeypatch):
     mailbox.sync_cursor = "100"
     db.add(WebhookSubscription(
         mailbox_id=mailbox.id, provider="google", external_id="watch",
-        expires_at=datetime.now(timezone.utc) + timedelta(days=3),
-        last_delivery_success_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+        expires_at=datetime.now(UTC) + timedelta(days=3),
+        last_delivery_success_at=datetime.now(UTC) - timedelta(minutes=10),
     ))
     db.commit()
     monkeypatch.setattr(mailbox_sync, "ensure_google_access_token", AsyncMock(return_value="token"))
@@ -274,8 +281,8 @@ def test_gmail_webhook_failure_marks_mailbox_webhook_unhealthy(monkeypatch):
     mailbox.sync_cursor = "100"
     db.add(WebhookSubscription(
         mailbox_id=mailbox.id, provider="google", external_id="watch",
-        expires_at=datetime.now(timezone.utc) + timedelta(days=3),
-        last_delivery_success_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        expires_at=datetime.now(UTC) + timedelta(days=3),
+        last_delivery_success_at=datetime.now(UTC) - timedelta(hours=1),
     ))
     db.commit()
     db.refresh(mailbox)
@@ -337,7 +344,7 @@ def test_reconnect_clears_sign_in_errors_but_keeps_other_failures():
     mailbox.last_sync_error = expired
     db.add(WebhookSubscription(
         mailbox_id=mailbox.id, provider="google", external_id="watch",
-        last_delivery_failure_at=datetime.now(timezone.utc), last_delivery_error=expired,
+        last_delivery_failure_at=datetime.now(UTC), last_delivery_error=expired,
     ))
     db.commit()
     db.refresh(mailbox)
@@ -481,7 +488,7 @@ def test_outlook_delta_tracks_each_folder_and_keeps_cursor_on_failure(monkeypatc
 def test_outlook_delta_baselines_missing_folder_without_refetching_old_history(monkeypatch):
     engine, db, mailbox = _mailbox(Provider.MICROSOFT)
     mailbox.full_sync_completed = True
-    mailbox.last_sync_completed_at = datetime(2026, 10, 26, 18, 0, tzinfo=timezone.utc)
+    mailbox.last_sync_completed_at = datetime(2026, 10, 26, 18, 0, tzinfo=UTC)
     mailbox.sync_cursor = json.dumps({
         "inbox": "https://graph.microsoft.com/v1.0/inbox/done",
     })

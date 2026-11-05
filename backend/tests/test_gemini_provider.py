@@ -14,7 +14,7 @@ from app.api import ai_settings
 from app.classify.openai_classifier import classify_email
 from app.db import Base, get_db
 from app.models import AiSettings
-from app.services.ai_backend import AiBackend, GEMINI_OPENAI_BASE_URL
+from app.services.ai_backend import GEMINI_OPENAI_BASE_URL, AiBackend
 
 
 def test_gemini_backend_uses_google_openai_compatible_endpoint():
@@ -52,10 +52,6 @@ def test_selected_gemini_backend_is_used_for_classification(monkeypatch):
     monkeypatch.setattr("app.classify.openai_classifier.get_ai_backend", lambda: backend)
     monkeypatch.setattr("app.classify.openai_classifier.get_normalized_active_prompt", lambda: "Classify this email.")
     monkeypatch.setattr("app.classify.openai_classifier.get_ai_client", lambda _b: fake_client)
-    monkeypatch.setattr(
-        "app.classify.openai_classifier.AsyncOpenAI",
-        lambda **kwargs: (_ for _ in ()).throw(AssertionError("OpenAI client should not be used")),
-    )
 
     result = asyncio.run(classify_email(
         subject="Hello",
@@ -106,10 +102,6 @@ def test_selected_ollama_backend_never_calls_openai_and_closes_client(monkeypatc
     monkeypatch.setattr(
         "app.classify.openai_classifier.get_settings",
         lambda: SimpleNamespace(email_classification_mode="ai_only"),
-    )
-    monkeypatch.setattr(
-        "app.classify.openai_classifier.AsyncOpenAI",
-        lambda **kwargs: (_ for _ in ()).throw(AssertionError("OpenAI client should not be used")),
     )
 
     result = asyncio.run(classify_email(

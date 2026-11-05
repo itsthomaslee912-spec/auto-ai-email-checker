@@ -1,23 +1,22 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from app.db import SessionLocal
 from app.config import get_settings
+from app.db import SessionLocal
 from app.models import MailboxJobState
 from app.services.service_health import INSTANCE_ID
-
 
 ACTIVE_STATES = {"queued", "starting", "running"}
 
 
 def _lease_deadline(now: datetime | None = None) -> datetime:
-    return (now or datetime.now(timezone.utc)) + timedelta(
+    return (now or datetime.now(UTC)) + timedelta(
         seconds=max(30, get_settings().mailbox_job_lease_seconds)
     )
 
@@ -93,7 +92,7 @@ def get_statuses(db: Session, mailbox_ids: list[int], job_type: str) -> list[dic
 def enqueue(
     db: Session, mailbox_id: int, job_type: str, *, options: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     _recover_expired(db, job_type, now)
     row = db.query(MailboxJobState).filter(
         MailboxJobState.mailbox_id == mailbox_id,
@@ -140,7 +139,7 @@ def persist(mailbox_id: int, job_type: str, status: dict[str, Any]) -> None:
                 {"pending_only": bool(status["pending_only"])},
                 separators=(",", ":"),
             )
-        row.updated_at = datetime.now(timezone.utc)
+        row.updated_at = datetime.now(UTC)
         if row.state in {"starting", "running"}:
             row.claimed_by = INSTANCE_ID
             row.lease_expires_at = _lease_deadline(row.updated_at)
@@ -178,7 +177,7 @@ def stop_is_requested(mailbox_id: int, job_type: str) -> bool:
 
 def claim(job_type: str, *, limit: int = 10) -> list[tuple[int, dict[str, Any]]]:
     with SessionLocal() as db:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         _recover_expired(db, job_type, now)
         stmt = (
             select(MailboxJobState)

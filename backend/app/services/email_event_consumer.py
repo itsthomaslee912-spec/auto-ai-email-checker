@@ -128,7 +128,7 @@ async def _next_message(messages, channel, queue_name: str, stop_event: asyncio.
                 try:
                     return delivery.result()
                 except StopAsyncIteration:
-                    raise _ConsumerStalled("Queue iterator closed; consumer detached")
+                    raise _ConsumerStalled("Queue iterator closed; consumer detached") from None
 
             waiting = await _queue_depth(channel, queue_name)
             if waiting > 0:

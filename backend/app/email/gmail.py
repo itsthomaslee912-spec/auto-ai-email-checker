@@ -5,7 +5,7 @@ import base64
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 import httpx
@@ -168,7 +168,7 @@ def _calendar_attachment_parts(payload: dict) -> list[dict]:
     while stack:
         part = stack.pop()
         body = part.get("body") or {}
-        filename = (part.get("filename") or "").lower()
+        (part.get("filename") or "").lower()
         if _is_calendar_part(part) and body.get("attachmentId") and not body.get("data"):
             matches.append(part)
         stack.extend(part.get("parts") or [])
@@ -211,8 +211,8 @@ def _header(headers: list[dict], name: str) -> str:
 
 def _as_aware_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _parse_received_header_date(value: str) -> datetime | None:
@@ -254,7 +254,7 @@ def _gmail_received_at(raw: dict, headers: list[dict]) -> datetime | None:
         return received_at
     if raw.get("internalDate"):
         try:
-            return datetime.fromtimestamp(int(raw["internalDate"]) / 1000, tz=timezone.utc)
+            return datetime.fromtimestamp(int(raw["internalDate"]) / 1000, tz=UTC)
         except Exception:
             pass
     date_raw = _header(headers, "Date")
@@ -529,7 +529,7 @@ async def gmail_list_folder_id_map(
             )
         )
     mapping: dict[str, str] = {}
-    for (folder, _query), (ids, _estimate) in zip(GMAIL_FOLDER_QUERIES, results):
+    for (folder, _query), (ids, _estimate) in zip(GMAIL_FOLDER_QUERIES, results, strict=False):
         for mid in ids:
             mapping[mid] = folder
     return mapping
@@ -649,10 +649,10 @@ async def gmail_send_message(
     references: str | None = None,
     thread_id: str | None = None,
 ) -> dict:
-    from email.mime.text import MIMEText
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.base import MIMEBase
     from email import encoders
+    from email.mime.base import MIMEBase
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
     from email.utils import formataddr, formatdate
 
     message = MIMEMultipart() if attachments else MIMEText(body_text, "plain", "utf-8")

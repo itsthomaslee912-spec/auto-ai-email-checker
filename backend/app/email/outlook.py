@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from html.parser import HTMLParser
 
 import httpx
@@ -390,8 +390,8 @@ def normalize_outlook_message(raw: dict) -> dict:
         try:
             parsed = datetime.fromisoformat(str(received_raw).replace("Z", "+00:00"))
             if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            received_at = parsed.astimezone(timezone.utc)
+                parsed = parsed.replace(tzinfo=UTC)
+            received_at = parsed.astimezone(UTC)
         except Exception:
             received_at = None
 

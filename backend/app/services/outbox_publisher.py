@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import and_, or_, select
 
@@ -35,7 +35,7 @@ class ClaimedEvent:
 
 def _claim_batch() -> list[ClaimedEvent]:
     settings = get_settings()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     stale_claim = now - timedelta(minutes=5)
     with SessionLocal() as db:
         # A broker can route a message to a fast consumer and still return a
@@ -91,7 +91,7 @@ def _claim_batch() -> list[ClaimedEvent]:
 
 def _finish_batch(events: list[ClaimedEvent], failures: dict[int, str]) -> int:
     published = 0
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with SessionLocal() as db:
         for event in events:
             row = db.get(OutboxEvent, event.id)

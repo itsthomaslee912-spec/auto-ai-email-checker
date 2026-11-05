@@ -11,7 +11,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, aliased, load_only
@@ -30,6 +30,7 @@ _CLOSING_LABELS = {"interview_scheduled", "rejected_closed", "offer", "interview
 _IGNORED_FOLDERS = ["trash", "spam", "sent"]
 _STAGE_WORDS_RE = re.compile(r"\b(screen|screening|interview|discussion|call|chat|intro|introduction|meeting|round)\b", re.IGNORECASE)
 _UNBOOKED_SUBTYPES = {"reschedule", "time_change"}
+_BOOKING_SOFT_STOPWORDS = {"the", "and", "inc", "ltd", "llc", "corp", "group", "for"}
 
 # Pending / resolved logic only needs metadata. Loading body_html/body_text for
 # thousands of rows dominates calendar open latency.
@@ -126,6 +127,7 @@ class _BookingRef:
     job_role: str
     source_received_at: datetime | None
     created_at: datetime | None
+    start_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -206,12 +208,17 @@ def _booked_by_event(
         # and remain subject to the ordering guard below.
         if event.source_email_id == request.id:
             return True
-        booked_at = as_utc(event.source_received_at) or as_utc(event.created_at)
+        email_booked_at = as_utc(event.source_received_at)
+        booked_at = email_booked_at or as_utc(event.created_at)
         # Recruiter threads are often reused for later interview rounds. A
         # broad historical association can link the new request/availability
         # to the old calendar row, but an older booking cannot resolve a newer
         # request in that thread.
-        if received is not None and booked_at is not None and booked_at < received:
+        # Use only the actual email receipt timestamp for this guard —
+        # created_at is DB insertion time and can precede a just-received
+        # invitation when the event came from calendar sync rather than email
+        # extraction, which would incorrectly skip valid bookings.
+        if email_booked_at is not None and received is not None and email_booked_at < received:
             continue
         if request.id in linked_email_ids.get(event.id, set()):
             return True
@@ -222,9 +229,41 @@ def _booked_by_event(
         if request.thread_id and event.source_thread_id == request.thread_id:
             return True
         if not request_company:
-            continue
-        if booked_at is None or received is None or booked_at <= received:
-            continue
+            # Soft match: when LLM extraction found no company on the
+            # invitation, check if the booking's company name appears as a
+            # token in the invitation subject (last-resort heuristic for
+            # invitations that arrived without extractable metadata).
+            if not event.company:
+                continue
+            company_tokens = {
+                w.casefold()
+                for w in re.split(r"[\s/]+", event.company)
+                if len(w) >= 3 and w.casefold() not in _BOOKING_SOFT_STOPWORDS
+            }
+            subj = (request.subject or "").casefold()
+            if not company_tokens or not any(tok in subj for tok in company_tokens):
+                continue
+            # Company token found — still require correct timing.
+            if email_booked_at is not None:
+                if received is None or email_booked_at <= received:
+                    continue
+            else:
+                start = as_utc(event.start_at) if event.start_at else None
+                if start is None or received is None or start <= received:
+                    continue
+            return True
+        # For email-sourced events: booking email must arrive after invitation.
+        # For calendar-sync'd events (no email timestamp): use start_at as a
+        # proxy — the interview must be scheduled after the invitation was
+        # received. This avoids confusing a past round's calendar event with
+        # the current open invitation at the same company.
+        if email_booked_at is not None:
+            if received is None or email_booked_at <= received:
+                continue
+        else:
+            start = as_utc(event.start_at) if event.start_at else None
+            if start is None or received is None or start <= received:
+                continue
         if companies_match(event.company, request_company) and _same_role(event.job_role, request_role):
             return True
     return False
@@ -257,6 +296,7 @@ def _confirmed_bookings(db: Session, mailbox_ids: list[int]) -> tuple[list[_Book
                 job_role=row.job_role or "",
                 source_received_at=row.source_received_at,
                 created_at=row.created_at,
+                start_at=row.start_at,
             )
             for row in db.query(
                 CalendarEvent.id,
@@ -267,6 +307,7 @@ def _confirmed_bookings(db: Session, mailbox_ids: list[int]) -> tuple[list[_Book
                 CalendarEvent.job_role,
                 CalendarEvent.source_received_at,
                 CalendarEvent.created_at,
+                CalendarEvent.start_at,
             ).filter(
                 CalendarEvent.mailbox_id.in_(mailbox_ids),
                 CalendarEvent.kind == "confirmed",
@@ -298,8 +339,8 @@ def _emails_by_id(db: Session, ids: set[int], *, with_body: bool = False) -> dic
 
 def _follower_messages(db: Session, mailbox_ids: list[int], after: datetime) -> list[_MailRef]:
     """Interview mail newer than `after`. One read serves both calendar requests."""
-    after = as_utc(after) or datetime.now(timezone.utc)
-    coverage = min(after, datetime.now(timezone.utc) - PENDING_WINDOW).replace(minute=0, second=0, microsecond=0)
+    after = as_utc(after) or datetime.now(UTC)
+    coverage = min(after, datetime.now(UTC) - PENDING_WINDOW).replace(minute=0, second=0, microsecond=0)
     key = (id(db.get_bind()), tuple(mailbox_ids), coverage)
 
     def load() -> list[_MailRef]:
@@ -579,7 +620,7 @@ def pending_interview_requests(
     # point-in-time calculation. Production requests omit it and can share.
     if now is not None:
         return _pending_interview_requests_uncached(db, mailbox_ids, now)
-    effective_now = datetime.now(timezone.utc)
+    effective_now = datetime.now(UTC)
     key = (id(db.get_bind()), tuple(sorted(mailbox_ids)))
     return _cached(
         _pending_cache,

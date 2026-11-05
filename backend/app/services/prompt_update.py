@@ -4,15 +4,20 @@ import json
 import logging
 import re
 
-from openai import AsyncOpenAI
 from sqlalchemy.orm import Session
 
 from app.classify.prompt import SYSTEM_PROMPT, with_interview_subtype_rules
 from app.classify.prompt_store import activate_prompt_text
+from app.config import get_settings
 from app.models import ClassifyCorrection, ClassifyPromptVersion, EmailLabel
 from app.schemas import ClassifyPromptStatusOut, ClassifyPromptUpdateOut
-from app.config import get_settings
-from app.services.ai_backend import AiBackend, close_ai_client, get_ai_backend, get_ai_client, has_saved_ai_settings
+from app.services.ai_backend import (
+    AiBackend,
+    close_ai_client,
+    get_ai_backend,
+    get_ai_client,
+    has_saved_ai_settings,
+)
 
 logger = logging.getLogger(__name__)
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 
 from sqlalchemy.exc import IntegrityError
@@ -45,7 +45,7 @@ def enqueue_webhook_delivery(
         dedupe_key=dedupe_key,
         payload=encoded_payload,
         status="pending",
-        available_at=datetime.now(timezone.utc),
+        available_at=datetime.now(UTC),
     )
     with SessionLocal() as db:
         db.add(job)
@@ -64,7 +64,7 @@ def enqueue_webhook_delivery(
                 existing.last_error = None
                 if existing.status != "processing":
                     existing.status = "pending"
-                    existing.available_at = datetime.now(timezone.utc)
+                    existing.available_at = datetime.now(UTC)
                 db.commit()
             return False
     _wake_event.set()
@@ -79,14 +79,14 @@ def _recover_interrupted_jobs() -> None:
         for job in jobs:
             job.status = "pending"
             job.claimed_at = None
-            job.available_at = datetime.now(timezone.utc)
+            job.available_at = datetime.now(UTC)
         if jobs:
             db.commit()
             logger.warning("Recovered %s interrupted webhook job(s)", len(jobs))
 
 
 def _claim_next_job() -> tuple[int, str, dict, int, str] | None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with SessionLocal() as db:
         job = (
             db.query(WebhookDeliveryJob)
@@ -133,7 +133,7 @@ def _complete_job(job_id: int, claimed_payload: str) -> None:
             else:
                 job.status = "pending"
                 job.claimed_at = None
-                job.available_at = datetime.now(timezone.utc)
+                job.available_at = datetime.now(UTC)
             db.commit()
 
 
@@ -156,7 +156,7 @@ def _retry_job(job_id: int, attempts: int, exc: Exception) -> None:
             )
         else:
             job.status = "pending"
-            job.available_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+            job.available_at = datetime.now(UTC) + timedelta(seconds=delay)
         db.commit()
 
 

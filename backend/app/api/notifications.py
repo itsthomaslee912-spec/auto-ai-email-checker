@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import update
@@ -62,7 +62,7 @@ def mark_notification_read(
         raise HTTPException(status_code=404, detail="Notification not found")
     if not row.is_read:
         row.is_read = True
-        row.read_at = datetime.now(timezone.utc)
+        row.read_at = datetime.now(UTC)
         db.commit()
         db.refresh(row)
     return _notification_out(row)
@@ -73,7 +73,7 @@ def mark_all_notifications_read(
     user_id: int = Depends(require_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     result = db.execute(
         update(Notification)
         .where(Notification.user_id == user_id, Notification.is_read.is_(False))

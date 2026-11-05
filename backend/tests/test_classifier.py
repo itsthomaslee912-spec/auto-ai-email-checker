@@ -1,6 +1,14 @@
 import pytest
 
-from app.classify.openai_classifier import apply_label_guards, _heuristic_label, _is_scheduled_interview, _is_true_rejection, _parse_strict_ai_result, deterministic_ai_only_classification, message_direction
+from app.classify.openai_classifier import (
+    _heuristic_label,
+    _is_scheduled_interview,
+    _is_true_rejection,
+    _parse_strict_ai_result,
+    apply_label_guards,
+    deterministic_ai_only_classification,
+    message_direction,
+)
 from app.classify.prompt import SYSTEM_PROMPT, with_interview_subtype_rules
 from app.models import EmailLabel
 

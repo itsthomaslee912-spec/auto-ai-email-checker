@@ -6,14 +6,19 @@ import time
 from types import SimpleNamespace
 from typing import Any
 
+from app.classify.correction_retrieval import load_correction_corpus, retrieve_relevant_corrections
 from app.classify.openai_classifier import (
     classify_email,
     deterministic_ai_only_classification,
     infer_interview_subtype,
     message_direction,
 )
-from app.classify.correction_retrieval import load_correction_corpus, retrieve_relevant_corrections
-from app.classify.outcome_extract import BACKFILL_LABELS, OUTCOME_LABELS, extract_company_role, resolve_company_role
+from app.classify.outcome_extract import (
+    BACKFILL_LABELS,
+    OUTCOME_LABELS,
+    extract_company_role,
+    resolve_company_role,
+)
 from app.config import get_settings
 from app.models import CalendarEvent, EmailLabel, EmailMessage, MailboxConnection
 from app.realtime.sse import publish
@@ -21,9 +26,7 @@ from app.schemas import EmailOut
 from app.services.ai_backend import ai_call_concurrency, get_ai_backend
 from app.services.calendar_extract import (
     CALENDAR_LABELS,
-    clean_company_name,
     collapse_duplicate_calendar_events_post_commit,
-    employer_instead_of_sender_domain,
     message_appointment_slots,
     message_cancels_appointment,
     process_calendar_email,
@@ -612,7 +615,7 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                 return
             chunk, remaining = remaining[:batch_size], remaining[batch_size:]
             outcomes = await asyncio.gather(*(classify_row(row) for row in chunk))
-            for row, outcome in zip(chunk, outcomes):
+            for row, outcome in zip(chunk, outcomes, strict=False):
                 processed += 1
                 if outcome is None:
                     failed += 1

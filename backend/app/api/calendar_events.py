@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, contains_eager, defer
 
 from app.auth.session import mailbox_scope
 from app.db import get_db
-from app.models import CalendarEvent, CalendarEventEmail, EmailLabel, EmailMessage, MailboxConnection
+from app.models import (
+    CalendarEvent,
+    CalendarEventEmail,
+    EmailLabel,
+    EmailMessage,
+    MailboxConnection,
+)
 from app.realtime.sse import publish
 from app.schemas import (
     CalendarEventCreateIn,
@@ -20,7 +26,6 @@ from app.schemas import (
     PendingInterviewOut,
     PendingInterviewSlotOut,
 )
-from app.services.pending_interviews import pending_interview_requests, resolved_availability_ids
 from app.services.calendar_extract import (
     appointment_email_ids,
     clean_meeting_provider,
@@ -28,6 +33,7 @@ from app.services.calendar_extract import (
     job_role_or_empty,
     roles_compatible,
 )
+from app.services.pending_interviews import pending_interview_requests, resolved_availability_ids
 from app.timeutil import as_utc
 
 router = APIRouter(prefix="/api/calendar-events", tags=["calendar"])
@@ -185,7 +191,7 @@ async def _set_pending_dismissed(db: Session, email_id: int, dismissed: bool) ->
     )
     if email is None:
         raise HTTPException(status_code=404, detail="Email not found")
-    email.pending_dismissed_at = datetime.now(timezone.utc) if dismissed else None
+    email.pending_dismissed_at = datetime.now(UTC) if dismissed else None
     db.commit()
     await publish("calendar.changed", {"action": "pending_dismissed" if dismissed else "pending_restored", "email_id": email_id, "mailbox_id": email.mailbox_id})
 
@@ -223,8 +229,15 @@ def get_interview_timeline(event_id: int, db: Session = Depends(get_db)) -> list
             CalendarEvent.mailbox_id == event.mailbox_id,
             CalendarEvent.kind == "confirmed",
             CalendarEvent.origin == "email",
-            CalendarEvent.is_visible.is_(True),
             CalendarEvent.superseded_by_event_id.is_(None),
+            # Visible chips plus completed prior rounds that a later reschedule
+            # wrongly hid (MSCI Oct 27 passed while Nov 10 is still open).
+            or_(
+                CalendarEvent.is_visible.is_(True),
+                CalendarEvent.application_status.in_(
+                    ("passed", "rejected", "position_closed", "offer")
+                ),
+            ),
         )
         .order_by(CalendarEvent.start_at.asc(), CalendarEvent.id.asc())
         .all()

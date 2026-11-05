@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 from sqlalchemy import create_engine
@@ -46,7 +46,7 @@ def test_reply_ui_classifies_and_projects_outgoing_time_acceptance():
             subject="RE: AutoZone",
             sender="shipra.khandelwal@autozone.com",
             recipients=mailbox.email_address,
-            received_at=datetime(2026, 11, 4, 23, 10, tzinfo=timezone.utc),
+            received_at=datetime(2026, 11, 4, 23, 10, tzinfo=UTC),
             body_text=(
                 "The interview will need to be scheduled for 7:00 AM CST "
                 "on November 10 instead of 8:00 AM. Would that still work for you?"
@@ -83,5 +83,5 @@ def test_reply_ui_classifies_and_projects_outgoing_time_acceptance():
         assert event.kind == "confirmed"
         assert event.company == "AutoZone"
         assert event.job_role == "Systems Engineer"
-        assert event.start_at == datetime(2026, 11, 10, 13, 0, tzinfo=timezone.utc)
+        assert event.start_at == datetime(2026, 11, 10, 13, 0, tzinfo=UTC)
 

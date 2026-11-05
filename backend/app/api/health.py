@@ -3,8 +3,8 @@ from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from app.auth.session import require_user
-from app.db import SessionLocal, get_db
 from app.config import get_settings
+from app.db import SessionLocal, get_db
 from app.models import OutboxEvent
 from app.schemas import HealthOut
 from app.services.auto_sync import get_auto_sync_status, run_auto_sync_check

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -53,7 +53,7 @@ def test_backfill_loop_processes_batch_then_idles_without_ai(monkeypatch):
                 provider_message_id=f"msg-{i}",
                 subject=f"Interview {i}",
                 sender="recruiter@example.com",
-                body_text=_ics_body(datetime(2026, 10, 20, 15, 0, tzinfo=timezone.utc)),
+                body_text=_ics_body(datetime(2026, 10, 20, 15, 0, tzinfo=UTC)),
                 label=EmailLabel.INTERVIEW_SCHEDULED.value,
             ))
         db.commit()
@@ -161,7 +161,7 @@ def test_backfill_loop_skips_real_landing_page_http_calls(monkeypatch):
             subject="Interview scheduling",
             sender="recruiter@example.com",
             body_text=(
-                _ics_body(datetime(2026, 10, 20, 15, 0, tzinfo=timezone.utc))
+                _ics_body(datetime(2026, 10, 20, 15, 0, tzinfo=UTC))
                 + "\nhttps://olivia.paradox.ai/abcdef123456"
             ),
             label=EmailLabel.INTERVIEW_SCHEDULED.value,
@@ -237,7 +237,7 @@ def test_backfill_failure_is_recorded_without_starving_later_mail(monkeypatch):
                 subject="Interview broken",
                 sender="recruiter@example.com",
                 label=EmailLabel.INTERVIEW_SCHEDULED.value,
-                received_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
+                received_at=datetime(2026, 10, 1, tzinfo=UTC),
             ),
             EmailMessage(
                 mailbox_id=mailbox_id,
@@ -245,7 +245,7 @@ def test_backfill_failure_is_recorded_without_starving_later_mail(monkeypatch):
                 subject="Interview later",
                 sender="recruiter@example.com",
                 label=EmailLabel.INTERVIEW_SCHEDULED.value,
-                received_at=datetime(2026, 10, 2, tzinfo=timezone.utc),
+                received_at=datetime(2026, 10, 2, tzinfo=UTC),
             ),
         ])
         db.commit()
@@ -257,7 +257,7 @@ def test_backfill_failure_is_recorded_without_starving_later_mail(monkeypatch):
         if email.provider_message_id == "broken":
             raise ValueError("malformed calendar payload")
         email.calendar_processed_hash = calendar_backfill.email_calendar_hash(email)
-        email.calendar_processed_at = datetime.now(timezone.utc)
+        email.calendar_processed_at = datetime.now(UTC)
         return False
 
     monkeypatch.setattr(calendar_backfill, "process_calendar_email", process)

@@ -1,30 +1,30 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import base64
+import logging
 import re
 import threading
 import time
+from datetime import UTC, datetime
 from email.utils import getaddresses
-from datetime import datetime, timezone
 from typing import Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from anyio import from_thread
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy import String, and_, case, cast, func, literal_column, or_
 from sqlalchemy.orm import Session, defer, load_only, sessionmaker
 
 from app.auth.oauth_google import ensure_google_access_token
+from app.auth.oauth_microsoft import ensure_microsoft_access_token
 from app.auth.session import current_user_id, mailbox_scope
-from app.classify.outcome_extract import OUTCOME_LABELS, apply_outcome
 from app.classify.openai_classifier import (
     deterministic_ai_only_classification,
     infer_interview_subtype,
 )
-from app.services.ai_backend import close_ai_client, get_ai_backend, get_ai_client
-from app.auth.oauth_microsoft import ensure_microsoft_access_token
+from app.classify.outcome_extract import OUTCOME_LABELS, apply_outcome
 from app.db import SessionLocal, get_db
+from app.email.folders import VALID_FOLDERS
 from app.email.gmail import (
     gmail_get_message,
     gmail_mark_read,
@@ -41,7 +41,6 @@ from app.email.outlook import (
     outlook_reply_message,
     outlook_send_message,
 )
-from app.email.folders import VALID_FOLDERS
 from app.models import (
     CalendarEvent,
     CalendarEventEmail,
@@ -54,11 +53,6 @@ from app.models import (
     email_search_document_sql,
 )
 from app.realtime.sse import publish
-from app.services.calendar_extract import (
-    CALENDAR_LABELS,
-    collapse_duplicate_calendar_events_post_commit,
-    process_calendar_email,
-)
 from app.schemas import (
     AiReplyIn,
     AiReplyOut,
@@ -70,6 +64,12 @@ from app.schemas import (
     MarkAllReadOut,
     SendEmailIn,
     SendEmailOut,
+)
+from app.services.ai_backend import close_ai_client, get_ai_backend, get_ai_client
+from app.services.calendar_extract import (
+    CALENDAR_LABELS,
+    collapse_duplicate_calendar_events_post_commit,
+    process_calendar_email,
 )
 
 logger = logging.getLogger(__name__)
@@ -170,7 +170,7 @@ def _email_from_active_mailbox(
 
 def _normalize_cursor_at(value: datetime) -> datetime:
     if value.tzinfo is not None:
-        return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value.astimezone(UTC).replace(tzinfo=None)
     return value.replace(tzinfo=None)
 
 
@@ -283,8 +283,8 @@ def _list_meta(
                 )
                 .all()
             )
-        label_counts = {item: 0 for item in valid}
-        folder_counts = {item: 0 for item in VALID_FOLDERS}
+        label_counts = dict.fromkeys(valid, 0)
+        folder_counts = dict.fromkeys(VALID_FOLDERS, 0)
         mailbox_counts: dict[str, int] = {}
         mailbox_unread_counts: dict[str, int] = {}
         breakdown: dict[tuple[int, str, str, bool], int] = {}
@@ -506,8 +506,8 @@ def list_emails(
     mailbox_counts = meta["mailbox_counts"]
     mailbox_unread_counts = meta["mailbox_unread_counts"]
     if mailbox_id is not None:
-        label_counts = {item: 0 for item in valid}
-        folder_counts = {item: 0 for item in VALID_FOLDERS}
+        label_counts = dict.fromkeys(valid, 0)
+        folder_counts = dict.fromkeys(VALID_FOLDERS, 0)
         for mid, lab, fold, _unread, amount in meta["count_breakdown"]:
             if mid != mailbox_id:
                 continue
@@ -1096,14 +1096,14 @@ async def send_email(payload: SendEmailIn, db: Session = Depends(get_db)) -> Sen
         direction="outgoing",
     )
     sent = EmailMessage(
-        mailbox_id=mailbox.id, provider_message_id=provider_message_id or f"local-sent-{datetime.now(timezone.utc).timestamp()}",
+        mailbox_id=mailbox.id, provider_message_id=provider_message_id or f"local-sent-{datetime.now(UTC).timestamp()}",
         subject=payload.subject.strip() or "(no subject)",
         sender=(
             f"{mailbox.display_name} <{mailbox.email_address}>"
             if mailbox.display_name else mailbox.email_address
         ),
         recipients=to_address,
-        received_at=datetime.now(timezone.utc), snippet=payload.body_text[:500], body_text=payload.body_text,
+        received_at=datetime.now(UTC), snippet=payload.body_text[:500], body_text=payload.body_text,
         folder=MailFolder.SENT.value,
         is_read=True,
         label=(sent_classification.label if sent_classification else EmailLabel.OTHER.value),

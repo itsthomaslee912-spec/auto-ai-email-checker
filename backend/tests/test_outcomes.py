@@ -9,7 +9,12 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.api import emails, mailboxes
-from app.classify.outcome_extract import BACKFILL_LABELS, OUTCOME_LABELS, apply_outcome, parse_company_role
+from app.classify.outcome_extract import (
+    BACKFILL_LABELS,
+    OUTCOME_LABELS,
+    apply_outcome,
+    parse_company_role,
+)
 from app.db import Base, get_db
 from app.models import EmailLabel, EmailMessage, MailboxConnection, Provider, User
 

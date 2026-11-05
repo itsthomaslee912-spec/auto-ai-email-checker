@@ -3,14 +3,24 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import and_, or_
 
 from app.db import SessionLocal
 from app.models import EmailMessage
 from app.realtime.sse import publish
-from app.services.calendar_extract import CALENDAR_LABELS, collapse_duplicate_calendar_events, defer_duplicate_collapse, email_calendar_hash, needs_calendar_event_repair, process_calendar_email, refresh_calendar_event_details, repair_meeting_landing_urls, skip_landing_page_resolution
+from app.services.calendar_extract import (
+    CALENDAR_LABELS,
+    collapse_duplicate_calendar_events,
+    defer_duplicate_collapse,
+    email_calendar_hash,
+    needs_calendar_event_repair,
+    process_calendar_email,
+    refresh_calendar_event_details,
+    repair_meeting_landing_urls,
+    skip_landing_page_resolution,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +190,7 @@ async def _backfill_calendar_events(
                         # matches the query again next batch forever and the
                         # backlog never shrinks past it.
                         email.calendar_processed_hash = email_calendar_hash(email)
-                        email.calendar_processed_at = datetime.now(timezone.utc)
+                        email.calendar_processed_at = datetime.now(UTC)
                     db.commit()
                 except Exception:
                     db.rollback()
@@ -193,7 +203,7 @@ async def _backfill_calendar_events(
                     failed = db.get(EmailMessage, email_id)
                     if failed is not None:
                         failed.calendar_processed_hash = email_calendar_hash(failed)
-                        failed.calendar_processed_at = datetime.now(timezone.utc)
+                        failed.calendar_processed_at = datetime.now(UTC)
                         failed.calendar_processing_error = "Calendar backfill failed; see backend log"
                         db.commit()
                 if index % 5 == 0:

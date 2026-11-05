@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
 import httpx
@@ -126,7 +126,7 @@ def upsert_google_mailbox(
     access_token = token_payload.get("access_token", "")
     refresh_token = token_payload.get("refresh_token", "")
     expires_in = int(token_payload.get("expires_in", 3600))
-    expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    expires_at = datetime.now(UTC) + timedelta(seconds=expires_in)
 
     mailbox = (
         db.query(MailboxConnection)
@@ -163,8 +163,8 @@ async def ensure_google_access_token(db: Session, mailbox: MailboxConnection) ->
     access = decrypt_token(mailbox.access_token_enc)
     expires = mailbox.token_expires_at
     if expires and expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
-    if expires and expires > datetime.now(timezone.utc) + timedelta(seconds=60):
+        expires = expires.replace(tzinfo=UTC)
+    if expires and expires > datetime.now(UTC) + timedelta(seconds=60):
         return access
 
     refresh = decrypt_token(mailbox.refresh_token_enc)
@@ -174,7 +174,7 @@ async def ensure_google_access_token(db: Session, mailbox: MailboxConnection) ->
     payload = await refresh_google_access_token(refresh)
     mailbox.access_token_enc = encrypt_token(payload["access_token"])
     expires_in = int(payload.get("expires_in", 3600))
-    mailbox.token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    mailbox.token_expires_at = datetime.now(UTC) + timedelta(seconds=expires_in)
     if payload.get("refresh_token"):
         mailbox.refresh_token_enc = encrypt_token(payload["refresh_token"])
     db.commit()

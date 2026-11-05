@@ -9,13 +9,13 @@ from app.auth.public_urls import (
 
 
 def _settings(**overrides):
-    base = dict(
-        backend_public_url="http://localhost:8000",
-        webhook_base_url="http://localhost:8000",
-        google_redirect_uri="http://localhost:8000/api/auth/google/callback",
-        microsoft_redirect_uri="http://localhost:8000/api/auth/microsoft/callback",
-        frontend_origin="http://localhost:5173",
-    )
+    base = {
+        "backend_public_url": "http://localhost:8000",
+        "webhook_base_url": "http://localhost:8000",
+        "google_redirect_uri": "http://localhost:8000/api/auth/google/callback",
+        "microsoft_redirect_uri": "http://localhost:8000/api/auth/microsoft/callback",
+        "frontend_origin": "http://localhost:5173",
+    }
     base.update(overrides)
     return SimpleNamespace(**base)
 

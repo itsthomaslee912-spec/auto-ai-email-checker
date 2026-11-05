@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -91,7 +91,7 @@ def test_expired_worker_lease_returns_job_to_queue(monkeypatch):
             options='{"force_full":false}',
             progress='{"state":"running"}',
             claimed_by="dead-replica",
-            lease_expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+            lease_expires_at=datetime.now(UTC) - timedelta(minutes=1),
             attempts=1,
         ))
         db.commit()
@@ -138,7 +138,7 @@ def test_pending_reclassify_mode_survives_lease_recovery(monkeypatch):
     })
     with session_factory() as db:
         row = db.query(MailboxJobState).one()
-        row.lease_expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        row.lease_expires_at = datetime.now(UTC) - timedelta(minutes=1)
         db.commit()
 
     assert job_queue.claim("reclassify") == [(mailbox_id, {"pending_only": True})]

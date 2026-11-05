@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.orm import Session
 
@@ -92,7 +92,7 @@ def has_registered_webhook(mailbox: MailboxConnection, now: datetime | None = No
         and webhook.provider == mailbox.provider
         and webhook.external_id
         and expires_at
-        and expires_at > (now or datetime.now(timezone.utc))
+        and expires_at > (now or datetime.now(UTC))
     )
 
 
@@ -142,7 +142,7 @@ def polling_reason(
     mailbox: MailboxConnection, ngrok: dict | None = None, now: datetime | None = None,
 ) -> str | None:
     """Return why this mailbox needs polling, or None when its webhook is delivering mail."""
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     if not has_registered_webhook(mailbox, now):
         return "Webhook is not registered or has expired"
     problem = tunnel_problem(ngrok)
@@ -202,7 +202,7 @@ async def poll_active_mailboxes() -> int:
     ngrok = await asyncio.to_thread(get_ngrok_status)
     safety_net_seconds = getattr(get_settings(), "auto_sync_webhook_safety_net_seconds", 900)
     safety_net_age = timedelta(seconds=max(60, safety_net_seconds))
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     mailboxes_to_sync: list[tuple[int, bool]] = []
     with SessionLocal() as db:
         for mailbox in db.query(MailboxConnection).filter(MailboxConnection.is_active.is_(True)).all():
@@ -344,7 +344,7 @@ def get_auto_sync_status(db: Session) -> dict:
     # sufficient to prove automatic sync is still running. Reading the worker
     # heartbeat even in monolith mode also makes status resilient to a process
     # launched by the service supervisor with a mismatched runtime flag.
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     persisted_check_at, persisted_error = _load_runtime_status(db)
     worker_seen_at = _load_sync_worker_heartbeat(db)
     worker_recent = bool(
@@ -404,7 +404,7 @@ async def run_auto_sync_check() -> None:
         _last_error = "Automatic sync check failed"
         logger.exception("Automatic sync check failed")
     finally:
-        _last_check_at = datetime.now(timezone.utc)
+        _last_check_at = datetime.now(UTC)
         if _distributed():
             try:
                 await asyncio.to_thread(_persist_runtime_status, _last_check_at, _last_error)

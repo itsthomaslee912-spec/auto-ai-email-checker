@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.orm import Session
 
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 async def renew_expiring_subscriptions() -> None:
     db: Session = SessionLocal()
     try:
-        soon = datetime.now(timezone.utc) + timedelta(hours=12)
+        soon = datetime.now(UTC) + timedelta(hours=12)
         webhooks = (
             db.query(WebhookSubscription)
             .filter(WebhookSubscription.expires_at.isnot(None))

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
-import asyncio
 
 from fastapi import BackgroundTasks, FastAPI
 from fastapi.testclient import TestClient
@@ -384,7 +384,7 @@ def test_mark_all_read_publishes_progress_events():
     published: list[tuple[str, dict]] = []
 
     async def fake_mark_many(_token, message_ids, *, on_progress=None):
-        for message_id in message_ids:
+        for _message_id in message_ids:
             if on_progress:
                 await on_progress(1)
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import httpx
 from fastapi import HTTPException
@@ -68,7 +68,7 @@ async def create_outlook_subscription(
 ) -> WebhookSubscription:
     settings = get_settings()
     notification_url = f"{settings.webhook_base_url.rstrip('/')}/api/webhooks/outlook"
-    expiration = datetime.now(timezone.utc) + _SUBSCRIPTION_LIFETIME
+    expiration = datetime.now(UTC) + _SUBSCRIPTION_LIFETIME
 
     webhook = mailbox.webhook
     existing_ids = parse_outlook_subscription_ids(webhook.external_id if webhook else None)
@@ -127,7 +127,7 @@ async def create_outlook_subscription(
 
 
 async def renew_outlook_subscription(access_token: str, subscription_id: str) -> dict:
-    expiration = datetime.now(timezone.utc) + _SUBSCRIPTION_LIFETIME
+    expiration = datetime.now(UTC) + _SUBSCRIPTION_LIFETIME
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.patch(
             f"{GRAPH}/subscriptions/{subscription_id}",

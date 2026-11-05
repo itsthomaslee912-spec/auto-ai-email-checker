@@ -44,8 +44,8 @@ def test_worker_health_status_reflects_worst_component():
 
 
 def test_record_service_heartbeat_persists_component_status(monkeypatch):
-    from app.services import service_health as sh
     from app.models import ServiceHeartbeat
+    from app.services import service_health as sh
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     ServiceHeartbeat.__table__.create(engine)
     sessions = sessionmaker(bind=engine)
@@ -175,7 +175,7 @@ def test_stop_async_iteration_triggers_consumer_stalled(monkeypatch):
             task.result()  # re-raises StopAsyncIteration
         except StopAsyncIteration:
             raised.append(True)
-            raise _ConsumerStalled("Queue iterator closed; consumer detached")
+            raise _ConsumerStalled("Queue iterator closed; consumer detached") from None
 
     async def _raise_stop():
         raise StopAsyncIteration

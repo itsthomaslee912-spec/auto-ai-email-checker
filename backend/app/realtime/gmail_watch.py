@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import httpx
 from fastapi import HTTPException
@@ -40,9 +40,9 @@ async def start_gmail_watch(db: Session, mailbox: MailboxConnection, access_toke
     expiration_ms = data.get("expiration")
     expires_at = None
     if expiration_ms:
-        expires_at = datetime.fromtimestamp(int(expiration_ms) / 1000, tz=timezone.utc)
+        expires_at = datetime.fromtimestamp(int(expiration_ms) / 1000, tz=UTC)
     else:
-        expires_at = datetime.now(timezone.utc) + timedelta(days=6)
+        expires_at = datetime.now(UTC) + timedelta(days=6)
 
     if not mailbox.sync_cursor:
         mailbox.sync_cursor = history_id or None

@@ -6,14 +6,19 @@ import logging
 import re
 from email.utils import parseaddr
 
-from openai import AsyncOpenAI
-
-from app.classify.prompt_store import get_normalized_active_prompt
 from app.classify.correction_retrieval import CorrectionExample, format_retrieved_corrections
+from app.classify.prompt_store import get_normalized_active_prompt
+from app.config import get_settings
 from app.models import EmailLabel
 from app.schemas import ClassificationResult
-from app.config import get_settings
-from app.services.ai_backend import AiBackend, ai_call_semaphore, close_ai_client, get_ai_backend, get_ai_client, has_saved_ai_settings
+from app.services.ai_backend import (
+    AiBackend,
+    ai_call_semaphore,
+    close_ai_client,
+    get_ai_backend,
+    get_ai_client,
+    has_saved_ai_settings,
+)
 
 logger = logging.getLogger(__name__)
 

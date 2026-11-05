@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session, load_only
 
-from app.auth.session import mailbox_scope
 from app.auth.oauth_google import ensure_google_access_token
 from app.auth.oauth_microsoft import ensure_microsoft_access_token
-from app.db import SessionLocal, get_db
+from app.auth.session import mailbox_scope
 from app.classify.outcome_extract import OUTCOME_LABELS, apply_outcome
 from app.config import get_settings
+from app.db import SessionLocal, get_db
 from app.models import EmailLabel, EmailMessage, MailboxConnection, Provider
 from app.realtime.gmail_watch import stop_gmail_watch
 from app.realtime.outlook_subscriptions import (
@@ -22,12 +22,12 @@ from app.realtime.outlook_subscriptions import (
 )
 from app.realtime.sse import publish
 from app.schemas import (
-    LabelTimelineOut,
     LabelTimelineBucketOut,
-    MailboxUpdateIn,
+    LabelTimelineOut,
     MailboxLabelStatsOut,
     MailboxOut,
     MailboxOutcomesOut,
+    MailboxUpdateIn,
     OutcomeEntryOut,
 )
 from app.services.mailbox_cleanup import delete_emails_for_mailbox
@@ -85,7 +85,7 @@ def _parse_bound(value: str, *, is_end: bool) -> tuple[datetime, str]:
         return start, raw
     parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        parsed = parsed.astimezone(UTC).replace(tzinfo=None)
     else:
         parsed = parsed.replace(tzinfo=None)
     if is_end:
@@ -106,7 +106,7 @@ def _active_mailbox(db: Session, mailbox_id: int) -> MailboxConnection:
 
 def _count_labels(db: Session, mailbox_ids: list[int], start: datetime, end: datetime) -> tuple[dict[str, int], int]:
     valid = {item.value for item in EmailLabel}
-    label_counts = {item: 0 for item in valid}
+    label_counts = dict.fromkeys(valid, 0)
     if not mailbox_ids:
         return label_counts, 0
     rows = (
@@ -272,7 +272,7 @@ def mailbox_label_timeline(
     for (received_at,) in times:
         if received_at is None:
             continue
-        stamp = received_at.astimezone(timezone.utc).replace(tzinfo=None) if received_at.tzinfo else received_at
+        stamp = received_at.astimezone(UTC).replace(tzinfo=None) if received_at.tzinfo else received_at
         key = (
             stamp.replace(minute=0, second=0, microsecond=0)
             if hourly
@@ -454,8 +454,8 @@ async def disconnect_mailbox_record(db: Session, mailbox: MailboxConnection) -> 
 
 @router.post("/{mailbox_id}/sync")
 async def sync_mailbox(mailbox_id: int, db: Session = Depends(get_db)) -> dict:
-    from app.services.mailbox_sync import start_mailbox_sync
     from app.services.job_queue import enqueue
+    from app.services.mailbox_sync import start_mailbox_sync
 
     mailbox = (
         db.query(MailboxConnection)
@@ -488,8 +488,8 @@ async def stop_mailbox_sync(mailbox_id: int, db: Session = Depends(get_db)) -> d
 
 @router.post("/{mailbox_id}/sync/full")
 async def full_rescan_mailbox(mailbox_id: int, db: Session = Depends(get_db)) -> dict:
-    from app.services.mailbox_sync import start_mailbox_sync
     from app.services.job_queue import enqueue
+    from app.services.mailbox_sync import start_mailbox_sync
 
     mailbox = (
         db.query(MailboxConnection)
@@ -515,8 +515,8 @@ def mailbox_sync_status(mailbox_id: int, db: Session = Depends(get_db)) -> dict:
 
 @router.post("/{mailbox_id}/reclassify")
 async def reclassify_mailbox(mailbox_id: int, db: Session = Depends(get_db)) -> dict:
-    from app.services.reclassify import start_mailbox_reclassify
     from app.services.job_queue import enqueue
+    from app.services.reclassify import start_mailbox_reclassify
 
     mailbox = (
         db.query(MailboxConnection)

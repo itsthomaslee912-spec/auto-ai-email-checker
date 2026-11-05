@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import func
@@ -48,7 +48,7 @@ def _counts(db: Session, model, column) -> dict[str, int]:
 @router.get("")
 def monitoring_snapshot(db: Session = Depends(get_db)) -> dict:
     require_admin()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     cutoff = now - STALE_AFTER
     service_names = tuple(SERVICE_DETAILS)
     # Heartbeats are retained across process restarts.  Loading the entire

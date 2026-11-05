@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -32,7 +32,7 @@ def env(monkeypatch):
             db.flush()
             mail = EmailMessage(
                 mailbox_id=box.id, provider_message_id=f"m-{box.id}", subject=f"hello {address}",
-                received_at=datetime(2026, 10, 1, tzinfo=timezone.utc), is_read=True,
+                received_at=datetime(2026, 10, 1, tzinfo=UTC), is_read=True,
             )
             db.add(mail)
             db.flush()

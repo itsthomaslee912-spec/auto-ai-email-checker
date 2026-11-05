@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -298,7 +298,7 @@ def test_pending_classification_is_hidden_from_lists_counts_details_and_conversa
             subject="Classified interview",
             sender="recruiter@example.com",
             label=EmailLabel.INTERVIEW_INVITATION.value,
-            received_at=datetime(2026, 10, 20, 12, tzinfo=timezone.utc),
+            received_at=datetime(2026, 10, 20, 12, tzinfo=UTC),
             classification_pending=False,
         )
         pending = EmailMessage(
@@ -308,7 +308,7 @@ def test_pending_classification_is_hidden_from_lists_counts_details_and_conversa
             subject="Temporary Other",
             sender="recruiter@example.com",
             label=EmailLabel.OTHER.value,
-            received_at=datetime(2026, 10, 20, 13, tzinfo=timezone.utc),
+            received_at=datetime(2026, 10, 20, 13, tzinfo=UTC),
             classification_pending=True,
         )
         db.add_all([visible, pending])
@@ -357,8 +357,8 @@ def test_conversation_view_keeps_the_newest_message_in_each_thread():
     )
     db.add(mailbox)
     db.flush()
-    older = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
-    newer = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+    older = datetime(2026, 10, 1, 12, tzinfo=UTC)
+    newer = datetime(2026, 10, 2, 12, tzinfo=UTC)
     db.add_all([
         EmailMessage(
             mailbox_id=mailbox.id,
@@ -442,8 +442,8 @@ def test_conversation_view_uses_unread_state_from_the_whole_thread():
     )
     db.add(mailbox)
     db.flush()
-    older = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
-    newer = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+    older = datetime(2026, 10, 1, 12, tzinfo=UTC)
+    newer = datetime(2026, 10, 2, 12, tzinfo=UTC)
     db.add_all([
         EmailMessage(
             mailbox_id=mailbox.id,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from threading import Lock
 
 from app.db import SessionLocal
@@ -16,7 +16,7 @@ def _next_timestamp(state: dict[str, datetime | str | None]) -> datetime:
     Some Windows clocks return the same microsecond for consecutive calls. A
     later failure must still supersede a success (and vice versa).
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     previous = [
         value
         for key in ("last_success_at", "last_failure_at")
@@ -34,7 +34,7 @@ def record_webhook_delivery_success(provider: str) -> None:
 
 
 def persist_webhook_delivery_success(provider: str) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with SessionLocal() as db:
         rows = db.query(WebhookSubscription).filter(
             WebhookSubscription.provider == provider
@@ -53,7 +53,7 @@ def record_webhook_delivery_failure(provider: str, message: str) -> None:
 
 
 def persist_webhook_delivery_failure(provider: str, message: str) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with SessionLocal() as db:
         rows = db.query(WebhookSubscription).filter(
             WebhookSubscription.provider == provider

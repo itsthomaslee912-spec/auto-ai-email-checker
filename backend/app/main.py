@@ -9,7 +9,20 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
-from app.api import ai_settings, app_auth, auth, calendar_events, classify, emails, events, health, mailboxes, monitoring, notifications, webhooks
+from app.api import (
+    ai_settings,
+    app_auth,
+    auth,
+    calendar_events,
+    classify,
+    emails,
+    events,
+    health,
+    mailboxes,
+    monitoring,
+    notifications,
+    webhooks,
+)
 from app.auth.session import require_user
 from app.config import get_settings
 from app.db import init_db

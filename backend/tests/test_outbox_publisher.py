@@ -1,6 +1,6 @@
 import asyncio
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from sqlalchemy import create_engine
@@ -43,7 +43,7 @@ def _session_factory():
 
 def test_publisher_recovers_stale_claim_but_not_active_claim(monkeypatch):
     sessions = _session_factory()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with sessions() as db:
         db.add_all([
             OutboxEvent(
@@ -102,7 +102,7 @@ def test_publisher_recovers_stale_claim_but_not_active_claim(monkeypatch):
 
 def test_publisher_aborts_batch_and_requires_fresh_channel(monkeypatch):
     sessions = _session_factory()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with sessions() as db:
         db.add_all([
             OutboxEvent(
@@ -128,7 +128,7 @@ def test_publisher_aborts_batch_and_requires_fresh_channel(monkeypatch):
 
     try:
         asyncio.run(outbox_publisher._publish_batch(exchange))
-        assert False, "publisher failure must rebuild the channel"
+        raise AssertionError("publisher failure must rebuild the channel")
     except outbox_publisher.BrokerPublishError:
         pass
 
@@ -143,7 +143,7 @@ def test_publisher_aborts_batch_and_requires_fresh_channel(monkeypatch):
 
 def test_claim_reconciles_activity_event_already_consumed(monkeypatch):
     sessions = _session_factory()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     activity_topic = outbox_publisher.topic("user.activity.v1")
     with sessions() as db:
         db.add(OutboxEvent(

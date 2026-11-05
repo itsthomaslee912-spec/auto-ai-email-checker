@@ -7,7 +7,6 @@ from sqlalchemy.orm import Session
 
 from app.models import ClassifyCorrection, EmailMessage
 
-
 _TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_+-]{2,}", re.I)
 _STOP = {
     "and", "are", "but", "for", "from", "have", "not", "our", "that", "the",

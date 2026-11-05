@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
@@ -88,7 +88,7 @@ async def login(payload: LoginIn, request: Request, response: Response, db: Sess
         await asyncio.sleep(0.6)
         raise HTTPException(status_code=401, detail="Email or password is incorrect")
     token, expires_at = create_session(db, user)
-    user.last_login_at = datetime.now(timezone.utc)
+    user.last_login_at = datetime.now(UTC)
     db.commit()
     response.set_cookie(
         SESSION_COOKIE,
