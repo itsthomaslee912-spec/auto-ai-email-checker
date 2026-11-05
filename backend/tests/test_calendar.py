@@ -6764,6 +6764,16 @@ def test_company_name_drops_sentence_spill_after_the_employer():
     assert explicit_hiring_employer(
         "Thank you for your interest in the Senior Forward Deployed Engineer, AI Agents role at CoreWeave. I would like to set up a time."
     ) == "CoreWeave"
+    # Plural forms must also be caught.
+    assert explicit_hiring_employer(
+        "Thank you for your interest in contract opportunities with VWGoA at the Innovation & Engineering Center California."
+    ) == "VWGoA"
+    assert explicit_hiring_employer(
+        "We have several openings at Databricks that might be a great fit."
+    ) == "Databricks"
+    assert explicit_hiring_employer(
+        "I wanted to reach out about some roles at Stripe for senior engineers."
+    ) == "Stripe"
 
 
 def test_explicit_hiring_employer_skips_interviewer_name_with_title():
