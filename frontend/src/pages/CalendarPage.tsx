@@ -897,7 +897,6 @@ const EventCard = memo(function EventCard({ event, color, account, timeZone, com
     {status.key !== "available" && status.key !== "active" && <span className="calendar-event-status-icon" role="img" aria-label={status.label}>{status.key === "canceled" ? <CanceledStatusIcon /> : <ApplicationStatusIcon status={status.key === "rejected_closed" ? "rejected" : status.key} />}</span>}
     <span className="calendar-event-main">
       <span className="calendar-event-company">{primaryLabel}</span>
-      {event.company && event.role && <span className="calendar-event-role">{event.role}</span>}
     </span>
     <span className={`event-type-badge meeting-${type.type}`} role="img" aria-label={type.label}><MeetingTypeIcon type={type.type} /></span>
   </div>
