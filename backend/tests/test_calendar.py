@@ -3316,6 +3316,14 @@ END:VCALENDAR""",
         assert aerovy.application_status == "active"
         assert gm.company == "GM"
 
+        # Every newly classified message runs the complete mailbox cleanup.
+        # That later pass must not rebuild the cross-company identity that the
+        # targeted repairs just removed.
+        collapse_duplicate_calendar_events(db, mailbox_id)
+        assert aerovy.company == "Aerovy"
+        assert aerovy.application_status == "active"
+        assert gm.company == "GM"
+
 
 def test_reprocessing_wrong_company_replaces_its_leaked_role():
     factory, (mailbox_id, _) = _database()
@@ -9077,6 +9085,67 @@ def test_same_sender_vendor_booking_keeps_the_employer_from_linked_invitation():
         assert booking.company == "ADUSA – Retail Business"
 
 
+def test_candidate_owned_same_sender_link_cannot_replace_explicit_booking_company():
+    """Sent replies from one mailbox are not shared recruiter identity."""
+    from app.services.calendar_extract import correct_sender_domain_employers
+
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        source = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="gm-candidate-acceptance",
+            thread_id="gm-thread",
+            folder="sent",
+            subject="Re: Greetings from GM",
+            sender="first@example.com",
+            received_at=datetime(2026, 10, 30, 19, 5, tzinfo=timezone.utc),
+            body_text="11/4 1:30 PM ET works well for me.",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+            company="GM",
+            job_role="Staff Software Engineer - Simulation Platform (Galileo)",
+        )
+        unrelated_sent_invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="aerovy-candidate-reply",
+            thread_id="aerovy-thread",
+            folder="sent",
+            subject="Re: Aerovy Hiring - Introduction",
+            sender="first@example.com",
+            received_at=datetime(2026, 10, 23, 14, 7, tzinfo=timezone.utc),
+            body_text="786-883-0098",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="Aerovy",
+            job_role="Staff Software Engineer",
+        )
+        db.add_all([source, unrelated_sent_invitation])
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=source.id,
+            source_thread_id=source.thread_id,
+            kind="confirmed",
+            is_visible=True,
+            origin="email",
+            title="GM — Staff Software Engineer - Simulation Platform (Galileo)",
+            company="GM",
+            job_role="Staff Software Engineer - Simulation Platform (Galileo)",
+            start_at=datetime(2026, 11, 4, 18, 30, tzinfo=timezone.utc),
+            end_at=datetime(2026, 11, 4, 19, 0, tzinfo=timezone.utc),
+        )
+        db.add(event)
+        db.flush()
+        db.add_all([
+            CalendarEventEmail(event_id=event.id, email_id=source.id),
+            CalendarEventEmail(event_id=event.id, email_id=unrelated_sent_invitation.id),
+        ])
+        db.flush()
+
+        assert correct_sender_domain_employers(db, mailbox_id) == 0
+        assert event.company == "GM"
+        assert event.title == "GM — Staff Software Engineer - Simulation Platform (Galileo)"
+
+
 def test_post_commit_calendar_cleanup_uses_isolated_checkpointed_session(monkeypatch):
     """Live duplicate cleanup must not reuse the projection transaction."""
     from app.services import calendar_extract
@@ -9230,6 +9299,75 @@ def test_mathworks_reschedule_with_availability_ask_leaves_interview_unbooked():
     assert leaves_interview_unbooked(email) is True
 
 
+def test_employer_time_question_cannot_overwrite_an_older_completed_round():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        prior_email = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="autozone-october-round",
+            thread_id="autozone-thread",
+            folder="inbox",
+            subject="Video Interview - Systems Engineer",
+            sender="shipra.khandelwal@autozone.com",
+            received_at=datetime(2026, 10, 21, 18, 41, tzinfo=timezone.utc),
+            body_text="Interview confirmed October 27 from 12:00-1:00 PM CST.",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+            company="AutoZone",
+            job_role="Systems Engineer",
+        )
+        proposal = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="autozone-november-proposal",
+            thread_id="autozone-thread",
+            folder="inbox",
+            subject="RE: AutoZone",
+            sender="shipra.khandelwal@autozone.com",
+            received_at=datetime(2026, 11, 4, 23, 10, tzinfo=timezone.utc),
+            body_text=(
+                "Hi Thomas,\n\n"
+                "The interview will need to be scheduled for 7:00 AM CST instead of "
+                "8:00 AM. Would that still work for you?\n\n"
+                "From: Thomas\nNovember 10 at 8:00 AM CST works well for me."
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="time_change",
+            company="AutoZone",
+            job_role="Systems Engineer",
+        )
+        db.add_all([prior_email, proposal])
+        db.flush()
+        prior = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=prior_email.id,
+            source_thread_id=prior_email.thread_id,
+            source_received_at=prior_email.received_at,
+            kind="confirmed",
+            is_visible=True,
+            origin="email",
+            title="AutoZone — Systems Engineer",
+            company="AutoZone",
+            job_role="Systems Engineer",
+            start_at=datetime(2026, 10, 27, 17, 0, tzinfo=timezone.utc),
+            end_at=datetime(2026, 10, 27, 18, 0, tzinfo=timezone.utc),
+            application_status="passed",
+        )
+        db.add(prior)
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, proposal, use_ai=False)) is True
+        assert proposal.label == EmailLabel.INTERVIEW_INVITATION.value
+        assert proposal.interview_subtype is None
+        assert prior.is_visible is True
+        assert prior.start_at == datetime(2026, 10, 27, 17, 0, tzinfo=timezone.utc)
+        offered = db.query(CalendarEvent).filter(
+            CalendarEvent.source_email_id == proposal.id,
+            CalendarEvent.kind == "availability",
+        ).one()
+        assert offered.is_visible is True
+        assert offered.start_at == datetime(2026, 11, 10, 13, 0, tzinfo=timezone.utc)
+
+
 def test_mathworks_between_time_range_is_availability_window():
     """'Between 2:00 PM and 4:00 PM' in an availability request is a window,
     not a booked interview slot."""
@@ -9284,6 +9422,64 @@ def test_modernloop_subjects_expose_company_and_role():
     assert interview_subject_company_role(
         "Shield AI | Interview for Mark | Staff Cloud Engineer (R5801) role"
     ) == ("Shield AI", "Staff Cloud Engineer (R5801)")
+
+
+def test_interview_request_subject_extracts_role():
+    # ATS format: "Interview Request: <Role>, <LastName>, <FirstName>"
+    assert interview_subject_company_role(
+        "Interview Request: Staff Data Engineer, Rosen, Pia"
+    ) == ("", "Staff Data Engineer")
+    # Without trailing recruiter name
+    assert interview_subject_company_role(
+        "Interview Request: Senior Software Engineer"
+    ) == ("", "Senior Software Engineer")
+    # Stage-only label is filtered out
+    assert interview_subject_company_role(
+        "Interview Request: Technical Screen, Smith, John"
+    ) == ("", "")
+
+
+def test_repair_fills_missing_role_from_interview_request_subject():
+    """Events stored before the Interview Request subject pattern was added get
+    their role backfilled by repair_placeholder_calendar_fields."""
+    factory, (mailbox_id, _) = _database()
+    start = datetime(2026, 11, 5, 21, 30, tzinfo=timezone.utc)
+    with factory() as db:
+        source = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="nmrk-invite",
+            thread_id="nmrk-thread",
+            subject="Interview Request: Staff Data Engineer, Rosen, Pia",
+            sender="Pia Rosen <Pia.Rosen@nmrk.com>",
+            received_at=start - timedelta(hours=1),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            company="",
+            job_role="",
+            outcome_extracted=True,
+        )
+        db.add(source)
+        db.flush()
+        event = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=source.id,
+            source_thread_id=source.thread_id,
+            kind="confirmed",
+            origin="email",
+            title="Interview",
+            company="",
+            job_role="",
+            start_at=start,
+            end_at=start + timedelta(minutes=30),
+            meeting_type="video",
+            is_visible=True,
+        )
+        db.add(event)
+        db.commit()
+
+        assert repair_placeholder_calendar_fields(db, mailbox_id) >= 1
+        db.commit()
+
+        assert event.job_role == "Staff Data Engineer"
 
 
 def test_modernloop_confirmation_enriches_event_and_closes_pending_invitation():

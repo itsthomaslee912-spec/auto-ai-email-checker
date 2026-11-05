@@ -75,6 +75,24 @@ def test_verification_code_has_deterministic_ai_only_result():
     assert result.confidence == 0.99
 
 
+def test_outgoing_concrete_time_acceptance_is_deterministic_availability_in_ai_only_mode():
+    result = deterministic_ai_only_classification(
+        subject="RE: AutoZone",
+        sender="Thomas <tlee941212@outlook.com>",
+        body_text=(
+            "Hi Shipra,\n\n"
+            "November 10 at 8:00 AM CST works well for me.\n\n"
+            "Best,\nThomas"
+        ),
+        snippet="",
+        direction="outgoing",
+    )
+
+    assert result is not None
+    assert result.label == EmailLabel.INTERVIEW_AVAILABILITY.value
+    assert result.confidence == 0.99
+
+
 def test_recruiting_portal_otp_has_deterministic_ai_only_result():
     result = deterministic_ai_only_classification(
         subject="OTP for login - Tata Consultancy Services Limited.",

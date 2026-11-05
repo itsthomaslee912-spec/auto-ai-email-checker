@@ -2709,6 +2709,13 @@ def interview_subject_company_role(subject: str | None) -> tuple[str, str]:
             r"(?:scheduled|confirmed|booked)\b",
             re.I,
         ),
+        # "Interview Request: Staff Data Engineer, Rosen, Pia"
+        # ATS systems (Workday, SAP SuccessFactors) append recruiter name as
+        # LastName, FirstName after the role; strip trailing person names.
+        re.compile(
+            r"^Interview\s+Request:\s*(?P<role>[A-Za-z][^,\n]{2,100}?)"
+            r"(?:,\s*[A-Z][A-Za-z'-]+,\s*[A-Z][A-Za-z'-]+)?\s*$",
+        ),
     )
     for pattern in patterns:
         match = pattern.search(value)
@@ -2898,8 +2905,29 @@ def correct_sender_domain_employers(db: Session, mailbox_id: int | None = None) 
             source_brand = sender_domain_brand(source)
             current = (event.company or source.company or "").strip()
             source_received = as_utc(source.received_at)
-            _, source_sender = parseaddr(source.sender or "")
+            source_sender_name, source_sender = parseaddr(source.sender or "")
             source_sender = _normalized_address(source_sender)
+            mailbox = db.get(MailboxConnection, event.mailbox_id)
+            source_is_candidate = bool(
+                (source.folder or "").casefold() == "sent"
+                or (
+                    mailbox is not None
+                    and source_sender
+                    and source_sender == _normalized_address(mailbox.email_address)
+                )
+            )
+            # A provider organizer label ("Jane Doe Recruiting") can be
+            # replaced by the employer from an earlier invitation by the same
+            # recruiter. The candidate's own Sent address is never organizer
+            # identity: using it here joined unrelated replies from the same
+            # mailbox (Aerovy and GM) and rewrote the correct GM company every
+            # time mailbox cleanup ran.
+            source_is_organizer_label = bool(
+                source_sender_name
+                and current
+                and re.search(r"\b(?:recruiting|recruitment|talent|scheduling)\b", current, re.I)
+                and _compact_company(current) == _compact_company(source_sender_name)
+            )
             invitations = [
                 item
                 for item in emails
@@ -2958,7 +2986,11 @@ def correct_sender_domain_employers(db: Session, mailbox_id: int | None = None) 
             )
             if invitations and (
                 (source_brand and companies_match(current, source_brand))
-                or same_sender_invitation
+                or (
+                    same_sender_invitation
+                    and not source_is_candidate
+                    and source_is_organizer_label
+                )
             ):
                 invitation = max(
                     invitations,
@@ -5502,6 +5534,34 @@ _AVAILABILITY_REQUEST_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+_UNCONFIRMED_EMPLOYER_TIME_RE = re.compile(
+    r"\b(?:"
+    r"would\s+(?:that|this|the\s+(?:date|time|slot))\s+(?:still\s+)?work(?:\s+for\s+you)?"
+    r"|(?:would|could)\s+you\s+(?:still\s+)?(?:make|do|attend)"
+    r"|does\s+(?:that|this|the\s+(?:date|time|slot))\s+work(?:\s+for\s+you)?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def employer_proposes_unconfirmed_time(email: EmailMessage) -> bool:
+    """True when an employer names a replacement time but asks for consent.
+
+    ``The interview will need to be scheduled for 7 AM instead of 8 AM. Would
+    that still work for you?`` is an offered slot, not a booked time change.
+    Treating it as confirmed can reuse and overwrite an older same-thread
+    interview round before the candidate answers.
+    """
+    if (
+        email.human_corrected
+        or email.folder in {"sent", "spam", "trash"}
+        or email.label != EmailLabel.INTERVIEW_SCHEDULED.value
+        or email.interview_subtype not in {"confirmation", "reschedule", "time_change"}
+    ):
+        return False
+    fresh = _fresh_message_text(email)
+    return bool(_CLOCK_OR_DATE_RE.search(fresh) and _UNCONFIRMED_EMPLOYER_TIME_RE.search(fresh))
 
 
 def misfiled_interview_availability_request(email: EmailMessage) -> bool:
@@ -8127,6 +8187,8 @@ def repair_placeholder_calendar_fields(db: Session, mailbox_id: int | None = Non
             ):
                 company = linked_company
         role = job_role_or_empty(event.job_role)
+        if not role and source is not None:
+            role = _role_named_in_interview_subject(source)
         provider = clean_meeting_provider(event.meeting_provider)
         meeting_type = event.meeting_type or "unspecified"
         if is_video_join_url(event.meeting_url):
@@ -8474,6 +8536,21 @@ async def process_calendar_email(
     use_ai: bool = True,
     priority: str = "live",
 ) -> bool:
+    if employer_proposes_unconfirmed_time(email):
+        # Persist the corrected category before projection. The ordinary
+        # invitation path keeps the proposed replacement open; a later
+        # candidate acceptance or provider invite promotes it to confirmed.
+        # Most importantly, it cannot select an older confirmed round as the
+        # target of a supposedly authoritative time-change update.
+        _retire_declined_availability(db, email)
+        email.label = EmailLabel.INTERVIEW_INVITATION.value
+        email.interview_subtype = None
+        email.calendar_processed_hash = None
+        email.calendar_processed_at = None
+        email.calendar_processing_error = None
+        return await _process_calendar_email(
+            db, email, force=force, use_ai=use_ai, priority=priority,
+        )
     if (
         email.folder not in {"sent", "spam", "trash"}
         and email.label == EmailLabel.INTERVIEW_SCHEDULED.value

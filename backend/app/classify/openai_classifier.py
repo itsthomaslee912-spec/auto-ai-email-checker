@@ -1020,6 +1020,7 @@ def deterministic_ai_only_classification(
     sender: str,
     body_text: str,
     snippet: str,
+    direction: str = "incoming",
 ) -> ClassificationResult | None:
     """Return high-certainty AI-only classifications that need no model call."""
     primary_text = _primary_message_text(subject, sender, body_text, snippet)
@@ -1033,6 +1034,28 @@ def deterministic_ai_only_classification(
     if _is_pre_interview_screen(primary_text):
         return ClassificationResult(
             label=EmailLabel.SCREENING.value,
+            category_subtype=None,
+            confidence=0.99,
+            response_id=None,
+        )
+
+    # A candidate accepting/proposing a concrete recruiting time is an
+    # objective scheduling action. Local models occasionally return ``other``
+    # for terse replies such as "November 10 at 8:00 AM CST works well for
+    # me" even though the direction and timestamp make the intent explicit.
+    # Keep this narrower than the hybrid heuristic: require both an acceptance
+    # phrase and a concrete clock, so ordinary outgoing conversation still
+    # uses the selected AI model.
+    if (
+        direction == "outgoing"
+        and re.search(
+            r"\b(?:i(?:'m| am)? available|my availability|works (?:well )?for me|i can do)\b",
+            primary_text,
+        )
+        and re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b", primary_text, re.I)
+    ):
+        return ClassificationResult(
+            label=EmailLabel.INTERVIEW_AVAILABILITY.value,
             category_subtype=None,
             confidence=0.99,
             response_id=None,
@@ -1131,6 +1154,7 @@ async def classify_email(
         sender=sender,
         body_text=body_text,
         snippet=snippet,
+        direction=direction,
     ) if ai_only else None
     if deterministic is not None:
         return deterministic

@@ -10,6 +10,7 @@ from app.classify.openai_classifier import (
     classify_email,
     deterministic_ai_only_classification,
     infer_interview_subtype,
+    message_direction,
 )
 from app.classify.correction_retrieval import load_correction_corpus, retrieve_relevant_corrections
 from app.classify.outcome_extract import BACKFILL_LABELS, OUTCOME_LABELS, extract_company_role, resolve_company_role
@@ -351,6 +352,11 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                     sender=row.sender or "",
                     body_text=row.body_text or "",
                     snippet=row.snippet or "",
+                    direction=message_direction(
+                        row.folder or "inbox",
+                        row.sender or "",
+                        account_email,
+                    )[0],
                 ) if ai_only else None
                 if result is None:
                     result = await classify_email(

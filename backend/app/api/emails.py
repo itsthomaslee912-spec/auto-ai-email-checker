@@ -18,7 +18,10 @@ from sqlalchemy.orm import Session, defer, load_only, sessionmaker
 from app.auth.oauth_google import ensure_google_access_token
 from app.auth.session import current_user_id, mailbox_scope
 from app.classify.outcome_extract import OUTCOME_LABELS, apply_outcome
-from app.classify.openai_classifier import infer_interview_subtype
+from app.classify.openai_classifier import (
+    deterministic_ai_only_classification,
+    infer_interview_subtype,
+)
 from app.services.ai_backend import close_ai_client, get_ai_backend
 from app.auth.oauth_microsoft import ensure_microsoft_access_token
 from app.db import SessionLocal, get_db
@@ -1075,8 +1078,23 @@ async def send_email(payload: SendEmailIn, db: Session = Depends(get_db)) -> Sen
     elif mailbox.provider not in (Provider.GOOGLE.value, Provider.MICROSOFT.value):
         raise HTTPException(status_code=400, detail="Unsupported provider")
 
-    # Save an immediate local Sent copy so the Sent folder updates without waiting
-    # for the next provider sync.
+    # Save an immediate local Sent copy so the Sent folder updates without
+    # waiting for the next provider sync. Classify objective outgoing
+    # scheduling replies before inserting the row; the old hard-coded
+    # ``Other`` label made every message sent from the Reply UI bypass the
+    # classifier permanently, even obvious replies such as "7:00 AM works for
+    # me". Messages without a deterministic result remain durable pending work
+    # for the classification worker instead of becoming permanent ``Other``.
+    sent_classification = deterministic_ai_only_classification(
+        subject=payload.subject.strip() or "(no subject)",
+        sender=(
+            f"{mailbox.display_name} <{mailbox.email_address}>"
+            if mailbox.display_name else mailbox.email_address
+        ),
+        body_text=payload.body_text,
+        snippet=payload.body_text[:500],
+        direction="outgoing",
+    )
     sent = EmailMessage(
         mailbox_id=mailbox.id, provider_message_id=provider_message_id or f"local-sent-{datetime.now(timezone.utc).timestamp()}",
         subject=payload.subject.strip() or "(no subject)",
@@ -1086,11 +1104,23 @@ async def send_email(payload: SendEmailIn, db: Session = Depends(get_db)) -> Sen
         ),
         recipients=to_address,
         received_at=datetime.now(timezone.utc), snippet=payload.body_text[:500], body_text=payload.body_text,
-        folder=MailFolder.SENT.value, is_read=True, label=EmailLabel.OTHER.value,
+        folder=MailFolder.SENT.value,
+        is_read=True,
+        label=(sent_classification.label if sent_classification else EmailLabel.OTHER.value),
+        category_subtype=(sent_classification.category_subtype if sent_classification else None),
+        interview_subtype=(sent_classification.interview_subtype if sent_classification else None),
+        confidence=(sent_classification.confidence if sent_classification else None),
+        classification_pending=sent_classification is None,
         thread_id=original.thread_id if original is not None else None,
     )
     db.add(sent)
+    db.flush()
+    calendar_changed = False
+    if sent_classification is not None and sent.label in CALENDAR_LABELS:
+        calendar_changed = await process_calendar_email(db, sent, use_ai=False)
     db.commit()
+    if calendar_changed:
+        await collapse_duplicate_calendar_events_post_commit(sent.mailbox_id)
     invalidate_email_list_caches()
     return SendEmailOut(ok=True, provider_message_id=provider_message_id)
 
