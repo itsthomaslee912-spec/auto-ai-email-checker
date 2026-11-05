@@ -120,7 +120,11 @@ class MailboxConnection(Base):
 
 class EmailMessage(Base):
     __tablename__ = "email_messages"
-    __table_args__ = (UniqueConstraint("mailbox_id", "provider_message_id", name="uq_mailbox_msg"),)
+    __table_args__ = (
+        UniqueConstraint("mailbox_id", "provider_message_id", name="uq_mailbox_msg"),
+        Index("ix_email_messages_mailbox_thread", "mailbox_id", "thread_id"),
+        Index("ix_email_messages_mailbox_received", "mailbox_id", "received_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     mailbox_id: Mapped[int] = mapped_column(

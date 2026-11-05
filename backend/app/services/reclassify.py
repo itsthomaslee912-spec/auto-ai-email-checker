@@ -328,13 +328,13 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
         updated = 0
         processed = 0
         failed = 0
+        ai_only = getattr(get_settings(), "email_classification_mode", "hybrid").strip().lower() == "ai_only"
 
         async def classify_row(
             row: Any,
         ) -> tuple[int, str, Any, tuple[str, str] | None, bool] | None:
             ai_priority = "live" if (pending_only or row.classification_pending) else "background"
             try:
-                ai_only = getattr(get_settings(), "email_classification_mode", "hybrid").strip().lower() == "ai_only"
                 if ai_only:
                     correction_examples = []
                 else:
@@ -378,7 +378,7 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
                     )
             except Exception:
                 logger.exception("Reclassify failed for email %s", row.id)
-                if getattr(get_settings(), "email_classification_mode", "hybrid").strip().lower() == "ai_only":
+                if ai_only:
                     return None
                 # Match live-ingest behavior: a temporarily unavailable local
                 # model must not strand a download-only email forever. The

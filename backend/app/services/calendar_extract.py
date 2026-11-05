@@ -2652,7 +2652,7 @@ def _company_quality(value: str) -> int:
 
 
 _HIRING_EMPLOYER_RE = re.compile(
-    r"\b(?:[Pp]osition|[Rr]ole|[Oo]pportunity|[Oo]pening|[Jj]ob|[Ii]nterview)[ \t]+(?:with|at)[ \t]+"
+    r"\b(?:[Pp]ositions?|[Rr]oles?|[Oo]pportunit(?:y|ies)|[Oo]penings?|[Jj]obs?|[Ii]nterviews?)[ \t]+(?:with|at)[ \t]+"
     r"([A-Z][A-Za-z0-9&']*(?:[ \t]+[A-Z][A-Za-z0-9&']*){0,3})",
 )
 
@@ -2876,18 +2876,49 @@ def correct_sender_domain_employers(db: Session, mailbox_id: int | None = None) 
     if mailbox_id is not None:
         query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
     events = query.all()
+    if not events:
+        return changed
+
+    # Pre-load all data needed in the loop with bulk queries to avoid N+1.
+    event_ids = [e.id for e in events]
+    unique_mailbox_ids = {e.mailbox_id for e in events}
+
+    cee_rows = (
+        db.query(CalendarEventEmail.event_id, CalendarEventEmail.email_id)
+        .filter(CalendarEventEmail.event_id.in_(event_ids))
+        .all()
+    )
+    _event_email_ids: dict[int, set[int]] = {}
+    for _ev_id, _em_id in cee_rows:
+        _event_email_ids.setdefault(_ev_id, set()).add(_em_id)
+
+    _all_email_ids: set[int] = set()
+    for e in events:
+        if e.source_email_id:
+            _all_email_ids.add(e.source_email_id)
+        _all_email_ids.update(_event_email_ids.get(e.id, set()))
+    _emails_map: dict[int, EmailMessage] = (
+        {em.id: em for em in db.query(EmailMessage).filter(EmailMessage.id.in_(_all_email_ids)).all()}
+        if _all_email_ids else {}
+    )
+
+    _mailboxes_map: dict[int, MailboxConnection] = {
+        m.id: m
+        for m in db.query(MailboxConnection).filter(MailboxConnection.id.in_(unique_mailbox_ids)).all()
+    }
+    # Warm the per-mailbox name cache once per unique mailbox_id.
+    for _mid in unique_mailbox_ids:
+        mailbox_candidate_name(db, _mid)
+
     for event in events:
         if event.company_human_corrected:
             continue
         owner_name = mailbox_candidate_name(db, event.mailbox_id)
         email_ids = {event.source_email_id} if event.source_email_id else set()
-        email_ids.update(
-            row[0]
-            for row in db.query(CalendarEventEmail.email_id).filter(CalendarEventEmail.event_id == event.id)
-        )
+        email_ids.update(_event_email_ids.get(event.id, set()))
         if not email_ids:
             continue
-        emails = db.query(EmailMessage).filter(EmailMessage.id.in_(email_ids)).all()
+        emails = [_emails_map[eid] for eid in email_ids if eid in _emails_map]
         corrected = ""
         corrected_role = ""
         source = next((item for item in emails if item.id == event.source_email_id), None)
@@ -2907,7 +2938,7 @@ def correct_sender_domain_employers(db: Session, mailbox_id: int | None = None) 
             source_received = as_utc(source.received_at)
             source_sender_name, source_sender = parseaddr(source.sender or "")
             source_sender = _normalized_address(source_sender)
-            mailbox = db.get(MailboxConnection, event.mailbox_id)
+            mailbox = _mailboxes_map.get(event.mailbox_id)
             source_is_candidate = bool(
                 (source.folder or "").casefold() == "sent"
                 or (

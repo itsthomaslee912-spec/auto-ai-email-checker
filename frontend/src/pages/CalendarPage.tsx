@@ -897,6 +897,7 @@ const EventCard = memo(function EventCard({ event, color, account, timeZone, com
     {status.key !== "available" && status.key !== "active" && <span className="calendar-event-status-icon" role="img" aria-label={status.label}>{status.key === "canceled" ? <CanceledStatusIcon /> : <ApplicationStatusIcon status={status.key === "rejected_closed" ? "rejected" : status.key} />}</span>}
     <span className="calendar-event-main">
       <span className="calendar-event-company">{primaryLabel}</span>
+      {event.company && event.role && <span className="calendar-event-role">{event.role}</span>}
     </span>
     <span className={`event-type-badge meeting-${type.type}`} role="img" aria-label={type.label}><MeetingTypeIcon type={type.type} /></span>
   </div>
@@ -1446,30 +1447,6 @@ export default function CalendarPage({
     if (cached) setEvents(cached);
     void load(cached ? "background" : "foreground");
   }, [active]); // eslint-disable-line react-hooks/exhaustive-deps -- reopen should paint cache then refresh quietly
-  useEffect(() => {
-    const source = openEvents();
-    let timer = 0;
-    let hasOpened = false;
-    const onChange = () => {
-      window.clearTimeout(timer);
-      timer = window.setTimeout(() => {
-        CALENDAR_RANGE_CACHE.clear();
-        void load("background", true);
-      }, 400);
-    };
-    const onOpen = () => {
-      // Re-fetch after an SSE reconnect because repairs may have completed
-      // while the backend was restarting and no change event could be sent.
-      if (hasOpened) onChange();
-      hasOpened = true;
-    };
-    source.addEventListener("connected", onOpen);
-    source.addEventListener("calendar.changed", onChange);
-    return () => {
-      window.clearTimeout(timer);
-      source.close();
-    };
-  }, [load]);
   const activeMailboxKey = useMemo(
     () => mailboxes.filter((mailbox) => mailbox.is_active).map((mailbox) => mailbox.id).sort((a, b) => a - b).join(","),
     [mailboxes],
@@ -1494,18 +1471,37 @@ export default function CalendarPage({
     return () => controller.abort();
   }, [loadPending, refreshKey]);
   useEffect(() => {
+    // Single SSE connection shared by calendar-range and pending-interviews listeners.
     const source = openEvents();
-    let timer = 0;
-    const onChange = () => {
-      window.clearTimeout(timer);
-      timer = window.setTimeout(() => { void loadPending(); }, 600);
+    let calendarTimer = 0;
+    let pendingTimer = 0;
+    let hasOpened = false;
+    const onCalendarChange = () => {
+      window.clearTimeout(calendarTimer);
+      calendarTimer = window.setTimeout(() => {
+        CALENDAR_RANGE_CACHE.clear();
+        void load("background", true);
+      }, 400);
     };
-    source.addEventListener("calendar.changed", onChange);
+    const onPendingChange = () => {
+      window.clearTimeout(pendingTimer);
+      pendingTimer = window.setTimeout(() => { void loadPending(); }, 600);
+    };
+    const onOpen = () => {
+      // Re-fetch after an SSE reconnect because repairs may have completed
+      // while the backend was restarting and no change event could be sent.
+      if (hasOpened) onCalendarChange();
+      hasOpened = true;
+    };
+    source.addEventListener("connected", onOpen);
+    source.addEventListener("calendar.changed", onCalendarChange);
+    source.addEventListener("calendar.changed", onPendingChange);
     return () => {
-      window.clearTimeout(timer);
+      window.clearTimeout(calendarTimer);
+      window.clearTimeout(pendingTimer);
       source.close();
     };
-  }, [loadPending]);
+  }, [load, loadPending]);
   useEffect(() => { localStorage.setItem("calendar-view", view); }, [view]);
   useEffect(() => { try { localStorage.setItem(CALENDAR_TIME_ZONE_KEY, timeZone); } catch { /* ignore unavailable storage */ } }, [timeZone]);
   useEffect(() => () => {
@@ -1587,15 +1583,16 @@ export default function CalendarPage({
     setMonthDay((current) => current && sameDay(current, day) ? null : day);
   }, []);
   const openMonthDay = useCallback((day: Date) => setMonthDay(day), []);
+  const mailboxesMap = useMemo(() => new Map(mailboxes.map((m) => [m.id, m])), [mailboxes]);
   const mailboxColor = useCallback((mailboxId: number) => {
-    const mailbox = mailboxes.find((item) => item.id === mailboxId);
+    const mailbox = mailboxesMap.get(mailboxId);
     return mailbox ? accountColor(mailbox) : defaultAccountColor(mailboxId);
-  }, [mailboxes]);
+  }, [mailboxesMap]);
   const mailboxAccount = useCallback((mailboxId: number, fallbackEmail?: string | null): CalendarAccountLabel => {
-    const mailbox = mailboxes.find((item) => item.id === mailboxId);
+    const mailbox = mailboxesMap.get(mailboxId);
     const email = mailbox?.email_address || fallbackEmail || "Unknown account";
     return { name: mailbox?.display_name?.trim() || email, email };
-  }, [mailboxes]);
+  }, [mailboxesMap]);
   const scheduledInterviewsByAccount = useMemo(() => mailboxes.filter((mailbox) => mailbox.is_active && !hiddenMailboxIds.includes(mailbox.id)).map((mailbox) => ({
     mailboxId: mailbox.id,
     name: mailbox.display_name?.trim() || mailbox.email_address,

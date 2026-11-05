@@ -961,11 +961,13 @@ def apply_label_guards(
     body_text: str,
     snippet: str,
     direction: str = "incoming",
+    _text: str | None = None,
+    _full_text: str | None = None,
 ) -> str:
     """Force only high-precision heuristic outcomes over a model label."""
     heuristic = _heuristic_label(subject, sender, body_text, snippet, direction=direction)
-    text = _primary_message_text(subject, sender, body_text, snippet)
-    full_text = _combined_text(subject, sender, body_text, snippet)
+    text = _text if _text is not None else _primary_message_text(subject, sender, body_text, snippet)
+    full_text = _full_text if _full_text is not None else _combined_text(subject, sender, body_text, snippet)
     # Weak alert/footer matches and broad screening language remain model
     # features. Only independently verifiable intent may override the model.
     strong = (
@@ -1141,6 +1143,7 @@ async def classify_email(
         if ai_only
         else _primary_message_text(subject, sender, body_text, snippet)
     )
+    combined_text = None if ai_only else _combined_text(subject, sender, body_text, snippet)
     # AI-only normally honors the selected model without semantic overrides.
     # Verification codes are the deliberate exception: entering the code is
     # an objectively required account/application step, and multiple local
@@ -1300,6 +1303,8 @@ async def classify_email(
             body_text=body_text,
             snippet=snippet,
             direction=direction,
+            _text=primary_text,
+            _full_text=combined_text,
         )
     if not ai_only:
         category_subtype = _parse_category_subtype(content, label)
