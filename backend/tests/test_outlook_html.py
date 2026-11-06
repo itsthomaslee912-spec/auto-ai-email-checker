@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.email.outlook import _strip_html
+from app.email.outlook import _is_outlook_header_fragment, _strip_html, normalize_outlook_message
 
 
 def test_strip_html_drops_hidden_display_none_spans():
@@ -52,3 +52,28 @@ def test_strip_html_decodes_entities():
 def test_strip_html_survives_malformed_markup():
     html = "<div>Unclosed tag <span>text"
     assert "text" in _strip_html(html)
+
+
+def test_outlook_header_fragment_is_not_treated_as_html_body():
+    fragment = (
+        "<jordanwm914@gmail.com>\r\n"
+        "Subject: RE: GDMS Req #75208\r\n\r\n"
+        "Hi Jordan,\r\n"
+        "Thank you for the message and letting me know the answers to the 2 questions.\r\n"
+    )
+    assert _is_outlook_header_fragment(fragment) is True
+    assert _is_outlook_header_fragment("<html><body><p>Hello</p></body></html>") is False
+
+    normalized = normalize_outlook_message(
+        {
+            "id": "gdms-1",
+            "subject": "RE: GDMS Req #75208",
+            "from": {"emailAddress": {"address": "jennifer.prem@gd-ms.com"}},
+            "body": {"contentType": "html", "content": fragment},
+            "bodyPreview": "Hi Jordan, My apologies for sending the incorrect dates",
+            "receivedDateTime": "2026-11-05T22:16:42Z",
+            "isRead": False,
+        }
+    )
+    assert normalized["body_html"] == ""
+    assert normalized["body_text"].startswith("<jordanwm914@gmail.com>")

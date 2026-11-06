@@ -544,7 +544,6 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   const [replyInstruction, setReplyInstruction] = useState("");
   const [quickRepliesOpen, setQuickRepliesOpen] = useState(false);
   const [replyFiles, setReplyFiles] = useState<File[]>([]);
-  const [resolvingReplyRecipient, setResolvingReplyRecipient] = useState(false);
   const [scheduleAt, setScheduleAt] = useState("");
   const [sendingReply, setSendingReply] = useState(false);
   const [aiDrafting, setAiDrafting] = useState(false);
@@ -1847,6 +1846,10 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     setSaveTraining(false);
     setPendingLabel(null);
     setCategoryPickerOpen(false);
+    setSendingReply(false);
+    setReplyOpen(false);
+    setReplyExpanded(false);
+    setQuickRepliesOpen(false);
     const cachedBody = Boolean(cached && (cached.body_html || cached.body_text));
     setLoadingDetail(!cachedBody);
     try {
@@ -2208,26 +2211,18 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     setReplyRecipients((current) => current.filter((item) => item.toLowerCase() !== address.toLowerCase()));
   }
 
-  async function openReplyComposer() {
-    if (!selected || resolvingReplyRecipient) return;
-    let message = selected;
-    if (message.folder !== "sent" && !message.reply_to?.trim()) {
-      setResolvingReplyRecipient(true);
-      try {
-        message = await fetchEmailDetail(message.id, false, false, true);
-        setSelected(message);
-      } catch (err) {
-        setBanner(err instanceof Error ? err.message : "Could not resolve the reply address");
-        return;
-      } finally {
-        setResolvingReplyRecipient(false);
-      }
-    }
+  function openReplyComposer() {
+    if (!selected) return;
+    const message = selected;
     const recipient = message.folder === "sent" && message.recipients
       ? message.recipients
       : message.reply_to || message.sender;
     const subject = /^re:/i.test(message.subject) ? message.subject : `Re: ${message.subject}`;
     const senderMailbox = mailboxById.get(message.mailbox_id) ?? selectedMailbox ?? activeReplyMailboxes[0];
+    // Open immediately with sender as the destination. A missing Reply-To used
+    // to block this button on a provider round-trip ("Checking recipient…"),
+    // which could hang and leave Reply stuck loading after the user already
+    // answered from another client.
     setScheduleAt("");
     setReplyInstruction("");
     setQuickRepliesOpen(false);
@@ -2237,6 +2232,30 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     setReplyRecipientDraft("");
     setReplyMailboxId(senderMailbox?.id ?? null);
     setReplyOpen(true);
+    if (message.folder !== "sent" && !message.reply_to?.trim()) {
+      const emailId = message.id;
+      void fetchEmailDetail(emailId, false, false, true)
+        .then((detail) => {
+          setSelected((current) => (current?.id === emailId ? detail : current));
+          const refined = extractEmailAddresses(detail.reply_to || detail.sender);
+          if (!refined.length) return;
+          setReplyRecipients((current) => {
+            // Only replace the provisional sender when the composer still has
+            // that same default destination — never clobber a manual edit.
+            const provisional = extractEmailAddresses(message.sender);
+            if (
+              current.length === provisional.length
+              && current.every((address, index) => address.toLowerCase() === provisional[index]?.toLowerCase())
+            ) {
+              return refined;
+            }
+            return current;
+          });
+        })
+        .catch(() => {
+          /* Sender fallback already opened the composer. */
+        });
+    }
   }
 
   async function applyQuickReply(kind: QuickReplyKind) {
@@ -3422,9 +3441,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
               {laterThread.map((message) => renderThreadMessage(message))}
               {!replyOpen && (
                 <div className="reply-action-row">
-                  <button type="button" className="reply-pill" disabled={resolvingReplyRecipient} onClick={() => void openReplyComposer()}>
+                  <button type="button" className="reply-pill" onClick={() => openReplyComposer()}>
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 8 4 12l5 4" /><path d="M4 12h9.5a5.5 5.5 0 0 1 5.5 5.5V19" /></svg>
-                    <span>{resolvingReplyRecipient ? "Checking recipient…" : "Reply"}</span>
+                    <span>Reply</span>
                   </button>
                 </div>
               )}

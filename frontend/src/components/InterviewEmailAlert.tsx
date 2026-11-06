@@ -165,7 +165,7 @@ function AttentionRow({ row, color, leaving, onOpen, onDiscard }: {
       )}
       <div className="mail-alert-actions">
         <button type="button" className="mail-alert-open" onClick={() => onOpen(row.emailId)}>
-          {row.kind === "scheduled" ? "Open" : "Reply"}
+          {row.kind === "scheduled" || row.slots.length > 0 ? "Open" : "Reply"}
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" /></svg>
         </button>
         {row.pending && (

@@ -126,6 +126,32 @@ class _HtmlTextExtractor(HTMLParser):
             self.chunks.append(data)
 
 
+_EMAIL_ANGLE_HEAD_RE = re.compile(r"^<[^\s<>]+@[^\s<>]+>\s*", re.I)
+_STRUCTURAL_HTML_RE = re.compile(
+    r"</?(?:html|body|div|p|br|table|span|font|a|img|td|tr|ul|ol|li|blockquote)\b",
+    re.I,
+)
+_OUTLOOK_HEADER_RE = re.compile(r"^(?:from|sent|to|subject)\s*:", re.I)
+
+
+def _is_outlook_header_fragment(content: str) -> bool:
+    """True for plain-text Outlook quotes mislabeled as HTML.
+
+    Example: a reply whose Graph ``body`` starts with
+    ``<jordanwm914@gmail.com>\\nSubject: RE: GDMS Req #75208`` and never
+    contains real markup. Rendering that fragment hides the fresh message.
+    """
+    text = (content or "").lstrip("\ufeff").strip()
+    if not text:
+        return False
+    without_address = _EMAIL_ANGLE_HEAD_RE.sub("", text, count=1).strip()
+    if without_address != text.strip() and not _STRUCTURAL_HTML_RE.search(without_address[:800]):
+        return bool(_OUTLOOK_HEADER_RE.match(without_address))
+    if not _STRUCTURAL_HTML_RE.search(text[:800]):
+        return bool(_OUTLOOK_HEADER_RE.match(text))
+    return False
+
+
 def _strip_html(html: str) -> str:
     parser = _HtmlTextExtractor()
     try:
@@ -399,8 +425,14 @@ def normalize_outlook_message(raw: dict) -> dict:
     content = body.get("content") or ""
     body_html = ""
     if (body.get("contentType") or "").lower() == "html":
-        body_html = content
-        body_text = _strip_html(content)
+        # Graph occasionally labels a truncated plain-text Outlook quote as
+        # HTML when it begins mid-header with "<user@host>" (GDMS replies).
+        # Storing that fragment hides the real body_text in the reader.
+        if _is_outlook_header_fragment(content):
+            body_text = content
+        else:
+            body_html = content
+            body_text = _strip_html(content)
     else:
         body_text = content
 

@@ -55,7 +55,15 @@ def _seed_mailbox(db, *, email_address: str) -> MailboxConnection:
     return mailbox
 
 
-def _add_email(db, mailbox_id: int, *, label: str, received_at: datetime, provider_message_id: str) -> None:
+def _add_email(
+    db,
+    mailbox_id: int,
+    *,
+    label: str,
+    received_at: datetime,
+    provider_message_id: str,
+    interview_subtype: str | None = None,
+) -> None:
     db.add(
         EmailMessage(
             mailbox_id=mailbox_id,
@@ -65,6 +73,7 @@ def _add_email(db, mailbox_id: int, *, label: str, received_at: datetime, provid
             snippet="snippet",
             body_text="body",
             label=label,
+            interview_subtype=interview_subtype,
             received_at=received_at,
         )
     )

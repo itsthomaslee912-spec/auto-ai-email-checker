@@ -29,6 +29,9 @@ from app.schemas import (
     MailboxOutcomesOut,
     MailboxUpdateIn,
     OutcomeEntryOut,
+    ProfileActivityBucketOut,
+    ProfileActivityRowOut,
+    ProfileActivityStatsOut,
 )
 from app.services.mailbox_cleanup import delete_emails_for_mailbox
 
@@ -214,6 +217,188 @@ def update_mailbox_settings(
     db.commit()
     db.refresh(mailbox)
     return mailbox
+
+
+def _same_calendar_day(start: datetime, end: datetime) -> bool:
+    """True when the inclusive range lands on one local/UTC calendar day."""
+    last = end - timedelta(microseconds=1)
+    return start.date() == last.date()
+
+
+def _profile_activity_counts(
+    db: Session,
+    mailbox_ids: list[int],
+    start: datetime,
+    end: datetime,
+) -> dict[int, tuple[int, int, int]]:
+    """Return mailbox_id -> (total, applied, canceled)."""
+    if not mailbox_ids:
+        return {}
+    totals = dict.fromkeys(mailbox_ids, 0)
+    applied = dict.fromkeys(mailbox_ids, 0)
+    canceled = dict.fromkeys(mailbox_ids, 0)
+    for mailbox_id, count in (
+        db.query(EmailMessage.mailbox_id, func.count(EmailMessage.id))
+        .filter(
+            EmailMessage.mailbox_id.in_(mailbox_ids),
+            EmailMessage.classification_pending.is_not(True),
+            EmailMessage.received_at.is_not(None),
+            EmailMessage.received_at >= start,
+            EmailMessage.received_at < end,
+        )
+        .group_by(EmailMessage.mailbox_id)
+        .all()
+    ):
+        totals[mailbox_id] = int(count)
+    for mailbox_id, count in (
+        db.query(EmailMessage.mailbox_id, func.count(EmailMessage.id))
+        .filter(
+            EmailMessage.mailbox_id.in_(mailbox_ids),
+            EmailMessage.classification_pending.is_not(True),
+            EmailMessage.label == EmailLabel.APPLICATION_CONFIRMATION.value,
+            EmailMessage.received_at.is_not(None),
+            EmailMessage.received_at >= start,
+            EmailMessage.received_at < end,
+        )
+        .group_by(EmailMessage.mailbox_id)
+        .all()
+    ):
+        applied[mailbox_id] = int(count)
+    for mailbox_id, count in (
+        db.query(EmailMessage.mailbox_id, func.count(EmailMessage.id))
+        .filter(
+            EmailMessage.mailbox_id.in_(mailbox_ids),
+            EmailMessage.classification_pending.is_not(True),
+            EmailMessage.interview_subtype == "cancellation",
+            EmailMessage.received_at.is_not(None),
+            EmailMessage.received_at >= start,
+            EmailMessage.received_at < end,
+        )
+        .group_by(EmailMessage.mailbox_id)
+        .all()
+    ):
+        canceled[mailbox_id] = int(count)
+    return {
+        mailbox_id: (totals[mailbox_id], applied[mailbox_id], canceled[mailbox_id])
+        for mailbox_id in mailbox_ids
+    }
+
+
+def _hourly_applied_canceled(
+    db: Session,
+    mailbox_ids: list[int],
+    start: datetime,
+    end: datetime,
+) -> list[ProfileActivityBucketOut]:
+    if not mailbox_ids:
+        return []
+    applied_times = (
+        db.query(EmailMessage.received_at)
+        .filter(
+            EmailMessage.mailbox_id.in_(mailbox_ids),
+            EmailMessage.classification_pending.is_not(True),
+            EmailMessage.label == EmailLabel.APPLICATION_CONFIRMATION.value,
+            EmailMessage.received_at.is_not(None),
+            EmailMessage.received_at >= start,
+            EmailMessage.received_at < end,
+        )
+        .all()
+    )
+    canceled_times = (
+        db.query(EmailMessage.received_at)
+        .filter(
+            EmailMessage.mailbox_id.in_(mailbox_ids),
+            EmailMessage.classification_pending.is_not(True),
+            EmailMessage.interview_subtype == "cancellation",
+            EmailMessage.received_at.is_not(None),
+            EmailMessage.received_at >= start,
+            EmailMessage.received_at < end,
+        )
+        .all()
+    )
+
+    def hour_key(received_at: datetime) -> datetime:
+        stamp = received_at.astimezone(UTC).replace(tzinfo=None) if received_at.tzinfo else received_at
+        return stamp.replace(minute=0, second=0, microsecond=0)
+
+    applied_counts: dict[datetime, int] = {}
+    for (received_at,) in applied_times:
+        if received_at is None:
+            continue
+        key = hour_key(received_at)
+        applied_counts[key] = applied_counts.get(key, 0) + 1
+    canceled_counts: dict[datetime, int] = {}
+    for (received_at,) in canceled_times:
+        if received_at is None:
+            continue
+        key = hour_key(received_at)
+        canceled_counts[key] = canceled_counts.get(key, 0) + 1
+
+    cursor = start.replace(minute=0, second=0, microsecond=0)
+    buckets: list[ProfileActivityBucketOut] = []
+    while cursor < end:
+        buckets.append(
+            ProfileActivityBucketOut(
+                bucket=cursor.isoformat(),
+                applied=applied_counts.get(cursor, 0),
+                canceled=canceled_counts.get(cursor, 0),
+            )
+        )
+        cursor += timedelta(hours=1)
+    return buckets
+
+
+@router.get("/activity-stats", response_model=ProfileActivityStatsOut)
+def mailbox_activity_stats(
+    date_from: str = Query(...),
+    date_to: str = Query(...),
+    mailbox_id: int | None = Query(None),
+    db: Session = Depends(get_db),
+) -> ProfileActivityStatsOut:
+    """Applied/canceled activity for assigned profiles in a date range.
+
+    Same calendar day returns hourly line-chart series. Multi-day ranges return
+    per-profile totals for a grouped bar chart.
+    """
+    start, end, start_label, end_label = _parse_range(date_from, date_to)
+    mailboxes = (
+        db.query(MailboxConnection)
+        .filter(mailbox_scope())
+        .order_by(MailboxConnection.email_address.asc(), MailboxConnection.id.asc())
+        .all()
+    )
+    if mailbox_id is not None:
+        mailboxes = [item for item in mailboxes if item.id == mailbox_id]
+        if not mailboxes:
+            raise HTTPException(status_code=404, detail="Mailbox not found")
+    mailbox_ids = [item.id for item in mailboxes]
+    counts = _profile_activity_counts(db, mailbox_ids, start, end)
+    profiles = [
+        ProfileActivityRowOut(
+            mailbox_id=item.id,
+            email_address=item.email_address,
+            display_name=item.display_name,
+            total=counts.get(item.id, (0, 0, 0))[0],
+            applied=counts.get(item.id, (0, 0, 0))[1],
+            canceled=counts.get(item.id, (0, 0, 0))[2],
+        )
+        for item in mailboxes
+    ]
+    if _same_calendar_day(start, end):
+        return ProfileActivityStatsOut(
+            mode="line",
+            date_from=start_label,
+            date_to=end_label,
+            profiles=profiles,
+            series=_hourly_applied_canceled(db, mailbox_ids, start, end),
+        )
+    return ProfileActivityStatsOut(
+        mode="bar",
+        date_from=start_label,
+        date_to=end_label,
+        profiles=profiles,
+        series=[],
+    )
 
 
 @router.get("/label-stats", response_model=MailboxLabelStatsOut)

@@ -20,6 +20,10 @@ function looksLikeHtml(value: string): boolean {
   return /<\/?[a-z][\s\S]*>/i.test(value);
 }
 
+function hasStructuralHtml(value: string): boolean {
+  return /<\/?(?:html|body|div|p|br|table|span|font|a|img|td|tr|ul|ol|li|blockquote)\b/i.test(value);
+}
+
 function splitMixedPlainHtml(value: string): { html: string; text: string } {
   const match = value.match(/<[a-z][\s\S]*>/i);
   if (!match || match.index == null) return { html: "", text: value.trim() };
@@ -30,8 +34,24 @@ function splitMixedPlainHtml(value: string): { html: string; text: string } {
   };
 }
 
+function isOutlookHeaderFragment(html: string): boolean {
+  const trimmed = (html || "").replace(/^\uFEFF/, "").trim();
+  if (!trimmed) return false;
+  // Graph sometimes stores a truncated plain-text quote as "HTML" that begins
+  // with a bare address tag from "To: Name <user@host>" (GDMS Req #75208).
+  const withoutAddress = trimmed.replace(/^\s*<[^<>\s]+@[^\s<>]+>\s*/i, "").trim();
+  if (withoutAddress !== trimmed && !hasStructuralHtml(withoutAddress.slice(0, 800))) {
+    return /^(?:from|sent|to|subject)\s*:/i.test(withoutAddress);
+  }
+  if (!hasStructuralHtml(trimmed.slice(0, 800))) {
+    return /^(?:from|sent|to|subject)\s*:/i.test(trimmed);
+  }
+  return false;
+}
+
 function isIncompleteQuotedHtml(html: string, text: string): boolean {
-  if (!html || !text || text.length < 200) return false;
+  if (!html || !text || text.length < 40) return false;
+  if (isOutlookHeaderFragment(html)) return true;
   const visible = new DOMParser().parseFromString(html, "text/html").body.textContent
     ?.replace(/\s+/g, " ")
     .trim() || "";

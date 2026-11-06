@@ -685,14 +685,22 @@ def _duration_from_nearby_text(value: str) -> timedelta | None:
 
 def _share_trailing_meridiem(text: str) -> str:
     """Give "1:00-1:30 PM" and "9:00 and 11:00 a.m." a meridiem on the start clock."""
+    # Spaced "November 10 - 9:00 AM" is a date then a range, not "10 AM - 9:00 AM".
+    # Only glue bare hours when the dash has no surrounding spaces ("4-4:30pm").
     shared = re.sub(
-        # Recruiters commonly omit both the minutes and meridiem from the
-        # first clock ("from 4-4:30pm PT"). Without sharing the trailing
-        # meridiem with that bare hour, the first clock is ignored and 4:30 is
-        # emitted as a separate default-duration appointment.
-        r"\b(\d{1,2}(?::\d{2})?)\s*([-–—])\s*(\d{1,2}(?::\d{2})?)\s*(a\.?m\.?|p\.?m\.?)",
+        r"\b(\d{1,2}:\d{2})\s*([-–—])\s*(\d{1,2}(?::\d{2})?)\s*(a\.?m\.?|p\.?m\.?)",
         lambda match: f"{match.group(1)} {match.group(4)} {match.group(2)} {match.group(3)} {match.group(4)}",
         text or "",
+        flags=re.I,
+    )
+    # Recruiters commonly omit both the minutes and meridiem from the
+    # first clock ("from 4-4:30pm PT"). Without sharing the trailing
+    # meridiem with that bare hour, the first clock is ignored and 4:30 is
+    # emitted as a separate default-duration appointment.
+    shared = re.sub(
+        r"\b(\d{1,2})([-–—])(\d{1,2}(?::\d{2})?)\s*(a\.?m\.?|p\.?m\.?)",
+        lambda match: f"{match.group(1)} {match.group(4)} {match.group(2)} {match.group(3)} {match.group(4)}",
+        shared,
         flags=re.I,
     )
     return re.sub(
@@ -844,7 +852,17 @@ def _slot_from_date_and_nearby_times(
     agenda_slots = _agenda_envelope_slots(source, position, date_end, year, month, day)
     if agenda_slots:
         return agenda_slots
-    times = list(_TIME_PATTERN.finditer(source, date_end, date_end + 240))
+    # Keep clocks for this date on its own offer. A flattened bullet list can
+    # put the next day's times within 240 characters of this date.
+    time_limit = date_end + 240
+    next_offer_break = re.search(
+        rf"[•▪◦]\s*(?:(?:{_WEEKDAY_PATTERN})[,]?\s+)?(?:{_MONTH_PATTERN})\b",
+        source[date_end:time_limit],
+        re.I,
+    )
+    if next_offer_break is not None and next_offer_break.start() > 0:
+        time_limit = date_end + next_offer_break.start()
+    times = list(_TIME_PATTERN.finditer(source, date_end, time_limit))
     lookback_start = max(0, position - 90)
     before_times = list(_TIME_PATTERN.finditer(source, lookback_start, position))
     if before_times:
@@ -917,19 +935,120 @@ def _slot_from_date_and_nearby_times(
             end = proposed
             end_is_explicit = True
             between = source[times[0].end() : end_clock.start()]
-            before = source[max(0, times[0].start() - 70) : times[0].start()]
+            before = source[max(0, times[0].start() - 90) : times[0].start()]
+            # "Tuesday, November 10 - 9:00 AM-11:00 AM ET" is a panel window the
+            # recruiter offers (GDMS), not a booked two-hour interview.
+            date_prefixed_range = bool(
+                re.search(
+                    rf"(?:{_MONTH_PATTERN})\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,\s*\d{{4}})?\s*[-–—]\s*$",
+                    before,
+                    re.I,
+                )
+            )
+            # "I am available at the following times: • Mon, November 9 at 12 PM
+            # - 1PM" is a list of concrete offers. The lead-in word "available"
+            # must not turn the first bullet into an availability window that
+            # `_prefer_specific_slots` then drops.
+            list_of_offers = bool(
+                re.search(r"\b(?:following|these)\s+times?\b", before, re.I)
+                or re.search(
+                    rf"[•▪◦]\s*(?:(?:{_WEEKDAY_PATTERN})[,]?\s+)?(?:{_MONTH_PATTERN})\b",
+                    before[-70:],
+                    re.I,
+                )
+            )
+            after_range = source[end_clock.end() : end_clock.end() + 100]
             is_window = bool(
                 len(between) <= 16
                 and (
                     re.search(r"\b(?:and|to)\b", between, re.I)
                     or re.fullmatch(r"\s*[-–—]\s*", between)
                 )
-                and re.search(r"\b(?:between|from|available|availability|free)\b", before, re.I)
+                and (
+                    re.search(r"\b(?:between|from|free|panel)\b", before, re.I)
+                    or (
+                        re.search(r"\b(?:available|availability)\b", before, re.I)
+                        and not list_of_offers
+                    )
+                    or date_prefixed_range
+                )
                 # "confirmed from 12 PM to 3 PM" / "scheduled 12–3 PM" is the
                 # confirmed block itself, not a window the candidate picks from.
                 and not re.search(r"\b(?:confirmed|scheduled|booked)\b", before, re.I)
+                # "Wed from 3:00 PM - 4:00 PM ET works well for me" accepts one
+                # offered range. Keep "anytime between 9 and 11 works well" as a
+                # real availability window the candidate is proposing.
+                and not (
+                    (
+                        bool(re.search(r"\bfrom\b", before, re.I) or date_prefixed_range)
+                        and not re.search(r"\bbetween\b", before, re.I)
+                    )
+                    and re.search(
+                        r"\b(?:works?(?:\s+well)?\s+for\s+me|that\s+works|i\s+can\s+make\s+(?:it|that))\b",
+                        after_range,
+                        re.I,
+                    )
+                )
             )
-    return [ExtractedSlot(start.astimezone(UTC), end.astimezone(UTC), zone_name, end_is_explicit, is_window)]
+    # One dated line can list several windows:
+    # "Wednesday, November 11 - 9:00 AM-10:00 AM ET, 12:00 PM-12:30 PM ET".
+    extra_windows: list[ExtractedSlot] = []
+    if is_window and end_clock is not None:
+        line_end = source.find("\n", date_end)
+        if line_end < 0:
+            line_end = min(len(source), date_end + 240)
+        # Flattened plain-text replies keep the next bullet on the same line:
+        # "…1PM PST(Systems Design) • Tue, November 10 at 12:30 PM…". Stop
+        # before that next dated offer so its range is not attached here.
+        next_offer = re.search(
+            rf"[•▪◦]\s*(?:(?:{_WEEKDAY_PATTERN})[,]?\s+)?(?:{_MONTH_PATTERN})\b",
+            source[end_clock.end() : line_end],
+            re.I,
+        )
+        if next_offer is not None:
+            line_end = end_clock.end() + next_offer.start()
+        more = list(_TIME_PATTERN.finditer(source, end_clock.end(), line_end))
+        index = 0
+        while index + 1 < len(more):
+            left, right = more[index], more[index + 1]
+            between_more = source[left.end() : right.start()]
+            if not (
+                len(between_more) <= 16
+                and (
+                    re.search(r"\b(?:and|to)\b", between_more, re.I)
+                    or re.fullmatch(r"\s*[-–—]\s*", between_more)
+                )
+            ):
+                index += 1
+                continue
+            try:
+                left_hour, left_minute = _clock_parts(left)
+                right_hour, right_minute = _clock_parts(right)
+                extra_start = datetime(year, month, day, left_hour, left_minute, tzinfo=zone)
+                extra_end = datetime(year, month, day, right_hour, right_minute, tzinfo=zone)
+                if extra_end <= extra_start:
+                    extra_end += timedelta(days=1)
+            except (KeyError, TypeError, ValueError):
+                index += 1
+                continue
+            if extra_end - extra_start <= timedelta(hours=12):
+                if reference and extra_start.astimezone(UTC) < reference - timedelta(days=120):
+                    extra_start = extra_start.replace(year=extra_start.year + 1)
+                    extra_end = extra_end.replace(year=extra_end.year + 1)
+                extra_windows.append(
+                    ExtractedSlot(
+                        extra_start.astimezone(UTC),
+                        extra_end.astimezone(UTC),
+                        zone_name,
+                        True,
+                        True,
+                    )
+                )
+            index += 2
+    return [
+        ExtractedSlot(start.astimezone(UTC), end.astimezone(UTC), zone_name, end_is_explicit, is_window),
+        *extra_windows,
+    ]
 
 
 def parse_text_slots(text: str, received_at: datetime | None = None) -> list[ExtractedSlot]:
@@ -2831,6 +2950,12 @@ def interview_subject_company_role(subject: str | None) -> tuple[str, str]:
         re.compile(
             r"^Your\s+interview\s+with\s+(?P<company>.+?)\s+is\s+"
             r"(?:scheduled|confirmed|booked)\b",
+            re.I,
+        ),
+        # Lever/Greenhouse: "Thank you for your interest in Multiply Labs, Mark"
+        re.compile(
+            r"^(?:Re:\s*)?Thank you for your interest in\s+"
+            r"(?P<company>[^,]{2,120}?)\s*,\s*[A-Z][a-zA-Z.'-]{1,40}\s*$",
             re.I,
         ),
         # "Interview Request: Staff Data Engineer, Rosen, Pia"
@@ -5139,27 +5264,45 @@ def repair_unapplied_application_outcomes(db: Session, mailbox_id: int | None = 
             outcome_status = "passed"
         else:
             continue
-        targets = [
-            event
-            for event in _outcome_events(db, email)
-            if event.application_status in {None, "", "active"}
-            or (
+        outcome_at = as_utc(email.received_at) or datetime.now(UTC)
+        targets = []
+        for event in _outcome_events(db, email):
+            status = event.application_status or "active"
+            existing_at = as_utc(event.outcome_at)
+            if status in {None, "", "active"}:
+                targets.append(event)
+                continue
+            # Multiply Labs: an Oct 26 "move forward" mark must not block the
+            # Nov 3 rejection for the same application.
+            if (
+                outcome_status in {"rejected", "position_closed"}
+                and status == "passed"
+                and (existing_at is None or existing_at <= outcome_at)
+            ):
+                targets.append(event)
+                continue
+            if (
                 event.outcome_source_email_id is None
-                and event.application_status not in {"rejected", "position_closed", "passed", "offer"}
-            )
-        ]
+                and status not in {"rejected", "position_closed", "passed", "offer"}
+            ):
+                targets.append(event)
         if not targets:
             continue
-        outcome_at = as_utc(email.received_at) or datetime.now(UTC)
         for target in targets:
-            # A newer outcome already owns this chip.
+            existing_at = as_utc(target.outcome_at)
+            # A newer outcome already owns this chip, unless this message is a
+            # later terminal rejection replacing an earlier passed mark.
             if (
                 target.outcome_source_email_id
                 and target.outcome_source_email_id != email.id
-                and target.application_status not in {None, "", "active"}
+                and (target.application_status or "active") not in {None, "", "active"}
+                and not (
+                    outcome_status in {"rejected", "position_closed"}
+                    and target.application_status == "passed"
+                    and (existing_at is None or existing_at <= outcome_at)
+                )
             ):
                 continue
-            existing_at = as_utc(target.outcome_at)
             if existing_at is not None and existing_at > outcome_at:
                 continue
             target.application_status = outcome_status
@@ -5176,14 +5319,16 @@ def repair_unapplied_application_outcomes(db: Session, mailbox_id: int | None = 
 
 
 def repair_stale_application_outcomes(db: Session, mailbox_id: int | None = None) -> int:
-    """Clear rejections that predate a re-booked interview or are company-only ambiguous.
+    """Clear outcomes that predate a re-booked interview or are company-only ambiguous.
 
     Everpure: deemed-export rejection in October closed a November re-book.
     Faire: a role-less "Thank You For Applying" closed the only chip while
     several Faire applications were still open.
+    Multiply Labs: an Oct 26 "move forward" note marked the Oct 29 technical
+    screen passed even though that booking arrived after the note.
     """
     query = _email_calendar_events(db).filter(
-        CalendarEvent.application_status.in_(("rejected", "position_closed")),
+        CalendarEvent.application_status.in_(("rejected", "position_closed", "passed")),
         CalendarEvent.outcome_source_email_id.is_not(None),
     )
     if mailbox_id is not None:
@@ -5778,6 +5923,10 @@ def _accepted_employer_proposal(db: Session, email: EmailMessage) -> EmailMessag
     in the same thread. Requiring one slot, explicit acceptance language, and
     an exact same-thread employer proposal avoids promoting a candidate's own
     unsolicited one-time suggestion.
+
+    Matching an availability *window* (GDMS panel lists, "between 2 and 4") is
+    not a booking — the employer still has to send a calendar invite. Only a
+    concrete non-window employer proposal can promote the reply to confirmed.
     """
     if (
         email.human_corrected
@@ -5814,10 +5963,66 @@ def _accepted_employer_proposal(db: Session, email: EmailMessage) -> EmailMessag
         offered = message_appointment_slots(candidate)
         if any(
             abs((accepted[0].start_at - slot.start_at).total_seconds()) <= 60
+            and not slot.is_availability_window
             for slot in offered
         ):
             return candidate
     return None
+
+
+def _accepted_employer_availability_window(db: Session, email: EmailMessage) -> bool:
+    """True when the Sent reply only picks an employer availability window.
+
+    GDMS-style panel lists are offers to choose from. "Wed 3-4 PM works well
+    for me" is still awaiting the employer's calendar invite, so it must not
+    become a confirmed calendar chip. Detection ignores ``human_corrected`` so a
+    prior mistaken promotion cannot leave a false booking on the calendar.
+    """
+    if email.folder != "sent" or not email.thread_id:
+        return False
+    # Exact non-window employer proposals are real acceptances; those still
+    # promote through ``_accepted_employer_proposal`` (which honors corrections).
+    if (
+        not email.human_corrected
+        and email.label in {
+            EmailLabel.INTERVIEW_AVAILABILITY.value,
+            EmailLabel.INTERVIEW_SCHEDULED.value,
+        }
+        and _accepted_employer_proposal(db, email) is not None
+    ):
+        return False
+    fresh = _without_quoted_history(_calendar_text(email))
+    if not _CANDIDATE_ACCEPTANCE_RE.search(fresh) or _UNCONFIRMED_CANDIDATE_PROPOSAL_RE.search(fresh):
+        return False
+    accepted = message_appointment_slots(email)
+    if len(accepted) != 1:
+        return False
+    received = as_utc(email.received_at)
+    related = (
+        db.query(EmailMessage)
+        .filter(
+            EmailMessage.mailbox_id == email.mailbox_id,
+            EmailMessage.thread_id == email.thread_id,
+            EmailMessage.id != email.id,
+            EmailMessage.folder.notin_({"sent", "spam", "trash"}),
+            *([EmailMessage.received_at <= received] if received else []),
+            *([EmailMessage.received_at >= received - _CROSS_THREAD_WINDOW] if received else []),
+        )
+        .order_by(EmailMessage.received_at.desc(), EmailMessage.id.desc())
+        .limit(20)
+        .all()
+    )
+    matched_window = False
+    matched_specific = False
+    for message in related:
+        for slot in message_appointment_slots(message):
+            if abs((accepted[0].start_at - slot.start_at).total_seconds()) > 60:
+                continue
+            if slot.is_availability_window:
+                matched_window = True
+            else:
+                matched_specific = True
+    return matched_window and not matched_specific
 
 _CANDIDATE_RESCHEDULE_TO_RE = re.compile(
     r"\b(?:reschedul(?:e|ed|ing)|move|change)\b[^\r\n]{0,120}?"
@@ -5924,7 +6129,11 @@ def candidate_proposed_availability(db: Session, email: EmailMessage) -> bool:
     # accepts it or sends an invite.
     if len(slots) > 1 or _UNCONFIRMED_CANDIDATE_PROPOSAL_RE.search(fresh):
         return True
-    employer_slots = message_appointment_slots(scheduling_message)
+    # Only a concrete employer proposal (not a multi-hour panel window) can
+    # make the candidate's matching reply look like a confirmation.
+    employer_slots = [
+        slot for slot in message_appointment_slots(scheduling_message) if not slot.is_availability_window
+    ]
     return not any(
         abs((candidate_slot.start_at - employer_slot.start_at).total_seconds()) <= 60
         for candidate_slot in slots
@@ -6663,7 +6872,10 @@ _NEGATIVE_OUTCOME_LANGUAGE_RE = re.compile(
     r"|move forward with other candidates?"
     r"|unfortunately\b.{0,80}\b(?:other candidates?|not (?:be )?moving forward|your application)"
     r"|we(?:'ve| have) decided not to (?:move|proceed|continue)"
+    r"|made the decision not to (?:move|proceed|continue)"
+    r"|decision not to move forward"
     r"|will not be moving forward"
+    r"|not (?:to )?move forward at this time"
     r"|not selected (?:for|to)"
     r"|pursue(?:ing)? other candidates?"
     r")",
@@ -7614,6 +7826,22 @@ def repair_availability_window_appointments(db: Session, mailbox_id: int | None 
             continue
         specific = [slot for slot in message_appointment_slots(email) if not slot.is_availability_window]
         if not specific:
+            # GDMS: the whole message is only a multi-slot panel list. Demote
+            # the false confirmed chip so the invitation path can recreate offers.
+            # Skip single-window messages (a candidate accepting one offered range).
+            if (
+                len(windows) <= 1
+                or message_is_booked_appointment(email)
+                or email.interview_subtype in {"confirmation", "calendar_invite", "reminder"}
+            ):
+                continue
+            event.is_visible = False
+            event.interview_status = email.interview_subtype or "reschedule"
+            if email.label == EmailLabel.INTERVIEW_SCHEDULED.value:
+                email.label = EmailLabel.INTERVIEW_INVITATION.value
+                email.interview_subtype = None
+                email.calendar_processed_hash = None
+            repaired += 1
             continue
         slot = specific[0]
         if abs((event_start - slot.start_at).total_seconds()) <= 60 and abs((event_end - slot.end_at).total_seconds()) <= 60:
@@ -7623,6 +7851,113 @@ def repair_availability_window_appointments(db: Session, mailbox_id: int | None 
         if slot.source_timezone:
             event.source_timezone = slot.source_timezone
         repaired += 1
+    return repaired
+
+
+def _hide_unselected_employer_windows(
+    db: Session,
+    email: EmailMessage,
+    selected: list[ExtractedSlot],
+    *,
+    pick_event: CalendarEvent | None = None,
+) -> int:
+    """Retire employer panel windows the candidate did not pick."""
+    if not selected or not email.thread_id:
+        return 0
+    selected_starts = [slot.start_at for slot in selected]
+    hidden = 0
+    offers = (
+        _email_calendar_events(db)
+        .filter(
+            CalendarEvent.mailbox_id == email.mailbox_id,
+            CalendarEvent.source_thread_id == email.thread_id,
+            CalendarEvent.kind == "availability",
+            CalendarEvent.source_email_id.is_not(None),
+            CalendarEvent.source_email_id != email.id,
+        )
+        .all()
+    )
+    for offer in offers:
+        source = db.get(EmailMessage, offer.source_email_id)
+        if source is None or source.folder == "sent":
+            continue
+        offer_start = as_utc(offer.start_at)
+        if offer_start is None:
+            continue
+        if any(abs((offer_start - start).total_seconds()) <= 60 for start in selected_starts):
+            # Same window the candidate picked — keep the candidate chip, hide
+            # the employer duplicate so the invitation shows one submitted time.
+            if offer.is_visible:
+                offer.is_visible = False
+                if pick_event is not None:
+                    offer.superseded_by_event_id = pick_event.id
+                hidden += 1
+            continue
+        if offer.is_visible or offer.superseded_by_event_id is None:
+            offer.is_visible = False
+            if pick_event is not None:
+                offer.superseded_by_event_id = pick_event.id
+            hidden += 1
+    return hidden
+
+
+def repair_unbooked_window_acceptances(db: Session, mailbox_id: int | None = None) -> int:
+    """Demote a false booking from picking an employer availability window.
+
+    "Wed 3-4 PM works well for me" after a panel-window list is still awaiting
+    the employer's invite. Keep that pick as the candidate's submitted
+    availability and hide the other unselected panel windows.
+    """
+    query = (
+        db.query(EmailMessage)
+        .filter(
+            EmailMessage.folder == "sent",
+            EmailMessage.thread_id.is_not(None),
+            EmailMessage.label.in_(
+                {
+                    EmailLabel.INTERVIEW_AVAILABILITY.value,
+                    EmailLabel.INTERVIEW_SCHEDULED.value,
+                    EmailLabel.INTERVIEW_INVITATION.value,
+                }
+            ),
+        )
+    )
+    if mailbox_id is not None:
+        query = query.filter(EmailMessage.mailbox_id == mailbox_id)
+    repaired = 0
+    for email in query.order_by(EmailMessage.received_at.desc(), EmailMessage.id.desc()).limit(500).all():
+        if not _accepted_employer_availability_window(db, email):
+            continue
+        if not email.human_corrected:
+            email.label = EmailLabel.INTERVIEW_AVAILABILITY.value
+            email.interview_subtype = None
+        selected = message_appointment_slots(email)
+        pick_event: CalendarEvent | None = None
+        for event in _email_calendar_events(db).filter(CalendarEvent.source_email_id == email.id).all():
+            touched = False
+            if event.kind == "confirmed":
+                event.kind = "availability"
+                event.interview_status = None
+                touched = True
+            if not event.is_visible:
+                event.is_visible = True
+                event.superseded_by_event_id = None
+                touched = True
+            if touched:
+                repaired += 1
+            if pick_event is None or (as_utc(event.start_at) or datetime.min.replace(tzinfo=UTC)) <= (
+                as_utc(pick_event.start_at) or datetime.min.replace(tzinfo=UTC)
+            ):
+                pick_event = event
+        if pick_event is None and selected:
+            # No stored chip yet — leave hash clear so processing recreates it.
+            email.calendar_processed_hash = None
+            repaired += 1
+            continue
+        repaired += _hide_unselected_employer_windows(db, email, selected, pick_event=pick_event)
+        email.calendar_processed_hash = email_calendar_hash(email)
+        email.calendar_processed_at = datetime.now(UTC)
+        email.calendar_processing_error = None
     return repaired
 
 
@@ -9094,6 +9429,9 @@ def collapse_duplicate_calendar_events(
     if repair_availability_window_appointments(db, mailbox_id) > 0:
         changed = True
     checkpoint()
+    if repair_unbooked_window_acceptances(db, mailbox_id) > 0:
+        changed = True
+    checkpoint()
     if repair_corrupted_company_names(db, mailbox_id) > 0:
         changed = True
         companies_match.cache_clear()
@@ -9309,6 +9647,47 @@ async def process_calendar_email(
             return await _process_calendar_email(
                 db, email, force=force, use_ai=use_ai, priority=priority,
             )
+    if _accepted_employer_availability_window(db, email):
+        # Picked a panel window / offered range. Record that as the candidate's
+        # submitted availability (still unbooked) and retire the other panel
+        # windows. Do not promote to a confirmed interview until the employer
+        # sends a real invite.
+        if not email.human_corrected:
+            invitation = _matching_interview_invitation(db, email)
+            related = _related_interview_emails(db, email)
+            context = [*related, *([invitation] if invitation is not None else []), email]
+            email.label = EmailLabel.INTERVIEW_AVAILABILITY.value
+            email.interview_subtype = None
+            if invitation is not None:
+                if not email.thread_id and invitation.thread_id:
+                    email.thread_id = invitation.thread_id
+                if not (email.company or "").strip() and invitation.company:
+                    email.company = invitation.company
+            known_role = _known_role(context)
+            if known_role:
+                email.job_role = known_role
+        for event in _email_calendar_events(db).filter(CalendarEvent.source_email_id == email.id).all():
+            if event.kind == "confirmed":
+                event.kind = "availability"
+                event.interview_status = None
+                event.is_visible = True
+                event.superseded_by_event_id = None
+        processed = await _process_calendar_email(
+            db, email, force=force, use_ai=use_ai, priority=priority,
+        )
+        selected = message_appointment_slots(email)
+        pick_event = (
+            _email_calendar_events(db)
+            .filter(
+                CalendarEvent.source_email_id == email.id,
+                CalendarEvent.kind == "availability",
+                CalendarEvent.is_visible.is_(True),
+            )
+            .order_by(CalendarEvent.start_at.asc(), CalendarEvent.id.asc())
+            .first()
+        )
+        _hide_unselected_employer_windows(db, email, selected, pick_event=pick_event)
+        return processed
     accepted_proposal = _accepted_employer_proposal(db, email)
     if accepted_proposal is not None and not email.human_corrected:
         email.label = EmailLabel.INTERVIEW_SCHEDULED.value
@@ -9654,6 +10033,20 @@ async def _process_calendar_email_locked(
         email.label = EmailLabel.INTERVIEW_SCHEDULED.value
         if not email.interview_subtype:
             email.interview_subtype = "calendar_invite"
+
+    # GDMS-style panel lists ("Tue Nov 10 - 9:00 AM-11:00 AM ET, ...") are
+    # offers to pick from, even when the classifier filed them as a
+    # scheduled time change. Do not promote those windows into confirmed chips.
+    if (
+        email.label == EmailLabel.INTERVIEW_SCHEDULED.value
+        and not cancels
+        and not message_is_booked_appointment(email)
+        and len(slots) > 1
+        and all(slot.is_availability_window for slot in slots)
+        and email.interview_subtype not in {"confirmation", "calendar_invite", "reminder"}
+    ):
+        email.label = EmailLabel.INTERVIEW_INVITATION.value
+        email.interview_subtype = None
 
     if email.label in {EmailLabel.INTERVIEW_INVITATION.value, EmailLabel.INTERVIEW_AVAILABILITY.value} and not cancels:
         existing = {

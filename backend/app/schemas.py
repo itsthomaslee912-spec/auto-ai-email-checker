@@ -226,6 +226,29 @@ class LabelTimelineOut(BaseModel):
     buckets: list[LabelTimelineBucketOut]
 
 
+class ProfileActivityBucketOut(BaseModel):
+    bucket: str
+    applied: int = 0
+    canceled: int = 0
+
+
+class ProfileActivityRowOut(BaseModel):
+    mailbox_id: int
+    email_address: str
+    display_name: str | None = None
+    total: int = 0
+    applied: int = 0
+    canceled: int = 0
+
+
+class ProfileActivityStatsOut(BaseModel):
+    mode: Literal["line", "bar"]
+    date_from: str
+    date_to: str
+    profiles: list[ProfileActivityRowOut]
+    series: list[ProfileActivityBucketOut] = []
+
+
 class OutcomeEntryOut(BaseModel):
     company: str = ""
     role: str = ""

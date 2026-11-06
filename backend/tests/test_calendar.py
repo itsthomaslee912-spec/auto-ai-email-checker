@@ -59,6 +59,7 @@ from app.services.calendar_extract import (
     refresh_calendar_event_details,
     refresh_calendar_events_linked_to_email,
     repair_availability_window_appointments,
+    repair_unbooked_window_acceptances,
     repair_calendar_attendee_response_labels,
     repair_conflicting_calendar_roles,
     repair_interview_stage_roles,
@@ -4641,6 +4642,93 @@ def test_rejection_before_rebooked_interview_does_not_close_new_chip():
         db.refresh(interview)
         assert interview.application_status == "active"
         assert interview.outcome_source_email_id is None
+
+
+def test_later_rejection_replaces_earlier_passed_mark_for_same_application():
+    """Multiply Labs: Nov 3 rejection must overwrite an Oct 26 'move forward' passed mark."""
+    from app.services.calendar_extract import (
+        interview_subject_company_role,
+        repair_unapplied_application_outcomes,
+    )
+
+    assert interview_subject_company_role(
+        "Thank you for your interest in Multiply Labs, Mark"
+    ) == ("Multiply Labs", "")
+
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        booking = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="multiply-tech-screen",
+            thread_id="multiply-tech-thread",
+            folder="inbox",
+            subject="Invitation: Technical Screen @ Thu Oct 29",
+            sender="calendar@multiplylabs.com",
+            received_at=datetime(2026, 10, 26, 16, 55, tzinfo=UTC),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="Multiply Labs",
+            job_role="Staff Infrastructure Engineer",
+        )
+        progressed = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="multiply-move-forward",
+            thread_id="multiply-screen-thread",
+            folder="inbox",
+            subject="Re: Reschedule Initial Screen Interview",
+            sender="Max Rademacher <max@multiplylabs.com>",
+            received_at=datetime(2026, 10, 26, 16, 38, tzinfo=UTC),
+            body_text="I enjoyed our conversation and I’m happy to say we’d like to move you forward.",
+            label=EmailLabel.INTERVIEW_FOLLOW_UP.value,
+            company="Multiply Labs",
+            job_role="Staff Infrastructure Engineer",
+        )
+        rejection = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="multiply-reject",
+            thread_id="multiply-reject-thread",
+            folder="inbox",
+            subject="Thank you for your interest in Multiply Labs, Mark",
+            sender="Multiply Labs <mail@hire.lever.co>",
+            received_at=datetime(2026, 11, 3, 23, 29, tzinfo=UTC),
+            body_text=(
+                "Dear Mark,\n\nThank you for taking the time to chat. After consideration, "
+                "we've made the decision not to move forward at this time.\n\nBest,\nMax"
+            ),
+            label=EmailLabel.REJECTED_CLOSED.value,
+            company="",
+            job_role="",
+            calendar_processed_hash="stale",
+            calendar_processed_at=datetime(2026, 11, 3, 23, 40, tzinfo=UTC),
+        )
+        db.add_all([booking, progressed, rejection])
+        db.flush()
+        interview = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=booking.id,
+            source_thread_id=booking.thread_id,
+            source_received_at=booking.received_at,
+            kind="confirmed",
+            origin="email",
+            title="Multiply Labs — Staff Infrastructure Engineer",
+            company="Multiply Labs",
+            job_role="Staff Infrastructure Engineer",
+            start_at=datetime(2026, 10, 29, 18, 30, tzinfo=UTC),
+            end_at=datetime(2026, 10, 29, 19, 30, tzinfo=UTC),
+            application_status="passed",
+            outcome_source_email_id=progressed.id,
+            outcome_at=progressed.received_at,
+            is_visible=True,
+        )
+        db.add(interview)
+        db.commit()
+        interview_id = interview.id
+
+        assert repair_unapplied_application_outcomes(db, mailbox_id) >= 1
+        db.commit()
+        interview = db.get(CalendarEvent, interview_id)
+        assert interview.application_status == "rejected"
+        assert interview.outcome_source_email_id == rejection.id
 
 
 def test_roleless_rejection_does_not_close_chip_when_multiple_applications_open():
@@ -10516,6 +10604,274 @@ def test_deshaw_confirmed_from_range_is_not_an_availability_window():
     assert slots[0].is_availability_window is False
     assert slots[0].start_at == datetime(2026, 11, 5, 17, tzinfo=UTC)
     assert slots[0].end_at == datetime(2026, 11, 5, 20, tzinfo=UTC)
+
+
+def test_lyft_bullet_list_keeps_each_dated_offer():
+    """'I am available at the following times' + bullet ranges are concrete
+    offers. The lead-in 'available' must not mark Nov 9 as a window that gets
+    dropped, and the next bullet's times must not attach to Nov 9."""
+    received = datetime(2026, 11, 5, 23, 39, tzinfo=UTC)
+    body = (
+        "Hi Edward,\n\n"
+        "Thank you for reaching out. I would be happy to connect. "
+        "I am available at the following times:\n\n"
+        "• Mon, November 9 at 12 PM - 1PM PST(Systems Design)\n"
+        "• Tue, November 10 at 12:30 PM -  2PM PST (Laptop Coding Interview)\n"
+        "• Wed, November 12 at 11 AM -  12PM PST (Experience Interview)\n"
+    )
+    slots = parse_text_slots(body, received)
+    assert [(slot.start_at, slot.end_at, slot.is_availability_window) for slot in slots] == [
+        (datetime(2026, 11, 9, 20, tzinfo=UTC), datetime(2026, 11, 9, 21, tzinfo=UTC), False),
+        (datetime(2026, 11, 10, 20, 30, tzinfo=UTC), datetime(2026, 11, 10, 22, tzinfo=UTC), False),
+        (datetime(2026, 11, 12, 19, tzinfo=UTC), datetime(2026, 11, 12, 20, tzinfo=UTC), False),
+    ]
+
+
+def test_gdms_panel_date_prefixed_ranges_are_availability_windows():
+    """GDMS 'Tuesday, November 10 - 9:00 AM-11:00 AM ET' lists are windows to
+    pick from, not a booked two-hour interview. Sharing a trailing meridiem
+    must not rewrite 'November 10 - 9:00 AM' into 'November 10 AM - 9:00 AM'."""
+    received = datetime(2026, 11, 5, 22, 16, tzinfo=UTC)
+    body = (
+        "My apologies for sending the incorrect dates and times for the panel "
+        "in my original message. They are updated here below:\n"
+        "\n"
+        "Tuesday, November 10 - 9:00 AM-11:00 AM ET\n"
+        "Wednesday, November 11 - 9:00 AM-10:00 AM ET, 12:00 PM-12:30 PM ET, "
+        "3:00 PM-4:00 PM ET\n"
+        "Thursday, November 12 - 9:00 AM-10:00 AM ET, 11:00 AM-12:00 PM ET, "
+        "12:30 PM-2:00 PM ET, 4:00 PM-5:00 PM ET\n"
+        "Friday, November 13 - 9:00 AM-10:00 AM ET, 11:00 AM-2:00 PM ET\n"
+    )
+    slots = parse_text_slots(body, received)
+    assert len(slots) == 10
+    assert all(slot.is_availability_window for slot in slots)
+    assert (slots[0].start_at, slots[0].end_at) == (
+        datetime(2026, 11, 10, 14, tzinfo=UTC),
+        datetime(2026, 11, 10, 16, tzinfo=UTC),
+    )
+    assert (slots[3].start_at, slots[3].end_at) == (
+        datetime(2026, 11, 11, 20, tzinfo=UTC),
+        datetime(2026, 11, 11, 21, tzinfo=UTC),
+    )
+
+
+def test_gdms_panel_windows_are_not_stored_as_confirmed():
+    """A time_change label on a panel-window list must demote to invitation
+    offers, and a prior confirmed chip matching a window is hidden."""
+    factory, (mailbox_id, _) = _database()
+    received = datetime(2026, 11, 5, 22, 16, tzinfo=UTC)
+    body = (
+        "My apologies for sending the incorrect dates and times for the panel "
+        "in my original message. They are updated here below:\n"
+        "\n"
+        "Tuesday, November 10 - 9:00 AM-11:00 AM ET\n"
+        "Wednesday, November 11 - 9:00 AM-10:00 AM ET, 3:00 PM-4:00 PM ET\n"
+    )
+    with factory() as db:
+        email = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="gdms-panel",
+            thread_id="gdms-panel",
+            subject="RE: GDMS Req #75208",
+            sender="Jennifer Prem <jennifer.prem@gd-ms.com>",
+            received_at=received,
+            body_text=body,
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="time_change",
+            company="General Dynamics Mission Systems",
+            job_role="Senior AI Platform & Applications Engineer",
+        )
+        db.add(email)
+        db.flush()
+        false_confirmed = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=email.id,
+            kind="confirmed",
+            origin="email",
+            company="General Dynamics Mission Systems",
+            job_role="Senior AI Platform & Applications Engineer",
+            start_at=datetime(2026, 11, 10, 14, tzinfo=UTC),
+            end_at=datetime(2026, 11, 10, 16, tzinfo=UTC),
+            interview_status="time_change",
+            application_status="active",
+            is_visible=True,
+        )
+        db.add(false_confirmed)
+        db.commit()
+        assert repair_availability_window_appointments(db) == 1
+        db.commit()
+        assert false_confirmed.is_visible is False
+        assert email.label == EmailLabel.INTERVIEW_INVITATION.value
+        assert email.calendar_processed_hash is None
+        assert asyncio.run(process_calendar_email(db, email, use_ai=False)) is True
+        db.commit()
+        offers = (
+            db.query(CalendarEvent)
+            .filter(
+                CalendarEvent.source_email_id == email.id,
+                CalendarEvent.kind == "availability",
+                CalendarEvent.is_visible.is_(True),
+            )
+            .order_by(CalendarEvent.start_at)
+            .all()
+        )
+        assert len(offers) == 3
+        assert [(event.start_at, event.end_at) for event in offers] == [
+            (datetime(2026, 11, 10, 14, tzinfo=UTC), datetime(2026, 11, 10, 16, tzinfo=UTC)),
+            (datetime(2026, 11, 11, 14, tzinfo=UTC), datetime(2026, 11, 11, 15, tzinfo=UTC)),
+            (datetime(2026, 11, 11, 20, tzinfo=UTC), datetime(2026, 11, 11, 21, tzinfo=UTC)),
+        ]
+        assert not any(
+            event.kind == "confirmed" and event.is_visible
+            for event in db.query(CalendarEvent).filter(CalendarEvent.source_email_id == email.id)
+        )
+
+
+def test_gdms_candidate_acceptance_of_panel_window_is_not_booked():
+    """Picking one panel window stays unbooked; that pick is the submitted availability."""
+    factory, (mailbox_id, _) = _database()
+    panel_body = (
+        "Updated panel times:\n"
+        "Tuesday, November 10 - 9:00 AM-11:00 AM ET\n"
+        "Wednesday, November 11 - 9:00 AM-10:00 AM ET, 3:00 PM-4:00 PM ET\n"
+    )
+    with factory() as db:
+        panel = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="gdms-panel-2",
+            thread_id="gdms-accept",
+            subject="RE: GDMS Req #75208",
+            sender="Jennifer Prem <jennifer.prem@gd-ms.com>",
+            folder="inbox",
+            received_at=datetime(2026, 11, 5, 22, 16, tzinfo=UTC),
+            body_text=panel_body,
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="General Dynamics Mission Systems",
+            job_role="Senior AI Platform & Applications Engineer",
+        )
+        pick = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="gdms-pick",
+            thread_id="gdms-accept",
+            subject="RE: GDMS Req #75208",
+            sender="Jordan <jordanwm914@gmail.com>",
+            folder="sent",
+            received_at=datetime(2026, 11, 5, 22, 48, tzinfo=UTC),
+            body_text="Wednesday, November 11 from 3:00 PM - 4:00 PM ET works well for me.",
+            label=EmailLabel.INTERVIEW_AVAILABILITY.value,
+            company="General Dynamics Mission Systems",
+            job_role="Senior AI Platform & Applications Engineer",
+        )
+        db.add_all([panel, pick])
+        db.commit()
+        assert asyncio.run(process_calendar_email(db, panel, use_ai=False)) is True
+        assert asyncio.run(process_calendar_email(db, pick, use_ai=False)) is True
+        db.commit()
+        assert pick.label == EmailLabel.INTERVIEW_AVAILABILITY.value
+        assert pick.interview_subtype is None
+        assert not (
+            db.query(CalendarEvent)
+            .filter(
+                CalendarEvent.mailbox_id == mailbox_id,
+                CalendarEvent.kind == "confirmed",
+                CalendarEvent.is_visible.is_(True),
+            )
+            .count()
+        )
+        submitted = (
+            db.query(CalendarEvent)
+            .filter(
+                CalendarEvent.source_email_id == pick.id,
+                CalendarEvent.kind == "availability",
+                CalendarEvent.is_visible.is_(True),
+            )
+            .all()
+        )
+        assert len(submitted) == 1
+        assert submitted[0].start_at == datetime(2026, 11, 11, 20, tzinfo=UTC)
+        assert submitted[0].end_at == datetime(2026, 11, 11, 21, tzinfo=UTC)
+        assert not (
+            db.query(CalendarEvent)
+            .filter(
+                CalendarEvent.source_email_id == panel.id,
+                CalendarEvent.is_visible.is_(True),
+            )
+            .count()
+        )
+
+
+def test_repair_demotes_false_booked_panel_window_acceptance():
+    """A prior promotion of a panel-window pick to confirmed becomes submitted availability."""
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        panel = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="gdms-panel-repair",
+            thread_id="gdms-repair",
+            subject="RE: GDMS Req #75208",
+            sender="Jennifer Prem <jennifer.prem@gd-ms.com>",
+            folder="inbox",
+            received_at=datetime(2026, 11, 5, 22, 16, tzinfo=UTC),
+            body_text=(
+                "Tuesday, November 10 - 9:00 AM-11:00 AM ET\n"
+                "Wednesday, November 11 - 3:00 PM-4:00 PM ET\n"
+            ),
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="General Dynamics Mission Systems",
+            job_role="Senior AI Platform & Applications Engineer",
+        )
+        pick = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="gdms-pick-repair",
+            thread_id="gdms-repair",
+            subject="RE: GDMS Req #75208",
+            sender="Jordan <jordanwm914@gmail.com>",
+            folder="sent",
+            received_at=datetime(2026, 11, 5, 22, 48, tzinfo=UTC),
+            body_text="Wednesday, November 11 from 3:00 PM - 4:00 PM ET works well for me.",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="confirmation",
+            company="General Dynamics Mission Systems",
+            job_role="Senior AI Platform & Applications Engineer",
+        )
+        db.add_all([panel, pick])
+        db.flush()
+        false_booked = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=pick.id,
+            kind="confirmed",
+            origin="email",
+            company="General Dynamics Mission Systems",
+            job_role="Senior AI Platform & Applications Engineer",
+            start_at=datetime(2026, 11, 11, 20, tzinfo=UTC),
+            end_at=datetime(2026, 11, 11, 21, tzinfo=UTC),
+            interview_status="confirmation",
+            application_status="active",
+            is_visible=True,
+            source_thread_id=pick.thread_id,
+        )
+        other_window = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=panel.id,
+            kind="availability",
+            origin="email",
+            company="General Dynamics Mission Systems",
+            job_role="Senior AI Platform & Applications Engineer",
+            start_at=datetime(2026, 11, 10, 14, tzinfo=UTC),
+            end_at=datetime(2026, 11, 10, 16, tzinfo=UTC),
+            application_status="active",
+            is_visible=True,
+            source_thread_id=panel.thread_id,
+        )
+        db.add_all([false_booked, other_window])
+        db.commit()
+        assert repair_unbooked_window_acceptances(db) >= 1
+        db.commit()
+        assert pick.label == EmailLabel.INTERVIEW_AVAILABILITY.value
+        assert false_booked.kind == "availability"
+        assert false_booked.is_visible is True
+        assert other_window.is_visible is False
 
 
 def test_modernloop_subjects_expose_company_and_role():
