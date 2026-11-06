@@ -128,6 +128,40 @@ def test_download_only_existing_refresh_defers_calendar_and_classification(tmp_p
         db.refresh(email)
         assert email.thread_id == "thread-new"
         assert "BEGIN:VCALENDAR" in email.body_text
+        # Already-labeled interviews only need calendar reprocessing, not another
+        # AI classification pass that would flood Pending AI.
+        assert email.classification_pending is not True
+        assert email.calendar_processed_hash is None
+    engine.dispose()
+
+
+def test_download_only_existing_refresh_repends_uncategorized_mail(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'refresh-other.db'}", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    with Session() as db:
+        user = User(external_id="refresh-other")
+        db.add(user)
+        db.flush()
+        mailbox = MailboxConnection(user_id=user.id, provider=Provider.GOOGLE.value, email_address="other@example.com", access_token_enc="x", is_active=True)
+        db.add(mailbox)
+        db.flush()
+        email = EmailMessage(mailbox_id=mailbox.id, provider_message_id="other-message", subject="Hello", sender="sender@example.com", body_text="plain", label=EmailLabel.OTHER.value)
+        db.add(email)
+        db.commit()
+
+        async def process(*_args, **_kwargs):
+            raise AssertionError("download-only sync must not run calendar reconciliation")
+
+        monkeypatch.setattr("app.services.ingest.process_calendar_email", process)
+        asyncio.run(ingest_normalized_message(db, mailbox, {
+            "provider_message_id": "other-message",
+            "subject": "Hello",
+            "sender": "sender@example.com",
+            "body_text": "plain with more detail",
+        }, download_only=True))
+
+        db.refresh(email)
         assert email.classification_pending is True
         assert email.calendar_processed_hash is None
     engine.dispose()

@@ -292,6 +292,16 @@ def init_db() -> None:
                     "UPDATE email_messages SET classification_pending = FALSE "
                     "WHERE classification_pending = TRUE AND human_corrected = TRUE"
                 ))
+                # Already-categorized mail (often interviews whose ICS body was
+                # refreshed by download-only sync, or calendar-promoted labels)
+                # must not occupy the AI queue. Only ``other`` still needs a
+                # model pass.
+                conn.execute(text(
+                    "UPDATE email_messages SET classification_pending = FALSE "
+                    "WHERE classification_pending = TRUE "
+                    "AND COALESCE(human_corrected, FALSE) = FALSE "
+                    "AND label IS NOT NULL AND label <> 'other'"
+                ))
         if "calendar_events" in tables:
             calendar_cols = {c["name"] for c in inspect(conn).get_columns("calendar_events")}
             if "interviewer" not in calendar_cols:

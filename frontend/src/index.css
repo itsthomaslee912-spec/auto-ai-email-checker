@@ -153,12 +153,15 @@ body,
 
 html {
   font-size: var(--font-size, 16px);
+  overflow-x: clip;
 }
 
 body {
   font-family: var(--sans);
   color: var(--ink);
   background: var(--bg);
+  overflow-x: clip;
+  overscroll-behavior: none;
 }
 
 /* App-wide readable scrollbars */
@@ -197,8 +200,10 @@ body {
 .app-shell {
   display: grid;
   grid-template-columns: var(--accounts-w) var(--accounts-gap, 6px) var(--list-w) 6px minmax(0, 1fr);
+  width: 100%;
   height: 100%;
-  min-height: 100vh;
+  min-height: 100dvh;
+  overflow: hidden;
   background: var(--bg);
 }
 
@@ -2096,50 +2101,8 @@ body {
   justify-self: start;
 }
 
-@media (max-width: 980px) {
-  .app-shell {
-    grid-template-columns: 220px 1fr;
-    grid-template-rows: 1fr 1fr;
-  }
-
-  .pane-splitter {
-    display: none;
-  }
-
-  .pane-accounts {
-    grid-row: 1 / span 2;
-  }
-
-  .pane-list {
-    grid-column: 2;
-    grid-row: 1;
-  }
-
-  .pane-reader {
-    grid-column: 2;
-    grid-row: 2;
-    border-top: 1px solid var(--line);
-  }
-}
-
-@media (max-width: 720px) {
-  .app-shell {
-    grid-template-columns: 1fr;
-    grid-template-rows: auto 50vh auto;
-  }
-
-  .pane-accounts,
-  .pane-list,
-  .pane-reader {
-    grid-column: 1;
-    grid-row: auto;
-    border-right: none;
-  }
-
-  .pane-accounts {
-    max-height: 40vh;
-  }
-}
+/* Tablet/phone shell layouts live in the dedicated blocks near the end of
+   this file so cascade order stays predictable on Android Chrome. */
 
 .app-shell.view-table {
   grid-template-columns: var(--accounts-w) var(--accounts-gap, 6px) minmax(0, 1fr);
@@ -2285,26 +2248,11 @@ body {
 }
 
 @media (max-width: 720px) {
-  .app-shell.view-table {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto 55vh;
-    height: auto;
-  }
-  .app-shell.view-table .pane-accounts {
-    grid-column: 1;
-    grid-row: 1;
-  }
-  .app-shell.view-table .accounts-splitter { display: none; }
-  .app-shell.view-table .pane-list {
-    grid-column: 1;
-    grid-row: 2;
-    height: 55vh;
-  }
   .app-shell.view-table.table-dialog-open .pane-reader {
     top: 0;
     left: 0;
     transform: none;
-    width: 100vw;
+    width: 100%;
     height: 100dvh;
     border-radius: 0;
   }
@@ -3269,8 +3217,9 @@ body {
   }
 
   .stats-bars {
-    grid-template-columns: repeat(8, minmax(64px, 1fr));
-    min-width: 560px;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    min-width: 0;
+    overflow-x: auto;
   }
 
   .stats-visuals {
@@ -4840,6 +4789,9 @@ button:active:not(:disabled) {
 .outcome-pie-modal h3 { margin: 0.15rem 0 0; }
 .outcome-table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius-md); }
 .outcome-table { min-width: 40rem; }
+@media (max-width: 720px) {
+  .outcome-table { min-width: 0; width: 100%; }
+}
 .outcome-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 0.65rem; }
 .outcome-list article { display: grid; gap: 0.25rem; padding: 0.8rem; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--bg-elev); }
 .outcome-list article span, .outcome-list article small { color: var(--muted); }
@@ -5985,7 +5937,7 @@ html[data-theme="light"] .progress-negative .interview-progress-marker { color: 
   .calendar-details .details-secondary-action { flex: 1 1 auto; }
 }
 @media (max-width: 720px) {
-  .app-shell.page-calendar { grid-template-columns: minmax(0,1fr); }.app-shell.page-calendar .pane-accounts, .app-shell.page-calendar > .pane-splitter { display: none; }.calendar-workspace { grid-column: 1; }.calendar-grid.month { grid-template-columns: repeat(7, minmax(6.5rem,1fr)); }.details-sticky { padding-top: max(.7rem, env(safe-area-inset-top)); }.editor-row { grid-template-columns: 1fr; }.calendar-editor { max-height: 100vh; border-radius: 0; }
+  .app-shell.page-calendar { grid-template-columns: minmax(0,1fr); }.app-shell.page-calendar .pane-accounts, .app-shell.page-calendar > .pane-splitter { display: none; }.calendar-workspace { grid-column: 1; }.calendar-grid.month { grid-template-columns: repeat(7, minmax(0,1fr)); }.details-sticky { padding-top: max(.7rem, env(safe-area-inset-top)); }.editor-row { grid-template-columns: 1fr; }.calendar-editor { max-height: 100dvh; border-radius: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -7058,60 +7010,7 @@ html[data-theme="light"] .progress-negative .interview-progress-marker { color: 
   }
 }
 
-@media (max-width: 720px) {
-  .app-shell:not(.calendar-open):not(.monitoring-open).reading-right,
-  .app-shell:not(.calendar-open):not(.monitoring-open).reading-below {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto 55vh 55vh;
-    height: auto;
-  }
-
-  .app-shell:not(.calendar-open):not(.monitoring-open).reading-no-split {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto 65vh;
-    height: auto;
-  }
-
-  .app-shell:not(.calendar-open):not(.monitoring-open).reading-right .pane-accounts,
-  .app-shell:not(.calendar-open):not(.monitoring-open).reading-below .pane-accounts,
-  .app-shell:not(.calendar-open):not(.monitoring-open).reading-no-split .pane-accounts {
-    grid-column: 1;
-    grid-row: 1;
-  }
-
-  .app-shell:not(.calendar-open):not(.monitoring-open).reading-right .accounts-splitter,
-  .app-shell:not(.calendar-open):not(.monitoring-open).reading-below .accounts-splitter,
-  .app-shell:not(.calendar-open):not(.monitoring-open).reading-no-split .accounts-splitter,
-  .app-shell:not(.calendar-open):not(.monitoring-open).reading-right .reader-splitter,
-  .app-shell:not(.calendar-open):not(.monitoring-open).reading-below .reader-splitter {
-    display: none;
-  }
-
-  .app-shell:not(.calendar-open):not(.monitoring-open).reading-right .pane-list,
-  .app-shell:not(.calendar-open):not(.monitoring-open).reading-below .pane-list,
-  .app-shell:not(.calendar-open):not(.monitoring-open).reading-no-split .pane-list {
-    grid-column: 1;
-    grid-row: 2;
-    height: auto;
-  }
-
-  .app-shell:not(.calendar-open):not(.monitoring-open).reading-right .pane-reader,
-  .app-shell:not(.calendar-open):not(.monitoring-open).reading-below .pane-reader {
-    grid-column: 1;
-    grid-row: 3;
-    height: auto;
-    border-top: 1px solid var(--line);
-  }
-
-  .app-shell:not(.calendar-open):not(.monitoring-open).reading-no-split.table-dialog-open .pane-reader {
-    top: 0;
-    left: 0;
-    transform: none;
-    width: 100vw;
-    height: 100dvh;
-    border-radius: 0;
-  }
-}
+/* Phone reading-pane layout is defined in the unified phone shell block below. */
 
 .pane-accounts {
   gap: 0;
@@ -8189,7 +8088,16 @@ button:disabled {
   .add-account-btn,
   .calendar-editor footer button,
   .calendar-state button,
-  .picker-footer button { min-height: 2.75rem; }
+  .picker-footer button,
+  .sidebar-rail-btn,
+  .sidebar-sync-trigger,
+  .list-header-icon,
+  .list-search-clear,
+  .compact-select-trigger,
+  .mobile-reader-toolbar button {
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -9782,6 +9690,8 @@ html[data-theme="light"] .system-alert-backdrop {
    document taller than the viewport, which made Android navigation and
    scrolling appear broken. */
 .mobile-reader-toolbar { display: none; }
+.sidebar-mobile-scrim { display: none; }
+
 @media (max-width: 720px) {
   .app-shell,
   .app-shell.view-table,
@@ -9794,7 +9704,8 @@ html[data-theme="light"] .system-alert-backdrop {
   .app-shell:not(.calendar-open):not(.monitoring-open).reading-right,
   .app-shell:not(.calendar-open):not(.monitoring-open).reading-below,
   .app-shell:not(.calendar-open):not(.monitoring-open).reading-no-split {
-    width: 100vw;
+    width: 100%;
+    max-width: 100%;
     height: 100dvh;
     min-height: 0;
     grid-template-columns: 3.55rem minmax(0, 1fr);
@@ -9809,17 +9720,32 @@ html[data-theme="light"] .system-alert-backdrop {
     grid-column: 1;
     grid-row: 1;
     width: 3.55rem;
-    height: 100dvh;
+    height: 100%;
     max-height: none;
     z-index: 45;
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
   }
 
   .app-shell > .pane-accounts:not(.is-collapsed) {
     position: fixed;
     inset: 0 auto 0 0;
-    width: min(19rem, 88vw);
+    width: min(19rem, 88%);
     max-height: none;
     box-shadow: 18px 0 48px color-mix(in srgb, #000 55%, transparent);
+  }
+
+  .sidebar-mobile-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 44;
+    border: 0;
+    padding: 0;
+    margin: 0;
+    background: rgba(4, 8, 14, 0.52);
+    backdrop-filter: blur(2px);
+    cursor: pointer;
   }
 
   .app-shell > .accounts-splitter,
@@ -9834,7 +9760,7 @@ html[data-theme="light"] .system-alert-backdrop {
     grid-column: 2;
     grid-row: 1;
     width: auto;
-    height: 100dvh;
+    height: 100%;
     min-height: 0;
   }
 
@@ -9843,13 +9769,14 @@ html[data-theme="light"] .system-alert-backdrop {
     position: fixed;
     z-index: 100;
     inset: 0;
-    width: 100vw;
+    width: 100%;
     height: 100dvh;
     display: flex;
     border: 0;
     border-radius: 0;
     background: var(--bg);
     transform: none;
+    padding-bottom: env(safe-area-inset-bottom);
   }
 
   .mobile-reader-toolbar {
@@ -9862,7 +9789,7 @@ html[data-theme="light"] .system-alert-backdrop {
     background: var(--bg-pane);
   }
   .mobile-reader-toolbar button {
-    min-height: 2.35rem;
+    min-height: 2.75rem;
     display: inline-flex;
     align-items: center;
     gap: .35rem;
@@ -9872,7 +9799,7 @@ html[data-theme="light"] .system-alert-backdrop {
     background: transparent;
     color: var(--accent);
     font: inherit;
-    font-size: .82rem;
+    font-size: .9rem;
     font-weight: 720;
   }
   .mobile-reader-toolbar button:active { background: var(--bg-hover); }
@@ -9884,27 +9811,82 @@ html[data-theme="light"] .system-alert-backdrop {
     grid-column: 2;
     grid-row: 1;
     width: auto;
-    height: 100dvh;
+    height: 100%;
     display: flex;
     border: 0;
   }
-  .app-shell.calendar-open .calendar-grid.month { grid-template-columns: repeat(7, minmax(5.75rem, 1fr)); }
-  .app-shell.calendar-open .calendar-toolbar { padding-top: max(.55rem, env(safe-area-inset-top)); }
+  .app-shell.calendar-open .calendar-grid.month {
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+  }
+  .app-shell.calendar-open .calendar-day {
+    min-height: 4.5rem;
+    padding: .3rem;
+  }
+  .app-shell.calendar-open .calendar-toolbar {
+    padding-top: max(.55rem, env(safe-area-inset-top));
+    flex-wrap: wrap;
+    gap: .35rem;
+  }
+  .app-shell.calendar-open .calendar-toolbar .calendar-timezone-trigger {
+    max-width: none;
+    width: auto;
+    flex: 1 1 8rem;
+  }
 
   .app-shell > .monitoring-page,
   .app-shell > .statistics-page {
     grid-column: 2;
     grid-row: 1;
     width: auto;
-    height: 100dvh;
+    height: 100%;
     min-height: 0;
     overflow: auto;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .list-search-input,
+  .reply-subject-field input,
+  .reply-composer textarea,
+  .reply-ai-prompt input,
+  .settings-field input,
+  .settings-field textarea,
+  .settings-field select,
+  .compact-select-trigger,
+  .signin-card input {
+    font-size: max(1rem, 16px);
+  }
+
+  .list-header {
+    padding-top: max(.45rem, env(safe-area-inset-top));
+  }
+
+  .reply-composer footer {
+    padding-bottom: max(.45rem, env(safe-area-inset-bottom));
+  }
+
+  .settings-page {
+    min-height: 100dvh;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .settings-content {
+    padding-bottom: max(1.5rem, env(safe-area-inset-bottom));
   }
 
   .reader-article { min-height: 0; overflow: hidden; }
   .mail-alert-backdrop,
   .dialog-backdrop,
   .modal-backdrop { padding: max(.6rem, env(safe-area-inset-top)) .6rem max(.6rem, env(safe-area-inset-bottom)); }
+}
+
+.page-fallback {
+  display: grid;
+  place-items: center;
+  min-height: 12rem;
+  width: 100%;
+  height: 100%;
+  color: var(--muted);
+  font-size: .9rem;
 }
 @media (prefers-reduced-motion: reduce) {
   .mail-alert, .mail-alert-backdrop, .mail-alert-count { animation: none; }

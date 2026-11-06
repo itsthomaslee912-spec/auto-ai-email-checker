@@ -90,7 +90,15 @@ async def ingest_normalized_message(
                     # webhook / 600s mailbox timeout loop. These durable flags
                     # hand enrichment to the classification and calendar
                     # workers after the provider cursor has safely advanced.
-                    existing.classification_pending = True
+                    #
+                    # Only re-queue AI when the row still lacks a durable
+                    # category. Re-pending already-labeled mail (especially
+                    # interviews whose ICS body refreshes often) flooded the
+                    # single Ollama slot and left monitoring stuck on
+                    # "Pending AI" even though calendar invalidation below is
+                    # enough for appointment updates.
+                    if existing.label == EmailLabel.OTHER.value:
+                        existing.classification_pending = True
                     existing.calendar_processed_hash = None
                     existing.calendar_processing_error = None
                 else:

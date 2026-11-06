@@ -305,10 +305,12 @@ export default function MonitoringPage({ active, aiStatus, aiStatusOffline }: { 
       }
       if (["email.classified", "sync.done", "reclassify.progress", "reclassify.done"].includes(eventName)) {
         if (snapshotRefreshTimerRef.current != null) window.clearTimeout(snapshotRefreshTimerRef.current);
+        // Coalesce classify storms so the heavy monitoring snapshot is not
+        // rebuilt on every single email.classified event.
         snapshotRefreshTimerRef.current = window.setTimeout(() => {
           snapshotRefreshTimerRef.current = null;
           void load(true);
-        }, 250);
+        }, eventName === "email.classified" || eventName === "reclassify.progress" ? 8_000 : 1_000);
       }
       setFlowTick((tick) => tick + 1);
     };

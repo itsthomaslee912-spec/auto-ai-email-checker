@@ -333,6 +333,35 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
         failed = 0
         ai_only = getattr(get_settings(), "email_classification_mode", "hybrid").strip().lower() == "ai_only"
 
+        def clear_stale_labeled_pending(email_id: int) -> dict[str, Any]:
+            """Finalize rows that already have a durable category.
+
+            Download-only content refresh and calendar promotion historically
+            left ``classification_pending`` set on interview-labeled mail.
+            Those rows do not need another model call — only the flag cleared —
+            and sending them through Ollama one-by-one stranded hundreds of
+            Pending AI items behind concurrency=1.
+            """
+            db = SessionLocal()
+            try:
+                email = db.query(EmailMessage).filter(EmailMessage.id == email_id).one_or_none()
+                if email is None or email.human_corrected:
+                    return {"skipped": True}
+                if not email.classification_pending:
+                    return {"skipped": True}
+                if email.label == EmailLabel.OTHER.value:
+                    return {"needs_ai": True}
+                email.classification_pending = False
+                db.commit()
+                db.refresh(email)
+                payload = EmailOut.model_validate(email).model_dump()
+                payload["previous_label"] = email.label
+                payload["updated"] = True
+                payload["classification_completed"] = True
+                return {"cleared": True, "payload": payload, "email_id": email.id}
+            finally:
+                db.close()
+
         async def classify_row(
             row: Any,
         ) -> tuple[int, str, Any, tuple[str, str] | None, bool] | None:
@@ -583,6 +612,57 @@ async def _run_reclassify_job(mailbox_id: int, *, pending_only: bool = False) ->
         remaining = list(rows)
         known_ids = {row.id for row in remaining}
         pending_retry_after: dict[int, float] = {}
+
+        # Drain already-labeled pending rows without occupying the AI gate.
+        stale_labeled = [
+            row for row in remaining
+            if row.classification_pending and row.label != EmailLabel.OTHER.value
+        ]
+        if stale_labeled:
+            remaining = [
+                row for row in remaining
+                if not (row.classification_pending and row.label != EmailLabel.OTHER.value)
+            ]
+            for row in stale_labeled:
+                if _should_stop(mailbox_id):
+                    stopped_by_request = True
+                    break
+                applied = await asyncio.to_thread(clear_stale_labeled_pending, row.id)
+                processed += 1
+                if applied.get("skipped"):
+                    continue
+                if applied.get("needs_ai"):
+                    remaining.append(row)
+                    continue
+                if applied.get("cleared"):
+                    updated += 1
+                    if applied.get("payload"):
+                        await publish("email.classified", applied["payload"])
+                await asyncio.sleep(0)
+            await _publish_progress(
+                mailbox_id,
+                updated=updated,
+                processed=processed,
+                failed=failed,
+                total=total,
+                message=(
+                    f"Finalized {updated} already-labeled of {total}"
+                    f" — {len(remaining)} still need AI"
+                ),
+            )
+            if stopped_by_request:
+                job = _set_job(
+                    mailbox_id,
+                    state="stopped",
+                    updated=updated,
+                    processed=processed,
+                    failed=failed,
+                    total=total,
+                    message=f"Reclassify stopped — updated {updated} of {total}",
+                )
+                await publish("reclassify.done", dict(job))
+                return
+
         while True:
             if not pending_only:
                 fresh_pending = await asyncio.to_thread(load_rows, only_pending=True)

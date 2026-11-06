@@ -239,13 +239,19 @@ async def poll_active_mailboxes() -> int:
 
 def get_auto_sync_status(db: Session) -> dict:
     from app.auth.session import mailbox_scope
+    from sqlalchemy.orm import joinedload
 
     interval = max(30, get_settings().auto_sync_interval_seconds)
     # Probe ngrok before beginning the request's database transaction.  The
     # local agent may take a few seconds to answer, and holding a pooled
     # connection during that network wait needlessly starves the API.
     ngrok = get_ngrok_status()
-    mailboxes = db.query(MailboxConnection).filter(mailbox_scope()).all()
+    mailboxes = (
+        db.query(MailboxConnection)
+        .options(joinedload(MailboxConnection.webhook))
+        .filter(mailbox_scope())
+        .all()
+    )
     problems = []
     syncing = False
     webhook_accounts = 0

@@ -69,6 +69,7 @@ from app.services.calendar_extract import (
     repair_phantom_availability_slots,
     repair_placeholder_calendar_fields,
     repair_quoted_option_bookings,
+    repair_schedule_promise_bookings,
 )
 
 
@@ -3910,6 +3911,224 @@ def test_confirmation_without_repeated_time_promotes_latest_thread_availability(
         assert visible[0].start_at == datetime(2026, 10, 22, 18, 30, tzinfo=UTC)
         assert visible[0].company == "H-E-B"
         assert visible[0].job_role == "Sr. Software Engineer"
+
+
+def test_css_font_size_pt_is_not_noon_pacific():
+    """HTML ``font-size: 12pt`` must not become a 12:00 PT appointment clock."""
+    html = (
+        '<div style="font-family: Aptos; font-size: 12pt; color: rgb(0, 0, 0);">'
+        "Thank you for being accommodating, I will get that scheduled shortly."
+        "</div>"
+        '<div id="divRplyFwdMsg">From: Mark<br>'
+        "Sent: Tuesday, October 27, 2026 9:55 AM<br>"
+        "11/2 at 1:00 PM PST was on my earlier availability list.</div>"
+    )
+    email = EmailMessage(
+        mailbox_id=1,
+        provider_message_id="css-pt",
+        subject="Re: Lam Research Interview - Senior Cloud Engineer",
+        sender="Courtney.Sleeper@lamresearch.com",
+        received_at=datetime(2026, 10, 27, 17, 16, tzinfo=UTC),
+        snippet="Thank you for being accommodating, I will get that scheduled shortly.",
+        body_text="Thank you for being accommodating, I will get that scheduled shortly.",
+        body_html=html,
+        label=EmailLabel.INTERVIEW_SCHEDULED.value,
+    )
+    assert message_appointment_slots(email) == []
+    assert parse_text_slots(html, email.received_at) == []
+
+
+def test_schedule_shortly_promise_does_not_confirm_old_availability():
+    """A recruiter promise to schedule later must not book a prior offered slot.
+
+    Lam Research: candidate offered 11/2 1:00 PM, later accepted 10:30 AM, then
+    Courtney wrote \"I will get that scheduled shortly\" with no time. The HTML
+    signature's ``12pt`` plus the quoted 1:00 PM must not become a 3pm ET chip.
+    """
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        invitation = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="lam-invite",
+            thread_id="lam-thread",
+            folder="inbox",
+            subject="Lam Research Interview - Senior Cloud Engineer",
+            sender="Courtney.Sleeper@lamresearch.com",
+            received_at=datetime(2026, 10, 26, 23, 15, tzinfo=UTC),
+            body_text="I'll be scheduling your interview for the Senior Cloud Engineer position.",
+            label=EmailLabel.INTERVIEW_INVITATION.value,
+            company="Lam Research",
+            job_role="Senior Cloud Engineer",
+        )
+        offered = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="lam-offer",
+            thread_id="lam-thread",
+            folder="sent",
+            subject="Re: Lam Research Interview - Senior Cloud Engineer",
+            sender="mark@example.com",
+            received_at=datetime(2026, 10, 27, 0, 4, tzinfo=UTC),
+            body_text=(
+                "Please see my availability (all times in PST):\n"
+                "- 11/2 at 1:00 PM\n"
+                "- 11/3 at 12:00 PM\n"
+            ),
+            label=EmailLabel.INTERVIEW_AVAILABILITY.value,
+            company="Lam Research",
+            job_role="Senior Cloud Engineer",
+        )
+        accepted = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="lam-accept",
+            thread_id="lam-thread",
+            folder="sent",
+            subject="Re: Lam Research Interview - Senior Cloud Engineer",
+            sender="mark@example.com",
+            received_at=datetime(2026, 10, 27, 16, 55, tzinfo=UTC),
+            body_text="11/2 at 10:30am PST works for me.",
+            label=EmailLabel.INTERVIEW_AVAILABILITY.value,
+            company="Lam Research",
+            job_role="Senior Cloud Engineer",
+        )
+        promise = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="lam-promise",
+            thread_id="lam-thread",
+            folder="inbox",
+            subject="Re: Lam Research Interview - Senior Cloud Engineer",
+            sender="Courtney.Sleeper@lamresearch.com",
+            received_at=datetime(2026, 10, 27, 17, 16, tzinfo=UTC),
+            snippet="Thank you for being accommodating, I will get that scheduled shortly.",
+            body_text="Thank you for being accommodating, I will get that scheduled shortly.",
+            body_html=(
+                '<div style="font-size: 12pt; color: rgb(0, 0, 0);">'
+                "Thank you for being accommodating, I will get that scheduled shortly."
+                "</div>"
+                '<div id="divRplyFwdMsg">From: Mark<br>'
+                "11/2 at 1:00 PM PST</div>"
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            company="Lam Research",
+            job_role="Senior Cloud Engineer",
+        )
+        invite = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="lam-ics",
+            thread_id="lam-thread",
+            folder="inbox",
+            subject="Lam Research Microsoft Teams Virtual Interview",
+            sender="Courtney.Sleeper@lamresearch.com",
+            received_at=datetime(2026, 10, 27, 17, 23, tzinfo=UTC),
+            body_text=(
+                "You are scheduled to meet with the panel.\n"
+                "BEGIN:VCALENDAR\nBEGIN:VEVENT\n"
+                "DTSTART;TZID=America/Los_Angeles:20261102T103000\n"
+                "DTEND;TZID=America/Los_Angeles:20261102T113000\n"
+                "END:VEVENT\nEND:VCALENDAR\n"
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="Lam Research",
+            job_role="Senior Cloud Engineer",
+        )
+        db.add_all([invitation, offered, accepted, promise, invite])
+        db.flush()
+
+        assert asyncio.run(process_calendar_email(db, offered, use_ai=False)) is True
+        assert asyncio.run(process_calendar_email(db, accepted, use_ai=False)) is True
+        assert asyncio.run(process_calendar_email(db, promise, use_ai=False)) is True
+        assert asyncio.run(process_calendar_email(db, invite, use_ai=False)) is True
+
+        visible = [
+            event
+            for event in db.query(CalendarEvent).filter(CalendarEvent.is_visible.is_(True)).all()
+            if event.kind == "confirmed"
+        ]
+        assert len(visible) == 1
+        assert visible[0].start_at == datetime(2026, 11, 2, 18, 30, tzinfo=UTC)
+        assert visible[0].source_email_id == invite.id
+        noon_pt = datetime(2026, 11, 2, 20, 0, tzinfo=UTC)
+        assert all(event.start_at != noon_pt for event in visible)
+
+
+def test_repair_hides_schedule_promise_chip_when_ics_invite_exists():
+    factory, (mailbox_id, _) = _database()
+    with factory() as db:
+        promise = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="promise-source",
+            thread_id="lam-repair",
+            folder="inbox",
+            subject="Re: Lam Research Interview",
+            sender="recruiter@lamresearch.com",
+            received_at=datetime(2026, 10, 27, 17, 16, tzinfo=UTC),
+            body_text="Thank you for being accommodating, I will get that scheduled shortly.",
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            company="Lam Research",
+            job_role="Senior Cloud Engineer",
+        )
+        invite = EmailMessage(
+            mailbox_id=mailbox_id,
+            provider_message_id="ics-source",
+            thread_id="lam-repair",
+            folder="inbox",
+            subject="Teams Interview",
+            sender="recruiter@lamresearch.com",
+            received_at=datetime(2026, 10, 27, 17, 23, tzinfo=UTC),
+            body_text=(
+                "BEGIN:VCALENDAR\nBEGIN:VEVENT\n"
+                "DTSTART;TZID=America/Los_Angeles:20261102T103000\n"
+                "DTEND;TZID=America/Los_Angeles:20261102T113000\n"
+                "END:VEVENT\nEND:VCALENDAR\n"
+            ),
+            label=EmailLabel.INTERVIEW_SCHEDULED.value,
+            interview_subtype="calendar_invite",
+            company="Lam Research",
+            job_role="Senior Cloud Engineer",
+        )
+        db.add_all([promise, invite])
+        db.flush()
+        phantom = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=promise.id,
+            source_thread_id=promise.thread_id,
+            source_received_at=promise.received_at,
+            kind="confirmed",
+            origin="email",
+            title="Lam Research — Senior Cloud Engineer",
+            company="Lam Research",
+            job_role="Senior Cloud Engineer",
+            start_at=datetime(2026, 11, 2, 20, 0, tzinfo=UTC),
+            end_at=datetime(2026, 11, 2, 20, 30, tzinfo=UTC),
+            source_timezone="America/Los_Angeles",
+            interview_status="confirmation",
+            is_visible=True,
+        )
+        real = CalendarEvent(
+            mailbox_id=mailbox_id,
+            source_email_id=invite.id,
+            source_thread_id=invite.thread_id,
+            source_received_at=invite.received_at,
+            kind="confirmed",
+            origin="email",
+            title="Lam Research — Senior Cloud Engineer",
+            company="Lam Research",
+            job_role="Senior Cloud Engineer",
+            start_at=datetime(2026, 11, 2, 18, 30, tzinfo=UTC),
+            end_at=datetime(2026, 11, 2, 19, 30, tzinfo=UTC),
+            source_timezone="America/Los_Angeles",
+            interview_status="calendar_invite",
+            is_visible=True,
+        )
+        db.add_all([phantom, real])
+        db.flush()
+
+        assert repair_schedule_promise_bookings(db, mailbox_id) == 1
+        db.refresh(phantom)
+        db.refresh(real)
+        assert phantom.is_visible is False
+        assert phantom.superseded_by_event_id == real.id
+        assert real.is_visible is True
 
 
 def test_sent_reply_without_a_shared_thread_id_matches_by_subject():

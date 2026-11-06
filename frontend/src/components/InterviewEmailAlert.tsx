@@ -13,7 +13,8 @@ import {
 
 const SNOOZE_KEY = "interview-attention.snooze";
 const SNOOZE_MS = 30 * 60_000;
-const REFRESH_MS = 120_000;
+const REFRESH_MS = 180_000;
+const EVENT_DEBOUNCE_MS = 8_000;
 
 type Snooze = { until: number; ids: number[] };
 type RowKind = "invitation" | "reschedule" | "scheduled";
@@ -206,21 +207,28 @@ export default function InterviewEmailAlert({ mailboxes, refreshKey, suppressed,
   const primaryRef = useRef<HTMLButtonElement>(null);
   const launcherRef = useRef<HTMLButtonElement>(null);
 
+  const inflightRef = useRef(false);
   const refresh = useCallback(async () => {
-    const [nextPending, nextMail] = await Promise.allSettled([fetchPendingInterviews(), fetchInterviewEmailAlerts()]);
-    if (nextPending.status === "fulfilled") setPending(nextPending.value);
-    if (nextMail.status === "fulfilled") setMail(nextMail.value);
-    setNow(Date.now());
+    if (inflightRef.current) return;
+    inflightRef.current = true;
+    try {
+      const [nextPending, nextMail] = await Promise.allSettled([fetchPendingInterviews(), fetchInterviewEmailAlerts()]);
+      if (nextPending.status === "fulfilled") setPending(nextPending.value);
+      if (nextMail.status === "fulfilled") setMail(nextMail.value);
+      setNow(Date.now());
+    } finally {
+      inflightRef.current = false;
+    }
   }, []);
 
   const debounceRef = useRef<number | null>(null);
   const scheduleRefresh = useCallback(() => {
-    // A sync emits one event per message; coalesce them into one request.
+    // Classify/sync storms emit dozens of events; coalesce into one request.
     if (debounceRef.current != null) window.clearTimeout(debounceRef.current);
     debounceRef.current = window.setTimeout(() => {
       debounceRef.current = null;
       void refresh();
-    }, 1200);
+    }, EVENT_DEBOUNCE_MS);
   }, [refresh]);
 
   useEffect(() => {
@@ -229,12 +237,20 @@ export default function InterviewEmailAlert({ mailboxes, refreshKey, suppressed,
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void refresh();
     }, REFRESH_MS);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") scheduleRefresh();
+    };
+    document.addEventListener("visibilitychange", onVisible);
     const source = openEvents();
-    const names = ["connected", "email.classified", "sync.done", "calendar.changed"];
+    // Skip email.classified — optimistic UI + calendar.changed/sync.done cover
+    // the cases that actually change attention rows, without refetching on every
+    // classification during a backlog drain.
+    const names = ["connected", "sync.done", "calendar.changed"];
     names.forEach((name) => source.addEventListener(name, scheduleRefresh));
     return () => {
       window.clearTimeout(first);
       window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
       if (debounceRef.current != null) window.clearTimeout(debounceRef.current);
       names.forEach((name) => source.removeEventListener(name, scheduleRefresh));
       source.close();

@@ -1,4 +1,4 @@
-import { CSSProperties, Dispatch, DragEvent, FormEvent, KeyboardEvent, PointerEvent, SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CSSProperties, Dispatch, DragEvent, FormEvent, KeyboardEvent, PointerEvent, SetStateAction, Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import ApplicationActionCopies from "./components/ApplicationActionCopies";
 import EmailBody from "./components/EmailBody";
@@ -10,10 +10,20 @@ import SystemAlert, { type SystemIssue } from "./components/SystemAlert";
 import InterviewAlarm from "./components/InterviewAlarm";
 import InterviewEmailAlert from "./components/InterviewEmailAlert";
 import { UiIcon } from "./components/UiIcon";
-import SettingsPage, { type SettingsSection } from "./pages/SettingsPage";
-import CalendarPage, { warmCalendarCache } from "./pages/CalendarPage";
-import MonitoringPage from "./pages/MonitoringPage";
-import StatisticsPage from "./pages/StatisticsPage";
+import type { SettingsSection } from "./pages/SettingsPage";
+
+const SettingsPage = lazy(() => import("./pages/SettingsPage"));
+const CalendarPage = lazy(() => import("./pages/CalendarPage"));
+const MonitoringPage = lazy(() => import("./pages/MonitoringPage"));
+const StatisticsPage = lazy(() => import("./pages/StatisticsPage"));
+
+function warmCalendarCache(): void {
+  void import("./pages/CalendarPage").then((mod) => mod.warmCalendarCache());
+}
+
+function PageFallback({ label = "Loading…" }: { label?: string }) {
+  return <div className="page-fallback" role="status" aria-live="polite">{label}</div>;
+}
 import {
   disconnectMailbox,
   openEvents,
@@ -81,10 +91,19 @@ import {
 import { applyTheme, loadThemePref, saveThemePref, type ThemePref } from "./theme";
 
 const PAGE_SIZE = 50;
-const LIST_OVERSCAN = 12;
+const LIST_OVERSCAN_DESKTOP = 12;
+const LIST_OVERSCAN_PHONE = 5;
 const LIST_ROW_GROUP_H = 40;
 const LIST_ROW_EMAIL_H = 102;
 const LIST_ROW_TABLE_H = 72;
+
+function isPhoneViewport(): boolean {
+  try {
+    return window.matchMedia("(max-width: 720px)").matches;
+  } catch {
+    return false;
+  }
+}
 
 type ListRow =
   | { kind: "group"; key: string; heading: string; count: number }
@@ -523,15 +542,41 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("appearance");
   const [sidebarSections, setSidebarSections] = useState({ inbox: true, categories: true });
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
-    try { return window.matchMedia("(max-width: 720px)").matches || localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1"; } catch { return false; }
+    try { return isPhoneViewport() || localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1"; } catch { return false; }
   });
+  const [listOverscan, setListOverscan] = useState(() => (isPhoneViewport() ? LIST_OVERSCAN_PHONE : LIST_OVERSCAN_DESKTOP));
+  const collapseSidebar = useCallback((persist = true) => {
+    setSidebarCollapsed(true);
+    setSyncMenuOpen(false);
+    if (!persist) return;
+    try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, "1"); } catch { /* ignore */ }
+  }, []);
+  const expandSidebar = useCallback(() => {
+    setSidebarCollapsed(false);
+    try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, "0"); } catch { /* ignore */ }
+  }, []);
   useEffect(() => {
     const phoneLayout = window.matchMedia("(max-width: 720px)");
-    const collapseForPhone = () => { if (phoneLayout.matches) setSidebarCollapsed(true); };
-    collapseForPhone();
-    phoneLayout.addEventListener("change", collapseForPhone);
-    return () => phoneLayout.removeEventListener("change", collapseForPhone);
+    const syncPhoneLayout = () => {
+      const phone = phoneLayout.matches;
+      setListOverscan(phone ? LIST_OVERSCAN_PHONE : LIST_OVERSCAN_DESKTOP);
+      if (phone) setSidebarCollapsed(true);
+    };
+    syncPhoneLayout();
+    phoneLayout.addEventListener("change", syncPhoneLayout);
+    return () => phoneLayout.removeEventListener("change", syncPhoneLayout);
   }, []);
+  useEffect(() => {
+    if (sidebarCollapsed || !isPhoneViewport()) return;
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        collapseSidebar();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [sidebarCollapsed, collapseSidebar]);
   const [resizing, setResizing] = useState<"accounts" | "list" | null>(null);
   const [replyOpen, setReplyOpen] = useState(false);
   const [replyExpanded, setReplyExpanded] = useState(false);
@@ -915,7 +960,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     void refreshAutoSyncStatus();
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void refreshAutoSyncStatus();
-    }, 30_000);
+    }, 60_000);
     return () => window.clearInterval(timer);
   }, [refreshAutoSyncStatus]);
 
@@ -1080,7 +1125,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
             [item.label]: (prev[item.label] ?? 0) + 1,
           }));
         }
-        refreshCountsRef.current();
+        // Optimistic counts already updated above. Full /api/emails meta
+        // refresh is deferred to sync.done / reclassify.done so classify
+        // storms do not hammer the sidebar aggregation query.
       } catch {
         /* ignore */
       }
@@ -1164,6 +1211,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         }
         void refreshMailboxes();
         void loadFirstPage();
+        refreshCountsRef.current();
         setMailboxAction(
           mailboxId,
           data.state === "error" ? "error" : "success",
@@ -1194,6 +1242,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
           setSyncingIds(next);
         }
         void refreshMailboxes();
+        refreshCountsRef.current();
         setMailboxAction(
           mailboxId,
           data.state === "error" ? "error" : "success",
@@ -1364,6 +1413,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     if (!sessionUser.is_admin) return;
     setSettingsOpen(false);
     setMobileReaderOpen(false);
+    if (isPhoneViewport()) collapseSidebar(false);
     setActivePage("monitoring");
   }
 
@@ -1371,6 +1421,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     if (!sessionUser.is_admin) return;
     setSettingsOpen(false);
     setMobileReaderOpen(false);
+    if (isPhoneViewport()) collapseSidebar(false);
     setActivePage("statistics");
   }
 
@@ -1525,7 +1576,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
       listRowsRef.current[index]?.kind === "group"
         ? LIST_ROW_GROUP_H
         : emailRowHeight(viewModeRef.current),
-    overscan: LIST_OVERSCAN,
+    overscan: listOverscan,
     getItemKey: (index) => {
       const row = listRowsRef.current[index];
       if (!row) return index;
@@ -1564,8 +1615,8 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
 
   useEffect(() => {
     if (loading || lastVirtualIndex < 0) return;
-    if (lastVirtualIndex >= listRows.length - LIST_OVERSCAN) void loadMore();
-  }, [lastVirtualIndex, listRows.length, loadMore, loading]);
+    if (lastVirtualIndex >= listRows.length - listOverscan) void loadMore();
+  }, [lastVirtualIndex, listRows.length, listOverscan, loadMore, loading]);
 
   function toggleDateGroup(key: string) {
     setCollapsedDates((prev) => {
@@ -1678,6 +1729,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   function openCalendar() {
     setCalendarMounted(true);
     setMobileReaderOpen(false);
+    if (isPhoneViewport()) collapseSidebar(false);
     setActivePage("calendar");
   }
 
@@ -2313,6 +2365,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
 
   function selectLabel(next: "all" | EmailLabel) {
     scrollRef.current?.scrollTo(0, 0);
+    if (isPhoneViewport()) collapseSidebar(false);
     if (interviewSubtype !== "all") {
       setInterviewSubtype("all");
       if (label === next) return;
@@ -2334,6 +2387,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
   function selectMailboxFolder(id: number | null, nextFolder: "all" | MailFolder) {
     setMobileReaderOpen(false);
     setActivePage("inbox");
+    if (isPhoneViewport()) collapseSidebar(false);
     scrollRef.current?.scrollTo(0, 0);
     if (selectedMailboxId === id && folder === nextFolder) {
       setEmails([]);
@@ -2806,6 +2860,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     return (
       <>
       <InterviewAlarm mailboxes={mailboxes} />
+      <Suspense fallback={<PageFallback label="Loading settings…" />}>
       <SettingsPage
         section={settingsSection}
         onSectionChange={setSettingsSection}
@@ -2852,6 +2907,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         accountStatus={mailboxActions}
         reclassifyProgress={reclassifyProgress}
       />
+      </Suspense>
       </>
     );
   }
@@ -2885,6 +2941,14 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         onReopen={reopenSystemAlert}
         onRecheck={() => void recheckStatus()}
       />
+      {!sidebarCollapsed && (
+        <button
+          type="button"
+          className="sidebar-mobile-scrim"
+          aria-label="Close sidebar"
+          onClick={() => collapseSidebar()}
+        />
+      )}
       <aside className={`pane-accounts${sidebarCollapsed ? " is-collapsed" : ""}`} ref={accountsPaneRef}>
         {sidebarCollapsed ? (
           <nav className="sidebar-rail" aria-label="Mailbox navigation">
@@ -2905,7 +2969,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
               {sessionUser.is_admin && <button type="button" className={`sidebar-rail-btn${activePage === "statistics" ? " active" : ""}`} aria-label="Statistics" data-tooltip="Statistics" data-tooltip-hint="Email categories and recruiting outcomes" data-tooltip-placement="right" onClick={openStatistics}>
                 <SidebarIcon name="statistics" />
               </button>}
-              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && label !== "all" ? " active" : ""}`} aria-label="Categories" data-tooltip="Categories" data-tooltip-hint="Opens the sidebar to filter by category" data-tooltip-placement="right" onClick={() => { setActivePage("inbox"); setSidebarSections((current) => ({ ...current, categories: true })); setSidebarCollapsed(false); try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, "0"); } catch { /* ignore */ } }}>
+              <button type="button" className={`sidebar-rail-btn${activePage === "inbox" && label !== "all" ? " active" : ""}`} aria-label="Categories" data-tooltip="Categories" data-tooltip-hint="Opens the sidebar to filter by category" data-tooltip-placement="right" onClick={() => { setActivePage("inbox"); setSidebarSections((current) => ({ ...current, categories: true })); expandSidebar(); }}>
                 <svg className="sidebar-nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3.5h6" /><path d="M10 3.5v5.2L7 12.2h10L14 8.7V3.5" /><path d="M12 12.2v8.3" /></svg>
               </button>
             </div>
@@ -2916,10 +2980,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
               data-tooltip="Show sidebar"
               data-tooltip-hint="Expand accounts and categories"
               data-tooltip-placement="right"
-              onClick={() => {
-                setSidebarCollapsed(false);
-                try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, "0"); } catch { /* ignore */ }
-              }}
+              onClick={expandSidebar}
             >
               <svg className="sidebar-nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
             </button>
@@ -2939,11 +3000,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                 data-tooltip="Hide sidebar"
                 data-tooltip-hint="Collapse this panel"
                 data-tooltip-placement="bottom"
-                onClick={() => {
-                  setSyncMenuOpen(false);
-                  setSidebarCollapsed(true);
-                  try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, "1"); } catch { /* ignore */ }
-                }}
+                onClick={() => collapseSidebar()}
               >
                 <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2" /><path d="M8 11V7.5a4 4 0 0 1 7.6-1.7" /></svg>
               </button>
@@ -3056,11 +3113,15 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
       />
 
       {activePage === "monitoring" && sessionUser.is_admin && (
-        <MonitoringPage active aiStatus={aiStatus} aiStatusOffline={aiStatusOffline} />
+        <Suspense fallback={<PageFallback label="Loading monitoring…" />}>
+          <MonitoringPage active aiStatus={aiStatus} aiStatusOffline={aiStatusOffline} />
+        </Suspense>
       )}
 
       {activePage === "statistics" && sessionUser.is_admin && (
-        <StatisticsPage active mailboxes={mailboxes} initialMailboxId={selectedMailboxId} />
+        <Suspense fallback={<PageFallback label="Loading statistics…" />}>
+          <StatisticsPage active mailboxes={mailboxes} initialMailboxId={selectedMailboxId} />
+        </Suspense>
       )}
 
       {activePage === "inbox" && <>
@@ -3281,12 +3342,14 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
         {activePage === "inbox" && mobileReaderOpen && selectedId != null && (readingPane !== "no_split" || tableDialogOpen) && <header className="mobile-reader-toolbar"><button type="button" onClick={closeMobileReader} aria-label="Back to messages"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7M8 12h11" /></svg><span>Messages</span></button></header>}
         {calendarMounted && (
           <div className={`calendar-page-host${activePage === "calendar" ? "" : " is-hidden"}`} hidden={activePage !== "calendar"} aria-hidden={activePage !== "calendar"}>
-            <CalendarPage
-              mailboxes={orderedMailboxes}
-              refreshKey={calendarRefreshKey}
-              active={activePage === "calendar"}
-              onClose={() => setActivePage("inbox")}
-            />
+            <Suspense fallback={<PageFallback label="Loading calendar…" />}>
+              <CalendarPage
+                mailboxes={orderedMailboxes}
+                refreshKey={calendarRefreshKey}
+                active={activePage === "calendar"}
+                onClose={() => setActivePage("inbox")}
+              />
+            </Suspense>
           </div>
         )}
         {activePage !== "calendar" && <>

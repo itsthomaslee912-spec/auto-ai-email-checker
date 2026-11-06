@@ -146,8 +146,8 @@ class _MailRef:
 
 _cache_lock = threading.Lock()
 _cache_inflight: dict[tuple, threading.Event] = {}
-_CACHE_TTL_SECONDS = 2.0
-_PENDING_CACHE_TTL_SECONDS = 10.0
+_CACHE_TTL_SECONDS = 5.0
+_PENDING_CACHE_TTL_SECONDS = 45.0
 _booking_cache: dict[tuple, tuple[float, tuple[list[_BookingRef], dict[int, set[int]]]]] = {}
 _follower_cache: dict[tuple, tuple[float, list[_MailRef]]] = {}
 _pending_cache: dict[tuple, tuple[float, list[PendingInterview]]] = {}
@@ -286,6 +286,10 @@ def _confirmed_bookings(db: Session, mailbox_ids: list[int]) -> tuple[list[_Book
     key = (id(db.get_bind()), tuple(mailbox_ids))
 
     def load() -> tuple[list[_BookingRef], dict[int, set[int]]]:
+        # Pending resolution only cares about recent/upcoming bookings.
+        # Loading every historical confirmed event made /pending scan the
+        # full calendar table on every cache miss.
+        since = datetime.now(UTC) - PENDING_WINDOW
         booked_events = [
             _BookingRef(
                 id=row.id,
@@ -312,6 +316,11 @@ def _confirmed_bookings(db: Session, mailbox_ids: list[int]) -> tuple[list[_Book
                 CalendarEvent.mailbox_id.in_(mailbox_ids),
                 CalendarEvent.kind == "confirmed",
                 CalendarEvent.is_visible.is_(True),
+                or_(
+                    CalendarEvent.start_at >= since,
+                    CalendarEvent.created_at >= since,
+                    CalendarEvent.source_received_at >= since,
+                ),
             ).all()
         ]
         booked_ids = [event.id for event in booked_events]

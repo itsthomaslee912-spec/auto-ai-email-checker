@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
-import App from "../App";
+import { Suspense, lazy, useCallback, useEffect, useState } from "react";
 import { AUTH_EXPIRED_EVENT, fetchSession, signOut, type SessionUser } from "../api";
 import SignInPage from "../pages/SignInPage";
+
+const App = lazy(() => import("../App"));
 
 type GateState =
   | { status: "checking" }
@@ -72,5 +73,9 @@ export default function AuthGate() {
   if (state.status === "signed-out") {
     return <SignInPage notice={state.notice} onSignedIn={(user) => setState({ status: "signed-in", user })} />;
   }
-  return <App key={state.user.id} sessionUser={state.user} onSignOut={handleSignOut} />;
+  return (
+    <Suspense fallback={<div className="signin-screen" aria-busy="true"><div className="signin-checking">Loading app…</div></div>}>
+      <App key={state.user.id} sessionUser={state.user} onSignOut={handleSignOut} />
+    </Suspense>
+  );
 }

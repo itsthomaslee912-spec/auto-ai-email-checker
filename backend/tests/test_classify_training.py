@@ -507,6 +507,43 @@ def test_pending_classification_publishes_completion_when_label_is_unchanged(mon
         assert db.get(EmailMessage, email_id).classification_pending is False
 
 
+def test_pending_reclassify_finalizes_already_labeled_mail_without_ai(monkeypatch):
+    """Interview-labeled pending rows must clear without another model call."""
+    from app.services import ai_backend, reclassify
+
+    SessionLocal = _session_factory()
+    with SessionLocal() as db:
+        email = _seed_email(db, label=EmailLabel.INTERVIEW_SCHEDULED.value)
+        email.classification_pending = True
+        email.confidence = 0.95
+        email.calendar_processed_hash = "already-projected"
+        email.calendar_processed_at = datetime.now(UTC)
+        db.commit()
+        mailbox_id = email.mailbox_id
+        email_id = email.id
+
+    classify = AsyncMock(side_effect=AssertionError("already-labeled pending must not call the model"))
+    publish = AsyncMock()
+    monkeypatch.setattr("app.db.SessionLocal", SessionLocal)
+    monkeypatch.setattr(reclassify, "classify_email", classify)
+    monkeypatch.setattr(reclassify, "get_ai_backend", lambda: SimpleNamespace(provider="test"))
+    monkeypatch.setattr(reclassify, "publish", publish)
+    ai_backend._ai_call_gate = None
+    reclassify._mailbox_gate = None
+
+    asyncio.run(reclassify._run_reclassify_job(mailbox_id, pending_only=True))
+
+    classify.assert_not_awaited()
+    classified = [call.args[1] for call in publish.await_args_list if call.args[0] == "email.classified"]
+    assert len(classified) == 1
+    assert classified[0]["classification_completed"] is True
+    with SessionLocal() as db:
+        stored = db.get(EmailMessage, email_id)
+        assert stored.classification_pending is False
+        assert stored.label == EmailLabel.INTERVIEW_SCHEDULED.value
+        assert stored.calendar_processed_hash == "already-projected"
+
+
 def test_pending_interview_classification_invalidates_temporary_calendar_hash(monkeypatch):
     """Backfill may inspect download-only mail before its final AI label exists.
 

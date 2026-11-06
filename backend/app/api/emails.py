@@ -79,6 +79,10 @@ _label_effect_locks: dict[int, threading.Lock] = {}
 _LIST_META_TTL_SECONDS = 30.0
 _list_meta_cache: dict[tuple, tuple[float, dict]] = {}
 _list_meta_cache_lock = threading.Lock()
+# Classification storms used to clear this cache on every email. Debounce so
+# the expensive GROUP BY stays warm until work settles.
+_LIST_META_INVALIDATE_DEBOUNCE_SECONDS = 2.5
+_list_meta_invalidate_after = 0.0
 _RECIPIENT_EMAIL_RE = re.compile(r"^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.I)
 
 
@@ -112,6 +116,20 @@ _LIST_COLUMNS = load_only(
     EmailMessage.folder,
     EmailMessage.thread_id,
     EmailMessage.created_at,
+)
+_ALERT_COLUMNS = load_only(
+    EmailMessage.id,
+    EmailMessage.mailbox_id,
+    EmailMessage.subject,
+    EmailMessage.sender,
+    EmailMessage.received_at,
+    EmailMessage.label,
+    EmailMessage.interview_subtype,
+    EmailMessage.company,
+    EmailMessage.job_role,
+    EmailMessage.is_read,
+    EmailMessage.folder,
+    EmailMessage.pending_dismissed_at,
 )
 
 InboxTypeLiteral = Literal["default", "unread_first"]
@@ -239,6 +257,7 @@ def _list_meta(
     )
     with _list_meta_cache_lock:
         now = time.monotonic()
+        _flush_list_meta_invalidation_locked(now)
         cached = _list_meta_cache.get(key)
         if cached is not None and now - cached[0] < _LIST_META_TTL_SECONDS:
             return cached[1]
@@ -386,17 +405,40 @@ def _conversation_ranked(filtered):
 _conversation_total_cache: dict[tuple, tuple[float, int]] = {}
 
 
-def invalidate_email_list_caches() -> None:
-    """Discard list metadata after mail, labels, folders, or read state change."""
+def invalidate_email_list_caches(*, immediate: bool = False) -> None:
+    """Discard list metadata after mail, labels, folders, or read state change.
+
+    By default, invalidation is deferred a few seconds so a classify/sync burst
+    can keep serving cached sidebar totals until the storm settles.
+    """
+    global _list_meta_invalidate_after
     with _list_meta_cache_lock:
-        _list_meta_cache.clear()
-        _conversation_total_cache.clear()
+        if immediate:
+            _list_meta_cache.clear()
+            _conversation_total_cache.clear()
+            _list_meta_invalidate_after = 0.0
+            return
+        _list_meta_invalidate_after = time.monotonic() + _LIST_META_INVALIDATE_DEBOUNCE_SECONDS
+
+
+def _flush_list_meta_invalidation_locked(now: float | None = None) -> None:
+    global _list_meta_invalidate_after
+    when = _list_meta_invalidate_after
+    if not when:
+        return
+    now = time.monotonic() if now is None else now
+    if now < when:
+        return
+    _list_meta_cache.clear()
+    _conversation_total_cache.clear()
+    _list_meta_invalidate_after = 0.0
 
 
 def _conversation_total(filtered, key: tuple, before_id: int | None) -> int:
     key = (id(filtered.session.get_bind()), current_user_id.get(), *key)
     with _list_meta_cache_lock:
         now = time.monotonic()
+        _flush_list_meta_invalidation_locked(now)
         cached = _conversation_total_cache.get(key)
         if cached is not None and now - cached[0] < _LIST_META_TTL_SECONDS:
             return cached[1]
@@ -644,6 +686,7 @@ _ALERT_LABELS = (EmailLabel.INTERVIEW_INVITATION.value, EmailLabel.INTERVIEW_SCH
 def list_interview_alerts(db: Session = Depends(get_db)) -> list[InterviewEmailAlertOut]:
     rows = (
         _from_active_mailbox(db.query(EmailMessage))
+        .options(_ALERT_COLUMNS)
         .filter(
             MailboxConnection.is_active.is_(True),
             EmailMessage.is_read.is_not(True),

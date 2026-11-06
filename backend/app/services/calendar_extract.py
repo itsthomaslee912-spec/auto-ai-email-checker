@@ -336,8 +336,25 @@ _TIME_PATTERN = re.compile(
     # "2026:1:30pm" glues the clock to the year. A colon after a year is still
     # the start of the time; a colon after a digit is the middle of a clock.
     # ATS templates also emit labels without whitespace ("Time:10:30am").
-    r"(?:(?<![\d:])|(?<=\b20\d{2}:)|(?<=[A-Za-z]:))(?P<hour>1[0-2]|0?[1-9])(?::?(?P<minute>[0-5]\d))?\s*"
-    r"(?:(?P<ampm>a\.?m\.?|p\.?m\.?)\b|(?=(?:UTC|GMT|ET|EST|EDT|PT|PST|PDT|CT|CST|CDT|MT|MST|MDT)\b))",
+    # Two-letter zones (PT/ET/CT/MT) require whitespace so CSS ``font-size: 12pt``
+    # is never read as noon Pacific. Longer forms (PST, EDT, …) may stay glued.
+    r"(?:(?<![\d:])|(?<=\b20\d{2}:)|(?<=[A-Za-z]:))(?P<hour>1[0-2]|0?[1-9])(?::?(?P<minute>[0-5]\d))?"
+    r"(?:"
+    r"\s*(?P<ampm>a\.?m\.?|p\.?m\.?)\b"
+    r"|\s*(?=(?:UTC|GMT|EST|EDT|PST|PDT|CST|CDT|MST|MDT)\b)"
+    r"|\s+(?=(?:ET|PT|CT|MT)\b)"
+    r")",
+    re.I,
+)
+# Recruiter promises to book later are not confirmations of a concrete slot.
+_PENDING_SCHEDULE_PROMISE_RE = re.compile(
+    r"\b(?:"
+    r"(?:will|i(?:['’]|\s+)ll|i\s+will)\s+(?:get\s+(?:that|this|it)\s+)?scheduled"
+    r"|get\s+(?:that|this|it)\s+scheduled"
+    r"|scheduled\s+shortly"
+    r"|(?:will|i(?:['’]|\s+)ll|i\s+will)\s+(?:send|share|forward)\s+"
+    r"(?:(?:you|over)\s+)?(?:a\s+)?(?:calendar\s+)?(?:invite|invitation)"
+    r")\b",
     re.I,
 )
 _DURATION_PATTERNS = (
@@ -586,7 +603,11 @@ def _zone_from_nearby_text(value: str) -> tuple[timezone | ZoneInfo, str] | None
             offsets.append((offset.start(), timezone(timedelta(minutes=minutes)), label))
     upper = nearby.upper()
     for alias in sorted(TIME_ZONE_ALIASES, key=len, reverse=True):
-        match = re.search(rf"(?<![A-Z]){re.escape(alias)}(?![A-Z])", upper)
+        # Short aliases must not ride CSS units ("12PT") or other digit glue.
+        if alias in {"ET", "PT", "CT", "MT"}:
+            match = re.search(rf"(?<![A-Z0-9]){re.escape(alias)}(?![A-Z])", upper)
+        else:
+            match = re.search(rf"(?<![A-Z]){re.escape(alias)}(?![A-Z])", upper)
         if match:
             name = TIME_ZONE_ALIASES[alias]
             # "UTC" inside "UTC-05:00" is the offset, not a named zone.
@@ -3917,15 +3938,27 @@ def message_appointment_slots(email: EmailMessage) -> list[ExtractedSlot]:
                 if slot is not None:
                     return [slot]
     # A bare clock in a short reply ("around 11:30 AM PST") must not borrow a
-    # date from a job description buried in the quoted thread.
-    if times and quoted and re.search(r"\b(?:available|availability|reschedul|moved?|move|booked|confirmed|scheduled)\b", fresh or "", re.I):
-        zone_span = _zone_window(fresh, times[0].start() - 12, times[0].end() + 48)
+    # date from a job description buried in the quoted thread. Require am/pm or
+    # minutes so CSS leftovers and "scheduled shortly" promises cannot invent a
+    # noon appointment from ``font-size: 12pt``.
+    real_times = [match for match in times if match.group("ampm") or match.group("minute")]
+    if (
+        real_times
+        and quoted
+        and re.search(
+            r"\b(?:available|availability|reschedul|moved?|move|booked|confirmed|scheduled)\b",
+            fresh or "",
+            re.I,
+        )
+        and not _PENDING_SCHEDULE_PROMISE_RE.search(fresh or "")
+    ):
+        zone_span = _zone_window(fresh, real_times[0].start() - 12, real_times[0].end() + 48)
         zone_match = _zone_from_nearby_text(zone_span)
         date_parts = _first_interview_date(quoted, reference)
         if zone_match is not None and date_parts is not None:
             zone, zone_name = zone_match
             year, month, day = date_parts
-            slot = _slot_from_clock(times, year, month, day, zone, zone_name, reference)
+            slot = _slot_from_clock(real_times, year, month, day, zone, zone_name, reference)
             if slot is not None:
                 return [slot]
     # The reply already names a clock. Quoted options ("Oct 12 at 8am or
@@ -8057,6 +8090,73 @@ def _slot_matches_event(event: CalendarEvent, slots: list[ExtractedSlot]) -> boo
     return any(abs((slot.start_at - start).total_seconds()) <= 120 for slot in slots)
 
 
+def repair_schedule_promise_bookings(db: Session, mailbox_id: int | None = None) -> int:
+    """Hide chips invented from a recruiter promise that has not booked a time.
+
+    ``Thank you … I will get that scheduled shortly`` names no appointment.
+    Older parsers still turned HTML ``font-size: 12pt`` plus a quoted date into
+    a noon Pacific confirmation. Prefer a same-company ICS invite as keeper.
+    """
+    query = _email_calendar_events(db).filter(
+        CalendarEvent.is_visible.is_(True),
+        CalendarEvent.kind == "confirmed",
+        CalendarEvent.origin == "email",
+        CalendarEvent.source_email_id.isnot(None),
+    )
+    if mailbox_id is not None:
+        query = query.filter(CalendarEvent.mailbox_id == mailbox_id)
+    events = query.all()
+    hidden = 0
+    for event in events:
+        email = db.get(EmailMessage, event.source_email_id)
+        if email is None or not event.is_visible:
+            continue
+        if parse_ics_slots(_calendar_text(email)):
+            continue
+        if message_appointment_slots(email):
+            continue
+        body = (email.body_text or "").strip() or (email.body_html or "").strip() or (email.snippet or "")
+        if parse_text_slots(_without_quoted_history(body), email.received_at):
+            continue
+        fresh = _fresh_message_text(email)
+        if not _PENDING_SCHEDULE_PROMISE_RE.search(fresh):
+            continue
+        start = as_utc(event.start_at) or datetime.min.replace(tzinfo=UTC)
+        candidates = [
+            other
+            for other in events
+            if other.id != event.id
+            and other.is_visible
+            and other.mailbox_id == event.mailbox_id
+            and companies_match(other.company, event.company)
+            and roles_compatible(other.job_role, event.job_role)
+        ]
+        same_day = [
+            other
+            for other in candidates
+            if as_utc(other.start_at) is not None and as_utc(other.start_at).date() == start.date()
+        ]
+        pool = same_day or candidates
+        ics_keepers = [
+            other
+            for other in pool
+            if other.source_email_id and _source_email_has_ics(db, other)
+        ]
+        keeper = min(
+            ics_keepers or pool,
+            key=lambda other: abs((as_utc(other.start_at) - start).total_seconds()),
+            default=None,
+        )
+        event.is_visible = False
+        if keeper is not None:
+            event.superseded_by_event_id = keeper.id
+            _transfer_event_email_links(db, event, keeper)
+        hidden += 1
+    if hidden:
+        db.flush()
+    return hidden
+
+
 def hide_quote_clock_events(db: Session, mailbox_id: int | None = None) -> int:
     """Hide an interview whose time is only the quoted message's send clock.
 
@@ -9465,6 +9565,9 @@ def collapse_duplicate_calendar_events(
     if promote_booked_availability(db, mailbox_id):
         changed = True
     checkpoint()
+    if repair_schedule_promise_bookings(db, mailbox_id):
+        changed = True
+    checkpoint()
     if hide_quote_clock_events(db, mailbox_id):
         changed = True
     checkpoint()
@@ -9813,6 +9916,13 @@ async def _process_calendar_email_locked(
 ) -> bool:
     if email.label not in CALENDAR_LABELS:
         return False
+    # Calendar promotion (ICS match, misfiled booking, availability request)
+    # assigns a durable interview category without going through the AI
+    # classifier. Clear the import/enrichment flag here so monitoring does not
+    # keep counting those rows as "Pending AI" and the classification worker
+    # does not spend an Ollama slot re-confirming them.
+    if email.classification_pending and not email.human_corrected:
+        email.classification_pending = False
     # Do not acquire SELECT ... FOR UPDATE here. Calendar extraction can wait
     # on the local AI model, and retaining that row lock blocked unrelated
     # calendar cleanup transactions for many minutes. The per-email asyncio
@@ -9967,13 +10077,15 @@ async def _process_calendar_email_locked(
     # "Great! Chat soon" after the recruiter proposed 2:30 and the candidate
     # accepted. Reuse the newest still-open time in that same thread instead
     # of deferring extraction or leaving both the rejected and accepted offers
-    # visible as availability.
+    # visible as availability. "I will get that scheduled shortly" is the
+    # opposite: the recruiter has not booked anything yet.
     confirmation_time = as_utc(email.received_at)
     thread_confirmation_availability = None
     if (
         email.label == EmailLabel.INTERVIEW_SCHEDULED.value
         and email.interview_subtype in {None, "confirmation"}
         and email.thread_id
+        and not _PENDING_SCHEDULE_PROMISE_RE.search(_fresh_message_text(email))
     ):
         candidates = [
             event
@@ -10015,6 +10127,16 @@ async def _process_calendar_email_locked(
                 email.calendar_processed_at = datetime.now(UTC)
                 email.calendar_processing_error = None
                 return True
+        # "I will get that scheduled shortly" is finished work: no time yet, so
+        # no chip. Do not leave it deferred waiting for an AI slot invent.
+        if (
+            email.label == EmailLabel.INTERVIEW_SCHEDULED.value
+            and _PENDING_SCHEDULE_PROMISE_RE.search(_fresh_message_text(email))
+        ):
+            email.calendar_processed_hash = digest
+            email.calendar_processed_at = datetime.now(UTC)
+            email.calendar_processing_error = None
+            return True
         email.calendar_processing_error = "Calendar extraction deferred until the selected AI provider is available"
         return False
 

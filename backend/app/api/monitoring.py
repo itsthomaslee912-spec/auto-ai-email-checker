@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.auth.session import require_admin, require_user
 from app.config import get_settings
@@ -92,9 +92,12 @@ def monitoring_snapshot(db: Session = Depends(get_db)) -> dict:
     outbox = _counts(db, OutboxEvent, OutboxEvent.status)
     webhook_jobs = _counts(db, WebhookDeliveryJob, WebhookDeliveryJob.status)
     mailbox_jobs = _counts(db, MailboxJobState, MailboxJobState.state)
-    active_mailboxes = db.query(MailboxConnection).filter(
-        MailboxConnection.is_active.is_(True)
-    ).all()
+    active_mailboxes = (
+        db.query(MailboxConnection)
+        .options(joinedload(MailboxConnection.webhook))
+        .filter(MailboxConnection.is_active.is_(True))
+        .all()
+    )
     mailbox_issues = []
     for mailbox in active_mailboxes:
         webhook_error = mailbox.webhook.last_delivery_error if mailbox.webhook else None
@@ -121,13 +124,17 @@ def monitoring_snapshot(db: Session = Depends(get_db)) -> dict:
     relay = next(item for item in services if item["name"] == "event-relay")
     rabbitmq_configured = get_settings().rabbitmq_enabled
 
-    email_count = int(db.query(func.count(EmailMessage.id)).scalar() or 0)
-    pending_classification = int(db.query(func.count(EmailMessage.id)).filter(
-        EmailMessage.classification_pending.is_(True),
-        # Human corrections are authoritative and the classification worker
-        # deliberately skips them. Do not report work it will never consume.
-        EmailMessage.human_corrected.is_not(True),
-    ).scalar() or 0)
+    # One pass over email_messages for the two monitoring counters instead of
+    # two full-table COUNT(*) queries under classify/sync load.
+    email_totals = db.query(
+        func.count(EmailMessage.id),
+        func.count(EmailMessage.id).filter(
+            EmailMessage.classification_pending.is_(True),
+            EmailMessage.human_corrected.is_not(True),
+        ),
+    ).one()
+    email_count = int(email_totals[0] or 0)
+    pending_classification = int(email_totals[1] or 0)
     feedback_count = int(db.query(func.count(ClassifyCorrection.id)).scalar() or 0)
 
     return {

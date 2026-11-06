@@ -128,8 +128,15 @@ export function loadFontFamily(): FontFamily {
   return "dm-sans";
 }
 
+declare global {
+  interface Window {
+    __loadAppFont?: (font: string) => void;
+  }
+}
+
 export function applyFontFamily(font: FontFamily): void {
   document.documentElement.dataset.font = font;
+  window.__loadAppFont?.(font);
 }
 
 export function saveFontFamily(font: FontFamily): void {
