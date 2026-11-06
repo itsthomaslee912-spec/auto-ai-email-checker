@@ -2212,12 +2212,24 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
     const recipients = extractEmailAddresses([...replyRecipients, ...draftRecipients].join(", "));
     const toAddress = recipients.join(", ");
     const subject = replySubjectText.trim();
-    if (!selected || !replyMailbox || !replyText.trim() || recipients.length === 0 || !subject) return;
+    if (!selected || !replyMailbox || !replyText.trim() || recipients.length === 0 || !subject || sendingReply) return;
+    const mailboxId = replyMailbox.id;
+    const selectedId = selected.id;
+    const bodyText = replyText;
+    const files = replyFiles;
+    const scheduled = Boolean(scheduleAt);
     const run = async () => {
       setSendingReply(true);
       try {
-        await sendEmail({ mailbox_id: replyMailbox.id, to_address: toAddress, subject, body_text: replyText, attachments: await filePayload(replyFiles), reply_to_email_id: selected.id });
-        setBanner(scheduleAt ? "Reply scheduled and sent." : "Reply sent. It is now in Sent.");
+        await sendEmail({
+          mailbox_id: mailboxId,
+          to_address: toAddress,
+          subject,
+          body_text: bodyText,
+          attachments: await filePayload(files),
+          reply_to_email_id: selectedId,
+        });
+        setBanner(scheduled ? "Reply scheduled and sent." : "Reply sent. It is now in Sent.");
         setReplyOpen(false); setReplyExpanded(false); setReplySubjectText(""); setReplyRecipients([]); setReplyRecipientDraft(""); setReplyMailboxId(null); setReplySenderOpen(false); setQuickRepliesOpen(false); setReplyText(""); setReplyInstruction(""); setReplyFiles([]); setScheduleAt("");
         if (folder === "sent") void loadFirstPage();
       } catch (err) { setBanner(err instanceof Error ? err.message : "Could not send reply"); }
@@ -3511,7 +3523,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                 </div>
               )}
               {replyOpen && (
-                <section className={`reply-composer${replyExpanded ? " is-expanded" : ""}`} aria-label="Reply composer">
+                <section className={`reply-composer${replyExpanded ? " is-expanded" : ""}${sendingReply ? " is-sending" : ""}`} aria-label="Reply composer" aria-busy={sendingReply || undefined}>
                   <header className="reply-compose-header">
                     <div className="reply-compose-heading">
                       <label className="reply-subject-field">
@@ -3521,6 +3533,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                           value={replySubjectText}
                           onChange={(event) => setReplySubjectText(event.target.value)}
                           placeholder="Subject"
+                          disabled={sendingReply}
                         />
                       </label>
                       <div className="reply-recipient-field">
@@ -3529,7 +3542,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                           {replyRecipients.map((address) => (
                             <span className="reply-recipient-chip" key={address} title={address}>
                               <span>{address}</span>
-                              <button type="button" aria-label={`Remove ${address}`} onClick={() => removeReplyRecipient(address)}>×</button>
+                              <button type="button" aria-label={`Remove ${address}`} disabled={sendingReply} onClick={() => removeReplyRecipient(address)}>×</button>
                             </span>
                           ))}
                           <input
@@ -3549,6 +3562,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                             placeholder={replyRecipients.length ? "Add another email" : "recipient@example.com"}
                             inputMode="email"
                             autoComplete="email"
+                            disabled={sendingReply}
                           />
                         </span>
                       </div>
@@ -3558,6 +3572,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                         type="button"
                         aria-label={replyExpanded ? "Restore reply composer" : "Expand reply composer"}
                         data-tooltip={replyExpanded ? "Restore" : "Expand"}
+                        disabled={sendingReply}
                         onClick={() => setReplyExpanded((expanded) => !expanded)}
                       >
                         <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -3566,14 +3581,14 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                             : <><path d="M9 4H4v5M15 20h5v-5" /><path d="m4 4 5 5M20 20l-5-5" /></>}
                         </svg>
                       </button>
-                      <button type="button" aria-label="Close reply composer" data-tooltip="Close" onClick={closeReplyComposer}>
+                      <button type="button" aria-label="Close reply composer" data-tooltip="Close" disabled={sendingReply} onClick={closeReplyComposer}>
                         <UiIcon name="close" />
                       </button>
                     </div>
                   </header>
-                  <textarea ref={replyTextareaRef} autoFocus value={replyText} onChange={(event) => setReplyText(event.target.value)} placeholder="Enter text" />
+                  <textarea ref={replyTextareaRef} autoFocus value={replyText} onChange={(event) => setReplyText(event.target.value)} placeholder="Enter text" disabled={sendingReply} />
                   <form className="reply-ai-prompt" onSubmit={(event) => { event.preventDefault(); void draftAiReply(); }}>
-                    <button type="submit" className="reply-ai-generate" disabled={aiDrafting} aria-label="Generate reply from description">
+                    <button type="submit" className="reply-ai-generate" disabled={aiDrafting || sendingReply} aria-label="Generate reply from description">
                       <UiIcon name="spark" />
                       {aiDrafting ? "Drafting…" : "Generate a reply"}
                     </button>
@@ -3583,7 +3598,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                       onChange={(event) => setReplyInstruction(event.target.value)}
                       placeholder="Add instructions (optional)"
                       maxLength={2000}
-                      disabled={aiDrafting}
+                      disabled={aiDrafting || sendingReply}
                     />
                   </form>
                   {replyFiles.length > 0 && (
@@ -3600,6 +3615,7 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                           aria-label="Open quick reply templates"
                           aria-haspopup="menu"
                           aria-expanded={quickRepliesOpen}
+                          disabled={sendingReply}
                           onClick={() => setQuickRepliesOpen((open) => !open)}
                         >
                           <UiIcon name="spark" />
@@ -3617,9 +3633,9 @@ export default function App({ sessionUser, onSignOut }: { sessionUser: SessionUs
                           </div>
                         )}
                       </div>
-                      <label className="reply-footer-tool reply-attach" data-tooltip="Attach files">
+                      <label className={`reply-footer-tool reply-attach${sendingReply ? " is-disabled" : ""}`} data-tooltip="Attach files">
                         <UiIcon name="paperclip" />
-                        <input type="file" multiple onChange={(event) => setReplyFiles(Array.from(event.target.files ?? []))} />
+                        <input type="file" multiple disabled={sendingReply} onChange={(event) => setReplyFiles(Array.from(event.target.files ?? []))} />
                       </label>
                       <button type="button" className="reply-footer-tool" aria-label="Schedule send" data-tooltip="Schedule send" disabled={sendingReply || !replyMailbox} onClick={() => setScheduleDialogOpen(true)}>
                         <UiIcon name="clock" />

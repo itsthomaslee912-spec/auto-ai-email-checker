@@ -1044,7 +1044,11 @@ def get_email_conversation(
 
 
 @router.post("/send", response_model=SendEmailOut)
-async def send_email(payload: SendEmailIn, db: Session = Depends(get_db)) -> SendEmailOut:
+async def send_email(
+    payload: SendEmailIn,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> SendEmailOut:
     mailbox = (
         db.query(MailboxConnection)
         .filter(
@@ -1078,48 +1082,66 @@ async def send_email(payload: SendEmailIn, db: Session = Depends(get_db)) -> Sen
             .one_or_none()
         )
     is_provider_original = original is not None and not original.provider_message_id.startswith("local-")
+    original_provider_message_id = original.provider_message_id if is_provider_original else None
+    original_thread_id = original.thread_id if original is not None else None
+    provider = mailbox.provider
+    from_name = mailbox.display_name
+    from_email = mailbox.email_address
+    mailbox_id = mailbox.id
 
-    if mailbox.provider == Provider.GOOGLE.value:
+    if provider == Provider.GOOGLE.value:
         token = await ensure_google_access_token(db, mailbox)
-        in_reply_to = references = None
-        if is_provider_original:
-            in_reply_to, references = await gmail_reply_headers(token, original.provider_message_id)
-        result = await gmail_send_message(
-            token,
-            to_addresses=to_addresses,
-            subject=payload.subject.strip() or "(no subject)",
-            body_text=payload.body_text,
-            from_name=mailbox.display_name,
-            from_email=mailbox.email_address,
-            attachments=attachments,
-            in_reply_to=in_reply_to,
-            references=references,
-            thread_id=original.thread_id if in_reply_to and original.thread_id else None,
-        )
-        provider_message_id = result.get("id")
-
-    if mailbox.provider == Provider.MICROSOFT.value:
+    elif provider == Provider.MICROSOFT.value:
         token = await ensure_microsoft_access_token(db, mailbox)
-        if is_provider_original:
-            await outlook_reply_message(
-                token,
-                original.provider_message_id,
-                to_addresses=to_addresses,
-                body_text=payload.body_text,
-                attachments=attachments,
-            )
-        else:
-            await outlook_send_message(
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported provider")
+
+    # Release the request's pooled connection before provider HTTP. Holding it
+    # through Gmail/Outlook round-trips exhausted the pool (size 5) and left
+    # the Reply UI spinner stuck while other requests queued for a checkout.
+    db.commit()
+
+    provider_message_id: str | None = None
+    try:
+        if provider == Provider.GOOGLE.value:
+            in_reply_to = references = None
+            if original_provider_message_id:
+                in_reply_to, references = await gmail_reply_headers(token, original_provider_message_id)
+            result = await gmail_send_message(
                 token,
                 to_addresses=to_addresses,
                 subject=payload.subject.strip() or "(no subject)",
                 body_text=payload.body_text,
+                from_name=from_name,
+                from_email=from_email,
                 attachments=attachments,
+                in_reply_to=in_reply_to,
+                references=references,
+                thread_id=original_thread_id if in_reply_to and original_thread_id else None,
             )
-        provider_message_id = None
-
-    elif mailbox.provider not in (Provider.GOOGLE.value, Provider.MICROSOFT.value):
-        raise HTTPException(status_code=400, detail="Unsupported provider")
+            provider_message_id = result.get("id")
+        else:
+            if original_provider_message_id:
+                await outlook_reply_message(
+                    token,
+                    original_provider_message_id,
+                    to_addresses=to_addresses,
+                    body_text=payload.body_text,
+                    attachments=attachments,
+                )
+            else:
+                await outlook_send_message(
+                    token,
+                    to_addresses=to_addresses,
+                    subject=payload.subject.strip() or "(no subject)",
+                    body_text=payload.body_text,
+                    attachments=attachments,
+                )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Provider send failed mailbox_id=%s provider=%s", mailbox_id, provider)
+        raise HTTPException(status_code=502, detail=f"Could not send email via {provider}") from exc
 
     # Save an immediate local Sent copy so the Sent folder updates without
     # waiting for the next provider sync. Classify objective outgoing
@@ -1131,19 +1153,20 @@ async def send_email(payload: SendEmailIn, db: Session = Depends(get_db)) -> Sen
     sent_classification = deterministic_ai_only_classification(
         subject=payload.subject.strip() or "(no subject)",
         sender=(
-            f"{mailbox.display_name} <{mailbox.email_address}>"
-            if mailbox.display_name else mailbox.email_address
+            f"{from_name} <{from_email}>"
+            if from_name else from_email
         ),
         body_text=payload.body_text,
         snippet=payload.body_text[:500],
         direction="outgoing",
     )
     sent = EmailMessage(
-        mailbox_id=mailbox.id, provider_message_id=provider_message_id or f"local-sent-{datetime.now(UTC).timestamp()}",
+        mailbox_id=mailbox_id,
+        provider_message_id=provider_message_id or f"local-sent-{datetime.now(UTC).timestamp()}",
         subject=payload.subject.strip() or "(no subject)",
         sender=(
-            f"{mailbox.display_name} <{mailbox.email_address}>"
-            if mailbox.display_name else mailbox.email_address
+            f"{from_name} <{from_email}>"
+            if from_name else from_email
         ),
         recipients=to_address,
         received_at=datetime.now(UTC), snippet=payload.body_text[:500], body_text=payload.body_text,
@@ -1154,16 +1177,21 @@ async def send_email(payload: SendEmailIn, db: Session = Depends(get_db)) -> Sen
         interview_subtype=(sent_classification.interview_subtype if sent_classification else None),
         confidence=(sent_classification.confidence if sent_classification else None),
         classification_pending=sent_classification is None,
-        thread_id=original.thread_id if original is not None else None,
+        thread_id=original_thread_id,
     )
     db.add(sent)
     db.flush()
     calendar_changed = False
     if sent_classification is not None and sent.label in CALENDAR_LABELS:
-        calendar_changed = await process_calendar_email(db, sent, use_ai=False)
+        try:
+            calendar_changed = await process_calendar_email(db, sent, use_ai=False)
+        except Exception:
+            logger.exception("Calendar projection failed after send email_id=%s", sent.id)
     db.commit()
     if calendar_changed:
-        await collapse_duplicate_calendar_events_post_commit(sent.mailbox_id)
+        # Whole-mailbox collapse can take many seconds; never block the Reply
+        # UI spinner on it. Background maintenance still converges the chips.
+        background_tasks.add_task(collapse_duplicate_calendar_events_post_commit, mailbox_id)
     invalidate_email_list_caches()
     return SendEmailOut(ok=True, provider_message_id=provider_message_id)
 

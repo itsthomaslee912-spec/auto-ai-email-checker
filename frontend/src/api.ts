@@ -518,13 +518,27 @@ export async function sendEmail(payload: {
   attachments?: EmailAttachment[];
   reply_to_email_id?: number;
 }): Promise<{ ok: boolean; provider_message_id: string | null }> {
-  const res = await apiFetch(`${API_BASE}/api/emails/send`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) throw new Error(await readApiError(res, "Failed to send email"));
-  return res.json();
+  const controller = new AbortController();
+  // Provider send plus a local Sent write should finish well under a minute.
+  // Without a deadline a stuck pool/proxy left the Reply button spinning.
+  const timeout = window.setTimeout(() => controller.abort(), 45_000);
+  try {
+    const res = await apiFetch(`${API_BASE}/api/emails/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(await readApiError(res, "Failed to send email"));
+    return res.json();
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error("Sending timed out. Check your connection and try again.");
+    }
+    throw err;
+  } finally {
+    window.clearTimeout(timeout);
+  }
 }
 
 export async function createAiReply(id: number, instruction = ""): Promise<{ body_text: string }> {

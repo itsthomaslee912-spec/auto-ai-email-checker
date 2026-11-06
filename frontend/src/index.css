@@ -3846,6 +3846,18 @@ button:active:not(:disabled) {
   border-color: color-mix(in srgb, var(--accent) 25%, var(--line));
   box-shadow: 0 28px 90px color-mix(in srgb, #000 55%, transparent);
 }
+.reply-composer.is-sending {
+  opacity: 0.78;
+}
+.reply-composer.is-sending textarea,
+.reply-composer.is-sending input,
+.reply-composer.is-sending .reply-recipient-chip button {
+  cursor: wait;
+}
+.reply-attach.is-disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
 .reply-compose-header,
 .reply-composer footer {
   display: flex;

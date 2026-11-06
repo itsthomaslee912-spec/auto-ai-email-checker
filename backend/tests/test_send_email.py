@@ -4,6 +4,7 @@ import asyncio
 from datetime import UTC, datetime, timezone
 from unittest.mock import AsyncMock, patch
 
+from fastapi import BackgroundTasks
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -65,12 +66,13 @@ def test_reply_ui_classifies_and_projects_outgoing_time_acceptance():
             body_text="7:00 AM CST on November 10 works for me.",
             reply_to_email_id=proposal.id,
         )
+        background = BackgroundTasks()
         with (
             patch.object(emails, "ensure_microsoft_access_token", AsyncMock(return_value="token")),
             patch.object(emails, "outlook_reply_message", AsyncMock()),
-            patch.object(emails, "collapse_duplicate_calendar_events_post_commit", AsyncMock(return_value=False)),
+            patch.object(emails, "collapse_duplicate_calendar_events_post_commit", AsyncMock(return_value=False)) as collapse,
         ):
-            result = asyncio.run(emails.send_email(payload, db))
+            result = asyncio.run(emails.send_email(payload, background, db))
 
         assert result.ok is True
         sent = db.query(EmailMessage).filter(EmailMessage.folder == "sent").one()
@@ -84,4 +86,6 @@ def test_reply_ui_classifies_and_projects_outgoing_time_acceptance():
         assert event.company == "AutoZone"
         assert event.job_role == "Systems Engineer"
         assert event.start_at == datetime(2026, 11, 10, 13, 0, tzinfo=UTC)
+        assert len(background.tasks) == 1
+        assert background.tasks[0].func is collapse
 
