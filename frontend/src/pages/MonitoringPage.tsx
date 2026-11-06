@@ -404,22 +404,6 @@ export default function MonitoringPage({ active, aiStatus, aiStatusOffline }: { 
           <span className="monitoring-overview-state">{snapshot.overall_status}</span>
         </section>
 
-        <section className="monitoring-metrics" aria-label="Platform totals">
-          {[
-            { label: "Active mailboxes", value: snapshot.metrics.active_mailboxes, detail: "Connected provider accounts", icon: <><rect x="3" y="4" width="18" height="16" rx="3" /><path d="M3 14h5l2 3h4l2-3h5" /></> },
-            { label: "Stored emails", value: snapshot.metrics.emails, detail: "Available to search and classify", icon: <><rect x="3" y="5" width="18" height="14" rx="2" /><path d="m3 7 9 6 9-6" /></> },
-            { label: "Pending AI", value: snapshot.metrics.pending_classification, detail: "Waiting for classification", icon: <><rect x="6" y="6" width="12" height="12" rx="2" /><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2" /></> },
-            { label: "Sign-in users", value: snapshot.metrics.users, detail: "Application accounts", icon: <><circle cx="9" cy="8" r="3.2" /><path d="M2.5 20a6.5 6.5 0 0 1 13 0M16.4 11.2A3 3 0 1 0 15 5.5M21.5 20a6 6 0 0 0-3.4-5.4" /></> },
-          ].map((metric) => (
-            <article className="monitoring-metric" key={metric.label}>
-              <span className="monitoring-metric-icon" aria-hidden="true"><svg viewBox="0 0 24 24">{metric.icon}</svg></span>
-              <span className="monitoring-metric-label">{metric.label}</span>
-              <strong>{number(metric.value)}</strong>
-              <small>{metric.detail}</small>
-            </article>
-          ))}
-        </section>
-
         {view === "architecture" ? (
           <section className="monitoring-section">
             <div className="monitoring-section-title">
