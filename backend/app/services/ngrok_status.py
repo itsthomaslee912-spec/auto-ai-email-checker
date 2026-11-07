@@ -7,9 +7,14 @@ import httpx
 
 from app.config import get_settings
 
-_AGENT_URL = "http://127.0.0.1:4040/api/tunnels"
+_DEFAULT_AGENT_URL = "http://127.0.0.1:4040/api/tunnels"
 _CACHE_SECONDS = 30.0
 _cached: tuple[float, dict] | None = None
+
+
+def _agent_url() -> str:
+    configured = (getattr(get_settings(), "ngrok_agent_url", None) or "").strip()
+    return configured or _DEFAULT_AGENT_URL
 
 
 def _public_host(url: str | None) -> str:
@@ -28,7 +33,7 @@ def _probe() -> dict:
         # answer on a free-tier tunnel, so a sub-second timeout reports a
         # healthy tunnel as "offline" on most probes. The result is cached for
         # _CACHE_SECONDS, so a generous timeout here costs nothing.
-        response = httpx.get(_AGENT_URL, timeout=3.0)
+        response = httpx.get(_agent_url(), timeout=3.0)
         response.raise_for_status()
         payload = response.json()
     except Exception:

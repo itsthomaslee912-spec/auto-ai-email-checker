@@ -78,7 +78,7 @@ Set-Location ..
 
 ## Run with Docker
 
-Build and start the full stack (Postgres, RabbitMQ, API, workers, frontend):
+Build and start the full stack (Postgres, RabbitMQ, API, workers, frontend, ngrok):
 
 ```powershell
 .\docker-up.bat
@@ -90,10 +90,15 @@ Or:
 .\scripts\docker-up.ps1 -Build
 ```
 
+ngrok starts by default and tunnels to the API using `WEBHOOK_BASE_URL` from
+`.env` (your reserved HTTPS domain). `docker-up.ps1` loads `NGROK_AUTHTOKEN`
+from `.env` or from `%LOCALAPPDATA%\ngrok\ngrok.yml`.
+
 Open:
 
 - UI: `http://localhost:5173`
 - API health: `http://localhost:8000/api/health`
+- ngrok inspect: `http://localhost:4040`
 - RabbitMQ management: `http://localhost:15672` (`guest` / `guest`)
 
 Compose overrides `DATABASE_URL` and `RABBITMQ_URL` to the Docker network hosts
@@ -113,6 +118,14 @@ Stop the Docker stack:
 ```
 
 Add `-Volumes` only when you also want to wipe the Postgres volume.
+
+To copy an existing native Windows Postgres database into the Docker volume:
+
+```powershell
+.\scripts\migrate-local-postgres-to-docker.ps1
+```
+
+This dumps `.local/postgresql` (`email_checker`), recreates the Docker Postgres volume, restores into `email_platform`, and restarts the stack. Dump files land under `.local/db-migrate/` (gitignored).
 
 ## Run natively on Windows
 
@@ -187,6 +200,8 @@ scripts/              Native Windows and Docker helpers
 docker-compose.yml    Full Docker stack
 docker-up.bat         Build and start Docker services
 docker-down.bat       Stop Docker services
+scripts/migrate-local-postgres-to-docker.ps1
+                      Copy native Postgres data into Docker
 run.ps1               Native application launcher
 run.bat               Native launcher with ngrok enabled
 stop.bat              Native service shutdown

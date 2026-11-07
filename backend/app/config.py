@@ -62,6 +62,9 @@ class Settings(BaseSettings):
     database_idle_transaction_timeout_seconds: float = 300.0
     token_encryption_key: str = ""
     webhook_base_url: str = "http://localhost:8000"
+    # Local ngrok agent inspection API. Override to http://ngrok:4040/api/tunnels
+    # when the agent runs as a Docker Compose service.
+    ngrok_agent_url: str = "http://127.0.0.1:4040/api/tunnels"
     frontend_origin: str = "http://localhost:5173"
     backend_public_url: str = "http://localhost:8000"
     session_secret: str = "change-me-session-secret"

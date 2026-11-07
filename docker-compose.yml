@@ -13,6 +13,7 @@ x-backend-env: &backend-env
   FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:5173}
   WEBHOOK_BASE_URL: ${WEBHOOK_BASE_URL:-http://127.0.0.1:8000}
   BACKEND_PUBLIC_URL: ${BACKEND_PUBLIC_URL:-http://127.0.0.1:8000}
+  NGROK_AGENT_URL: ${NGROK_AGENT_URL:-http://ngrok:4040/api/tunnels}
   GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://127.0.0.1:8000/api/auth/google/callback}
   MICROSOFT_REDIRECT_URI: ${MICROSOFT_REDIRECT_URI:-http://127.0.0.1:8000/api/auth/microsoft/callback}
 
@@ -32,7 +33,7 @@ x-backend: &backend
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-email_app}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
@@ -100,6 +101,22 @@ services:
       api:
         condition: service_healthy
     restart: unless-stopped
+
+  ngrok:
+    image: ngrok/ngrok:3
+    restart: unless-stopped
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+    command:
+      - "http"
+      - "--log=stdout"
+      - "--url=${WEBHOOK_BASE_URL}"
+      - "http://api:8000"
+    ports:
+      - "${NGROK_INSPECT_PORT:-4040}:4040"
+    depends_on:
+      api:
+        condition: service_healthy
 
 volumes:
   postgres_data:

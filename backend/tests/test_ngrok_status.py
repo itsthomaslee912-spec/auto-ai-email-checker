@@ -6,7 +6,10 @@ from app.services.ngrok_status import clear_ngrok_status_cache, get_ngrok_status
 
 
 def _settings(url: str):
-    return SimpleNamespace(webhook_base_url=url)
+    return SimpleNamespace(
+        webhook_base_url=url,
+        ngrok_agent_url="http://127.0.0.1:4040/api/tunnels",
+    )
 
 
 def test_ngrok_status_is_online_when_the_tunnel_matches(monkeypatch):
