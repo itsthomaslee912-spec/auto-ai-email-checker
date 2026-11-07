@@ -1,0 +1,105 @@
+name: auto-ai-email-checker
+
+x-backend-env: &backend-env
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-email_app}:${POSTGRES_PASSWORD:-change-me}@postgres:5432/${POSTGRES_DB:-email_platform}
+  RABBITMQ_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
+  RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-aec.events}
+  RABBITMQ_ROUTING_PREFIX: ${RABBITMQ_ROUTING_PREFIX:-aec}
+  RABBITMQ_PREFETCH_COUNT: ${RABBITMQ_PREFETCH_COUNT:-8}
+  RABBITMQ_OUTBOX_BATCH_SIZE: ${RABBITMQ_OUTBOX_BATCH_SIZE:-100}
+  RABBITMQ_OUTBOX_POLL_SECONDS: ${RABBITMQ_OUTBOX_POLL_SECONDS:-0.25}
+  DISTRIBUTED_RUNTIME: "true"
+  RUN_DB_INIT: ${RUN_DB_INIT:-true}
+  FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:5173}
+  WEBHOOK_BASE_URL: ${WEBHOOK_BASE_URL:-http://127.0.0.1:8000}
+  BACKEND_PUBLIC_URL: ${BACKEND_PUBLIC_URL:-http://127.0.0.1:8000}
+  GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://127.0.0.1:8000/api/auth/google/callback}
+  MICROSOFT_REDIRECT_URI: ${MICROSOFT_REDIRECT_URI:-http://127.0.0.1:8000/api/auth/microsoft/callback}
+
+x-backend: &backend
+  build:
+    context: ./backend
+  env_file:
+    - .env
+  environment:
+    <<: *backend-env
+  depends_on:
+    postgres:
+      condition: service_healthy
+    rabbitmq:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-email_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-email_platform}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-email_app} -d ${POSTGRES_DB:-email_platform}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    <<: *backend
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  sync-worker:
+    <<: *backend
+    command: ["python", "-m", "app.workers.sync"]
+
+  classification-worker:
+    <<: *backend
+    command: ["python", "-m", "app.workers.classification"]
+
+  event-relay:
+    <<: *backend
+    command: ["python", "-m", "app.workers.event_relay"]
+
+  notification-service:
+    <<: *backend
+    command: ["python", "-m", "app.workers.notification"]
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "${FRONTEND_PORT:-5173}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

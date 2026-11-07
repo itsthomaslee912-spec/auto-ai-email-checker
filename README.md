@@ -29,9 +29,16 @@ delivery and live-event fan-out. The notification service is an independent
 process that consumes user activity, persists in-app notifications, and emits
 delivery-ready events for the API WebSocket gateway. The API, sync worker,
 classification worker, event relay, notification service, PostgreSQL,
-RabbitMQ, Vite, and optional ngrok tunnel all run directly on Windows.
+RabbitMQ, and frontend can run either natively on Windows or in Docker.
 
 ## Requirements
+
+### Docker (recommended)
+
+- Docker Desktop with WSL 2
+- A project `.env` with OAuth and AI credentials (see `.env.example`)
+
+### Native Windows
 
 - Windows PowerShell
 - The project-local PostgreSQL installation under `.local/postgresql`
@@ -69,7 +76,45 @@ npm install
 Set-Location ..
 ```
 
-## Run
+## Run with Docker
+
+Build and start the full stack (Postgres, RabbitMQ, API, workers, frontend):
+
+```powershell
+.\docker-up.bat
+```
+
+Or:
+
+```powershell
+.\scripts\docker-up.ps1 -Build
+```
+
+Open:
+
+- UI: `http://localhost:5173`
+- API health: `http://localhost:8000/api/health`
+- RabbitMQ management: `http://localhost:15672` (`guest` / `guest`)
+
+Compose overrides `DATABASE_URL` and `RABBITMQ_URL` to the Docker network hosts
+while still loading OAuth and AI keys from `.env`. Optional Docker-only knobs
+are documented in `.env.docker.example`.
+
+Follow the logs:
+
+```powershell
+docker compose logs -f
+```
+
+Stop the Docker stack:
+
+```powershell
+.\docker-down.bat
+```
+
+Add `-Volumes` only when you also want to wipe the Postgres volume.
+
+## Run natively on Windows
 
 Start locally:
 
@@ -136,13 +181,17 @@ WS  /api/ws/activity
 ## Repository layout
 
 ```text
-backend/       FastAPI API, workers, integrations, and tests
-frontend/      React and Vite user interface
-scripts/       Native Windows setup and process supervision
-run.ps1        Native application launcher
-run.bat        Launcher with ngrok enabled
-stop.bat       Native service shutdown
-.env.example   Native environment template
+backend/              FastAPI API, workers, integrations, and tests
+frontend/             React and Vite user interface
+scripts/              Native Windows and Docker helpers
+docker-compose.yml    Full Docker stack
+docker-up.bat         Build and start Docker services
+docker-down.bat       Stop Docker services
+run.ps1               Native application launcher
+run.bat               Native launcher with ngrok enabled
+stop.bat              Native service shutdown
+.env.example          Environment template
+.env.docker.example   Optional Docker port / credential overrides
 ```
 
 ## Service boundaries
